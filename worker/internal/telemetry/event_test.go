@@ -9,7 +9,7 @@ import (
 
 func TestInitEventUsesOfficial1PEnvelope(t *testing.T) {
 	ev := InitEvent(Identity{
-		DeviceID:           "dev-hash",
+		DeviceID:           strings.Repeat("ab", 32),
 		AccountUUID:        "acc",
 		OrgUUID:            "org",
 		Email:              "slot@example.com",
@@ -43,7 +43,7 @@ func TestInitEventUsesOfficial1PEnvelope(t *testing.T) {
 	for _, must := range []string{
 		`"event_type":"ClaudeCodeInternalEvent"`,
 		`"event_name":"tengu_init"`,
-		`"device_id":"dev-hash"`,
+		`"device_id":"` + strings.Repeat("ab", 32) + `"`,
 		`"account_uuid":"acc"`,
 		`"organization_uuid":"org"`,
 		`"email":"slot@example.com"`,
@@ -52,7 +52,7 @@ func TestInitEventUsesOfficial1PEnvelope(t *testing.T) {
 		`"platform":"linux"`,
 		`"platform_raw":"linux"`,
 		`"arch":"x64"`,
-		`"node_version":"v24.3.0"`,
+		`"shell":"bash"`,
 		`"linux_distro_id":"ubuntu"`,
 		`"linux_distro_version":"24.04"`,
 		`"linux_kernel":"6.8.0-generic"`,
@@ -62,6 +62,11 @@ func TestInitEventUsesOfficial1PEnvelope(t *testing.T) {
 	} {
 		if !strings.Contains(string(raw), must) {
 			t.Fatalf("missing %s in %s", must, raw)
+		}
+	}
+	for _, drop := range []string{`"node_version"`, `"is_running_with_bun"`, `"betas"`, `"additional_metadata"`, `"model"`} {
+		if strings.Contains(string(raw), drop) {
+			t.Fatalf("did not expect %s in %s", drop, raw)
 		}
 	}
 	if strings.Contains(string(raw), `"properties"`) {
@@ -94,6 +99,9 @@ func TestSuccessEventMatchesBridgeEnvelope(t *testing.T) {
 	if !strings.Contains(string(raw), `"linux_kernel"`) {
 		t.Fatalf("full env missing linux_kernel: %s", raw)
 	}
+	if strings.Contains(string(raw), `"model"`) || strings.Contains(string(raw), "claude-sonnet-5") {
+		t.Fatalf("model must not be uploaded: %s", raw)
+	}
 }
 
 func TestGrowthbookPrefersOfficialUserID(t *testing.T) {
@@ -107,6 +115,12 @@ func TestGrowthbookPrefersOfficialUserID(t *testing.T) {
 	attrs := body["attributes"].(map[string]any)
 	if attrs["id"] != "userid" || attrs["deviceID"] != "userid" {
 		t.Fatalf("attrs=%v", attrs)
+	}
+	if attrs["userType"] != "external" || attrs["entrypoint"] != "cli" {
+		t.Fatalf("attrs=%v", attrs)
+	}
+	if _, ok := body["forcedFeatures"].([]any); !ok {
+		t.Fatalf("forcedFeatures=%T", body["forcedFeatures"])
 	}
 	if attrs["subscriptionType"] != "apple_subscription" {
 		t.Fatalf("subscription=%v", attrs["subscriptionType"])
@@ -127,36 +141,107 @@ func TestInitEventOmitsEmptyOptionalFields(t *testing.T) {
 	}
 }
 
-func TestEventUsesConfiguredEnvAnd278Betas(t *testing.T) {
+func TestEventUsesConfiguredEnvAndOmitsBetas(t *testing.T) {
 	ev := InitEvent(Identity{
 		DeviceID: "d",
 		Betas:    "thinking-binding-controls-2026-08-01",
-		Env:      map[string]any{"platform": "linux", "version": "2.1.278", "linux_kernel": "from-env"},
+		Env:      map[string]any{"platform": "linux", "version": "2.1.278", "linux_kernel": "from-env", "node_version": "v1", "is_running_with_bun": true},
 	}, time.Date(2026, 8, 23, 1, 0, 0, 0, time.UTC))
 	raw, err := json.Marshal(ev)
 	if err != nil {
 		t.Fatal(err)
 	}
 	body := string(raw)
-	for _, must := range []string{`"linux_kernel":"from-env"`, `"version":"2.1.278"`, "thinking-binding-controls-2026-08-01"} {
+	for _, must := range []string{`"linux_kernel":"from-env"`, `"version":"2.1.278"`, `"shell":"bash"`, `"vcs":"git"`, `"runtimes":"node"`} {
 		if !strings.Contains(body, must) {
 			t.Fatalf("missing %s in %s", must, body)
 		}
 	}
-	if strings.Contains(body, "2.1.241") || strings.Contains(body, "advanced-tool-use-2025-11-20") {
-		t.Fatalf("stale protocol marker in %s", body)
+	for _, drop := range []string{"thinking-binding-controls-2026-08-01", `"node_version"`, `"is_running_with_bun"`, "2.1.241"} {
+		if strings.Contains(body, drop) {
+			t.Fatalf("unexpected %s in %s", drop, body)
+		}
 	}
 	fallback := InitEvent(Identity{}, time.Date(2026, 8, 23, 1, 0, 0, 0, time.UTC))
 	raw, _ = json.Marshal(fallback)
 	body = string(raw)
-	if !strings.Contains(body, "thinking-binding-controls-2026-08-01") || !strings.Contains(body, `"version":"2.1.284"`) {
+	if strings.Contains(body, "thinking-binding-controls") || strings.Contains(body, "advanced-tool-use") {
+		t.Fatalf("fallback uploaded betas: %s", body)
+	}
+	if !strings.Contains(body, `"version":"2.1.293"`) || !strings.Contains(body, `"shell":"bash"`) {
 		t.Fatalf("fallback=%s", body)
 	}
-	if !strings.Contains(body, "advanced-tool-use-2025-11-20") || !strings.Contains(body, "mid-conversation-system-clear-at-2026-08-21") {
-		t.Fatalf("fallback betas=%s", body)
-	}
 	attrs := GrowthbookEval(Identity{UserID: "u"})["attributes"].(map[string]any)
-	if attrs["appVersion"] != "2.1.284" {
+	if attrs["appVersion"] != "2.1.293" {
 		t.Fatalf("appVersion=%v", attrs["appVersion"])
+	}
+}
+
+func TestSanitizeEnvKeepsObservedHardwareAndDropsSecrets(t *testing.T) {
+	ev := InitEvent(Identity{
+		Env: map[string]any{
+			"platform":         "linux",
+			"cpu_model":        "Intel(R) Xeon(R) CPU",
+			"cpu_cores":        float64(4),
+			"memory_bytes":     float64(4294967296),
+			"root_disk":        "/dev/vda2",
+			"mac":              "52:54:00:11:22:33",
+			"dmi_manufacturer": "Dell Inc.",
+			"dmi_product":      "OptiPlex 7090",
+			"dmi_version":      "1.0",
+			"dmi_family":       "OptiPlex",
+			"dmi_serial":       "ABC123",
+			"dmi_uuid":         "11111111-2222-3333-4444-555555555555",
+			"node_version":     "v1",
+			"authorization":    "secret",
+			"hostname":         "guest-01",
+			"machine_id":       "should-drop",
+		},
+	}, time.Date(2026, 8, 23, 1, 0, 0, 0, time.UTC))
+	env, _ := ev.EventData["env"].(map[string]any)
+	if env["cpu_model"] != "Intel(R) Xeon(R) CPU" {
+		t.Fatalf("cpu_model=%v", env["cpu_model"])
+	}
+	if env["cpu_cores"] != float64(4) || env["memory_bytes"] != float64(4294967296) {
+		t.Fatalf("numeric hardware=%v", env)
+	}
+	if env["dmi_product"] != "OptiPlex 7090" || env["mac"] != "52:54:00:11:22:33" {
+		t.Fatalf("dmi/mac=%v", env)
+	}
+	for _, drop := range []string{"node_version", "authorization", "hostname", "machine_id"} {
+		if _, ok := env[drop]; ok {
+			t.Fatalf("leaked %s in %v", drop, env)
+		}
+	}
+	raw, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ContainsForbidden(raw) {
+		t.Fatalf("forbidden field leaked: %s", raw)
+	}
+}
+
+func TestEnvBlockFallbackUsesIdentityHardware(t *testing.T) {
+	ev := InitEvent(Identity{
+		Platform:        "linux",
+		CPUModel:        "AMD EPYC",
+		CPUCores:        8,
+		MemoryBytes:     8589934592,
+		RootDisk:        "/dev/vda1",
+		MAC:             "52:54:00:aa:bb:cc",
+		DMIManufacturer: "QEMU",
+		DMIProduct:      "Standard PC",
+		DMIUUID:         "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+	}, time.Date(2026, 8, 23, 1, 0, 0, 0, time.UTC))
+	env, _ := ev.EventData["env"].(map[string]any)
+	if env["cpu_model"] != "AMD EPYC" {
+		t.Fatalf("cpu_model=%v", env["cpu_model"])
+	}
+	if env["cpu_cores"] != int64(8) || env["memory_bytes"] != int64(8589934592) {
+		t.Fatalf("numeric=%v", env)
+	}
+	if env["dmi_manufacturer"] != "QEMU" || env["mac"] != "52:54:00:aa:bb:cc" {
+		t.Fatalf("dmi/mac=%v", env)
 	}
 }

@@ -23,7 +23,7 @@ export const PERSONA_PRESETS: readonly PersonaPreset[] = [
   'zero',
   'custom',
 ]
-export const DEFAULT_PERSONA_PRESET: PersonaPreset = 'official'
+export const DEFAULT_PERSONA_PRESET: PersonaPreset = 'official_full'
 export const OVERLAY_PRESETS: readonly OverlayPreset[] = [
   'off',
   'official',
@@ -133,8 +133,8 @@ export const DEFAULT_PERSONA_TEMPLATES: Record<PersonaPreset, PersonaBlock[]> =
         text: '{{identity}}',
       },
       {
-        id: 'caller_agent',
-        note: '常驻约束 + 调用方 agent prompt，都空则整块丢弃。2.1.263 起 1h global',
+        id: 'agent',
+        note: '常驻约束 + 调用方官方提示词。空则丢弃。1h 断点在本块，排在会变的第5段之前。',
         drop_if_empty: true,
         type: 'text',
         text: '{{agent_standing}}{{caller_agent}}',
@@ -149,7 +149,7 @@ export const DEFAULT_PERSONA_TEMPLATES: Record<PersonaPreset, PersonaBlock[]> =
       },
       {
         id: 'caller_system',
-        note: '调用方 --append-system-prompt 剩余 system，原文追加不清洗',
+        note: '第5段可选。只放顶层 system。role=system 留在消息列表。空则丢弃',
         drop_if_empty: true,
         type: 'text',
         text: '{{caller_system}}',
@@ -207,7 +207,7 @@ export const DEFAULT_PERSONA_TEMPLATES: Record<PersonaPreset, PersonaBlock[]> =
         id: 'agent_slot',
         hide: true,
         type: 'text',
-        text: '{{agent_standing}}{{caller_agent}}',
+        text: '{{agent_standing}}',
         cache_control: { type: 'ephemeral', ttl: '1h' },
       },
       {
@@ -219,6 +219,7 @@ export const DEFAULT_PERSONA_TEMPLATES: Record<PersonaPreset, PersonaBlock[]> =
       },
       {
         id: 'caller_system',
+        note: '第5段可选。调用方 system 都写这里，空则丢弃',
         drop_if_empty: true,
         type: 'text',
         text: '{{caller_system}}',
@@ -693,14 +694,6 @@ export function fillTemplateVars(
   })
 }
 
-/**
- * gateway `leftoverGoesToMidSystem`：official / official_full 把调用方 system
- * 挪到首条 user 之后的 role=system（haiku 除外），不在 system[] 里。
- */
-export function callerSystemStaysInSystem(preset: PersonaPreset): boolean {
-  return preset !== 'official' && preset !== 'official_full'
-}
-
 export type SystemPreviewBlock = {
   id: string
   text: string
@@ -711,16 +704,55 @@ export type SystemPreviewBlock = {
   placeholder: boolean
 }
 
+function withStandingSlot(
+  blocks: readonly RawBlock[],
+  standingText: string
+): RawBlock[] {
+  if (!String(standingText ?? '').trim()) return [...blocks]
+  if (
+    blocks.some((block) =>
+      String(block?.text || '').includes('{{agent_standing}}')
+    )
+  ) {
+    return [...blocks]
+  }
+  const idx = blocks.findIndex((block) => {
+    const id = String(block?.id || '')
+    const text = String(block?.text || '')
+    return (
+      /agent/i.test(id) ||
+      text.includes('{{caller_agent}}') ||
+      text.includes('{{agent_official}}')
+    )
+  })
+  const copy = blocks.map((block) => ({ ...block }))
+  if (idx < 0) {
+    copy.splice(Math.min(copy.length, 2), 0, {
+      id: 'agent_standing',
+      type: 'text',
+      text: '{{agent_standing}}',
+    })
+    return copy
+  }
+  const existing = String(copy[idx].text || '')
+  copy[idx].text = existing.replace(/\u200b/g, '').trim()
+    ? `{{agent_standing}}${existing}`
+    : '{{agent_standing}}'
+  return copy
+}
+
 /**
  * 模板 → 出站 system[]，镜像 gateway `renderPersonaTemplate`。
  * 引用 {{billing}} / {{billing_semi}} 的块整块不展示：那一行是计费头。
+ * 本档常驻开关打开时，即使保存的模板丢掉了 {{agent_standing}}，也写进 agent 块。
  */
 export function previewSystemBlocks(
   blocks: readonly RawBlock[],
   vars: Record<string, string>
 ): SystemPreviewBlock[] {
+  const source = withStandingSlot(blocks, vars.agent_standing || '')
   const out: SystemPreviewBlock[] = []
-  for (const block of blocks) {
+  for (const block of source) {
     if (!block || typeof block !== 'object') continue
     const used = extractTemplateVars(block.text)
     if (used.some((name) => BILLING_VARS.includes(name))) continue

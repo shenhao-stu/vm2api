@@ -14,18 +14,15 @@ import {
   rustKernelReachable,
   rustKernelBusy,
   isNeedsRefreshResult,
+  kernelFaults,
 } from './rust-kernel-client.mjs'
 import {
-  ensureRustKernel,
   kernelBinPath,
-  scheduleWrapRecycle,
   awaitWrapRecycle,
   noteWrapHop,
   beginWrapHop,
   endWrapHop,
   wrapHopInflight,
-  deferWrapRecycle,
-  credentialsNewerThanKernel,
 } from './rust-kernel-supervisor.mjs'
 
 const rustHealthCache = new Map()
@@ -126,48 +123,12 @@ export function resolveHopEngine(vm, _routing = {}, { rustReady = null, binPath 
   return { engine: 'rust', wanted, reason: 'configured_rust', fallback: false }
 }
 
-/**
- * Only a hop that may have leaked a CLI slot is recycled. An upstream answer
- * the transport restored (429 limit, 529, 401, stream error) is a response,
- * not a dead slot — SIGKILLing the CLI there is how a layout mismatch loops.
- */
-export function isDeadWrapHop(result) {
-  if (!result) return false
-  if (isClientCancelledResult(result)) return false
-  if (result.transportError) return true
-  const msg = String(result?.body?.error?.message || '')
-  if (/connection error/i.test(msg)) return true
-  if (result.streamError) return false
-  const status = Number(result.status) || 0
-  if (status === 429 || status === 529 || status === 401 || status === 403) return false
-  // No visible output is not a leaked CLI. Recycling here SIGKILLs the
-  // supervisor child, then the same-account retry dies on the restart.
-  return false
-}
-
-/** Transport failure may have leaked a CLI slot. Release it now; do not wait out the recycle cooldown. */
-function releaseLeakedSlots(exec, recycleWrap) {
-  clearRustHealthCache(cacheKey(exec))
-  if (typeof recycleWrap === 'function') {
-    recycleWrap(exec)
-    return
-  }
-  scheduleWrapRecycle(exec, { cooldownMs: 0 })
-}
-
-function recycleLeakedWrap(exec, recycleWrap) {
-  if (wrapHopInflight(exec) > 0) {
-    deferWrapRecycle(exec, (item) => releaseLeakedSlots(item, recycleWrap))
-    return
-  }
-  releaseLeakedSlots(exec, recycleWrap)
-}
-
 function rustUnavailableResult(ready) {
-  const slotBusy = ready?.reason === 'slot_busy'
+  // Both mean "try another VM": the kernel answered and said so.
+  const answered = ready?.reason === 'slot_busy' || ready?.reason === 'kernel_unavailable'
   return {
     ok: false,
-    status: slotBusy ? 503 : 0,
+    status: answered ? 503 : 0,
     via: 'rust-kernel',
     engine: 'rust',
     body: {
@@ -179,8 +140,8 @@ function rustUnavailableResult(ready) {
       },
     },
     headers: {},
-    terminalState: slotBusy ? 'rejected' : 'transport_error',
-    transportError: !slotBusy,
+    terminalState: answered ? 'rejected' : 'transport_error',
+    transportError: !answered,
   }
 }
 
@@ -222,25 +183,12 @@ async function prepareSlotCredentials(exec) {
   ensureOfficialCredentialLink(exec.homeDir, ids || {})
 }
 
-async function bounceRustForFreshTicket(exec) {
-  await prepareSlotCredentials(exec)
-  await ensureWorkerCredential(exec)
-  const rec = scheduleWrapRecycle(exec, { cooldownMs: 0 })
-  if (rec.pending) await rec.pending
-  clearRustHealthCache(cacheKey(exec))
-  const started = await ensureRustKernel(exec)
-  if (started?.ok) rememberRustHealth(exec, started)
-  else clearRustHealthCache(cacheKey(exec))
-  return started
-}
-
 async function prepareRust(exec, { ensure, routing, slotWaitMs } = {}) {
   await awaitWrapRecycle(exec)
+  const fault = kernelFaults.get(cacheKey(exec))
+  if (fault) return { ok: false, reason: 'kernel_unavailable', error: fault }
   if (typeof ensure === 'function') return ensure(exec)
   await prepareSlotCredentials(exec)
-  if (credentialsNewerThanKernel(exec)) {
-    return bounceRustForFreshTicket(exec)
-  }
   const ttl = rustHealthTtlMs(routing)
   const cached = peekRustHealth(exec, ttl)
   if (cached && rustKernelReachable(cached.health)) {
@@ -252,6 +200,15 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs } = {}) {
     rememberRustHealth(exec, ready)
     return ready
   }
+  // The kernel spent its own CLI restarts, or the watchdog spent its container
+  // restarts. Only the watchdog restarts it, bounded; a request must not.
+  if (health?.healthy === false) {
+    return {
+      ok: false,
+      reason: 'kernel_unavailable',
+      error: health?.unhealthy_reason || 'rust kernel unhealthy',
+    }
+  }
   if (rustShouldWaitForSlot(health, wrapHopInflight(exec))) {
     const waited = await waitForReadySlot(exec, resolveHopSlotWaitMs({ remainingBudgetMs: slotWaitMs, routing }))
     if (waited?.ok) {
@@ -260,11 +217,8 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs } = {}) {
     }
     return waited
   }
-  if (exec?.homeDir) await ensureWorkerCredential(exec)
-  const started = await ensureRustKernel(exec)
-  if (started?.ok) rememberRustHealth(exec, started)
-  else clearRustHealthCache(cacheKey(exec))
-  return started
+  clearRustHealthCache(cacheKey(exec))
+  return { ok: false, reason: 'kernel_unavailable', error: 'rust kernel is down; watchdog recovery pending' }
 }
 
 async function runHop({ mode, opts }) {
@@ -279,9 +233,24 @@ async function runHop({ mode, opts }) {
       slotWaitMs: opts.slotWaitMs,
     })
     if (ready?.ok) {
+      if (opts.requestContext && opts.cliHop && ready.health?.classifier_request_context !== true) {
+        return {
+          ok: false,
+          status: 400,
+          terminalState: 'rejected',
+          upstreamExecutions: 0,
+          body: {
+            type: 'error',
+            error: {
+              type: 'invalid_request_error',
+              code: 'classifier_runtime_unsupported',
+              message: 'The kernel/CLI runtime does not support classifier request context.',
+            },
+          },
+        }
+      }
       reason = ready.reason || 'configured_rust'
     } else {
-      if (ready?.reason === 'slot_busy') releaseLeakedSlots(opts.exec, opts.recycleWrap)
       return {
         ...rustUnavailableResult(ready),
         wanted_engine: 'rust',
@@ -313,9 +282,8 @@ async function runHop({ mode, opts }) {
       const ensured = await ensure(opts.exec, { force: true })
       if (ensured?.ok !== true) result = credentialEnsureFailure(result, ensured)
       else {
-        const recycle = opts.recycleWrap || scheduleWrapRecycle
-        recycle(opts.exec)
-        await awaitWrapRecycle(opts.exec)
+        // The CLI invalidates its OAuth cache from the shared credential file
+        // before creating each API client. Recycling here kills sibling hops.
         result = await send(opts)
         result = { ...result, credential_retried: true }
         noteWrapHop(opts.exec)
@@ -329,8 +297,10 @@ async function runHop({ mode, opts }) {
     }
   } finally {
     endWrapHop(opts.exec)
-    if (!opts.signal?.aborted && !isClientCancelledResult(result) && isDeadWrapHop(result)) {
-      recycleLeakedWrap(opts.exec, opts.recycleWrap)
+    // Inference failures only invalidate health. The watchdog owns container
+    // recovery, so concurrent requests cannot bypass its restart budget.
+    if (result?.transportError || result?.body?.error?.code === 'kernel_unavailable') {
+      clearRustHealthCache(cacheKey(opts.exec))
     }
   }
 }

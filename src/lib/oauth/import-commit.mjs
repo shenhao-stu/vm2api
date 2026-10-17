@@ -5,8 +5,15 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { atomicWriteJson, withVmLock } from '../vm/vm-file.mjs'
-import { bindVmProxy, getVm, persistAccountTier, isCodexVm } from '../vm/vm-registry.mjs'
+import { withVmLock } from '../vm/vm-file.mjs'
+import {
+  adoptVmProxyBinding,
+  bindVmProxy,
+  getVm,
+  persistAccountTier,
+  isCodexVm,
+  patchVmRecord,
+} from '../vm/vm-registry.mjs'
 import { isSlotProxyDesynced } from '../vm/vm-runtime.mjs'
 import { reloadSlotReady } from '../vm/slot-runtime.mjs'
 import { resolveImportProxy } from '../vm/proxy-resolve.mjs'
@@ -14,7 +21,7 @@ import { collectSlotIdentity } from '../vm/guest-identity.mjs'
 import { importWorkerCredential } from '../transport/go-worker-client.mjs'
 import { credentialModeFromOauth, canOfficialCc } from './credential-mode.mjs'
 import { resolveAuthScheme } from './auth-scheme.mjs'
-import { flattenOauthIdentity } from './oauth-identity.mjs'
+import { flattenOauthIdentity, normalizeSubscriptionType } from './oauth-identity.mjs'
 import { persistOauthToVm, writeWorkerCredentialFile } from './oauth-credentials.mjs'
 import {
   officialCcUidGid,
@@ -91,6 +98,9 @@ export function createImportCommit(ctx) {
       email: identity.email || existing.claude?.email || null,
       account_uuid: identity.account_uuid || existing.claude?.account_uuid || null,
       org_uuid: identity.org_uuid || existing.claude?.org_uuid || null,
+      subscription_type:
+        identity.subscription_type || normalizeSubscriptionType(existing?.claude?.account_tier) || 'pro',
+      account_tier: normalizeSubscriptionType(existing?.claude?.account_tier) || 'pro',
       scopes: Array.isArray(oauth.scopes)
         ? oauth.scopes
         : String(oauth.scope || '')
@@ -140,15 +150,14 @@ export function createImportCommit(ctx) {
       vm: existing,
       homeDir: path.join(ctx.cfg.paths.project, 'vms', vmId, 'cli-home'),
     }
+    const bound = ctx.proxyPool?.getProxyForVm?.(vmId)
+    if (bound) {
+      // Re-bind even when the id already matches: a prior stale write may have
+      // left proxy_cli_enabled=false on a bound slot (#332).
+      bindVmProxy(ctx.cfg.paths.project, vmId, bound)
+      adoptVmProxyBinding(existing, getVm(ctx.cfg.paths.project, vmId))
+    }
     if (process.env.KIN_CRS_MOCK !== '1') {
-      // The exchange already used the pool's SOCKS5; the slot must start on that same
-      // exit. A record whose proxy fell out of sync (null / other id) would start with
-      // no exit — on a node that is a hard refusal after the grant was already minted.
-      const bound = ctx.proxyPool?.getProxyForVm?.(vmId)
-      if (bound && existing.proxy?.id !== bound.id) {
-        bindVmProxy(ctx.cfg.paths.project, vmId, bound)
-        existing.proxy = getVm(ctx.cfg.paths.project, vmId)?.proxy || existing.proxy
-      }
       const socket = existing.runtime?.worker_socket
       const needReload = !socket || !fs.existsSync(socket) || isSlotProxyDesynced(existing, ctx.cfg.paths.project)
       if (needReload) {
@@ -156,17 +165,27 @@ export function createImportCommit(ctx) {
         if (!boot.ok) {
           return { ok: false, status: 502, error: { code: 'worker_start_failed', message: boot.error } }
         }
-        existing.runtime = boot.runtime
-        existing.status = 'running'
-        existing.schedulable = true
-        existing.schedule_disabled_reason = null
-        atomicWriteJson(vmPath, existing, { mode: 0o600 })
+        const written = patchVmRecord(ctx.cfg.paths.project, vmId, {
+          runtime: boot.runtime,
+          status: 'running',
+          schedulable: true,
+          schedule_disabled_reason: null,
+        })
+        if (written) Object.assign(existing, written)
+        else {
+          existing.runtime = boot.runtime
+          existing.status = 'running'
+          existing.schedulable = true
+          existing.schedule_disabled_reason = null
+        }
         workerExec.vm = existing
       }
     }
+    const importCred =
+      typeof ctx.importWorkerCredential === 'function' ? ctx.importWorkerCredential : importWorkerCredential
     let workerImport = null
     for (let attempt = 0; attempt < 30; attempt++) {
-      workerImport = await importWorkerCredential(workerExec, importedCredential)
+      workerImport = await importCred(workerExec, importedCredential)
       if (workerImport.ok) break
       if (process.env.KIN_CRS_MOCK === '1') break
       await new Promise((resolve) => setTimeout(resolve, 100))
@@ -203,13 +222,12 @@ export function createImportCommit(ctx) {
         rebindOauthAccount({ ...existing, ...JSON.parse(fs.readFileSync(vmPath, 'utf8')), id: vmId })
       } catch {}
       const refreshed = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-      existing.claude = refreshed.claude || existing.claude
-      existing.schedulable = refreshed.schedulable
-      existing.schedule_disabled_reason = refreshed.schedule_disabled_reason
-      existing.status = refreshed.status
-      if (name) existing.name = name
-      existing.updated_at = new Date().toISOString()
-      atomicWriteJson(vmPath, existing, { mode: 0o600 })
+      if (name && refreshed.name !== name) {
+        const written = patchVmRecord(ctx.cfg.paths.project, vmId, { name })
+        Object.assign(existing, written || refreshed, { name })
+      } else {
+        Object.assign(existing, refreshed)
+      }
     })
     try {
       writeWorkerCredentialFile(workerExec.homeDir, importedCredential)

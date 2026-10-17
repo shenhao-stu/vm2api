@@ -5,6 +5,7 @@
  * Unofficial agent block is CRS_AGENT_EXPANSION (not the official SWE prompt).
  */
 import { createRequire } from 'node:module'
+import { validTimezone } from '../core/timezone.mjs'
 
 const require = createRequire(import.meta.url)
 const FIXTURE = require('./official-cc-system-2.1.241.json')
@@ -135,8 +136,8 @@ export function parseInboundEnvFacts(texts = []) {
       facts.locale = sanitizeEnvToken(firstEnvField(loc?.[1] || ''), 64)
     }
     if (!facts.timezone) {
-      const tz = text.match(/\bTimezone:\s*([^\n]+)/i)
-      facts.timezone = sanitizeEnvToken(firstEnvField(tz?.[1] || ''), 64)
+      const tz = text.match(/(?:^|\n)\s*-?\s*(?:Timezone|Time zone|TZ)\s*[:=]\s*([^\n]+)/i)
+      facts.timezone = validTimezone(firstEnvField(tz?.[1] || ''))
     }
     if (!facts.osVersion) {
       const os = text.match(/(?:^|\n)\s*-?\s*OS Version:\s*([^\n]+)/i)
@@ -159,6 +160,7 @@ export function displayNameForModel(modelId = '') {
   if (/opus-5/i.test(id)) return 'Opus 5'
   if (/sonnet-5-5(?:-|$)/i.test(id)) return 'Sonnet 5.5'
   if (/sonnet-5/i.test(id)) return 'Sonnet 5'
+  if (/haiku-5(?:-5|\.5)(?=-|$)/i.test(id)) return 'Haiku 5.5'
   if (/haiku-4-5/i.test(id)) return 'Haiku 4.5'
   if (/opus/i.test(id)) return 'Opus'
   if (/sonnet/i.test(id)) return 'Sonnet'
@@ -252,15 +254,13 @@ export function buildOverwriteEnvironmentSection({
   const shellLine = `\n - Shell: ${sanitizeEnvToken(shell) || 'unknown'}`
   const osLine = resolvedOs
     ? `\n - OS Version: ${resolvedOs}${loc}${tz}`
-    : loc || tz
-      ? `\n - OS Version:${loc}${tz}`
-      : ''
+    : `${loc ? `\n - Locale: ${locValue}` : ''}${tz ? `\n - Timezone: ${tzValue}` : ''}`
   return `# Environment
 You have been invoked in the following environment: 
 ${cwdLine}${gitLine}${platformLine}${shellLine}${osLine}
  - You are powered by the model named ${modelName}. The exact model ID is ${exact}.
- - Assistant knowledge cutoff is ${/sonnet-5-5(?:-|$)/i.test(exact) ? 'June 2026' : 'January 2026'}.
- - The most recent Claude models are the Claude 5 family and Haiku 4.5. Model IDs — Fable 5: 'claude-fable-5', Opus 5.5: 'claude-opus-5-5', Opus 5: 'claude-opus-5', Sonnet 5.5: 'claude-sonnet-5-5', Sonnet 5: 'claude-sonnet-5', Haiku 4.5: 'claude-haiku-4-5-20251001'. When building AI applications, default to the latest and most capable Claude models.
+ - Assistant knowledge cutoff is ${/(?:sonnet-5-5|haiku-5-5)(?:-|$)/i.test(exact) ? 'June 2026' : 'January 2026'}.
+ - The most recent Claude models are the Claude 5 family and Haiku 5.5. Model IDs — Fable 5: 'claude-fable-5', Opus 5.5: 'claude-opus-5-5', Opus 5: 'claude-opus-5', Sonnet 5.5: 'claude-sonnet-5-5', Sonnet 5: 'claude-sonnet-5', Haiku 5.5: 'claude-haiku-5-5', Haiku 4.5: 'claude-haiku-4-5-20251001'. When building AI applications, default to the latest and most capable Claude models.
  - Claude Code is available as a CLI in the terminal, desktop app (Mac/Windows), web app (claude.ai/code), and IDE extensions (VS Code, JetBrains).
  - Fast mode for Claude Code uses Claude Opus with faster output (it does not downgrade to a smaller model). It can be toggled with /fast and is available on Opus 5/4.8.
 

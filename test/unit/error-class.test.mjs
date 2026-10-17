@@ -35,8 +35,10 @@ test('classifyRequestError maps known codes and statuses', () => {
   )
   assert.equal(classifyRequestError({ status: 403, error_code: 'api_key_expired' }).error_class, 'auth')
   assert.equal(classifyRequestError({ status: 403, error_code: 'distill_blocked' }).error_class, 'distill')
+  assert.equal(classifyRequestError({ status: 400, error_code: 'refusal_guard' }).error_class, 'refusal')
   assert.equal(classifyRequestError({ status: 403, error_code: 'refusal_guard' }).error_class, 'refusal')
   assert.equal(classifyRequestError({ status: 500, error_code: 'refusal_guard' }).error_class, 'refusal')
+  assert.equal(classifyRequestError({ status: 503, error_code: 'refusal_guard' }).error_class, 'refusal')
   assert.equal(classifyRequestError({ status: 401, error_code: 'upstream_auth_error' }).error_class, 'credential')
   assert.equal(
     classifyRequestError({
@@ -50,6 +52,11 @@ test('classifyRequestError maps known codes and statuses', () => {
   assert.equal(classifyRequestError({ status: 504, error_code: 'upstream_timeout' }).error_class, 'timeout')
   assert.equal(classifyRequestError({ status: 503, error_code: 'slot_busy' }).error_class, 'overloaded')
   assert.equal(classifyRequestError({ status: 503, error_code: 'wrap_connection_error' }).error_class, 'other')
+  assert.equal(classifyRequestError({ status: 503 }).error_class, 'unavailable')
+  assert.equal(classifyRequestError({ status: 529 }).error_class, 'overloaded')
+  assert.equal(classifyRequestError({ status: 503, error_code: 'kernel_unavailable' }).error_class, 'other')
+  assert.equal(classifyRequestError({ status: 529, error_code: 'pool_overload_cooldown' }).error_class, 'overloaded')
+  assert.equal(classifyRequestError({ status: 429, error_code: 'pool_rate_limited' }).error_class, 'rate_limit')
   assert.equal(classifyRequestError({ status: 403, error_message: 'Just a moment Cloudflare' }).error_class, 'proxy')
   assert.equal(
     classifyRequestError({
@@ -114,4 +121,26 @@ test('excludeErrorClassSql hides ingress auth without dropping oauth credential 
   assert.match(sql, /NOT \(/)
   assert.match(sql, /IFNULL\(error_code/)
   assert.match(sql, /upstream_auth_error/)
+})
+
+test('default auth mute keeps policy 403s that already name a non-auth class', async () => {
+  const { DatabaseSync } = await import('node:sqlite')
+  const db = new DatabaseSync(':memory:')
+  db.exec('CREATE TABLE logs (status INTEGER, error_code TEXT, vm_id TEXT)')
+  const insert = db.prepare('INSERT INTO logs VALUES (?, ?, ?)')
+  for (const row of [
+    [401, 'invalid_api_key', null],
+    [403, null, null],
+    [403, 'claude_code_only', null],
+    [403, 'key_group_mismatch', null],
+    [403, 'distill_blocked', null],
+    [401, 'upstream_auth_error', null],
+  ]) {
+    insert.run(...row)
+  }
+  const kept = db
+    .prepare(`SELECT error_code FROM logs WHERE ${excludeErrorClassSql('auth')}`)
+    .all()
+    .map((r) => r.error_code)
+  assert.deepEqual(kept.sort(), ['claude_code_only', 'distill_blocked', 'key_group_mismatch', 'upstream_auth_error'])
 })

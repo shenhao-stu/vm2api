@@ -126,7 +126,7 @@ test('ingestHeaders reads OpenAI prompt_tokens_details cache fields', () => {
     },
   )
   const acc = q.snapshot().accounts.find((a) => a.account_id === 'a-oa')
-  assert.equal(acc.tokens_in, 20)
+  assert.equal(acc.tokens_in, 6)
   assert.equal(acc.tokens_out, 4)
   assert.equal(acc.cache_read_tokens, 11)
   assert.equal(acc.cache_creation_tokens, 3)
@@ -866,6 +866,39 @@ test('429 unified exhausted marks headers rejected without inventing official 10
   assert.equal(q.canAccept('acc-429').ok, false)
 })
 
+test('local 429 without quota evidence does not reject the 5h window', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ingestHeaders('acc-local-429', {
+    'anthropic-ratelimit-unified-5h-utilization': '0.23',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-7d-utilization': '0.04',
+    'anthropic-ratelimit-unified-7d-status': 'allowed',
+  })
+  q.ingestHeaders('acc-local-429', {}, null, { status: 429, exhausted: false, countRequest: false })
+  q.ingestHeaders('acc-local-503', {
+    'anthropic-ratelimit-unified-5h-utilization': '0.23',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+  })
+  q.ingestHeaders('acc-local-503', {}, null, { status: 503, exhausted: false, countRequest: false })
+  const local = q.repo.get('acc-local-429')
+  assert.equal(local.unified.headers['5h'].status, 'allowed')
+  assert.equal(local.unified.headers['5h'].utilization, 0.23)
+  assert.equal(local.unified.headers['7d'].status, 'allowed')
+  assert.equal(q.repo.get('acc-local-503').unified.headers['5h'].status, 'allowed')
+  q.ingestHeaders(
+    'acc-header-429',
+    {
+      'anthropic-ratelimit-unified-5h-utilization': '0.9',
+      'anthropic-ratelimit-unified-5h-status': 'rejected',
+    },
+    null,
+    { status: 429, exhausted: false, countRequest: false },
+  )
+  assert.equal(q.repo.get('acc-header-429').unified.headers['5h'].status, 'rejected')
+  assert.equal(q.canAccept('acc-local-429').ok, true)
+  assert.equal(q.canAccept('acc-header-429').ok, false)
+})
+
 test('stuck 5h header with growing tokens does not lift official utilization', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),
@@ -953,7 +986,7 @@ test('persistEffectiveWindows clears leftover quota cooldown when official is un
   assert.equal(q.canAccept('acc-reconcile').ok, true)
 })
 
-test('official 0.44 allowed overwrites local 0.85 and clears quota cooldown', () => {
+test('official 0.44 allowed overwrites local 0.9 and clears quota cooldown', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),
     config: { quota: { safety_ratio: 0.85, block_on_5h: true, block_on_7d: true } },
@@ -975,7 +1008,8 @@ test('official 0.44 allowed overwrites local 0.85 and clears quota cooldown', ()
   q.ingestOAuthUsage('acc-clear', {
     ok: true,
     source: 'official-cc-usage',
-    five_hour: { utilization: 0.85, status: 'allowed', resets_at: futureReset(4 * 3600_000) },
+    // 0.85 line + 0.05 default overshoot.
+    five_hour: { utilization: 0.9, status: 'allowed', resets_at: futureReset(4 * 3600_000) },
     seven_day: { utilization: 0.36, status: 'allowed' },
     probed_at: new Date().toISOString(),
   })

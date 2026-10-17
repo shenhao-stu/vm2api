@@ -12,14 +12,17 @@ import {
   persistAccountTier,
   persistVmQuotaOverride,
   persistVmSessionSlots,
+  persistVmMaxSessions,
   setVmSchedulable,
 } from '../vm/vm-registry.mjs'
-import { normalizeInferenceConfig, normalizeSessionSlots } from '../vm/slot-engine.mjs'
+import { normalizeInferenceConfig, normalizeSessionSlots, resolveInferenceEngine } from '../vm/slot-engine.mjs'
+import { slotExec } from '../vm/slot-runtime.mjs'
+import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 
 import { accountTierKey, mergeTierMaps, normalizeTiers } from '../pool/quota-tiers.mjs'
 import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
 import { setManualScheduleWins } from '../pool/schedule-policy.mjs'
-import { PoolScheduler } from '../pool/pool-scheduler.mjs'
+import { PoolScheduler, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { FailoverRunner } from '../pool/failover-runner.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { RateLimitService } from '../pool/rate-limit-service.mjs'
@@ -33,8 +36,17 @@ import { normalizeLoggingConfig } from './request-log.mjs'
 import { markVmRefreshError } from '../oauth/oauth-credentials.mjs'
 import { shouldMarkMissingRefresh } from '../pool/schedule-eligibility.mjs'
 import { normalizeCodexRouting } from '../protocol/codex-route.mjs'
+import {
+  validateOpenAIQuotaPatch,
+  mergeOpenAIQuotaPolicy,
+  normalizeOpenAIQuotaPolicy,
+} from '../pool/openai-quota-policy.mjs'
 import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
-import { syncClaudeKernelConfigs } from '../transport/rust-kernel-supervisor.mjs'
+import { requestKernelReloadWhenIdle, syncClaudeKernelConfigs } from '../transport/rust-kernel-supervisor.mjs'
+import { isCodexVm } from '../vm/vm-kind.mjs'
+import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
+import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
+import { normalizeVmConfig } from '../vm/machine-spec.mjs'
 
 export function createRoutingRuntime(ctx) {
   const getRouting = () => (typeof ctx.getRoutingConfig === 'function' ? ctx.getRoutingConfig() : ctx.routingConfig)
@@ -71,7 +83,7 @@ export function createRoutingRuntime(ctx) {
     vm.policy = { ...(vm.policy || {}), maxConcurrency: value, concurrencyOverride: override }
     vm.updated_at = new Date().toISOString()
     atomicWriteJson(vmPath, vm, { mode: 0o600 })
-    ctx.accountQuota.setMaxConcurrency(vm.claude?.account_uuid || vm.id, value, { override })
+    if (!isCodexVm(vm)) ctx.accountQuota.setMaxConcurrency(vm.claude?.account_uuid || vm.id, value, { override })
     return vm
   }
 
@@ -83,12 +95,16 @@ export function createRoutingRuntime(ctx) {
     vm.policy = { ...(vm.policy || {}), maxRpm: value, rpmOverride: override }
     vm.updated_at = new Date().toISOString()
     atomicWriteJson(vmPath, vm, { mode: 0o600 })
-    ctx.accountQuota.setMaxRpm(vm.claude?.account_uuid || vm.id, value, { override })
+    if (!isCodexVm(vm) && vm.claude) ctx.accountQuota.setMaxRpm(vm.claude.account_uuid || vm.id, value, { override })
     return vm
   }
 
   function applyVmSessionSlots(id, n, { override = true } = {}) {
     return persistVmSessionSlots(ctx.cfg.paths.project, id, normalizeSessionSlots(n), { override })
+  }
+
+  function applyVmMaxSessions(id, n, { override = true } = {}) {
+    return persistVmMaxSessions(ctx.cfg.paths.project, id, n, { override })
   }
 
   /** `override` is already parsed (`parseVmQuotaOverride`); null = follow global quota. */
@@ -119,6 +135,11 @@ export function createRoutingRuntime(ctx) {
     const v = Math.max(0, Math.min(256, Number(n) || 0))
     const skip = []
     for (const vm of listVms(ctx.cfg.paths.project)) {
+      if (isCodexVm(vm)) {
+        skip.push(vm.id)
+        if (vm.account_uuid) skip.push(vm.account_uuid)
+        continue
+      }
       // listVms returns flattened summaries; override flags live in the raw record.
       const storedVm = getVm(ctx.cfg.paths.project, vm.id)
       if (storedVm?.policy?.concurrencyOverride) {
@@ -147,6 +168,11 @@ export function createRoutingRuntime(ctx) {
     const skip = []
     const applied = { default: 0, pro: 0, max: 0, skipped: 0 }
     for (const vm of listVms(ctx.cfg.paths.project)) {
+      if (isCodexVm(vm)) {
+        skip.push(vm.id)
+        if (vm.account_uuid) skip.push(vm.account_uuid)
+        continue
+      }
       // listVms returns flattened summaries; override flags live in the raw record.
       const storedVm = getVm(ctx.cfg.paths.project, vm.id)
       if (storedVm?.policy?.concurrencyOverride) {
@@ -167,12 +193,58 @@ export function createRoutingRuntime(ctx) {
     return applied
   }
 
+  /**
+   * Drop a VM's manual concurrency / RPM / seat-cap pin and take the value the
+   * next routing save would push to it, so the slot follows its tier again.
+   */
+  function inheritVmScheduling(
+    id,
+    { concurrency = false, rpm = false, sessionSlots = false, maxSessions = false } = {},
+  ) {
+    const listed = listVms(ctx.cfg.paths.project).find((vm) => vm.id === id)
+    if (!listed) return null
+    const routingConfig = getRouting()
+    let vm = listed
+    if (concurrency || rpm) {
+      if (listed.codex_kernel || listed.platform === 'openai' || listed.family === 'codex') {
+        const policy = normalizeOpenAIQuotaPolicy(routingConfig.codex?.quota)
+        const current = getVm(ctx.cfg.paths.project, id)
+        if (current) {
+          if (concurrency) applyVmConcurrency(id, policy.max_concurrency, { override: false })
+          if (rpm) applyVmRpm(id, policy.max_rpm, { override: false })
+          vm = getVm(ctx.cfg.paths.project, id) || vm
+        }
+      } else {
+        const policy = normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)[
+          vmTierKey(listed)
+        ]
+        if (concurrency) vm = applyVmConcurrency(id, Number(policy?.max_concurrency ?? 2), { override: false }) || vm
+        if (rpm) vm = applyVmRpm(id, Number(policy?.max_rpm ?? 0), { override: false }) || vm
+      }
+    }
+    if (listed.codex_kernel && maxSessions) {
+      vm =
+        applyVmMaxSessions(id, normalizeOpenAIQuotaPolicy(routingConfig.codex?.quota).max_sessions, {
+          override: false,
+        }) || vm
+    }
+    if (sessionSlots) {
+      vm = applyVmSessionSlots(id, routingConfig.inference?.session_slots, { override: false }) || vm
+    }
+    return vm
+  }
+
   function applyRoutingTierRpm(tiers) {
     const routingConfig = getRouting()
     const policies = normalizeTiers(tiers, routingConfig.quota, routingConfig.concurrency)
     const skip = []
     const applied = { default: 0, pro: 0, max: 0, skipped: 0 }
     for (const vm of listVms(ctx.cfg.paths.project)) {
+      if (isCodexVm(vm)) {
+        skip.push(vm.id)
+        if (vm.account_uuid) skip.push(vm.account_uuid)
+        continue
+      }
       // listVms returns flattened summaries; override flags live in the raw record.
       const storedVm = getVm(ctx.cfg.paths.project, vm.id)
       if (storedVm?.policy?.rpmOverride) {
@@ -190,6 +262,53 @@ export function createRoutingRuntime(ctx) {
       applied[key] += 1
     }
     ctx.accountQuota.applyTierRpm(policies, { skipIds: skip })
+    return applied
+  }
+
+  function applyRoutingOpenAIQuota(policy = null) {
+    const next = normalizeOpenAIQuotaPolicy(policy || getRouting().codex?.quota)
+    const applied = { concurrency: 0, rpm: 0, sessions: 0, skipped: 0 }
+    for (const listed of listVms(ctx.cfg.paths.project, getRouting())) {
+      if (!listed.codex_kernel && listed.platform !== 'openai' && listed.family !== 'codex') continue
+      const stored = getVm(ctx.cfg.paths.project, listed.id)
+      if (!stored) continue
+      const current = stored.policy || {}
+      const patch = {}
+      if (current.concurrencyOverride !== true && Number(current.maxConcurrency) !== next.max_concurrency) {
+        patch.maxConcurrency = next.max_concurrency
+        patch.concurrencyOverride = false
+        applied.concurrency += 1
+      }
+      if (current.rpmOverride !== true && Number(current.maxRpm) !== next.max_rpm) {
+        patch.maxRpm = next.max_rpm
+        patch.rpmOverride = false
+        applied.rpm += 1
+      }
+      if (current.sessionsOverride !== true && Number(current.maxSessions) !== next.max_sessions) {
+        patch.maxSessions = next.max_sessions
+        patch.sessionsOverride = false
+        applied.sessions += 1
+      }
+      if (Object.keys(patch).length) {
+        atomicWriteJson(
+          path.join(ctx.cfg.paths.project, 'vms', `${listed.id}.json`),
+          {
+            ...stored,
+            policy: { ...current, ...patch },
+          },
+          { mode: 0o600 },
+        )
+      }
+      // Re-evaluate only the local soft quota restriction.  This preserves
+      // operator disable, credential failures, upstream hard blocks, leases,
+      // and the session registry owned by the existing runtime.
+      syncCodexQuotaSchedule(ctx.cfg.paths.project, getVm(ctx.cfg.paths.project, listed.id) || stored, {
+        policy: next,
+      })
+    }
+    for (let i = 0; i < Math.max(1, applied.concurrency + applied.rpm + applied.sessions); i += 1) {
+      wakeOpenAIWaiter()
+    }
     return applied
   }
 
@@ -262,20 +381,36 @@ export function createRoutingRuntime(ctx) {
     return syncClaudeKernelConfigs(ctx.cfg.paths.project, routingConfig)
   }
 
+  // kernel.json hot-reloads, but the job watchdog reads its idle limit from env at start.
+  function reloadClaudeKernelsWhenIdle(routingConfig) {
+    const project = ctx.cfg.paths.project
+    let queued = 0
+    for (const { id } of listVms(project)) {
+      const vm = getVm(project, id)
+      if (!vm || isCodexVm(vm) || vm.status !== 'running') continue
+      if (resolveInferenceEngine(vm, routingConfig) !== 'rust') continue
+      if (requestKernelReloadWhenIdle(slotExec(project, vm)).ok) queued += 1
+    }
+    return queued
+  }
+
   function persistRoutingPatch(body = {}) {
+    const hasCodexQuota = body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')
+    if (hasCodexQuota) validateOpenAIQuotaPatch(body.codex.quota)
     let routingConfig = getRouting()
     const prevOfficialCc = routingConfig.official_cc
     const prevHealthProbe = routingConfig.health_probe
     const prevUsageProbe = routingConfig.usage_probe
     const prevNotify = routingConfig.notify
     const prevTiers = routingConfig.tiers
-    const previousSessionSlots = normalizeSessionSlots(routingConfig.inference?.session_slots)
+    const prevIdleMs = streamIdleTimeoutMs(routingConfig)
+    const prevRequestBytes = maxRequestBytes(routingConfig)
     setRouting(routingConfig)
     if (body.sticky) routingConfig.sticky = { ...(routingConfig.sticky || {}), ...body.sticky }
     if (body.quota) routingConfig.quota = { ...(routingConfig.quota || {}), ...body.quota }
     if (body.concurrency) routingConfig.concurrency = { ...(routingConfig.concurrency || {}), ...body.concurrency }
     if (body.pool) {
-      routingConfig.pool = { ...(routingConfig.pool || {}), ...body.pool }
+      routingConfig.pool = normalizePoolRouting({ ...(routingConfig.pool || {}), ...body.pool })
       setManualScheduleWins(routingConfig.pool.manual_schedule_wins)
     }
     if (body.failover) routingConfig.failover = { ...(routingConfig.failover || {}), ...body.failover }
@@ -288,7 +423,21 @@ export function createRoutingRuntime(ctx) {
     const nextSessionSlots = normalizeSessionSlots(routingConfig.inference?.session_slots)
     if (body.compatibility)
       routingConfig.compatibility = { ...(routingConfig.compatibility || {}), ...body.compatibility }
-    if (body.codex) routingConfig.codex = normalizeCodexRouting({ ...(routingConfig.codex || {}), ...body.codex })
+    if (body.codex) {
+      const nextCodex = { ...(routingConfig.codex || {}), ...body.codex }
+      if (hasCodexQuota) {
+        nextCodex.quota = mergeOpenAIQuotaPolicy(routingConfig.codex?.quota, body.codex.quota)
+      }
+      routingConfig.codex = normalizeCodexRouting(nextCodex)
+    }
+    if (body.vm) {
+      const prev = routingConfig.vm && typeof routingConfig.vm === 'object' ? routingConfig.vm : {}
+      const next = { ...prev, ...body.vm }
+      if (body.vm.smbios && typeof body.vm.smbios === 'object') {
+        next.smbios = { ...(prev.smbios || {}), ...body.vm.smbios }
+      }
+      routingConfig.vm = normalizeVmConfig(next)
+    }
     applyOfficialCcRoutingBody(body, prevOfficialCc)
     applyHealthProbeRoutingBody(body, prevHealthProbe)
     applyUsageProbeRoutingBody(body, prevUsageProbe)
@@ -314,8 +463,19 @@ export function createRoutingRuntime(ctx) {
     ctx.stickyRouter.reloadConfig(routingConfig)
     ctx.accountQuota.reloadConfig(routingConfig)
     getPool()?.reloadConfig?.(poolSchedulerConfig())
-    const kernelPersona = compatibilityTouchesKernel(body.compatibility) ? syncKernelPanelConfig(routingConfig) : null
-    if (body.pool || body.failover) initPoolRuntime()
+    const idleChanged = streamIdleTimeoutMs(routingConfig) !== prevIdleMs
+    const requestBytesChanged = maxRequestBytes(routingConfig) !== prevRequestBytes
+    // Body limit is applied once, when axum builds DefaultBodyLimit.
+    const kernelPersona =
+      compatibilityTouchesKernel(body.compatibility) || idleChanged || requestBytesChanged
+        ? syncKernelPanelConfig(routingConfig)
+        : null
+    const kernelReload = idleChanged || requestBytesChanged ? reloadClaudeKernelsWhenIdle(routingConfig) : 0
+    // Pool and failover settings hot-reload into the live scheduler and runner.
+    // Rebuilding them would drop the seat book and queues while their requests
+    // still run (the panel sends `failover` with every routing save).
+    if (body.pool) configureUnitCircuit(routingConfig)
+    if (body.failover) ctx.failoverRunner?.reloadConfig?.(routingConfig.failover || {})
     try {
       return {
         concurrency: applyRoutingTierConcurrency(routingConfig.tiers),
@@ -324,7 +484,11 @@ export function createRoutingRuntime(ctx) {
           body.inference && Object.prototype.hasOwnProperty.call(body.inference, 'session_slots')
             ? applyRoutingSessionSlots(nextSessionSlots)
             : { updated: 0, skipped: 0 },
+        openai_quota: hasCodexQuota
+          ? applyRoutingOpenAIQuota(routingConfig.codex.quota)
+          : { concurrency: 0, rpm: 0, sessions: 0, skipped: 0 },
         kernel_persona: kernelPersona,
+        kernel_reload: kernelReload,
       }
     } catch (err) {
       console.error(
@@ -333,7 +497,12 @@ export function createRoutingRuntime(ctx) {
           error: String(err?.message || err),
         }),
       )
-      return { concurrency: { skipped: 0 }, rpm: { skipped: 0 }, kernel_persona: kernelPersona }
+      return {
+        concurrency: { skipped: 0 },
+        rpm: { skipped: 0 },
+        kernel_persona: kernelPersona,
+        kernel_reload: kernelReload,
+      }
     }
   }
 
@@ -350,13 +519,68 @@ export function createRoutingRuntime(ctx) {
     }
     try {
       const doc = JSON.parse(raw)
+      const hasOpenAIQuota = Object.prototype.hasOwnProperty.call(doc.codex || {}, 'quota')
       doc.codex = normalizeCodexRouting(doc.codex)
+      doc.pool = normalizePoolRouting(doc.pool)
+      doc.vm = normalizeVmConfig(doc.vm)
+      if (!hasOpenAIQuota) migrateLegacyOpenAIPolicies(doc)
       return doc
     } catch (error) {
       throw new Error(`Routing config '${ctx.routingConfigPath}' has invalid JSON: ${error?.message || error}`, {
         cause: error,
       })
     }
+  }
+
+  function migrateLegacyOpenAIPolicies(doc) {
+    const quota = normalizeOpenAIQuotaPolicy(doc.codex?.quota)
+    for (const summary of listVms(ctx.cfg.paths.project)) {
+      if (!isCodexVm(summary)) continue
+      const stored = getVm(ctx.cfg.paths.project, summary.id)
+      if (!stored) continue
+      const policy = stored.policy || {}
+      const nextPolicy = { ...policy }
+      let vmChanged = false
+      const preserve = (field, override, fallback) => {
+        if (policy[override] === true) return
+        const raw = policy[field]
+        const present = Object.prototype.hasOwnProperty.call(policy, field) && raw !== null && raw !== ''
+        const value = field === 'maxConcurrency' && raw === 0 ? 2 : raw
+        if (!present || typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+          if (nextPolicy[field] !== fallback || nextPolicy[override] !== false) {
+            nextPolicy[field] = fallback
+            nextPolicy[override] = false
+            vmChanged = true
+          }
+          return
+        }
+        if (value !== fallback) {
+          if (nextPolicy[field] !== value || nextPolicy[override] !== true) vmChanged = true
+          nextPolicy[field] = value
+          nextPolicy[override] = true
+          return
+        }
+        if (nextPolicy[field] !== fallback || nextPolicy[override] !== false) vmChanged = true
+        nextPolicy[field] = fallback
+        nextPolicy[override] = false
+      }
+      preserve('maxConcurrency', 'concurrencyOverride', quota.max_concurrency)
+      preserve('maxRpm', 'rpmOverride', quota.max_rpm)
+      preserve('maxSessions', 'sessionsOverride', quota.max_sessions)
+      if (vmChanged) {
+        atomicWriteJson(
+          path.join(ctx.cfg.paths.project, 'vms', `${summary.id}.json`),
+          {
+            ...stored,
+            policy: nextPolicy,
+          },
+          { mode: 0o600 },
+        )
+      }
+    }
+    const canonical = normalizeCodexRouting(doc.codex)
+    doc.codex = canonical
+    atomicWriteJson(ctx.routingConfigPath, doc, { mode: 0o600 })
   }
 
   function poolSchedulerConfig() {
@@ -384,6 +608,13 @@ export function createRoutingRuntime(ctx) {
     return String(tier || '').toLowerCase()
   }
 
+  function configureUnitCircuit(routingConfig) {
+    unitCircuit.configure({
+      failureThreshold: routingConfig.pool?.circuit_failure_threshold,
+      openMs: routingConfig.pool?.circuit_open_ms,
+    })
+  }
+
   function initPoolRuntime() {
     const routingConfig = getRouting()
     const runtimeRepo = new AccountRuntimeRepo()
@@ -403,10 +634,7 @@ export function createRoutingRuntime(ctx) {
       config: poolSchedulerConfig(),
     })
     setPool(poolScheduler)
-    unitCircuit.configure({
-      failureThreshold: routingConfig.pool?.circuit_failure_threshold,
-      openMs: routingConfig.pool?.circuit_open_ms,
-    })
+    configureUnitCircuit(routingConfig)
     ctx.accountQuota.onQuotaCooldownCleared = () => {
       try {
         poolScheduler.notifyCapacity()
@@ -487,13 +715,17 @@ export function createRoutingRuntime(ctx) {
     applyRoutingConcurrency,
     applyRoutingTierConcurrency,
     applyRoutingTierRpm,
+    applyRoutingOpenAIQuota,
     syncTierDefaultsIntoRouting,
     loadRoutingConfig,
     poolSchedulerConfig,
     initPoolRuntime,
     applyVmConcurrency,
     applyVmRpm,
+    applyVmMaxSessions,
+    migrateLegacyOpenAIPolicies,
     applyVmSessionSlots,
+    inheritVmScheduling,
     applyVmQuotaOverride,
     storedAccountTier,
     vmTierKey,

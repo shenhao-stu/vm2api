@@ -22,7 +22,8 @@ import { resolveStoreDb } from '../db/database.mjs'
 import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
 import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mjs'
 import { costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
-import { normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
+import { disjointOpenaiUsage } from '../protocol/openai-usage.mjs'
+import { REASONING_EFFORTS, sessionIdForLog } from '../protocol/log-fields.mjs'
 
 /** Persist the token a client actually sent — only for failed ingress auth. */
 export function presentedApiKeyForLog(token) {
@@ -103,10 +104,10 @@ function summarizeBody(body) {
 }
 
 /**
- * Cache-creation TTL breakdown, normalized like Sub2API:
- * prefer usage.cache_creation.ephemeral_5m/1h; when the breakdown is absent
- * but cache_creation_input_tokens > 0, attribute everything to the resolved TTL
- * (default 1h).
+ * Cache-creation TTL breakdown.
+ * Prefer usage.cache_creation.ephemeral_5m/1h; when the split is absent but
+ * cache_creation_input_tokens > 0, bill 1h only on an explicit cache_ttl === '1h',
+ * else 5m. DEFAULT_CACHE_TTL is not a billing fallback.
  */
 function cacheCreationBreakdown(usage) {
   if (!usage || typeof usage !== 'object') {
@@ -117,13 +118,56 @@ function cacheCreationBreakdown(usage) {
   let hour = Number(nested?.ephemeral_1h_input_tokens) || 0
   const total = Number(usage.cache_creation_input_tokens ?? usage.cache_creation_tokens) || 0
   if (five === 0 && hour === 0 && total > 0) {
-    if (normalizeCacheTtl(usage.cache_ttl) === '1h') hour = total
+    if (usage.cache_ttl === '1h') hour = total
     else five = total
   }
   if (five === 0 && hour === 0) {
     return { cache_creation_5m_tokens: null, cache_creation_1h_tokens: null }
   }
   return { cache_creation_5m_tokens: five, cache_creation_1h_tokens: hour }
+}
+
+function webSearchRequestsOf(usage) {
+  const n = Number(usage?.server_tool_use?.web_search_requests ?? usage?.web_search_requests)
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0
+}
+
+const PRICED_COLUMN_KEYS = [
+  'input_cost',
+  'output_cost',
+  'cache_read_cost',
+  'cache_creation_cost',
+  'web_search_cost',
+  'total_cost',
+  'pricing_model',
+  'price_source',
+  'price_version',
+  'service_tier',
+  'speed',
+  'long_context',
+]
+
+function costColumnsForLog(usage, model, extra = {}) {
+  if (extra.pricing_model != null) {
+    const out = {}
+    for (const key of PRICED_COLUMN_KEYS) out[key] = extra[key] ?? null
+    return out
+  }
+  const priced = costColumnsFromUsage(usage, model)
+  return {
+    input_cost: priced.input_cost ?? null,
+    output_cost: priced.output_cost ?? null,
+    cache_read_cost: priced.cache_read_cost ?? null,
+    cache_creation_cost: priced.cache_creation_cost ?? null,
+    web_search_cost: priced.web_search_cost ?? null,
+    total_cost: priced.total_cost ?? null,
+    pricing_model: priced.pricing_model ?? null,
+    price_source: priced.price_source ?? null,
+    price_version: priced.price_version ?? null,
+    service_tier: priced.service_tier ?? null,
+    speed: priced.speed ?? null,
+    long_context: priced.long_context ?? null,
+  }
 }
 
 /** Tri-state model mismatch: null = upstream did not declare a model. */
@@ -143,7 +187,7 @@ function redactHeaders(headers = {}) {
   const out = {}
   for (const [k, v] of Object.entries(headers)) {
     const key = String(k).toLowerCase()
-    if (key === 'authorization' || key === 'x-api-key' || key === 'cookie') {
+    if (key === 'authorization' || key === 'x-api-key' || key === 'cookie' || key === 'set-cookie') {
       out[key] = '***REDACTED***'
     } else if (key === 'x-panel-token') {
       out[key] = '***REDACTED***'
@@ -280,6 +324,25 @@ function clampBody(obj, maxChars = 200_000) {
   return { _truncated: true, _chars: raw.length, preview: raw.slice(0, maxChars) }
 }
 
+/**
+ * Client-facing response as stored in a debug record. The body stays raw text
+ * (SSE frames or JSON) so the panel can show exactly what went out; only
+ * credential-shaped substrings are masked.
+ */
+function debugResponse(captured) {
+  let body = captured.body || ''
+  try {
+    body = JSON.parse(redactSecrets(body))
+  } catch {}
+  return {
+    status: captured.status ?? null,
+    headers: captured.headers || null,
+    body,
+    bytes: captured.bytes || 0,
+    truncated: !!captured.truncated,
+  }
+}
+
 export function resolveLogMode(envMode, req) {
   const hdr = String(req?.headers?.['x-kin-log'] || '')
     .trim()
@@ -379,7 +442,57 @@ export class RequestLogStore {
       ip: safeIp(req),
       user_agent: String(req.headers?.['user-agent'] || '').slice(0, 512),
       headers: mode === 'debug' ? redactHeaders(req.headers) : null,
+      // Outbound bodies carry the gateway's rewrite (persona / overlay) and are
+      // readable by the owning tenant; only the operator's configured mode may
+      // enable them, never the caller's x-kin-debug / x-kin-log header.
+      capture_outbound: this.mode === 'debug',
     }
+  }
+
+  /**
+   * Debug mode only: mirror what the client actually received (status,
+   * headers, body bytes up to maxDebugBodyChars) onto `ctx.response` so
+   * finish() can store it next to the inbound/outbound bodies. Normal mode
+   * never wraps the response.
+   */
+  tapResponse(ctx, res) {
+    if (!ctx || ctx.mode !== 'debug' || !res || ctx.response) return
+    const limit = Math.max(0, this.maxDebugBodyChars)
+    const captured = { status: null, headers: null, body: '', bytes: 0, truncated: false }
+    ctx.response = captured
+    const decoder = new TextDecoder()
+    const take = (chunk, encoding) => {
+      if (chunk == null || typeof chunk === 'function') return
+      const buf =
+        typeof chunk === 'string' ? Buffer.from(chunk, typeof encoding === 'string' ? encoding : 'utf8') : chunk
+      if (!(buf instanceof Uint8Array)) return
+      captured.bytes += buf.byteLength
+      if (captured.truncated) return
+      const room = limit - captured.body.length
+      const text = decoder.decode(buf, { stream: true })
+      if (text.length <= room) {
+        captured.body += text
+        return
+      }
+      captured.body += text.slice(0, Math.max(0, room))
+      captured.truncated = true
+    }
+    const write = res.write
+    const end = res.end
+    res.write = function tappedWrite(chunk, encoding, cb) {
+      take(chunk, encoding)
+      return write.call(this, chunk, encoding, cb)
+    }
+    res.end = function tappedEnd(chunk, encoding, cb) {
+      take(chunk, encoding)
+      return end.call(this, chunk, encoding, cb)
+    }
+    res.once('finish', () => {
+      captured.status = res.statusCode || null
+      try {
+        captured.headers = redactHeaders(res.getHeaders?.() || {})
+      } catch {}
+    })
   }
 
   /**
@@ -389,7 +502,27 @@ export class RequestLogStore {
   finish(ctx, extra = {}) {
     if (!ctx || ctx.mode === 'off') return null
     const duration_ms = Math.max(0, Date.now() - (ctx.t0 || Date.now()))
-    const usage = normalizeUsage(extra.usage || {})
+    const usage = normalizeUsage(disjointOpenaiUsage(extra.usage || {}) || {})
+    const breakdown = cacheCreationBreakdown(usage)
+    const webSearch = extra.web_search_requests ?? webSearchRequestsOf(usage)
+    const billedUsage = {
+      ...usage,
+      input_tokens: extra.input_tokens ?? usage.input_tokens,
+      output_tokens: extra.output_tokens ?? usage.output_tokens,
+      cache_read_tokens: extra.cache_read_tokens ?? usage.cache_read_input_tokens ?? usage.cache_read_tokens,
+      cache_creation_tokens:
+        extra.cache_creation_tokens ?? usage.cache_creation_input_tokens ?? usage.cache_creation_tokens,
+      cache_creation_5m_tokens:
+        extra.cache_creation_5m_tokens ?? usage.cache_creation_5m_tokens ?? breakdown.cache_creation_5m_tokens,
+      cache_creation_1h_tokens:
+        extra.cache_creation_1h_tokens ?? usage.cache_creation_1h_tokens ?? breakdown.cache_creation_1h_tokens,
+      cache_creation: usage.cache_creation,
+      web_search_requests: webSearch,
+      cache_ttl: usage.cache_ttl,
+      service_tier: extra.service_tier ?? usage.service_tier,
+      speed: extra.speed ?? usage.speed,
+      requested_speed: extra.requested_speed ?? usage.requested_speed,
+    }
     const summary = {
       id: 'log_' + crypto.randomBytes(6).toString('hex'),
       request_id: ctx.request_id,
@@ -419,7 +552,8 @@ export class RequestLogStore {
       cache_read_tokens: extra.cache_read_tokens ?? usage.cache_read_tokens ?? usage.cache_read_input_tokens ?? null,
       cache_creation_tokens:
         extra.cache_creation_tokens ?? usage.cache_creation_tokens ?? usage.cache_creation_input_tokens ?? null,
-      ...cacheCreationBreakdown(usage),
+      ...breakdown,
+      web_search_requests: webSearch,
       requested_model: extra.requested_model || extra.model || null,
       upstream_model: extra.upstream_model || null,
       model_mismatch: modelMismatch(extra.requested_model || extra.model, extra.upstream_model),
@@ -428,27 +562,21 @@ export class RequestLogStore {
       attempt_count: extra.attempt_count ?? null,
       final_state: extra.final_state || null,
       final_account_id: extra.final_account_id || extra.account_id || null,
+      session_id: sessionIdForLog(extra.session_id),
+      outbound_session_id: sessionIdForLog(extra.outbound_session_id),
+      reasoning_effort: REASONING_EFFORTS.has(extra.reasoning_effort) ? extra.reasoning_effort : null,
+      // Gate verdict JSON from intercept-gate; the risk audit groups on it.
+      intercept: extra.intercept ? String(extra.intercept).slice(0, 400) : null,
       // sub2api ownership + billing columns
       user_id: extra.user_id ?? null,
+      vm_owner_user_id: this.repo.vmOwnerOf(extra.vm_id),
       group_id: extra.group_id ?? 1,
       rate_multiplier: Number.isFinite(Number(extra.rate_multiplier)) ? Number(extra.rate_multiplier) : 1,
-      ...costColumnsFromUsage(
-        {
-          ...usage,
-          input_tokens: extra.input_tokens ?? usage.input_tokens,
-          output_tokens: extra.output_tokens ?? usage.output_tokens,
-          cache_read_tokens: extra.cache_read_tokens ?? usage.cache_read_input_tokens ?? usage.cache_read_tokens,
-          cache_creation_tokens:
-            extra.cache_creation_tokens ?? usage.cache_creation_input_tokens ?? usage.cache_creation_tokens,
-          cache_creation_5m_tokens: extra.cache_creation_5m_tokens ?? usage.cache_creation_5m_tokens,
-          cache_creation: usage.cache_creation,
-        },
-        extra.upstream_model || extra.model || extra.requested_model,
-      ),
+      ...costColumnsForLog(billedUsage, extra.upstream_model || extra.model || extra.requested_model, extra),
     }
     // sub2api actual_cost: official cost × group rate multiplier (0 is a valid rate)
     if (summary.total_cost != null) {
-      summary.actual_cost = summary.total_cost * summary.rate_multiplier
+      summary.actual_cost = extra.actual_cost ?? summary.total_cost * summary.rate_multiplier
     }
     const classified = classifyRequestError(summary)
     if (classified?.error_class) summary.error_class = classified.error_class
@@ -465,16 +593,26 @@ export class RequestLogStore {
         ...summary,
         headers: ctx.headers,
         inbound_summary: extra.inbound_summary || summarizeBody(extra.inbound_body),
-        request_body_snapshot: extra.inbound_body != null ? sanitizeRequestBodySnapshot(extra.inbound_body) : null,
-        inbound_body: extra.inbound_body != null ? clampBody(extra.inbound_body, this.maxDebugBodyChars) : null,
+        request_body_snapshot:
+          !extra.classifier && extra.inbound_body != null ? sanitizeRequestBodySnapshot(extra.inbound_body) : null,
+        inbound_body:
+          !extra.classifier && extra.inbound_body != null
+            ? clampBody(extra.inbound_body, this.maxDebugBodyChars)
+            : null,
         hop_meta: extra.hop_meta || null,
         via: extra.via || extra.hop_meta?.via || null,
         upstream_status: extra.upstream_status ?? null,
         outbound_summary: extra.outbound_summary || null,
         cache_prefix: extra.cache_prefix || null,
         cache_continuity: extra.cache_continuity || null,
-        outbound_headers: extra.outbound_headers != null ? redactHeaders(extra.outbound_headers) : null,
-        outbound_body: extra.outbound_body != null ? clampBody(extra.outbound_body, this.maxDebugBodyChars) : null,
+        classifier: extra.classifier || null,
+        outbound_headers:
+          ctx.capture_outbound && extra.outbound_headers != null ? redactHeaders(extra.outbound_headers) : null,
+        outbound_body:
+          ctx.capture_outbound && !extra.classifier && extra.outbound_body != null
+            ? clampBody(extra.outbound_body, this.maxDebugBodyChars)
+            : null,
+        response: ctx.response ? debugResponse(ctx.response) : null,
       }
       try {
         this.repo.insertDebug(summary.request_id || summary.id, summary.ts, debugRec)
@@ -538,6 +676,10 @@ export class RequestLogStore {
     return this.repo.totals()
   }
 
+  hasSuccessfulRequest(opts = {}) {
+    return this.repo.hasSuccessfulRequest(opts)
+  }
+
   billingStats(opts = {}) {
     return this.repo.billingStats(opts)
   }
@@ -554,9 +696,17 @@ export class RequestLogStore {
     return this.repo.vmUsageStats(opts)
   }
 
+  keyUsageStats(opts = {}) {
+    return this.repo.keyUsageStats(opts)
+  }
+
   /** Windowed SLA / QPS / TTFT snapshot for overview + log analysis. */
   windowStats(opts = {}) {
     return this.repo.windowStats(opts)
+  }
+
+  protocolEntryStats(opts = {}) {
+    return this.repo.protocolEntryStats(opts)
   }
 
   listDebug({

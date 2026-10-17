@@ -1,3 +1,5 @@
+import type { WindowEstimate } from './panel-pricing'
+
 /**
  * 出站认证头方案。gateway 规范化后只有这两个值。
  *
@@ -32,6 +34,8 @@ export type VmProxySnap = {
   id?: string
   host?: string
   port?: number | string
+  /** 代理名称，运维手写（如对应哪台机器）；未填为 null。 */
+  label?: string | null
   status?: string
   enabled?: boolean
   blocked_reason?: 'ipv6_disabled' | null
@@ -49,8 +53,19 @@ export type VmProxySnap = {
   created_at?: string
   kind?: 'local' | 'socks5' | string
   scheme?: string
-  /** 出口地理位置；从未检测过为 null。 */
+  /** 透明 TCP 把唯一 DNS 应答改写成 SOCKS 主机名。默认关。 */
+  domain_forward?: boolean
+  /** 出口地理位置（IPv4）；从未检测过为 null。 */
   geo?: ProxyGeo | null
+  /** 公网 IPv6 出口地理位置；从未检测过为 null。 */
+  geo_v6?: ProxyGeo | null
+  /** 本地代理所在节点：池行是它那台 VPS（控制面为 null），槽位视图是槽所在节点。 */
+  node_id?: string | null
+  /**
+   * 节点显示名。Admin 本地代理槽位视图：控制面为 null，节点为标签。
+   * 字段出现即允许展示节点名；租户响应省略该字段。
+   */
+  node_name?: string | null
 }
 
 export type InferenceEngine = 'auto' | 'go' | 'rust'
@@ -103,12 +118,84 @@ export type VmCircuit = {
   open_ms: number
 }
 
+/** 槽位执行形态。缺省按 docker 展示。 */
+export type RuntimeType = 'docker' | 'kvm'
+
+/** `GET /cluster/local` 与 `GET /vms/create-options` 的 KVM 探测。 */
+export type KvmProbe = {
+  ok: boolean
+  accel: 'kvm' | 'tcg' | null
+  error: string | null
+}
+
+/** `GET /api/panel/vms/create-options` 剥壳后的 payload（`api()` 已拆 `data`）。 */
+export type VmCreateOptions = {
+  vm: unknown
+  kvm: KvmProbe
+}
+
+export type VmSmbios = {
+  manufacturer?: string
+  product?: string
+  version?: string
+  family?: string
+  serial?: string
+  uuid?: string
+}
+
+/** 创建时固化到槽位的机器规格。旧槽可能缺省。 */
+export type VmMachine = {
+  memory?: string
+  /** Optional Docker hard CPU quota. Missing/zero = unlimited; separate from KVM vcpus. */
+  docker_cpus?: number
+  vcpus?: number
+  disk_gb?: number
+  cpu_model?: string
+  mac?: string
+  smbios?: VmSmbios
+  disk_serial?: string
+}
+
+/** `GET /vms/:id` 的脱敏客户机特征。不含 machine-id / token / 代理账密。 */
+export type VmPhysicalDmi = {
+  manufacturer?: string | null
+  product?: string | null
+  version?: string | null
+  family?: string | null
+  serial?: string | null
+  uuid?: string | null
+}
+
+export type VmPhysicalFeatures = {
+  observed_at?: string | null
+  runtime_type?: RuntimeType | string | null
+  hostname?: string | null
+  os_id?: string | null
+  os_pretty?: string | null
+  kernel_release?: string | null
+  arch?: string | null
+  machine_id_present?: boolean
+  timezone?: string | null
+  locale?: string | null
+  cpu_model?: string | null
+  cpu_cores?: number | null
+  memory_bytes?: number | null
+  root_disk?: string | null
+  mac?: string | null
+  dmi?: VmPhysicalDmi | null
+  shell?: string | null
+  package_managers?: string | null
+  runtimes?: string | null
+}
+
 export type Vm = {
   id: string
   name?: string
   owner_user_id?: string | null
   /** 所在集群节点；null / 缺省 = 本机。远端槽位不支持官方初装、wrap-cli、换内核等。 */
   node_id?: string | null
+  /** Admin-only cluster node label for `node_id`. Tenants never receive this. */
+  node_name?: string | null
   origin?: string | null
   email?: string
   status?: string
@@ -116,7 +203,7 @@ export type Vm = {
   has_refresh?: boolean
   cred_status?: string | { text?: string; key?: string; tone?: string }
   /**
-   * 凭证类型的权威字段（连字符风格：`oauth` / `setup-token` / `apikey` / `console`）。
+   * 凭证类型的权威字段（`oauth` / `setup-token` / `official-setup-token` / `apikey`）。
    * gateway 的三个 Vm 序列化函数只产出这一个。
    */
   credential_mode?: string
@@ -126,13 +213,14 @@ export type Vm = {
   auth_scheme?: string
   availability?: {
     /**
-     * 后端 `availability.mjs` 实际产出 7 种：
-     * `none` / `bad` / `off` / `quota` / `sessions` / `cool` / `ok`。
-     * 此前只声明了 5 种（含后端根本不返回的 `warn`/`caution`），
-     * 导致 `off` 被误归类、「关闭调用」筛选恒为空。
+     * 后端 `availability.mjs` 实际产出 8 种：
+     * `none` / `bad` / `off` / `quota` / `cool` / `drain` / `rest` / `ok`。
+     * `rest`：`policy.active_hours` 工作时段外，休息中不接单。
+     * `drain`：5h/7d 进入闸线前 `critical_band` 到闸线 + `gate_overshoot` 之间，
+     * 仍接单（一次一个），但不再是单纯的「可用」。
      * 注意 `off` 的 `usable` 为 false，判断顺序上必须先于 `!usable`。
      */
-    key: 'ok' | 'none' | 'bad' | 'off' | 'quota' | 'sessions' | 'cool'
+    key: 'ok' | 'none' | 'bad' | 'off' | 'quota' | 'cool' | 'drain' | 'rest'
     usable: boolean
     text?: string
     reason?: string
@@ -151,8 +239,8 @@ export type Vm = {
   circuit?: VmCircuit | null
   cooldown_until?: number
   cooldown_reason?: string
-  utilization_5h?: number
-  utilization_7d?: number
+  utilization_5h?: number | null
+  utilization_7d?: number | null
   utilization_7d_oi?: number
   utilization_7d_sonnet?: number
   status_5h?: string
@@ -164,12 +252,12 @@ export type Vm = {
   codex_usage?: {
     windows?: Array<{
       id?: string
-      used_percent?: number
+      used_percent?: number | null
       reset_at?: string | null
     }>
     quota?: {
-      utilization_5h?: number
-      utilization_7d?: number
+      utilization_5h?: number | null
+      utilization_7d?: number | null
     }
   } | null
   /** Raw OpenAI `plan_type` from wham/usage (GPT slots only). */
@@ -177,6 +265,23 @@ export type Vm = {
   reset_credits?: {
     available_count?: number
     credits?: Array<{ expires_at?: string }>
+    fetched_at?: string
+  } | null
+  /** 限额重置按钮。setup-token 标签但 scope 含 user:profile 时也为 true。 */
+  can_claude_reset?: boolean
+  claude_reset_credits?: {
+    eligible?: boolean
+    available_count?: number
+    credits?: Array<{
+      label?: string
+      resets_left?: number
+      starts_at?: string
+      expires_at?: string
+      clears?: string[]
+      redeemable?: boolean
+    }>
+    cooldown_until?: string
+    weekly_resets_at?: string
     fetched_at?: string
   } | null
   near_limit?: boolean
@@ -197,6 +302,13 @@ export type Vm = {
   dataplane?: 'wrap' | 'cc' | 'crag' | null
   resolved_dataplane?: 'wrap' | 'cc' | 'crag' | null
   kernel?: string
+  /** docker | kvm。缺省按 docker 展示。 */
+  runtime_type?: RuntimeType | null
+  /** 创建时固化的机器规格；旧槽可能缺省。 */
+  machine?: VmMachine | null
+  /** 观测到的客户机特征；列表也可能带上。缺省按未采集展示。 */
+  physical_features?: VmPhysicalFeatures | null
+
   region?: string
   /** 槽位环境时区（容器 `TZ` + persona `# Environment`）。 */
   timezone?: string | null
@@ -206,21 +318,46 @@ export type Vm = {
   active?: boolean
   max_concurrency?: number
   max_rpm?: number
-  /** Claude CLI native 执行位热准入上限；内核固定预开 20。 */
+  /** OpenAI conversation-window cap; 0 means unlimited. */
+  max_sessions?: number | null
+  /** true = 本槽钉住并发；false = 跟随本平台全局默认。 */
+  concurrency_override?: boolean
+  /** true = 本槽钉住 RPM；false = 跟随本平台全局默认。 */
+  rpm_override?: boolean
+  max_sessions_override?: boolean
+  /** Claude CLI native 执行位热准入上限，也是预调度的席位上限；内核固定预开 20。 */
   session_slots?: number | null
   session_slots_override?: boolean
+  /** 去掉本槽覆盖（PATCH 字段传 null）后会落回的值。 */
+  scheduling_inherited?: VmSchedulingInherited | null
   /** 单槽位配额覆盖；缺字段 = 跟随全局 `settings/quota`。GPT 槽位恒为 null。 */
   quota_override?: VmQuotaOverride | null
   /** 覆盖后实际生效的配额。 */
   quota_policy?: VmQuotaView | null
   /** 不含覆盖、按全局分档算出的配额，供「跟随全局」展示。 */
   quota_inherited?: VmQuotaView | null
+  /** OpenAI 的生效额度与限制原因；不包含 Claude 分档/weekly split。 */
+  openai_quota_policy?:
+    | (OpenAIQuotaPolicy & {
+        reason: string | null
+        restricted_until: number | null
+        concurrency_override: boolean
+        rpm_override: boolean
+        sessions_override: boolean
+      })
+    | null
   /** 当前有效调度等级；自动模式范围 1～7，手动模式范围 1～10。 */
   schedule_level?: number
   /** 调度等级来源；缺失时按自动模式展示。 */
   schedule_level_mode?: 'auto' | 'manual'
+  /** 本槽工作时段；null / 缺省 = 24h 接单。窗口外不参与调度。 */
+  active_hours?: VmActiveHours | null
+  /** 工作时段实际使用的时区（自身钉住 → 槽位时区 → UTC）。 */
+  active_hours_timezone?: string | null
+  /** 此刻是否在工作时段内；未设时段为 null。独立于 availability（它可能被冷却/额度盖住）。 */
+  active_hours_active?: boolean | null
   rpm?: number
-  /** 同等级 WRR 权重，不是调度等级。 */
+  /** 同等级权重（只用于 Codex 选槽；Claude 预调度不看），不是调度等级。 */
   weight?: number
   inflight?: number
   allowed_models?: string[] | null
@@ -238,6 +375,8 @@ export type Vm = {
   today_cache_read_tokens?: number
   today_cache_creation_tokens?: number
   total_cost?: number
+  /** 累计 token（含缓存），与 total_cost 同源。 */
+  total_tokens?: number
   expires_at?: string
   refreshed_at?: string
   oauth_source?: string
@@ -248,7 +387,7 @@ export type Vm = {
   last_probe?: {
     at?: string
     ok?: boolean
-    error?: string
+    error?: unknown
     source?: string
     transport?: boolean
     rate_limited?: boolean
@@ -258,7 +397,7 @@ export type Vm = {
     ok?: boolean
     source?: string
     via?: string
-    error?: string | null
+    error?: unknown
     data_at?: string | null
   } | null
   probe_source?: string
@@ -277,10 +416,23 @@ export type Vm = {
   schedule_disabled_reason?: string
   container?: string
   official_cc?: OfficialCcStatus
-  /** 会话上限快照对象；旧字段 `session_active`/`session_max` 是它的扁平化镜像。 */
+  /**
+   * Codex 会话上限快照；`session_active`/`session_max` 是它的扁平化镜像。
+   * Claude 行不带这三项，席位看 `seats_*`。
+   */
   sessions?: { active?: number; max?: number }
   session_active?: number
   session_max?: number
+  /** 预调度席位簿：已占用的不同席位数，含宽限中的（Codex 为 null）。 */
+  seats_used?: number | null
+  /** 席位上限（VM 覆盖 → 全局 `inference.session_slots`）。 */
+  seats_max?: number | null
+  /** `seats_used` 中请求已结束、为原设备保留的宽限席位数。 */
+  seats_grace?: number | null
+  /** 在该 VM 上排队的请求数（等席位、并发、冷却 / RPM）。 */
+  queue_depth?: number | null
+  /** `queue_depth` 中已有席位、只在等并发的请求数。 */
+  conc_waiting?: number | null
   status_7d_oi?: string
   window_5h_cost?: number
   window_5h_requests?: number
@@ -290,7 +442,61 @@ export type Vm = {
   window_7d_success?: number
   window_7d_errors?: number
   window_7d_tokens?: number
+  window_fable_cost?: number
+  estimate_5h?: WindowEstimate
+  estimate_7d?: WindowEstimate
+  estimate_fable?: WindowEstimate | null
   [key: string]: unknown
+}
+
+/** 全局排队：还没落到任何 VM 的请求数与上限 `routing.pool.queue_max`。 */
+export type PoolQueueSummary = {
+  global_queue_depth: number
+  queue_max: number
+}
+
+/** `GET /api/panel/vms` 响应体。 */
+export type VmsListResponse = {
+  items?: Vm[]
+  active_vm?: string | null
+  total?: number
+  proxy_pool?: Record<string, unknown>
+  pool_queue?: PoolQueueSummary
+}
+
+/** 单台 VM 的实时席位；缺席的 VM 表示空闲（全 0）。 */
+export type PoolSeatLive = {
+  seats_used: number
+  seats_max: number
+  seats_grace: number
+  queue_depth: number
+  conc_waiting: number
+  /** 正在这台 VM 上执行的请求数（含无席位探测与 pin）。 */
+  inflight?: number
+}
+
+/** `GET /api/panel/pool/stream` 的 `event: seats` 负载。 */
+export type PoolSeatSnapshot = PoolQueueSummary & {
+  seats: Record<string, PoolSeatLive>
+  ts: number
+}
+
+/** 单台 VM 绑定的 SOCKS5 实时健康，随每次探测推送。 */
+export type PoolProxyLive = Pick<
+  VmProxySnap,
+  | 'id'
+  | 'status'
+  | 'enabled'
+  | 'blocked_reason'
+  | 'latency_ms'
+  | 'last_error'
+  | 'last_probe_at'
+>
+
+/** `GET /api/panel/pool/stream` 的 `event: proxy` 负载；键为 VM id。 */
+export type PoolProxySnapshot = {
+  proxies: Record<string, PoolProxyLive>
+  ts: number
 }
 
 /** `billing.by_model` 一行：同一上游模型按计费档位（tier / speed / 长上下文）拆开。 */
@@ -422,14 +628,42 @@ export type OfficialCcStatus = {
 export type VmQuotaView = {
   limit_5h: number
   limit_7d: number
-  max_sessions: number
-  session_idle_min: number
   block_on_5h: boolean
   block_on_7d: boolean
   weekly_split: boolean
 }
 
 export type VmQuotaOverride = Partial<VmQuotaView>
+
+/** 单槽工作时段（`vm.policy.active_hours`）。start 晚于 end = 跨夜班次。 */
+export type VmActiveHours = {
+  /** 本地 'HH:MM' 开工时间。 */
+  start: string
+  /** 本地 'HH:MM' 收工时间；与 start 不允许相同。 */
+  end: string
+  /** IANA 时区钉住值；缺省跟随槽位时区（代理出口时区）。 */
+  timezone?: string
+  /** 允许窗口开始的星期，0 = 周日；缺省 = 每天。 */
+  days?: number[]
+}
+
+/** VM 并发 / RPM / 席位上限跟随时的取值：并发与 RPM 来自分档，席位来自 `inference.session_slots`。 */
+export type VmSchedulingInherited = {
+  max_concurrency: number
+  max_rpm: number
+  /** OpenAI only; 0 means unlimited. */
+  max_sessions?: number | null
+  /** Codex 行为 null。 */
+  session_slots: number | null
+}
+
+export type OpenAIQuotaPolicy = {
+  limit_5h: number
+  limit_7d: number
+  max_concurrency: number
+  max_rpm: number
+  max_sessions: number
+}
 
 export type QuotaTierKey = 'default' | 'pro' | 'max'
 
@@ -438,8 +672,6 @@ export type QuotaTierPolicy = {
   max_rpm?: number
   limit_5h?: number
   limit_7d?: number
-  max_sessions?: number
-  session_idle_min?: number
   warn_ratio?: number
   [key: string]: unknown
 }

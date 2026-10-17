@@ -5,11 +5,13 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { normalizeTimezone, validTimezone } from '../core/timezone.mjs'
-import { atomicWriteJson } from './vm-file.mjs'
+import { validTimezone } from '../core/timezone.mjs'
+import { hasBoundExit } from './egress.mjs'
+import { atomicWriteJson, invalidateVmSlotReadCache } from './vm-file.mjs'
 import { defaultSeedPolicy } from '../protocol/seed-policy.mjs'
 import { writeSlotSeedFiles } from './slot-seed.mjs'
 import { manualScheduleLevelOf } from '../pool/credential-weight.mjs'
+import { activeHoursOf } from '../pool/active-hours.mjs'
 import { stampVmKind } from './vm-kind.mjs'
 import { materializeWrapCli } from './wrap-cli-runtime.mjs'
 import { listVms } from './vm-registry.mjs'
@@ -20,6 +22,7 @@ import {
   takenFingerprintKeys,
   writeGuestMachineIdFile,
 } from '../identity/workstation-fingerprint.mjs'
+import { assignComputerFingerprint } from '../identity/slot-computer.mjs'
 
 export function wipeSlotHome(projectRoot, id) {
   if (!projectRoot || !id) return
@@ -31,6 +34,7 @@ export function wipeSlotHome(projectRoot, id) {
   try {
     if (fs.existsSync(chat)) fs.unlinkSync(chat)
   } catch {}
+  invalidateVmSlotReadCache(projectRoot, id)
 }
 
 export function seedFreshCliHome(projectRoot, vm) {
@@ -55,10 +59,11 @@ export function buildRecreatedVmRecord(prev, generated) {
   const rpmOverride = policy.rpmOverride === true
   const weight = Number.isFinite(Number(policy.weight)) ? Math.max(1, Math.min(100, Number(policy.weight))) : 1
   const priority = manualScheduleLevelOf(prev)
+  const activeHours = activeHoursOf({ policy })
   const allowed = Array.isArray(policy.allowed_models)
     ? [...new Set(policy.allowed_models.map((id) => String(id || '').trim()).filter(Boolean))]
     : []
-  const timezone = validTimezone(prev.timezone) || normalizeTimezone(pack.timezone)
+  const timezone = validTimezone(prev.timezone) || validTimezone(pack.timezone) || null
   const locale = prev.locale || pack.locale
   const next = {
     id: prev.id,
@@ -80,6 +85,7 @@ export function buildRecreatedVmRecord(prev, generated) {
       inflight: 0,
       ...(allowed.length ? { allowed_models: allowed } : {}),
       ...(policy.quota && typeof policy.quota === 'object' ? { quota: policy.quota } : {}),
+      ...(activeHours ? { active_hours: activeHours } : {}),
     },
     claude: {},
     fingerprint: applyGeneratedFingerprint({}, { ...pack, timezone, locale, reset_at: now }),
@@ -88,7 +94,7 @@ export function buildRecreatedVmRecord(prev, generated) {
     updated_at: now,
     schedulable: false,
     schedule_disabled_reason: 'no_credential',
-    proxy_cli_enabled: prev.proxy_cli_enabled !== false,
+    proxy_cli_enabled: hasBoundExit(prev.proxy),
     seed_policy: defaultSeedPolicy(prev.seed_policy || {}),
     runtime: { type: prev.runtime?.type === 'kvm' ? 'kvm' : 'docker' },
     proxy_required: prev.proxy_required,
@@ -103,7 +109,7 @@ export function buildRecreatedVmRecord(prev, generated) {
 export function recreateVmFiles(projectRoot, prev) {
   if (!projectRoot || !prev?.id) throw new Error('projectRoot and vm id required')
   wipeSlotHome(projectRoot, prev.id)
-  const generated = generateWorkstationFingerprint(prev, {
+  const generated = assignComputerFingerprint(projectRoot, prev, {
     taken: takenFingerprintKeys(listVms(projectRoot), { exceptId: prev.id }),
   })
   const vm = buildRecreatedVmRecord(prev, generated)

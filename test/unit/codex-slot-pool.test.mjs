@@ -90,6 +90,22 @@ test('429 and usage_limit_reached fail over; committed hops do not', () => {
   assert.equal(isCodexFailoverError({ ok: false, status: 502, body: { error: { code: 'usage_limit_reached' } } }), true)
   assert.equal(isCodexFailoverError({ ok: false, status: 429, committed: true }), false)
   assert.equal(isCodexFailoverError({ ok: false, status: 502, body: { error: { code: 'upstream_transport' } } }), false)
+  assert.equal(
+    isCodexFailoverError({ ok: false, status: 503, committed: false, body: { error: { code: 'server_error' } } }),
+    true,
+  )
+  assert.equal(
+    isCodexFailoverError({ ok: false, status: 503, committed: true, body: { error: { code: 'server_error' } } }),
+    false,
+  )
+  assert.equal(
+    isCodexFailoverError({
+      ok: false,
+      status: 503,
+      body: { error: { code: 'codex_kernel_unavailable' } },
+    }),
+    false,
+  )
 })
 
 test('spent 5h window evaluates to restriction, not 调度关', () => {
@@ -264,4 +280,68 @@ test('RPM-only capacity miss reports when the window reopens', async () => {
   assert.equal(full.error, 'capacity_unavailable')
   assert.equal(full.retryAt, now + 60_000)
   resetOpenAIAccountRuntime()
+})
+
+test('a slot inside its rest window is neither ready nor parked', () => {
+  const now = Date.parse('2026-09-17T12:00:00.000Z')
+  const resting = gpt('vm-rest', {
+    timezone: 'UTC',
+    policy: { active_hours: { start: '20:00', end: '08:00', timezone: 'UTC' } },
+  })
+  const picked = pickCodexSlots([resting, gpt('vm-on')], { now })
+  assert.deepEqual(picked.ready, ['vm-on'])
+  assert.deepEqual(picked.parked, [])
+  assert.deepEqual(picked.ids, ['vm-on'])
+})
+
+test('an all-rest pool reports pool_resting with the first window open', () => {
+  const now = Date.parse('2026-09-17T12:00:00.000Z')
+  const resting = gpt('vm-rest', {
+    policy: { active_hours: { start: '20:00', end: '08:00', timezone: 'UTC' } },
+  })
+  const picked = pickCodexSlots([resting], { now })
+  assert.equal(picked.error, 'pool_resting')
+  assert.equal(picked.retryAt, Date.parse('2026-09-17T20:00:00.000Z'))
+  assert.deepEqual(picked.ids, [])
+})
+
+test('a resting slot that cannot serve the model promises no wake time', () => {
+  const now = Date.parse('2026-09-17T12:00:00.000Z')
+  const resting = gpt('vm-rest', {
+    policy: { allowed_models: ['gpt-other'], active_hours: { start: '20:00', end: '08:00', timezone: 'UTC' } },
+  })
+  assert.equal(pickCodexSlots([resting], { now, model: 'gpt-test' }).error, 'no_codex_vm')
+})
+
+test('a resting home reports boundState resting, not gone', () => {
+  const now = Date.parse('2026-09-17T12:00:00.000Z')
+  const home = gpt('vm-home', {
+    policy: { active_hours: { start: '20:00', end: '08:00', timezone: 'UTC' } },
+  })
+  const other = orderCodexSessionSlots([home, gpt('vm-on')], { boundVmId: 'vm-home', now })
+  assert.equal(other.boundState, 'resting')
+  assert.deepEqual(other.ids, ['vm-on'])
+  // A continuation only offers the home: the pool rests, and the caller learns why.
+  const alone = orderCodexSessionSlots([home], { boundVmId: 'vm-home', now })
+  assert.equal(alone.error, 'pool_resting')
+  assert.equal(alone.boundState, 'resting')
+})
+
+test('a pin still reaches a resting GPT slot', () => {
+  const now = Date.parse('2026-09-17T12:00:00.000Z')
+  const resting = gpt('vm-rest', {
+    policy: { active_hours: { start: '20:00', end: '08:00', timezone: 'UTC' } },
+  })
+  const picked = pickCodexSlots([resting], { pin: 'vm-rest', now })
+  assert.deepEqual(picked.ids, ['vm-rest'])
+})
+
+test('a listVms summary (top-level active_hours) is gated too', () => {
+  const now = Date.parse('2026-09-17T12:00:00.000Z')
+  const resting = gpt('vm-rest', {
+    timezone: 'UTC',
+    active_hours: { start: '20:00', end: '08:00', timezone: 'UTC' },
+  })
+  const picked = pickCodexSlots([resting, gpt('vm-on')], { now })
+  assert.deepEqual(picked.ids, ['vm-on'])
 })

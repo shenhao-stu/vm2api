@@ -27,23 +27,23 @@ test('panel expires_at is always milliseconds', () => {
   assert.equal(normalizePanelExpiresAt(null, null), null)
 })
 
-test('5h 87% over default 85% is 5h 限制 not 不可用', () => {
-  const st = credStatusFromQuota(
-    true,
-    {
-      utilization_5h: 0.87,
-      utilization_7d: 0.18,
-      status_5h: 'allowed',
-      status_7d: 'allowed',
-      last_probe: usageOk,
-    },
-    Date.now() + 3600_000,
-    extrasLive,
-  )
+test('5h past default 85% + 5% overshoot is 5h 限制 not 不可用; inside it is 临近闸线', () => {
+  const quota = (u5) => ({
+    utilization_5h: u5,
+    utilization_7d: 0.18,
+    status_5h: 'allowed',
+    status_7d: 'allowed',
+    last_probe: usageOk,
+  })
+  const st = credStatusFromQuota(true, quota(0.91), Date.now() + 3600_000, extrasLive)
   assert.equal(st.key, 'quota')
   assert.equal(st.text, '5h 限制')
   assert.equal(st.usable, true)
   assert.equal(st.accept, false)
+  const near = credStatusFromQuota(true, quota(0.87), Date.now() + 3600_000, extrasLive)
+  assert.equal(near.key, 'drain')
+  assert.equal(near.tone, 'caution')
+  assert.equal(near.accept, true)
 })
 
 test('fable banned without usage refresh is not 无效凭证', () => {

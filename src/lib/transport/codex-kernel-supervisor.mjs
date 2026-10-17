@@ -6,11 +6,19 @@ import { spawn } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { boundProxyUrl, isLocalEgressProxy } from '../vm/egress.mjs'
+import { boundProxyUrl, isLocalEgressProxy, localEgressProxyUrl } from '../vm/egress.mjs'
+import { vmNodeId } from '../cluster/placement.mjs'
 import { assertProxyAllowed } from '../vm/proxy-policy.mjs'
+import { maxRequestBytes } from '../core/config.mjs'
+import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 import { codexKernelHealth, codexKernelPaths } from './codex-kernel-client.mjs'
 
 const starts = new Map()
+
+// The kernel exits only through config.proxy_url; inherited proxy variables would give it a second, unseen exit.
+function kernelEnv(env = process.env) {
+  return Object.fromEntries(Object.entries(env).filter(([key]) => !/^(https?|all|no)_proxy$/i.test(key)))
+}
 
 function existingBin(candidate) {
   const bin = String(candidate || '').trim()
@@ -34,7 +42,7 @@ export function codexKernelBinPath() {
   return existingBin(path.resolve('bin/kin-codex-kernel'))
 }
 
-export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxyRequired } = {}) {
+export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxyRequired, routing } = {}) {
   if (!projectRoot || !vm?.id) return null
   assertProxyAllowed(vm.proxy)
   if (proxyUrl) assertProxyAllowed({ url: proxyUrl })
@@ -53,8 +61,12 @@ export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxy
   if (!secret) secret = crypto.randomBytes(24).toString('hex')
   fs.writeFileSync(tokenPath, secret + '\n', { mode: 0o600 })
   const local = isLocalEgressProxy(vm?.proxy)
-  const proxy = local ? '' : String(proxyUrl || boundProxyUrl(vm?.proxy) || '').trim()
-  const required = local ? false : proxyRequired == null ? !!proxy : !!proxyRequired
+  // Only a slot on this host treats local egress as the deployment proxy.
+  // A node slot is handed that node's forwarder; replacing it would exit from here.
+  const hostLocal = local && !vmNodeId(vm)
+  const proxy = hostLocal ? localEgressProxyUrl() : String(proxyUrl || boundProxyUrl(vm?.proxy) || '').trim()
+  // A configured deployment proxy is this slot's exit: fail closed instead of going direct.
+  const required = hostLocal ? !!proxy : proxyRequired == null ? !!proxy : !!proxyRequired
   const deviceId = String(vm.device_id || vm.fingerprint?.device_id || vm.id).trim() || vm.id
   const config = {
     vm_id: vm.id,
@@ -64,14 +76,83 @@ export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxy
     proxy_url: proxy,
     proxy_required: required,
     internal_token: secret,
-    // Keep Codex slots aligned with the 32 MiB body budget in the bundled
-    // kernel. Newer kernels can read this value; older binaries use the
-    // patched 32 MiB default directly.
-    max_request_bytes: 32 * 1024 * 1024,
+    max_request_bytes: maxRequestBytes(routing),
     test_endpoints: process.env.KIN_CODEX_TEST_ENDPOINTS === '1',
   }
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 })
   return { runDir, socketPath, configPath, credentialPath, tokenPath }
+}
+
+export function shouldRecycleCodexKernel({ wanted, stamped, inFlight } = {}) {
+  return wanted > 0 && stamped > 0 && wanted !== stamped && inFlight <= 1
+}
+
+function limitStampPath(configPath) {
+  return configPath ? path.join(path.dirname(configPath), 'codex-kernel.limit') : ''
+}
+
+function readLimitStamp(configPath) {
+  try {
+    return Number(fs.readFileSync(limitStampPath(configPath), 'utf8')) || 0
+  } catch {
+    return 0
+  }
+}
+
+function writeLimitStamp(configPath, bytes) {
+  if (!configPath || !(bytes > 0)) return
+  fs.writeFileSync(limitStampPath(configPath), `${bytes}\n`, { mode: 0o600 })
+}
+
+function configRequestBytes(configPath) {
+  try {
+    return Number(JSON.parse(fs.readFileSync(configPath, 'utf8')).max_request_bytes) || 0
+  } catch {
+    return 0
+  }
+}
+
+function childHasExited(child) {
+  return !child || child.exitCode != null || child.signalCode != null
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (childHasExited(child)) return Promise.resolve(true)
+  if (!(timeoutMs > 0)) return Promise.resolve(false)
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (exited) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(exited)
+    }
+    const timer = setTimeout(() => finish(childHasExited(child)), timeoutMs)
+    child.once('exit', () => finish(true))
+  })
+}
+
+/** SIGTERM, then SIGKILL. Unlink the socket only after the process is actually gone. */
+export async function finishCodexRecycle(child, socketPath, { termMs = 2000, killMs = 1000 } = {}) {
+  if (!childHasExited(child)) {
+    try {
+      child.kill('SIGTERM')
+    } catch {}
+  }
+  let exited = await waitForChildExit(child, termMs)
+  if (!exited && killMs > 0) {
+    try {
+      child.kill('SIGKILL')
+    } catch {}
+    exited = await waitForChildExit(child, killMs)
+  }
+  if (!exited) return { exited: false }
+  if (socketPath) {
+    try {
+      fs.unlinkSync(socketPath)
+    } catch {}
+  }
+  return { exited: true }
 }
 
 export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
@@ -79,6 +160,21 @@ export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
   if (!bin) return { ok: false, reason: 'bin_missing' }
   const paths = codexKernelPaths(exec)
   if (!paths.configPath) return { ok: false, reason: 'config_missing' }
+  const wanted = configRequestBytes(paths.configPath)
+  const stamped = readLimitStamp(paths.configPath)
+  const inFlight = openAIRuntimeSignals(exec.vmId).inFlight
+  // Only the request that holds this seat may recycle. A timeout is not an
+  // exit: leave the socket and the tracked child in place.
+  if (shouldRecycleCodexKernel({ wanted, stamped, inFlight })) {
+    const child = stopCodexKernel(exec.vmId)
+    if (child) {
+      const gone = await finishCodexRecycle(child, paths.socketPath)
+      if (!gone.exited) {
+        starts.set(exec.vmId, child)
+        return { ok: false, reason: 'recycle_timeout' }
+      }
+    }
+  }
   const live = await waitForHealth(exec, Math.min(800, Math.max(200, Number(timeoutMs) || 800)))
   if (live.ok) return { ok: true, reused: true, health: live.health }
   const current = starts.get(exec.vmId)
@@ -87,11 +183,13 @@ export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
     if (paths.socketPath) fs.unlinkSync(paths.socketPath)
   } catch {}
   const child = spawn(bin, [paths.configPath], {
+    env: kernelEnv(),
     stdio: 'ignore',
     detached: true,
   })
   child.unref()
   starts.set(exec.vmId, child)
+  writeLimitStamp(paths.configPath, wanted)
   return waitForHealth(exec, timeoutMs)
 }
 
@@ -119,6 +217,11 @@ export function stopCodexKernel(vmId) {
     starts.delete(vmId)
   }
   return child || null
+}
+
+/** A child this process spawned for the VM that has not exited (it may still be starting or hung). */
+export function codexKernelTracked(vmId) {
+  return !childHasExited(starts.get(vmId))
 }
 
 export function stopAllCodexKernels() {

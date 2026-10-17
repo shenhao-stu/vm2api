@@ -1,7 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { prepareCliHopBody, stripCliOwnedSystem } from '../../src/lib/protocol/outbound-attempt.mjs'
-import { CRS_OFFICIAL_SYSTEM, CRS_OFFICIAL_CLI_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
+import {
+  applyCrsUnofficialPersona,
+  CRS_OFFICIAL_SYSTEM,
+  CRS_OFFICIAL_CLI_SYSTEM,
+  parkableSystemText,
+} from '../../src/lib/identity/crs-persona.mjs'
 import { CRS_OFFICIAL_AGENT_PROMPT } from '../../src/lib/identity/official-cc-system-2.1.241.mjs'
 
 test('prepareCliHopBody drops metadata and CLI-owned system but keeps official agent leftover', () => {
@@ -28,6 +33,26 @@ test('prepareCliHopBody drops metadata and CLI-owned system but keeps official a
     { type: 'text', text: 'hi', cache_control: { type: 'ephemeral', ttl: '1h' } },
   ])
   assert.equal(body.stream, true)
+})
+
+test('prepareCliHopBody preserveSystem keeps official billing and system cache_control', () => {
+  const billing = 'x-anthropic-billing-header: cc_version=2.1.280.096; cc_entrypoint=cli; cch=bdff0;'
+  const body = prepareCliHopBody(
+    {
+      model: 'claude-opus-5-5',
+      max_tokens: 32,
+      system: [
+        { type: 'text', text: billing },
+        { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
+        { type: 'text', text: 'RFC 2119 keywords', cache_control: { type: 'ephemeral' } },
+      ],
+      messages: [{ role: 'user', content: 'ping' }],
+    },
+    { preserveSystem: true },
+  )
+  assert.equal(body.system[0].text, billing)
+  assert.match(body.system[1].text, /You are Claude Code/)
+  assert.deepEqual(body.system[2].cache_control, { type: 'ephemeral' })
 })
 
 test('prepareCliHopBody keeps caller leftover system and tools', () => {
@@ -78,7 +103,7 @@ test('prepareCliHopBody does not overwrite caller thinking disabled', () => {
   assert.equal(body.context_management, undefined)
 })
 
-test('prepareCliHopBody strips unsigned empty dummy and short thinking history', () => {
+test('prepareCliHopBody strips unsigned dummy and short thinking history', () => {
   const body = prepareCliHopBody({
     model: 'claude-sonnet-5',
     max_tokens: 256,
@@ -102,11 +127,37 @@ test('prepareCliHopBody strips unsigned empty dummy and short thinking history',
   assert.equal(body.temperature, 1)
   assert.deepEqual(body.messages[1].content, [
     { type: 'thinking', thinking: 'keep-me', signature: 'sig_real_1234567890abcdef' },
+    { type: 'thinking', thinking: '', signature: 'sig_empty_text_still_long_enough' },
     { type: 'text', text: 'hello' },
   ])
 })
+test('prepareCliHopBody keeps existing signatures and fills missing ones', () => {
+  const body = prepareCliHopBody(
+    {
+      model: 'claude-sonnet-5',
+      max_tokens: 256,
+      thinking: { type: 'adaptive' },
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'existing', signature: 'abc' },
+            { type: 'thinking', thinking: 'missing' },
+            { type: 'text', text: 'hello' },
+          ],
+        },
+      ],
+    },
+    { preserveThinkingBlocks: true },
+  )
+  assert.deepEqual(body.messages[1].content, [
+    { type: 'thinking', thinking: 'existing', signature: 'abc' },
+    { type: 'thinking', thinking: 'missing', signature: '' },
+    { type: 'text', text: 'hello', cache_control: { type: 'ephemeral', ttl: '1h' } },
+  ])
+})
 
-test('prepareCliHopBody drops an assistant turn that is only unsigned thinking', () => {
+test('prepareCliHopBody keeps a short non-dummy signature on Opus 5.5', () => {
   const body = prepareCliHopBody({
     model: 'claude-opus-5.5',
     max_tokens: 64000,
@@ -123,12 +174,9 @@ test('prepareCliHopBody drops an assistant turn that is only unsigned thinking',
   assert.equal(body.model, 'claude-opus-5-5')
   assert.deepEqual(
     body.messages.map((message) => message.role),
-    ['user'],
+    ['user', 'assistant', 'user'],
   )
-  assert.deepEqual(body.messages.at(-1).content, [
-    { type: 'text', text: 'first' },
-    { type: 'text', text: 'continue', cache_control: { type: 'ephemeral', ttl: '1h' } },
-  ])
+  assert.deepEqual(body.messages[1].content, [{ type: 'thinking', thinking: 'draft only', signature: 'abc' }])
 })
 
 test('prepareCliHopBody repaired does not refill thinking after signature downgrade', () => {
@@ -350,6 +398,68 @@ test('cli-hop lifts role=system turns for models that reject them', () => {
   })
   assert.ok(body.messages.every((message) => message.role !== 'system'))
   assert.equal(body.system.at(-1).text, 'reminder')
+})
+
+test('sonnet-5 lift keeps one context-budget reminder so the system tail stays stable', () => {
+  const budget = (left) => ({
+    role: 'system',
+    content: `<system-reminder>\n<total_tokens>${left} tokens left</total_tokens>\n</system-reminder>`,
+  })
+  const env = {
+    role: 'system',
+    content: '<system-reminder>\n# Environment\n - Primary working directory: /tmp\n</system-reminder>',
+  }
+  const base = {
+    model: 'claude-sonnet-5',
+    max_tokens: 256,
+    system: [{ type: 'text', text: 'main prompt' }],
+  }
+  const first = prepareCliHopBody({
+    ...base,
+    messages: [{ role: 'user', content: 'u1' }, env, budget(14930105)],
+  })
+  const second = prepareCliHopBody({
+    ...base,
+    messages: [
+      { role: 'user', content: 'u1' },
+      env,
+      budget(14930105),
+      { role: 'assistant', content: 'a1' },
+      { role: 'user', content: 'u2' },
+      budget(14928642),
+    ],
+  })
+  const reminders = (body) => JSON.stringify(body.system).match(/<total_tokens>/g)?.length || 0
+  assert.equal(reminders(first), 1)
+  assert.equal(reminders(second), 1)
+  assert.deepEqual(second.system, first.system)
+  assert.ok(second.messages.every((message) => message.role !== 'system'))
+  const persona = (body) =>
+    applyCrsUnofficialPersona(body, {
+      mode: 'official_full',
+      park: false,
+      forceConfigured: true,
+      model: 'claude-sonnet-5',
+      sessionId: '11111111-2222-4333-8444-555555555555',
+    })
+  const renderedFirst = persona(first)
+  const renderedSecond = persona(second)
+  assert.deepEqual(renderedSecond.system, renderedFirst.system)
+  assert.equal(JSON.stringify(renderedSecond.system).match(/<total_tokens>/g)?.length, 2)
+})
+
+test('a later budget drop leaves a mixed system-reminder wrapper intact', () => {
+  const only = '<system-reminder>\n<total_tokens>2 tokens left</total_tokens>\n</system-reminder>'
+  const mixed = '<system-reminder>\nKEEP\n<total_tokens>1 tokens left</total_tokens>\n</system-reminder>'
+  const joined = parkableSystemText([
+    { type: 'text', text: only },
+    { type: 'text', text: mixed },
+  ])
+  assert.equal(joined.split('<system-reminder>').length, joined.split('</system-reminder>').length)
+  assert.match(joined, /<system-reminder>\nKEEP\n\n?<\/system-reminder>/)
+  assert.equal(joined.match(/<total_tokens>/g)?.length, 1)
+  assert.match(joined, /<total_tokens>2 tokens left<\/total_tokens>/)
+  assert.doesNotMatch(joined, /<total_tokens>1 tokens left<\/total_tokens>/)
 })
 
 test('cli-hop makes Opus 5.5 acceptable to Claude Code 2.1.280', () => {

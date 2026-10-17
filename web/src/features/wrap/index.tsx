@@ -464,6 +464,7 @@ export function WrapSamplePage() {
   return (
     <PageHeader
       title={VIEW_TITLES.wrap}
+      description='切换数据面和重装内核。重装不改凭证、不改代理、不删容器。'
       extra={
         <div className='flex flex-wrap gap-2'>
           <input

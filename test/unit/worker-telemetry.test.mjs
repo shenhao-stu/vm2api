@@ -43,25 +43,39 @@ test('sidecar stays off without official identity', () => {
 test('sidecar enables with official ~/.claude.json IDs', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tel-'))
   writeOfficialHome(root, 'vm-02')
+  fs.writeFileSync(
+    path.join(root, 'vms', 'vm-02', 'cli-home', '.claude', 'kin-official-bootstrap.json'),
+    JSON.stringify({ status: 'ok', finished_at: '2026-10-07T06:36:42.123Z' }),
+  )
   const vm = {
     id: 'vm-02',
     seed_policy: { telemetry_disabled: false },
-    fingerprint: { device_id: 'd2', session_id: 's2' },
+    fingerprint: { device_id: 'd2', session_id: 's2', shell: '/bin/zsh', vcs: 'git', runtimes: 'bun,node' },
   }
   const out = buildWorkerTelemetry(vm, root)
   assert.equal(out.enabled, true)
-  assert.equal(out.identity.device_id, MACHINE)
+  assert.equal(out.identity.device_id, USER)
   assert.equal(out.identity.user_id, USER)
   assert.equal(out.identity.source, 'official-cc-init')
-  assert.equal(out.identity.cli_version, '2.1.284')
-  assert.equal(out.identity.env.version, '2.1.284')
-  assert.match(out.betas, /thinking-binding-controls-2026-08-01/)
-  assert.match(out.betas, /advanced-tool-use-2025-11-20/)
-  assert.match(out.betas, /mid-conversation-system-clear-at-2026-08-21/)
-  assert.match(out.betas, /extended-cache-ttl-2025-04-11/)
-  assert.doesNotMatch(out.betas, /fallback-credit-2026-06-01/)
-  assert.doesNotMatch(out.betas, /context-1m/)
-  assert.equal(out.identity.betas, out.betas)
+  assert.equal(out.betas, undefined)
+  assert.equal(out.identity.betas, undefined)
+  assert.equal(out.identity.env.shell, 'zsh')
+  assert.equal(out.identity.env.vcs, 'git')
+  assert.equal(out.identity.env.runtimes, 'bun,node')
+  assert.equal(out.identity.env.build_time, '2026-10-07T06:36:42Z')
+  assert.equal(out.identity.env.node_version, undefined)
+  assert.equal(out.identity.env.is_running_with_bun, undefined)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('machine id alone is not the 64-hex device id', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tel-'))
+  const home = path.join(root, 'vms', 'vm-02', 'cli-home')
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true })
+  fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify({ machineID: MACHINE, userID: 'not-64-hex' }))
+  const out = buildWorkerTelemetry({ id: 'vm-02', seed_policy: { telemetry_disabled: false } }, root)
+  assert.equal(out.enabled, false)
+  assert.equal(out.reason, 'waiting_official_identity')
   fs.rmSync(root, { recursive: true, force: true })
 })
 
@@ -117,4 +131,79 @@ test('syncWorkerTelemetry chowns the replaced worker.json to the slot uid', () =
     chown.mock.restore()
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+test('sidecar env uses observed hardware instead of workstation profile', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tel-hw-'))
+  writeOfficialHome(root, 'vm-02')
+  const vm = {
+    id: 'vm-02',
+    seed_policy: { telemetry_disabled: false },
+    fingerprint: {
+      device_id: 'd2',
+      session_id: 's2',
+      os_id: 'ubuntu',
+      os_pretty: 'Ubuntu 24.04.4 LTS',
+      kernel_release: '6.8.0-guest',
+      hardware: {
+        cpu_model: 'Intel(R) Xeon(R) CPU',
+        cpu_cores: 4,
+        memory_bytes: 4294967296,
+        root_disk: '/dev/vda2',
+        mac: '52:54:00:11:22:33',
+        dmi: {
+          manufacturer: 'Dell Inc.',
+          product: 'OptiPlex 7090',
+          version: '1.0',
+          family: 'OptiPlex',
+          serial: 'ABC123',
+          uuid: '11111111-2222-3333-4444-555555555555',
+        },
+        shell: '/bin/zsh',
+        package_managers: 'apt,pacman',
+        runtimes: 'bun,node',
+      },
+    },
+  }
+  const out = buildWorkerTelemetry(vm, root)
+  assert.equal(out.enabled, true)
+  assert.equal(out.identity.shell, 'zsh')
+  assert.equal(out.identity.package_managers, 'apt,pacman')
+  assert.equal(out.identity.runtimes, 'bun,node')
+  assert.equal(out.identity.env.shell, 'zsh')
+  assert.equal(out.identity.env.package_managers, 'apt,pacman')
+  assert.equal(out.identity.env.runtimes, 'bun,node')
+  assert.equal(out.identity.env.cpu_model, 'Intel(R) Xeon(R) CPU')
+  assert.equal(out.identity.cpu_model, 'Intel(R) Xeon(R) CPU')
+  assert.equal(out.identity.cpu_cores, 4)
+  assert.equal(out.identity.env.cpu_cores, 4)
+  assert.equal(out.identity.env.memory_bytes, 4294967296)
+  assert.equal(out.identity.env.root_disk, '/dev/vda2')
+  assert.equal(out.identity.env.mac, '52:54:00:11:22:33')
+  assert.equal(out.identity.env.dmi_manufacturer, 'Dell Inc.')
+  assert.equal(out.identity.env.dmi_product, 'OptiPlex 7090')
+  assert.equal(out.identity.env.dmi_version, '1.0')
+  assert.equal(out.identity.env.dmi_family, 'OptiPlex')
+  assert.equal(out.identity.env.dmi_serial, 'ABC123')
+  assert.equal(out.identity.env.dmi_uuid, '11111111-2222-3333-4444-555555555555')
+  assert.equal(out.identity.env.linux_kernel, '6.8.0-guest')
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('old VMs without hardware keep previous telemetry env fallbacks', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tel-old-'))
+  writeOfficialHome(root, 'vm-02')
+  const vm = {
+    id: 'vm-02',
+    seed_policy: { telemetry_disabled: false },
+    fingerprint: { device_id: 'd2', session_id: 's2', shell: '/bin/zsh', runtimes: 'bun,node' },
+  }
+  const out = buildWorkerTelemetry(vm, root)
+  assert.equal(out.enabled, true)
+  assert.equal(out.identity.env.shell, 'zsh')
+  assert.equal(out.identity.env.package_managers, '')
+  assert.equal(out.identity.env.runtimes, 'bun,node')
+  assert.equal(out.identity.env.cpu_model, undefined)
+  assert.equal(out.identity.env.dmi_uuid, undefined)
+  fs.rmSync(root, { recursive: true, force: true })
 })

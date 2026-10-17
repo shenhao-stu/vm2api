@@ -1,3 +1,4 @@
+import type { Vm } from '@/types/panel-vm'
 import { type CredType, credTypeLabel } from '@/lib/cred-type'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -21,6 +22,7 @@ import { TestChatResultCard } from '@/features/vm/test-chat-result-card'
 import type { TestChatResult } from '@/features/vm/test-chat-types'
 
 type VmTestTabProps = {
+  vm: Vm
   models: { id: string; label?: string; display_name?: string }[]
   model: string
   prompt: string
@@ -38,6 +40,7 @@ type VmTestTabProps = {
   onReasoningEffortChange: (value: string) => void
   onTest: () => void
   onRefreshModels: () => void
+  schedule?: React.ReactNode
 }
 
 const CODEX_EFFORTS = [
@@ -60,6 +63,7 @@ export function VmTestTab(props: VmTestTabProps) {
 /** 不依赖 Tabs 上下文的测试面板，详情页 Tab 与弹窗共用。 */
 export function VmTestPanel(props: VmTestTabProps & { className?: string }) {
   const {
+    vm,
     models,
     model,
     prompt,
@@ -77,6 +81,7 @@ export function VmTestPanel(props: VmTestTabProps & { className?: string }) {
     onReasoningEffortChange,
     onTest,
     onRefreshModels,
+    schedule,
   } = props
 
   return (
@@ -182,9 +187,10 @@ export function VmTestPanel(props: VmTestTabProps & { className?: string }) {
               刷新列表
             </Button>
           </div>
+          {schedule}
         </CardContent>
       </Card>
-      <TestChatResultCard result={result} running={running} />
+      <TestChatResultCard result={result} running={running} vm={vm} />
     </>
   )
 }

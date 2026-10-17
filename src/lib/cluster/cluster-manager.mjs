@@ -98,8 +98,14 @@ export class ClusterManager {
     socketDir = process.env.VM2API_CLUSTER_SOCKET_DIR,
     vmsOnNode = () => [],
     logger = console,
+    onNodesChanged = null,
+    onLinkState = null,
   }) {
     this.listen = listen
+    // Node add / remove: per-node resources (each VPS's local egress row) follow the list.
+    this.onNodesChanged = onNodesChanged
+    // Link settled (ready after its health check, or failed): per-node consumers refresh.
+    this.onLinkState = onLinkState
     this.containerName = containerName
     this._local = null
     this._localAt = 0
@@ -146,8 +152,14 @@ export class ClusterManager {
     const link = new SshLink({ id: node.id, resolveTarget: () => this._targetFor(node.id) })
     link.on('state', (state) => {
       this.logger.log(JSON.stringify({ event: 'cluster-link', node: node.id, state, error: link.error?.code || null }))
-      if (state === 'ready') this._checkHealth(node.id)
-      else this.health.delete(node.id)
+      if (state === 'ready') {
+        Promise.resolve(this._checkHealth(node.id))
+          .catch(() => {})
+          .finally(() => this._linkState(node.id, state))
+      } else {
+        this.health.delete(node.id)
+        this._linkState(node.id, state)
+      }
     })
     this.links.set(node.id, link)
     const bridge = new SocketRelay({
@@ -295,7 +307,24 @@ export class ClusterManager {
       host_key_alg: spec.host_key_alg || 'unknown',
     })
     this._attach(node)
+    this._nodesChanged()
     return this._view(node)
+  }
+
+  _linkState(id, state) {
+    try {
+      this.onLinkState?.(id, state)
+    } catch (err) {
+      this.logger.warn(`[cluster] link-state hook failed: ${err.message}`)
+    }
+  }
+
+  _nodesChanged() {
+    try {
+      this.onNodesChanged?.()
+    } catch (err) {
+      this.logger.warn(`[cluster] nodes-changed hook failed: ${err.message}`)
+    }
   }
 
   async remove(id) {
@@ -315,6 +344,7 @@ export class ClusterManager {
     this.health.delete(id)
     this.installs.delete(id)
     this.repo.remove(id)
+    this._nodesChanged()
   }
 
   reconnect(id) {
@@ -411,6 +441,65 @@ export class ClusterManager {
     this.slotRelays.delete(vmId)
     await Promise.all([entry.kernel.stop(), entry.worker.stop()])
     fs.rmSync(path.dirname(entry.paths.kernel), { recursive: true, force: true })
+  }
+
+  /** Link, node docker bridge and this slot's relays, for diagnosis. Never connects. */
+  slotBridgeStatus(nodeId, vmId) {
+    const link = this.links.get(nodeId)
+    const relays = this.slotRelays.get(vmId)
+    return {
+      link: link ? link.snapshot() : null,
+      bridge: this.bridges.get(nodeId)?.snapshot() || null,
+      relays: relays?.nodeId === nodeId ? { kernel: relays.kernel.snapshot(), worker: relays.worker.snapshot() } : null,
+    }
+  }
+
+  /** Reconnect unless ready or already connecting, then wait for the outcome. Throws node_not_ready. */
+  async ensureLinkReady(nodeId, timeoutMs = 20_000) {
+    const link = this.links.get(nodeId)
+    if (!link) throw new ClusterError(404, 'node_not_found', '节点不存在')
+    if (link.state === 'ready' && link.client) return link.snapshot()
+    const settled = new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer)
+        link.off('state', onState)
+        resolve()
+      }
+      const onState = (state) => {
+        if (state === 'ready' || state === 'error' || state === 'backoff') done()
+      }
+      const timer = setTimeout(done, timeoutMs)
+      link.on('state', onState)
+    })
+    if (link.state !== 'connecting') link.reconnect()
+    await settled
+    if (link.state !== 'ready' || !link.client) {
+      const detail = link.error?.message ? `：${link.error.message}` : ''
+      throw new ClusterError(409, 'node_not_ready', `节点未连接（${link.state}）${detail}`)
+    }
+    return link.snapshot()
+  }
+
+  /**
+   * Restart the node docker bridge if it died and rebuild this slot's relays if
+   * missing or dead. `force` rebuilds the slot relays regardless (operator recovery).
+   * Returns which pieces were rebuilt.
+   */
+  async healSlotBridges(nodeId, vmId, { force = false } = {}) {
+    const healed = []
+    const bridge = this.bridges.get(nodeId)
+    if (bridge && !bridge.alive()) {
+      await bridge.restart()
+      healed.push('bridge')
+    }
+    const relays = this.slotRelays.get(vmId)
+    const relaysAlive = relays?.nodeId === nodeId && relays.kernel.alive() && relays.worker.alive()
+    if (force || !relaysAlive) {
+      await this.dropSlotRelays(vmId)
+      await this.ensureSlotRelays(nodeId, vmId)
+      healed.push('relay')
+    }
+    return healed
   }
 
   /** Boot: relays exist before any link is ready so the scheduler's first health dial finds a socket. */

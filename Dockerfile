@@ -1,4 +1,28 @@
-# Control plane. linux amd64 bins, wrap-cli ELFs, and web/dist ship in git. The image does not compile the console.
+# Control plane. Only source is in git: the console and Go helpers build here, and the
+# prebuilt slot payloads come from the release pinned in deploy/payload.json.
+
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web
+RUN npm install -g pnpm@10
+WORKDIR /src/web
+COPY web/package.json web/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY web/ ./
+RUN pnpm build
+
+FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS helpers
+ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+WORKDIR /src/worker
+COPY worker/go.mod worker/go.sum ./
+RUN go mod download
+COPY worker/ ./
+RUN go build -buildvcs=false -trimpath -o /out/kin-worker ./cmd/kin-worker \
+  && go build -buildvcs=false -trimpath -o /out/kin-egress ./cmd/kin-egress
+
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS payload
+WORKDIR /src
+COPY deploy/payload.json deploy/payload.json
+COPY scripts/fetch-payload.mjs scripts/fetch-payload.mjs
+RUN node scripts/fetch-payload.mjs --dest /payload
 
 FROM node:22-bookworm-slim
 RUN apt-get update \
@@ -12,9 +36,13 @@ COPY src ./src
 COPY scripts ./scripts
 COPY VERSION CHANGELOG.md ./
 COPY docker/kin-os ./docker/kin-os
-COPY web/dist ./web/dist
-COPY bin/kin-kernel bin/kin-egress bin/kin-worker bin/kin-codex-kernel bin/kin-oauth-auth /opt/vm2api/image-bin/
+COPY docker/kin-kvm ./docker/kin-kvm
+COPY --from=web /src/web/dist ./web/dist
+COPY --from=payload /payload/bin/ /opt/vm2api/image-bin/
+COPY --from=helpers /out/ /opt/vm2api/image-bin/
 COPY share/wrap-cli /opt/vm2api/image-wrap-cli
+COPY --from=payload /payload/share/wrap-cli/ /opt/vm2api/image-wrap-cli/
+COPY --from=payload /payload/share/crag/ /opt/vm2api/image-crag/
 COPY scripts/docker-entrypoint.sh /usr/local/bin/vm2api-entrypoint
 RUN chmod 755 /usr/local/bin/vm2api-entrypoint /opt/vm2api/image-bin/* \
   && rm -f /opt/vm2api/src/lib/oauth/auth.js \
@@ -29,6 +57,7 @@ ENV NODE_ENV=production \
     KIN_EGRESS_BIN=/opt/vm2api/bin/kin-egress \
     KIN_WORKER_BIN=/opt/vm2api/bin/kin-worker \
     KIN_CODEX_KERNEL_BIN=/opt/vm2api/bin/kin-codex-kernel \
-    KIN_OAUTH_AUTH_BIN=/opt/vm2api/bin/kin-oauth-auth
+    KIN_OAUTH_AUTH_BIN=/opt/vm2api/bin/kin-oauth-auth \
+    KIN_COMPUTER_BIN=/opt/vm2api/bin/kin-computer
 EXPOSE 8787
 ENTRYPOINT ["/usr/local/bin/vm2api-entrypoint"]

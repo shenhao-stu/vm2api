@@ -16,7 +16,7 @@ const live = {
 
 test('normalize fills usage-probe defaults', () => {
   const n = normalizeUsageProbeConfig({ interval_sec: 3, concurrency: 99, stale_sec: 10 })
-  assert.equal(n.enabled, true)
+  assert.equal(n.enabled, false)
   assert.equal(n.interval_sec, 30)
   assert.equal(n.stale_sec, 60)
   assert.equal(n.concurrency, 8)

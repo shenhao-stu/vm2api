@@ -7,12 +7,15 @@
 import fetch from 'node-fetch'
 import fs from 'node:fs'
 import path from 'node:path'
-import { SocksProxyAgent } from 'socks-proxy-agent'
+import { createProxyAgent } from '../vm/proxy-agent.mjs'
 import { isSyncableGptCatalogId } from './gpt-ids.mjs'
 
 export { SKIP_GPT, GPT_ID_PREFIX, isGptSeriesId, isSyncableGptCatalogId } from './gpt-ids.mjs'
 
 export const CODEX_MODELS_URL = 'https://chatgpt.com/backend-api/codex/models'
+// Codex web search (`web.run`): the CLI posts to `{base_url}/alpha/search`; under ChatGPT login
+// that base is https://chatgpt.com/backend-api/codex.
+export const CODEX_SEARCH_URL = 'https://chatgpt.com/backend-api/codex/alpha/search'
 export const CHATGPT_MODELS_URL = CODEX_MODELS_URL
 export const CHATGPT_MODELS_URLS = Object.freeze([CODEX_MODELS_URL])
 export const CODEX_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token'
@@ -24,7 +27,7 @@ export const CODEX_OAUTH_SCOPE = 'openid profile email offline_access api.connec
 export const CODEX_OAUTH_ORIGINATOR = 'Codex Desktop'
 // This is the version embedded in the shipped kernel. Catalog discovery uses
 // the separately resolved official Codex client version below.
-export const CODEX_APP_VERSION = '0.153.4'
+export const CODEX_APP_VERSION = '0.160.0'
 // The model endpoint validates that Originator matches the User-Agent prefix.
 // OAuth still uses CODEX_OAUTH_ORIGINATOR (the desktop login surface), while
 // catalog requests use the resolved catalog client identity below.
@@ -33,7 +36,7 @@ export const CODEX_USER_AGENT = `${CODEX_CATALOG_ORIGINATOR}/${CODEX_APP_VERSION
 export const CODEX_CATALOG_VERSION_URL = 'https://registry.npmjs.org/@openai%2fcodex/latest'
 export const CODEX_CATALOG_VERSION_TTL_MS = 6 * 60 * 60 * 1000
 export const CODEX_CATALOG_VERSION_CACHE_FILE = 'codex-catalog-client.json'
-export const CODEX_CATALOG_DEFAULT_VERSION = '0.158.0'
+export const CODEX_CATALOG_DEFAULT_VERSION = '0.160.0'
 
 const SEMVER_RE = /^\d+\.\d+\.\d+$/
 
@@ -168,16 +171,18 @@ async function readFetchBody(res) {
   return null
 }
 
-export function makeSocksFetch(proxyUrl, timeoutMs = 15000) {
+export function makeProxyFetch(proxyUrl, timeoutMs = 15000, { maxMs = 30000 } = {}) {
   const px = String(proxyUrl || '')
     .trim()
     .replace(/^socks5:\/\//i, 'socks5h://')
-  const ms = Math.min(Math.max(Number(timeoutMs) || 15000, 3000), 30000)
+  const ms = Math.min(Math.max(Number(timeoutMs) || 15000, 3000), maxMs)
   return (url, init = {}) => {
+    // Build the agent before arming the timer, so a bad proxy URL throws without leaking it.
+    const agent = px ? createProxyAgent(px) : undefined
     const ac = new AbortController()
     const timer = setTimeout(() => ac.abort(), ms)
     const opts = { ...init, signal: ac.signal }
-    if (px) opts.agent = new SocksProxyAgent(px)
+    if (agent) opts.agent = agent
     return fetch(url, opts).finally(() => clearTimeout(timer))
   }
 }
@@ -189,7 +194,7 @@ export function makeSocksFetch(proxyUrl, timeoutMs = 15000) {
 export async function refreshCodexAccessToken(opts = {}) {
   const refreshToken = String(opts.refreshToken || '').trim()
   if (!refreshToken) return { ok: false, error: 'missing_refresh_token' }
-  const fetchFn = opts.fetchImpl || makeSocksFetch(opts.proxyUrl, opts.timeoutMs)
+  const fetchFn = opts.fetchImpl || makeProxyFetch(opts.proxyUrl, opts.timeoutMs)
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
     refresh_token: refreshToken,
@@ -236,7 +241,7 @@ export async function exchangeCodexAuthorizationCode(opts = {}) {
   const code = String(opts.code || '').trim()
   const codeVerifier = String(opts.codeVerifier || '').trim()
   if (!code || !codeVerifier) return { ok: false, error: 'code_required' }
-  const fetchFn = opts.fetchImpl || makeSocksFetch(opts.proxyUrl, opts.timeoutMs)
+  const fetchFn = opts.fetchImpl || makeProxyFetch(opts.proxyUrl, opts.timeoutMs)
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
     client_id: CODEX_OAUTH_CLIENT_ID,
@@ -317,7 +322,7 @@ export async function fetchChatgptModelCatalog(opts = {}) {
   if (accountId) headers['chatgpt-account-id'] = accountId
 
   const url = `${CODEX_MODELS_URL}?client_version=${encodeURIComponent(catalogVersion)}`
-  const fetchFn = opts.fetchImpl || makeSocksFetch(proxyUrl, opts.timeoutMs)
+  const fetchFn = opts.fetchImpl || makeProxyFetch(proxyUrl, opts.timeoutMs)
   try {
     const res = await fetchFn(url, { method: 'GET', headers })
     const status = Number(res?.status) || 0

@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { TestModelsPayload, Vm } from '@/types/panel-vm'
 import { toast } from 'sonner'
-import { api } from '@/lib/api'
+import { api, isApiError } from '@/lib/api'
 import { isCodexVm } from '@/lib/vm-kind'
 import { testModelsQueryOptions } from '@/features/vm/queries'
 import type { TestChatResult } from '@/features/vm/test-chat-types'
@@ -17,6 +17,12 @@ export function useVmTestChat(vm: Vm) {
   const [maxTokens, setMaxTokens] = useState(8192)
   const [reasoningEffort, setReasoningEffort] = useState('medium')
   const [result, setResult] = useState<TestChatResult | null>(null)
+  const edited = useRef({
+    model: false,
+    prompt: false,
+    maxTokens: false,
+    reasoningEffort: false,
+  })
   const models = useMemo(
     () => testModels.data?.items || testModels.data?.models || [],
     [testModels.data]
@@ -28,6 +34,42 @@ export function useVmTestChat(vm: Vm) {
       setModel(models[0].id)
     }
   }, [models, model])
+
+  const onModelChange = useCallback((value: string) => {
+    edited.current.model = true
+    setModel(value)
+  }, [])
+  const onPromptChange = useCallback((value: string) => {
+    edited.current.prompt = true
+    setPrompt(value)
+  }, [])
+  const onMaxTokensChange = useCallback((value: number) => {
+    edited.current.maxTokens = true
+    setMaxTokens(value)
+  }, [])
+  const onReasoningEffortChange = useCallback((value: string) => {
+    edited.current.reasoningEffort = true
+    setReasoningEffort(value)
+  }, [])
+  const onLoadSchedule = useCallback(
+    (schedule: {
+      model: string
+      prompt: string
+      max_tokens: number | null
+      reasoning_effort: string | null
+    }) => {
+      if (!edited.current.model) setModel(schedule.model)
+      if (!edited.current.prompt) setPrompt(schedule.prompt)
+      if (isCodexVm(vm)) {
+        if (!edited.current.reasoningEffort) {
+          setReasoningEffort(schedule.reasoning_effort || 'medium')
+        }
+      } else if (!edited.current.maxTokens) {
+        setMaxTokens(schedule.max_tokens || 64)
+      }
+    },
+    [vm]
+  )
 
   const send = useMutation({
     mutationFn: () =>
@@ -51,7 +93,9 @@ export function useVmTestChat(vm: Vm) {
       if (data?.ok) {
         toast.success(`测试成功 · ${data.duration_ms ?? 0}ms`)
       } else {
-        toast.error(`测试失败：${data?.error?.message || '未知错误'}`)
+        const code = data?.error?.code
+        const msg = data?.error?.message || '未知错误'
+        toast.error(code ? `测试失败：[${code}] ${msg}` : `测试失败：${msg}`)
       }
     },
     onError: (error: Error) => {
@@ -59,9 +103,19 @@ export function useVmTestChat(vm: Vm) {
         ok: false,
         duration_ms: 0,
         log: [],
-        error: { message: error.message },
+        error: {
+          message: error.message,
+          ...(isApiError(error)
+            ? {
+                code: error.code || undefined,
+                status: error.status || undefined,
+                type: error.type,
+              }
+            : {}),
+        },
       })
-      toast.error(error.message)
+      const code = isApiError(error) ? error.code : ''
+      toast.error(code ? `测试失败：[${code}] ${error.message}` : error.message)
     },
   })
 
@@ -74,10 +128,11 @@ export function useVmTestChat(vm: Vm) {
     result,
     running: send.isPending,
     modelsRefreshing: testModels.isFetching,
-    onModelChange: setModel,
-    onPromptChange: setPrompt,
-    onMaxTokensChange: setMaxTokens,
-    onReasoningEffortChange: setReasoningEffort,
+    onModelChange,
+    onPromptChange,
+    onMaxTokensChange,
+    onReasoningEffortChange,
+    onLoadSchedule,
     onTest: () => {
       setResult(null)
       send.mutate()

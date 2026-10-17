@@ -14,7 +14,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
-import { OS_CATALOG, imageForKernel } from '../vm/os-catalog.mjs'
+import { OS_CATALOG, imageForKernel, kvmImageForKernel } from '../vm/os-catalog.mjs'
 import { EGRESS_BIN } from '../vm/egress.mjs'
 import {
   describeKernelPayload,
@@ -75,10 +75,14 @@ export function slotPayload(projectRoot) {
       if (fs.statSync(src).isFile()) files.push({ name: `opt/kin/${WRAP_GLIBC_DIR}/${name}`, src, mode: 0o755 })
     }
   }
-  const worker = binOr('KIN_WORKER_BIN', path.join(projectRoot, 'bin', 'kin-worker'))
+  // Remote nodes require amd64 payloads, even when this control plane runs ARM64.
+  const worker = binOr('KIN_CLUSTER_WORKER_BIN', binOr('KIN_WORKER_BIN', path.join(projectRoot, 'bin', 'kin-worker')))
   requireElf(worker, 'kin-worker')
   files.push({ name: 'usr/local/bin/kin-worker', src: worker, mode: 0o755 })
-  const egress = fs.existsSync(EGRESS_BIN) ? EGRESS_BIN : path.join(projectRoot, 'bin', 'kin-egress')
+  const egress = binOr(
+    'KIN_CLUSTER_EGRESS_BIN',
+    fs.existsSync(EGRESS_BIN) ? EGRESS_BIN : path.join(projectRoot, 'bin', 'kin-egress'),
+  )
   requireElf(egress, 'kin-egress')
   files.push({ name: 'usr/local/bin/kin-egress', src: egress, mode: 0o755 })
   const codex = codexKernelBinPath() || path.join(projectRoot, 'bin', 'kin-codex-kernel')
@@ -100,7 +104,16 @@ function fileDigest(file) {
   return digest
 }
 
-export function slotDockerfile(baseImage) {
+export function slotDockerfile(baseImage, { runtime } = {}) {
+  if (runtime === 'kvm') {
+    return [
+      `FROM ${baseImage}`,
+      'COPY opt/kin/ /opt/kin-guest/opt/kin/',
+      'COPY usr/local/bin/ /opt/kin-guest/usr/local/bin/',
+      'LABEL kin.slot.full=1',
+      '',
+    ].join('\n')
+  }
   return [
     `FROM ${baseImage}`,
     'COPY opt/kin/ /opt/kin/',
@@ -111,25 +124,46 @@ export function slotDockerfile(baseImage) {
 }
 
 /**
- * `{ ref, base, hash, files }`. The tag is local to each node (never pushed):
- * vm2api/kin-slot-<kernel>:<hash12>. Content only — a release that leaves the
- * slot binaries alone must not orphan every node's image and stop its slots.
+ * `{ ref, base, hash, files, runtime }`. The tag is local to each node (never pushed):
+ * vm2api/kin-slot-<kernel>:<hash12> or vm2api/kin-slot-kvm-<kernel>:<hash12>.
+ * Docker output is identical when runtime is omitted.
  */
-export function slotImageSpec(projectRoot, kernel) {
+export function slotImageSpec(projectRoot, kernel, { runtime } = {}) {
   if (!OS_CATALOG[kernel]) throw new ClusterError(400, 'invalid_kernel', `未知系统：${kernel}`)
-  const base = imageForKernel(kernel)
+  const kvm = runtime === 'kvm'
+  const base = kvm ? kvmImageForKernel(kernel) : imageForKernel(kernel)
   const files = slotPayload(projectRoot)
   const hash = crypto.createHash('sha256')
-  hash.update(slotDockerfile(base))
+  hash.update(slotDockerfile(base, { runtime: kvm ? 'kvm' : 'docker' }))
   for (const f of files) {
     hash.update(`${f.name}\0${f.mode}\0`)
     hash.update(f.body ? crypto.createHash('sha256').update(f.body).digest('hex') : fileDigest(f.src))
   }
   const digest = hash.digest('hex').slice(0, 12)
-  return { ref: `vm2api/kin-slot-${kernel}:${digest}`, base, hash: digest, files }
+  return {
+    ref: kvm ? `vm2api/kin-slot-kvm-${kernel}:${digest}` : `vm2api/kin-slot-${kernel}:${digest}`,
+    base,
+    hash: digest,
+    files,
+    runtime: kvm ? 'kvm' : 'docker',
+  }
+}
+
+/**
+ * Cloud OS stays on the registry. A node pulls `base` only when that image is
+ * missing. The mother uploads the payload layer only when the slot tag is missing.
+ */
+export function slotImageAction({ slotPresent, basePresent } = {}) {
+  if (slotPresent) return 'skip'
+  if (!basePresent) return 'pull-base'
+  return 'build-payload'
 }
 
 export function slotBuildContext(spec) {
-  const entries = [{ name: 'Dockerfile', body: Buffer.from(slotDockerfile(spec.base)), mode: 0o644 }, ...spec.files]
+  const runtime = spec.runtime === 'kvm' ? 'kvm' : 'docker'
+  const entries = [
+    { name: 'Dockerfile', body: Buffer.from(slotDockerfile(spec.base, { runtime })), mode: 0o644 },
+    ...spec.files,
+  ]
   return tarStream(entries).pipe(zlib.createGzip({ level: 6 }))
 }

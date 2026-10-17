@@ -15,11 +15,14 @@
     "build:worker": "mkdir -p bin && cd worker && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-worker ./cmd/kin-worker",
     "build:egress": "mkdir -p bin && cd worker && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-egress ./cmd/kin-egress",
     "build:web": "pnpm -C web build",
+    "fetch:payload": "node scripts/fetch-payload.mjs",
     "test:web": "pnpm -C web test",
     "format": "biome format --write && gofmt -w worker && pnpm -C web format",
     "format:check": "biome format && node scripts/check-gofmt.mjs && pnpm -C web format:check"
   },
   "dependencies": {
+    "croner": "^10.0.1",
+    "https-proxy-agent": "^9.1.0",
     "node-fetch": "^2.7.0",
     "socks-proxy-agent": "^10.1.0",
     "ssh2": "^1.17.0",

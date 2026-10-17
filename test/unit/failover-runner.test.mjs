@@ -1,7 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
-import { SessionLimitRegistry } from '../../src/lib/pool/session-limit.mjs'
 
 class Scheduler {
   constructor(candidates) {
@@ -49,7 +48,7 @@ function candidate(number) {
   return {
     vmId: `vm-0${number}`,
     accountId: `account-${number}`,
-    selectionReason: number === 1 ? 'sticky' : 'weighted-round-robin',
+    selectionReason: number === 1 ? 'sticky' : 'balanced',
     waitMs: 0,
   }
 }
@@ -69,6 +68,38 @@ function success(text = 'ok') {
     },
   }
 }
+
+test('unsupported classifier runtime stops without counting execution or cooling accounts', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler })
+  let calls = 0
+  const result = await runner.run({
+    requestId: 'classifier-runtime',
+    model: 'claude-sonnet-4-6',
+    canonicalBody: { model: 'claude-sonnet-4-6' },
+    callAttempt: async () => {
+      calls++
+      return {
+        ok: false,
+        status: 400,
+        upstreamExecutions: 0,
+        terminalState: 'rejected',
+        body: {
+          error: {
+            type: 'invalid_request_error',
+            code: 'classifier_runtime_unsupported',
+            message: 'unsupported runtime',
+          },
+        },
+      }
+    },
+  })
+  assert.equal(calls, 1)
+  assert.equal(result.attemptCount, 0)
+  assert.equal(result.body.error.code, 'classifier_runtime_unsupported')
+  assert.deepEqual(scheduler.cooldowns, [])
+  assert.equal(scheduler.selectCalls, 1)
+})
 
 test('account1 quota exhausted rotates to account2 and commits final sticky', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
@@ -320,32 +351,6 @@ test('committed realtime stream failure never switches accounts', async () => {
   assert.equal(scheduler.selectCalls, 1)
 })
 
-test('committed incomplete hop keeps the session window', async () => {
-  const sessions = new SessionLimitRegistry()
-  sessions.touch('account-1', 'conversation-1')
-  const scheduler = new Scheduler([candidate(1), candidate(2)])
-  scheduler.accountQuota = { sessions }
-  const runner = new FailoverRunner({ scheduler })
-  const result = await runner.run({
-    requestId: 'req-committed-incomplete-session',
-    canonicalBody: { model: 'claude-opus-test' },
-    model: 'claude-opus-test',
-    stickyKey: 'conversation-1',
-    callAttempt: ({ onCommit }) => {
-      onCommit()
-      return {
-        ok: false,
-        status: 200,
-        committed: true,
-        terminalState: 'incomplete',
-        body: { error: { message: 'stream closed' } },
-      }
-    },
-  })
-  assert.equal(result.finalState, 'incomplete')
-  assert.equal(sessions.snapshot('account-1').active, 1)
-})
-
 test('cloudflare 403 does not trigger SOCKS disconnect', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const failures = []
@@ -460,6 +465,57 @@ test('signature error is repaired once on the same account when enabled', async 
   assert.equal(calls, 2)
 })
 
+test('search history repair still runs when the rejected hop outlived the deadline', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler, config: { total_retry_deadline_ms: 20 } })
+  const bodies = []
+  const result = await runner.run({
+    requestId: 'req-search-slow-400',
+    canonicalBody: {
+      model: 'claude-opus-test',
+      messages: [
+        { role: 'user', content: 'find it' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'server_tool_use', id: 'srvtoolu_1', name: 'web_search', input: { query: 'mac mini' } },
+            {
+              type: 'web_search_tool_result',
+              tool_use_id: 'srvtoolu_1',
+              content: [{ type: 'web_search_result', title: 'T', url: 'https://a.example', encrypted_content: 'AAAA' }],
+            },
+            { type: 'text', text: 'found' },
+          ],
+        },
+        { role: 'user', content: 'go on' },
+      ],
+    },
+    model: 'claude-opus-test',
+    callAttempt: async ({ body }) => {
+      bodies.push(body)
+      if (bodies.length === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 40))
+        return {
+          ok: false,
+          status: 400,
+          terminalState: 'rejected',
+          body: {
+            type: 'error',
+            error: {
+              type: 'invalid_request_error',
+              message: 'messages.1.content.0: Invalid `encrypted_content` in `search_result` block',
+            },
+          },
+        }
+      }
+      return success('repaired')
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(bodies.length, 2)
+  assert.equal(JSON.stringify(bodies[1]).includes('encrypted_content'), false)
+})
+
 test('signature 400 is not repaired when signature_repair is off', async () => {
   const scheduler = new Scheduler([{ ...candidate(1), vm: { family: 'codex', platform: 'openai' } }])
   const runner = new FailoverRunner({ scheduler })
@@ -495,7 +551,7 @@ test('signature 400 is not repaired when signature_repair is off', async () => {
   assert.equal(calls, 1)
 })
 
-test('cli-hop rust slot repairs signature 400 even when signature_repair is off', async () => {
+test('cli-hop signature 400 is not repaired when signature_repair is off', async () => {
   const scheduler = new Scheduler([
     {
       ...candidate(1),
@@ -520,27 +576,19 @@ test('cli-hop rust slot repairs signature 400 even when signature_repair is off'
       ],
     },
     model: 'claude-opus-test',
-    callAttempt: ({ body }) => {
+    callAttempt: () => {
       calls++
-      if (calls === 1) {
-        return {
-          ok: false,
-          status: 400,
-          terminalState: 'rejected',
-          body: { error: { message: 'Invalid `signature` in `thinking` block' } },
-        }
+      return {
+        ok: false,
+        status: 400,
+        terminalState: 'rejected',
+        body: { error: { message: 'Invalid `signature` in `thinking` block' } },
       }
-      assert.equal(body.thinking, undefined)
-      assert.deepEqual(body.messages[0].content, [
-        { type: 'text', text: 'x' },
-        { type: 'text', text: 'keep' },
-      ])
-      return success('repaired')
     },
   })
-  assert.equal(result.ok, true)
-  assert.equal(result.attemptCount, 2)
-  assert.equal(calls, 2)
+  assert.equal(result.ok, false)
+  assert.equal(result.status, 400)
+  assert.equal(calls, 1)
 })
 
 test('thinking-only hop moves to the next slot and returns the later text', async () => {
@@ -1057,7 +1105,8 @@ test('pool exhaustion details include the scheduler snapshot', async () => {
     model: 'claude-sonnet-test',
     callAttempt: () => success(),
   })
-  assert.equal(result.status, 429)
+  assert.equal(result.status, 529)
+  assert.equal(result.body.error.type, 'overloaded_error')
   assert.equal(result.body.error.code, 'pool_overloaded')
   assert.equal(result.body.error.message, '号池负载过高，稍后再试')
   assert.equal(result.retryAfterSec, 10_064)
@@ -1067,6 +1116,75 @@ test('pool exhaustion details include the scheduler snapshot', async () => {
   assert.equal(result.body.error.details.sticky_cleared, true)
   assert.equal(result.body.error.details.eligible, 2)
   assert.deepEqual(result.body.error.details.wait_reasons, ['account_cooldown'])
+})
+
+test('a seat queue timeout is a 529 overloaded_error with the planner retry-after', async () => {
+  const scheduler = {
+    async selectAndReserve() {
+      return { ok: false, reason: 'pool_queue_timeout', waitMs: 3000, retry_after_ms: 2_500, eligible: 2 }
+    },
+    markCooldown() {},
+    markSuccess() {},
+  }
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({
+    requestId: 'req-queue-timeout',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: () => success(),
+  })
+  assert.equal(result.status, 529)
+  assert.equal(result.body.error.type, 'overloaded_error')
+  assert.equal(result.body.error.code, 'pool_overloaded')
+  assert.equal(result.body.error.details.reason, 'pool_queue_timeout')
+  assert.equal(result.retryAfterSec, 3)
+})
+
+test('every account in an upstream cooldown: 529 cooldown is capacity, 429 cooldown is a 429', async () => {
+  const cases = [
+    ['pool_overload_cooldown', 529, 'overloaded_error', 'pool_overloaded'],
+    ['pool_rate_limited', 429, 'rate_limit_error', 'pool_rate_limited'],
+  ]
+  for (const [reason, status, type, code] of cases) {
+    const scheduler = {
+      async selectAndReserve() {
+        return { ok: false, reason, retry_after_ms: 41_200, eligible: 0 }
+      },
+      markCooldown() {},
+      markSuccess() {},
+    }
+    const result = await new FailoverRunner({ scheduler }).run({
+      requestId: `req-${reason}`,
+      canonicalBody: { model: 'claude-sonnet-test' },
+      model: 'claude-sonnet-test',
+      callAttempt: () => success(),
+    })
+    assert.equal(result.status, status, reason)
+    assert.equal(result.body.error.type, type, reason)
+    assert.equal(result.body.error.code, code, reason)
+    assert.equal(result.retryAfterSec, 42, reason)
+  }
+})
+
+test('a full pool queue answers 529 immediately with retry-after >= 1s', async () => {
+  const scheduler = {
+    async selectAndReserve() {
+      throw Object.assign(new Error('Claude pool queue is full'), { code: 'pool_wait_queue_full', retryAfterMs: null })
+    },
+    markCooldown() {},
+    markSuccess() {},
+  }
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({
+    requestId: 'req-queue-full',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: () => success(),
+  })
+  assert.equal(result.status, 529)
+  assert.equal(result.body.error.type, 'overloaded_error')
+  assert.equal(result.body.error.details.reason, 'pool_wait_queue_full')
+  assert.equal(result.retryAfterSec, 1)
 })
 
 test('one VM gets at most three executions for a request, hidden retries included', async () => {
@@ -1104,6 +1222,37 @@ test('one VM gets at most three executions for a request, hidden retries include
   assert.deepEqual(seen, ['vm-01', 'vm-01'])
 })
 
+test('a hop that failed with a kernel-named cause ends with that cause, not incomplete_response', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const seen = []
+  const runner = new FailoverRunner({
+    scheduler,
+    config: { same_account_retry_delay_ms: 0 },
+  })
+  const result = await runner.run({
+    requestId: 'req-network',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.vmId)
+      return {
+        ok: false,
+        status: 502,
+        committed: false,
+        terminalState: 'incomplete',
+        body: {
+          type: 'error',
+          error: { type: 'api_error', code: 'upstream_network_error', message: 'fetch failed: ECONNRESET' },
+        },
+      }
+    },
+  })
+  assert.equal(result.status, 502)
+  assert.equal(result.body.error.code, 'upstream_network_error')
+  assert.ok(seen.includes('vm-02'), 'a network failure moves on to another VM')
+  assert.deepEqual(scheduler.cooldowns, [], 'no account is penalised for it')
+})
+
 test('the fifth candidate is reached after four VMs fail', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3), candidate(4), candidate(5)])
   const seen = []
@@ -1128,6 +1277,120 @@ test('the fifth candidate is reached after four VMs fail', async () => {
   assert.equal(result.ok, true)
   assert.equal(result.vmId, 'vm-05')
   assert.deepEqual(seen, ['vm-01', 'vm-02', 'vm-03', 'vm-04', 'vm-05'])
+})
+
+test('session queue timeout defaults to 15 minutes and reloads over the default', () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler })
+  assert.equal(runner.config.session_queue_timeout_ms, 900_000)
+  runner.reloadConfig({ total_retry_deadline_ms: 50 })
+  assert.equal(runner.config.session_queue_timeout_ms, 900_000)
+  runner.reloadConfig({ session_queue_timeout_ms: 0 })
+  assert.equal(runner.config.session_queue_timeout_ms, 0)
+})
+
+test('a same-session waiter times out without starting or overlapping the holder', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler, config: { session_queue_timeout_ms: 40 } })
+  let release
+  let entered
+  const holderEntered = new Promise((resolve) => {
+    entered = resolve
+  })
+  let holderCalls = 0
+  let waiterCalls = 0
+  let followerCalls = 0
+  const holder = runner.run({
+    requestId: 'req-hold',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'shared-session',
+    callAttempt: () => {
+      holderCalls += 1
+      entered()
+      return new Promise((resolve) => {
+        release = () => resolve(success())
+      })
+    },
+  })
+  await holderEntered
+  const waiter = await runner.run({
+    requestId: 'req-wait',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'shared-session',
+    callAttempt: () => {
+      waiterCalls += 1
+      return success()
+    },
+  })
+  assert.equal(waiter.ok, false)
+  assert.equal(waiter.status, 529)
+  assert.equal(waiter.body.error.type, 'overloaded_error')
+  assert.equal(waiter.body.error.code, 'pool_overloaded')
+  assert.equal(waiter.body.error.details.reason, 'session_queue_timeout')
+  assert.equal(waiterCalls, 0)
+  assert.equal(holderCalls, 1)
+  let followerEntered = false
+  const follower = runner.run({
+    requestId: 'req-follow',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'shared-session',
+    callAttempt: () => {
+      followerEntered = true
+      followerCalls += 1
+      return success()
+    },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(followerEntered, false)
+  release()
+  const held = await holder
+  const followed = await follower
+  assert.equal(held.ok, true)
+  assert.equal(followed.ok, true)
+  assert.equal(followerCalls, 1)
+  assert.equal(waiterCalls, 0)
+  assert.equal(scheduler.selectCalls, 2)
+})
+
+test('session queue wait still aborts with the caller', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler, config: { session_queue_timeout_ms: 5_000 } })
+  let release
+  let entered
+  const holderEntered = new Promise((resolve) => {
+    entered = resolve
+  })
+  const holder = runner.run({
+    requestId: 'req-hold-abort',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'abort-session',
+    callAttempt: () => {
+      entered()
+      return new Promise((resolve) => {
+        release = () => resolve(success())
+      })
+    },
+  })
+  await holderEntered
+  const controller = new AbortController()
+  const pending = runner.run({
+    requestId: 'req-abort-wait',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'abort-session',
+    signal: controller.signal,
+    callAttempt: () => success(),
+  })
+  controller.abort()
+  const aborted = await pending
+  assert.equal(aborted.terminalState, 'cancelled')
+  assert.equal(aborted.status, 499)
+  release()
+  assert.equal((await holder).ok, true)
 })
 
 test('same sticky session requests execute serially', async () => {
@@ -1264,4 +1527,22 @@ test('explicit VM pin is not redirected by a family locked elsewhere', async () 
   }
   assert.equal(scheduler.state.selects.length, 3)
   assert.equal(scheduler.state.inflight, 0)
+})
+
+test('an all-rest pool 503 carries Retry-After for the next window open', async () => {
+  const scheduler = {
+    async selectAndReserve() {
+      return { ok: false, reason: 'no_eligible_accounts', retry_after_ms: 90_500, eligible: 0, available: 0 }
+    },
+  }
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({
+    requestId: 'req-all-rest',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: () => success(),
+  })
+  assert.equal(result.status, 503)
+  assert.equal(result.body.error.code, 'account_pool_exhausted')
+  assert.equal(result.retryAfterSec, 91)
 })

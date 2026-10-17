@@ -1,8 +1,26 @@
 import crypto from 'node:crypto'
-import { liftMidConversationSystemMessages, stripIllegalContentFields } from './sanitize.mjs'
+import {
+  anthropicContentIsEmpty,
+  dropEmptySystemControlTurns,
+  liftMidConversationSystemMessages,
+  mergeConsecutiveAnthropicMessages,
+  messageHasTurnControls,
+  stripIllegalContentFields,
+} from './sanitize.mjs'
 import { isAnthropicServerTool } from './web-search.mjs'
-import { normalizeThinkingForModel, ensureUnofficialAdaptiveThinking, ensureUnofficialEffortHigh } from './thinking.mjs'
-import { applyMaxTokensCap, applyModelRequestRules, getCapabilities } from './model-policy.mjs'
+import {
+  normalizeThinkingForModel,
+  ensureUnofficialAdaptiveThinking,
+  ensureUnofficialEffortHigh,
+  downgradeUngatedThinkingDisplay,
+} from './thinking.mjs'
+import {
+  applyMaxTokensCap,
+  applyModelRequestRules,
+  getCapabilities,
+  isHaiku55Model,
+  isOpus55Model,
+} from './model-policy.mjs'
 import { ensureOutputConfigSchema, rectifyUnofficialRequest } from './request-rectifier.mjs'
 import { DEFAULT_CACHE_TTL, applyCacheBreakpoints, stripCacheScopeFields } from './cache-ttl.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
@@ -96,6 +114,43 @@ export function hasUsableThinkingSignature(signature) {
   if (!value || value.length < 24) return false
   return !DUMMY_THINKING_SIGNATURES.has(value)
 }
+function signedThinkingModel(model = '') {
+  if (isOpus55Model(model) || isHaiku55Model(model)) return true
+  const bare = String(model || '')
+    .split('[')[0]
+    .split('/')
+    .filter(Boolean)
+    .pop()
+  return /^claude-sonnet-5(?:-5|\.5)(?=-|$)/i.test(bare || '')
+}
+
+/** 5.5 accepts any non-dummy signature. Length is not a checksum. */
+function hasNonDummyThinkingSignature(signature) {
+  const value = String(signature || '').trim()
+  return value.length > 0 && !DUMMY_THINKING_SIGNATURES.has(value)
+}
+
+function dropSignedThinkingChain(messages) {
+  return messages.map((message) => {
+    if (!Array.isArray(message?.content)) return message
+    let dropped = false
+    const content = []
+    for (const block of message.content) {
+      const type = block?.type
+      if (
+        type === 'thinking' ||
+        type === 'redacted_thinking' ||
+        (type == null && block && Object.hasOwn(block, 'thinking'))
+      ) {
+        dropped = true
+        continue
+      }
+      content.push(block)
+    }
+    if (!dropped) return message
+    return { ...message, content }
+  })
+}
 
 function thinkingModeEnabled(body) {
   const type = String(body?.thinking?.type || '').toLowerCase()
@@ -115,11 +170,20 @@ export function alignSamplingWithThinking(body = {}) {
   return out
 }
 
-/** Drop history thinking blocks Anthropic would reject (empty / unsigned / dummy). */
-export function stripInvalidThinkingBlocks(body = {}) {
+/**
+ * Drop history thinking blocks Anthropic would reject.
+ * Opus / Sonnet / Haiku 5.5 follow sub2api: one invalid block drops the whole
+ * signed chain, including later valid thinking and redacted_thinking. Turns
+ * left with no content are dropped. redacted_thinking stays when it carries
+ * data on 5.5, otherwise when its signature is usable. The preserve path is
+ * unchanged.
+ */
+export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks = false } = {}) {
   if (!Array.isArray(body.messages)) return body
   const keepSigned = thinkingModeEnabled(body)
+  const chainModel = !preserveThinkingBlocks && signedThinkingModel(body.model)
   let changed = false
+  let chainBroken = false
   const messages = body.messages.map((message) => {
     if (!Array.isArray(message?.content)) return message
     const content = []
@@ -127,65 +191,56 @@ export function stripInvalidThinkingBlocks(body = {}) {
     for (const block of message.content) {
       const type = block?.type
       if (type === 'thinking' || type === 'redacted_thinking') {
-        if (keepSigned && message.role === 'assistant') {
-          if (type === 'thinking' && !String(block.thinking || '').trim()) {
+        if ((keepSigned || preserveThinkingBlocks) && message.role === 'assistant') {
+          // Omitted thinking keeps empty text; redacted thinking keeps encrypted data.
+          if (preserveThinkingBlocks) {
+            if (type === 'thinking' && !Object.hasOwn(block, 'signature')) {
+              changed = true
+              filteredThis = true
+              content.push({ ...block, signature: '' })
+            } else {
+              content.push(block)
+            }
+            continue
+          }
+          if (chainModel && chainBroken) {
             changed = true
             filteredThis = true
             continue
           }
-          if (hasUsableThinkingSignature(block.signature)) {
+          if (type === 'redacted_thinking' && chainModel && String(block.data || '').trim()) {
             content.push(block)
             continue
           }
+          const signed = chainModel
+            ? hasNonDummyThinkingSignature(block.signature)
+            : hasUsableThinkingSignature(block.signature)
+          if (signed) {
+            content.push(block)
+            continue
+          }
+          if (chainModel) chainBroken = true
         }
         changed = true
         filteredThis = true
+        continue
+      }
+      if (type == null && block && Object.hasOwn(block, 'thinking')) {
+        changed = true
+        filteredThis = true
+        if (chainModel) chainBroken = true
         continue
       }
       content.push(block)
     }
     return filteredThis ? { ...message, content } : message
   })
-  if (!changed) return body
-  const withoutEmpty = messages.filter((message) => !messageContentIsEmpty(message?.content))
-  return { ...body, messages: mergeSameRole(withoutEmpty) }
-}
-
-function messageContentIsEmpty(content) {
-  if (content == null) return true
-  if (typeof content === 'string') return !content.trim()
-  if (!Array.isArray(content)) return false
-  if (!content.length) return true
-  return content.every((block) => {
-    if (typeof block === 'string') return !block.trim()
-    if (!block || typeof block !== 'object') return true
-    if (block.type === 'text' || block.type == null) return !String(block.text || '').trim()
-    return false
-  })
-}
-
-function mergeSameRole(messages) {
-  const out = []
-  for (const message of messages) {
-    const last = out[out.length - 1]
-    if (!last || last.role !== message.role) {
-      out.push({ ...message })
-      continue
-    }
-    last.content = mergeContent(last.content, message.content)
-  }
-  return out
-}
-
-function mergeContent(left, right) {
-  if (typeof left === 'string' && typeof right === 'string') return `${left}\n${right}`
-  const blocks = []
-  for (const part of [left, right]) {
-    if (part == null || part === '') continue
-    if (typeof part === 'string') blocks.push({ type: 'text', text: part })
-    else if (Array.isArray(part)) blocks.push(...part)
-  }
-  return blocks
+  const stripped = chainBroken ? dropSignedThinkingChain(messages) : messages
+  if (!changed && !chainBroken) return dropEmptySystemControlTurns(body)
+  const withoutEmpty = stripped.filter(
+    (message) => !anthropicContentIsEmpty(message?.content) || messageHasTurnControls(message),
+  )
+  return dropEmptySystemControlTurns({ ...body, messages: mergeConsecutiveAnthropicMessages(withoutEmpty) })
 }
 
 export const CONTEXT_MANAGEMENT_BETA = 'context-management-2025-06-27'
@@ -195,13 +250,21 @@ export const MID_CONVERSATION_SYSTEM_BETA = 'mid-conversation-system-2026-04-07'
 export function modelSupportsContextManagement(modelId = '') {
   const caps = getCapabilities(modelId)
   if (caps?.supports_context_management === false) return false
-  if (/haiku/i.test(String(modelId || ''))) return false
+  const id = String(modelId || '')
+  if (/haiku/i.test(id) && !/haiku-5/i.test(id)) return false
   return true
 }
 
-/** Haiku 400s `role 'system' is not supported on this model`. */
+/**
+ * Docs list: Fable 5 / 5.1, Mythos 5 / 5.1, Opus 5.5 / 5 / 4.8, Sonnet 5.5, Haiku 5.5.
+ * Sonnet 5, Haiku 4.5 and other Claude 4.x reject mid-conversation `role=system` (400).
+ */
 export function modelSupportsMidConversationSystem(modelId = '') {
-  return !/haiku/i.test(String(modelId || ''))
+  const id = String(modelId || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\[1m\]$/i, '')
+  return /^claude-(?:(?:fable|mythos)-5(?:[-.]1)?|opus-(?:5(?:[-.]5)?|4[-.]8)|(?:sonnet|haiku)-5[-.]5)(?:-|$)/.test(id)
 }
 
 /**
@@ -303,7 +366,8 @@ export function sanitizeAnthropicBodyForBetaTokens(body = {}, anthropicBetaHeade
   ) {
     out = liftMidConversationSystemMessages(out)
   }
-  return out
+  out = dropEmptySystemControlTurns(out)
+  return downgradeUngatedThinkingDisplay(out, anthropicBetaHeader)
 }
 
 /** sub2api normalizeClaudeOAuthRequestBody defaults (temperature / empty tools). */
@@ -328,6 +392,7 @@ export function prepareAnthropicRequest(
     cacheBreakpoints = null,
     cacheTtl = DEFAULT_CACHE_TTL,
     inbound = null,
+    preserveThinkingBlocks = false,
   } = {},
 ) {
   let out = clone(body)
@@ -349,7 +414,7 @@ export function prepareAnthropicRequest(
       content: cleanContent(normalizeImageContentBlocks(message?.content)),
     }))
   }
-  const stripped = stripInvalidThinkingBlocks(out)
+  const stripped = stripInvalidThinkingBlocks(out, { preserveThinkingBlocks })
   if (stripped.messages) out.messages = stripped.messages
   out = ensureClearThinkingContextManagement(out)
   out = alignSamplingWithThinking(out)

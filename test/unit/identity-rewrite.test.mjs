@@ -4,11 +4,13 @@ import {
   applyCrsIdentityReplace,
   buildStableSessionSeed,
   extractCallerSession,
+  extractFirstUserIdentity,
   normalizeSessionUserAgent,
   outboundSessionMode,
   rebuildOutboundSession,
   resolveOutboundSessionId,
   resolveInboundIdentity,
+  resolveSeatIdentity,
   sessionContextDiscriminator,
   REBUILD_SESSION_SEED,
   STABLE_SESSION_SEED,
@@ -239,20 +241,52 @@ test('missing caller session is stable across turns and not random', () => {
     clientIp: '203.0.113.9',
     userAgent: 'claude-cli/2.1.241 (external, sdk-cli)',
     apiKeyId: 'key-7',
-    firstUserText: 'first question',
+    firstUserIdentity: 'first question',
     epoch: 'pending',
   }
   const seed = buildStableSessionSeed('vm-01', sessionContextDiscriminator(base), 'first question')
   const round1 = resolveOutboundSessionId('', base)
-  const round2 = resolveOutboundSessionId('', { ...base, firstUserText: 'first question' })
+  const round2 = resolveOutboundSessionId('', { ...base, firstUserIdentity: 'first question' })
   assert.equal(round1, round2)
   assert.match(round1, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
   assert.equal(round1, rebuildOutboundSession({ identity: seed, epoch: 'pending' }))
   assert.notEqual(round1, uuidFromSeed(STABLE_SESSION_SEED + seed))
-  assert.notEqual(resolveOutboundSessionId('', { ...base, firstUserText: 'other opener' }), round1)
+  assert.notEqual(resolveOutboundSessionId('', { ...base, firstUserIdentity: 'other opener' }), round1)
   assert.notEqual(resolveOutboundSessionId('', { ...base, accountId: 'vm-02' }), round1)
   assert.equal(resolveOutboundSessionId('', { ...base, userAgent: 'claude-cli/2.1.999 (external, sdk-cli)' }), round1)
   assert.notEqual(resolveOutboundSessionId('', { ...base, epoch: 99 }), round1)
+})
+
+test('first user identity skips a verbatim system-reminder opener', () => {
+  const reminder = '<system-reminder>Today: 2026-10-04; current working directory: /work/demo</system-reminder>'
+  const opener = (question) => [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: reminder },
+        { type: 'text', text: question },
+      ],
+    },
+  ]
+  assert.equal(extractFirstUserIdentity(opener('会话 A 的问题')), '会话 A 的问题')
+  const base = { officialClient: false, accountId: 'vm-01', clientDiscriminator: 'ip:ua:key', epoch: 'pending' }
+  const seed = (question) =>
+    resolveOutboundSessionId('', { ...base, firstUserIdentity: extractFirstUserIdentity(opener(question)) })
+  assert.notEqual(seed('会话 A 的问题'), seed('会话 B 的问题'))
+  // A message that is only reminders still has an identity; a plain first block is used as-is.
+  assert.equal(extractFirstUserIdentity([{ role: 'user', content: [{ type: 'text', text: reminder }] }]), reminder)
+  assert.equal(
+    extractFirstUserIdentity([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: `${reminder}\n真正的问题` },
+          { type: 'text', text: 'later' },
+        ],
+      },
+    ]),
+    `${reminder}\n真正的问题`,
+  )
 })
 
 test('sticky outbound id is reused for the same VM and reminted after failover', () => {
@@ -262,7 +296,7 @@ test('sticky outbound id is reused for the same VM and reminted after failover',
     boundSessionId: '11111111-1111-4111-8111-111111111111',
     boundVmId: 'vm-01',
     vmId: 'vm-01',
-    firstUserText: 'trimmed current turn',
+    firstUserIdentity: 'trimmed current turn',
     clientDiscriminator: '203.0.113.9:claude-cli+sdk-cli:key-7',
     epoch: 10,
   }
@@ -332,4 +366,77 @@ test('resolveInboundIdentity reads explicit device_id from the raw inbound body'
     body: {},
   })
   assert.deepEqual(identity, { sessionId: 'session-raw', deviceId: 'device-raw', source: 'explicit-device' })
+})
+
+const LONG_TURN = 'please refactor the scheduler module and explain every single change you make'
+
+test('resolveSeatIdentity: device id first, then metadata session, never the API key', () => {
+  const both = { metadata: { user_id: JSON.stringify({ device_id: 'dev-1', session_id: 'sess-1' }) } }
+  const inbound = { ...both, messages: [{ role: 'user', content: LONG_TURN }] }
+  assert.deepEqual(resolveSeatIdentity({ inbound, body: inbound }), { key: 'seat:dev:dev-1', source: 'device' })
+  const explicit = { device_id: 'dev-2', messages: [{ role: 'user', content: LONG_TURN }] }
+  assert.equal(resolveSeatIdentity({ inbound: explicit, body: explicit }).key, 'seat:dev:dev-2')
+  const header = resolveSeatIdentity({
+    inbound: { messages: [{ role: 'user', content: LONG_TURN }] },
+    headers: { 'X-Kin-Device-Id': 'dev-3' },
+  })
+  assert.equal(header.key, 'seat:dev:dev-3')
+  const sessionOnly = {
+    metadata: { user_id: JSON.stringify({ session_id: 'sess-9' }) },
+    messages: [{ role: 'user', content: LONG_TURN }],
+  }
+  assert.deepEqual(resolveSeatIdentity({ inbound: sessionOnly, body: sessionOnly }), {
+    key: 'seat:sess:sess-9',
+    source: 'session',
+  })
+})
+
+test('resolveSeatIdentity: same IP + UA + first turn hashes to one identity whatever the API key', () => {
+  const turn = (extra = []) => ({
+    system: [{ type: 'text', text: 'You are a helpful assistant.' }],
+    messages: [{ role: 'user', content: LONG_TURN }, ...extra],
+  })
+  const headers = { 'user-agent': 'my-client/1.2.3', authorization: 'Bearer key-a', 'x-api-key': 'key-a' }
+  const first = resolveSeatIdentity({ inbound: turn(), headers, clientIp: '10.0.0.7' })
+  assert.equal(first.source, 'fingerprint')
+  assert.match(first.key, /^seat:h:[0-9a-f]{64}$/)
+  const otherKey = resolveSeatIdentity({
+    inbound: turn(),
+    headers: { 'user-agent': 'my-client/1.3.0', authorization: 'Bearer key-b', 'x-api-key': 'key-b' },
+    clientIp: '10.0.0.7',
+  })
+  assert.equal(otherKey.key, first.key)
+  const laterTurn = resolveSeatIdentity({
+    inbound: turn([
+      { role: 'assistant', content: 'done' },
+      { role: 'user', content: 'next' },
+    ]),
+    headers,
+    clientIp: '10.0.0.7',
+  })
+  assert.equal(laterTurn.key, first.key)
+  const otherIp = resolveSeatIdentity({ inbound: turn(), headers, clientIp: '10.0.0.8' })
+  assert.notEqual(otherIp.key, first.key)
+  const otherContent = resolveSeatIdentity({
+    inbound: { ...turn(), messages: [{ role: 'user', content: `${LONG_TURN} differently` }] },
+    headers,
+    clientIp: '10.0.0.7',
+  })
+  assert.notEqual(otherContent.key, first.key)
+})
+
+test('resolveSeatIdentity: cache_control ephemeral content outranks the client fingerprint', () => {
+  const inbound = {
+    system: [{ type: 'text', text: 'cached system prompt', cache_control: { type: 'ephemeral' } }],
+    messages: [{ role: 'user', content: LONG_TURN }],
+  }
+  const a = resolveSeatIdentity({ inbound, headers: { 'user-agent': 'a/1' }, clientIp: '1.1.1.1' })
+  const b = resolveSeatIdentity({ inbound, headers: { 'user-agent': 'b/1' }, clientIp: '2.2.2.2' })
+  assert.equal(a.source, 'cache')
+  assert.equal(a.key, b.key)
+})
+
+test('resolveSeatIdentity: a short one-shot probe takes no seat', () => {
+  const probe = { max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }
+  assert.deepEqual(resolveSeatIdentity({ inbound: probe, clientIp: '10.0.0.7' }), { key: null, source: 'probe' })
 })

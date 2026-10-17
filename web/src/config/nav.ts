@@ -1,37 +1,19 @@
-import {
-  Box,
-  Database,
-  Download,
-  Gauge,
-  KeyRound,
-  LayoutDashboard,
-  LineChart,
-  List,
-  MessageSquareText,
-  Monitor,
-  Network,
-  Puzzle,
-  ScrollText,
-  Settings,
-  Shield,
-  Users,
-} from 'lucide-react'
-
 export type ViewId =
   | 'overview'
   | 'cluster'
   | 'vm'
   | 'import'
-  | 'usage'
+  | 'specs'
   | 'billing'
   | 'proxies'
   | 'models'
-  | 'loadtest'
-  | 'protocol'
+  | 'risk'
   | 'system'
   | 'keys'
   | 'api'
+  | 'anthropic'
   | 'logs'
+  | 'statistics'
   | 'database'
   | 'settings'
   | 'users'
@@ -42,42 +24,26 @@ export const VIEW_TITLES: Record<ViewId, string> = {
   cluster: '集群',
   vm: '虚拟机',
   import: '导入',
-  usage: '用量',
+  specs: '规格',
   billing: '计费',
   proxies: '代理池',
   models: '模型',
-  loadtest: '压测',
-  protocol: '协议',
+  risk: '风险审计',
   system: 'system提示词',
   keys: '密钥',
   api: 'API',
+  anthropic: 'Anthropic',
   logs: '日志',
+  statistics: '统计',
   database: '数据库',
   settings: '设置',
   users: '用户',
   wrap: '内核',
 }
 
-export const NAV_ITEMS: {
-  id: ViewId
-  url: string
-  icon: typeof LayoutDashboard
-}[] = [
-  { id: 'overview', url: '/overview', icon: LayoutDashboard },
-  { id: 'cluster', url: '/cluster', icon: Network },
-  { id: 'vm', url: '/vm', icon: Monitor },
-  { id: 'import', url: '/import', icon: Download },
-  { id: 'usage', url: '/usage', icon: LineChart },
-  { id: 'billing', url: '/billing', icon: LineChart },
-  { id: 'proxies', url: '/proxies', icon: Shield },
-  { id: 'models', url: '/models', icon: List },
-  { id: 'loadtest', url: '/loadtest/reports', icon: Gauge },
-  { id: 'protocol', url: '/protocol', icon: Box },
-  { id: 'system', url: '/system', icon: MessageSquareText },
-  { id: 'keys', url: '/keys', icon: KeyRound },
-  { id: 'logs', url: '/logs', icon: ScrollText },
-  { id: 'database', url: '/database', icon: Database },
-  { id: 'settings', url: '/settings/sticky', icon: Settings },
-  { id: 'wrap', url: '/wrap', icon: Puzzle },
-  { id: 'users', url: '/users', icon: Users },
-]
+// 监控组四页的职责边界，避免同一块数据在多页重复出现。
+export const VIEW_DESCRIPTIONS: Partial<Record<ViewId, string>> = {
+  overview: '集群健康、账号可用性与近 1 小时服务质量',
+  statistics: '请求、消费与耗时趋势，以及用户 / 供应商 / 模型排行',
+  logs: '逐条请求记录，支持筛选、导出与查看详情',
+}

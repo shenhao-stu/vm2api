@@ -116,6 +116,10 @@ export class VmsRepo {
     this.settings.set(ACTIVE_VM_KEY, id)
   }
 
+  clearActiveVmId() {
+    this.settings.remove(ACTIVE_VM_KEY)
+  }
+
   _decode(row) {
     if (!row) return null
     let vm = null

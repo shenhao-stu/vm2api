@@ -1,3 +1,4 @@
+import type { VmActiveHours, VmQuotaOverride } from '@/types/panel-vm'
 import { apiBase, clearSession, hasSession, sessionToken } from '@/lib/session'
 
 export type PanelErrorMetadata = {
@@ -133,12 +134,21 @@ export async function api<T = unknown>(
 export type VmPatch = {
   inference_engine?: 'go' | 'rust' | ''
   persona_preset?: string
-  max_concurrency?: number
-  max_rpm?: number
-  session_slots?: number
+  /** null = 去掉本槽覆盖，跟随分档 / 全局。 */
+  max_concurrency?: number | null
+  max_rpm?: number | null
+  /** OpenAI only; null clears the pin and follows codex.quota.max_sessions. */
+  max_sessions?: number | null
+  session_slots?: number | null
+  quota_override?: VmQuotaOverride | null
   allowed_models?: string[]
   auth_scheme?: string
   schedule_level?: number | 'auto' | null
+  /** null = 清除工作时段，恢复 24h 接单。 */
+  active_hours?: VmActiveHours | null
+  /** Docker 槽在线提升内存（仅上调）。 */
+  memory?: string
+  machine?: { memory?: string }
 }
 
 export function patchVm<T = unknown>(id: string, body: VmPatch) {

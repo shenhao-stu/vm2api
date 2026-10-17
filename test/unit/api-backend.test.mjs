@@ -6,9 +6,11 @@ import os from 'node:os'
 import path from 'node:path'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
+import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { CRS_OFFICIAL_AGENT_PROMPT } from '../../src/lib/identity/crs-persona.mjs'
+import { sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
 import { DEFAULT_AGENT_STANDING } from '../../src/lib/identity/persona-template.mjs'
-import { resolveInferenceBackend, messagesUrl } from '../../src/lib/pool/api-protocol.mjs'
+import { resolveInferenceBackend, messagesUrl, runApiInference } from '../../src/lib/pool/api-protocol.mjs'
 
 function fakeResponse() {
   return { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
@@ -21,15 +23,14 @@ function messageStart() {
   })}\n\n`
 }
 
-test('managed key category selects backend', () => {
+test('only a managed key explicitly marked api uses the Anthropic address path', () => {
   assert.equal(resolveInferenceBackend({ apiKeyKind: 'managed', apiKeyRecord: { category: 'api' } }), 'api')
+  assert.equal(resolveInferenceBackend({ apiKeyKind: 'managed', apiKeyRecord: { category: ' API ' } }), 'api')
   assert.equal(resolveInferenceBackend({ apiKeyKind: 'managed', apiKeyRecord: { category: 'oauth' } }), 'oauth')
   assert.equal(resolveInferenceBackend({ apiKeyKind: 'managed', apiKeyRecord: {} }), 'oauth')
-})
-
-test('master key defaults oauth unless x-kin-backend=api', () => {
-  assert.equal(resolveInferenceBackend({ apiKeyKind: 'master', headers: {} }), 'oauth')
-  assert.equal(resolveInferenceBackend({ apiKeyKind: 'master', headers: { 'x-kin-backend': 'api' } }), 'api')
+  assert.equal(resolveInferenceBackend({ apiKeyKind: 'master', headers: { 'x-kin-backend': 'api' } }), 'oauth')
+  assert.equal(resolveInferenceBackend({ apiKeyKind: 'master', apiKeyRecord: { category: 'api' } }), 'oauth')
+  assert.equal(resolveInferenceBackend({ headers: { 'x-kin-backend': 'api' } }), 'oauth')
 })
 
 test('messagesUrl appends /v1/messages?beta=true', () => {
@@ -87,7 +88,7 @@ test('API backend applies the global official_full persona setting', async () =>
     requestLog: { start: () => ({ request_id: 'api-persona-test' }), finish() {} },
     stickyRouter: {},
     accountQuota: {},
-    apiKeyStore: {},
+    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
     apiScheduler: {
       pick: () => ({
         ok: true,
@@ -112,8 +113,9 @@ test('API backend applies the global official_full persona setting', async () =>
   const req = {
     method: 'POST',
     url: '/v1/messages',
-    headers: { authorization: 'Bearer master', 'x-kin-backend': 'api', 'user-agent': 'test-client' },
-    apiKeyKind: 'master',
+    headers: { authorization: 'Bearer sk-vm-api', 'user-agent': 'test-client' },
+    apiKeyKind: 'managed',
+    apiKeyRecord: { category: 'api' },
     once() {},
     off() {},
   }
@@ -211,6 +213,309 @@ test('OAuth cli-hop applies the resolved Protocol custom persona template', asyn
     assert.ok(prepared?.body)
     assert.equal(prepared.body.system.length, 1)
     assert.equal(prepared.body.system[0].text, 'CUSTOM_PERSONA UTC')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('logs the session id actually sent upstream, not the caller one', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-outbound-session-'))
+  const routingFile = path.join(root, 'routing.json')
+  fs.writeFileSync(routingFile, JSON.stringify({ compatibility: {} }))
+  const vm = { id: 'vm-01', claude: { mode: 'oauth' } }
+  const selected = {
+    vmId: vm.id,
+    accountId: 'account-1',
+    vm,
+    exec: { vmId: vm.id, vm, homeDir: path.join(root, 'home'), oauth: { account_uuid: 'account-1' } },
+  }
+  let prepared = null
+  let logged = null
+  const response = { ...fakeResponse(), on: (event, fn) => event === 'finish' && (response.finish = fn) }
+  const handler = createHandleProtocol({
+    json: (_res, status, body) => {
+      response.status = status
+      return body
+    },
+    writeSSEHeaders() {},
+    readBody: async () => ({
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: 'hello' }],
+      metadata: { user_id: JSON.stringify({ device_id: 'caller-dev', session_id: 'caller-sess' }) },
+    }),
+    requireAuth: () => true,
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000, stream_idle_timeout_ms: 2000 },
+      paths: { data: root, project: root },
+    },
+    requestLog: {
+      start: () => ({ request_id: 'outbound-session-test', mode: 'normal' }),
+      finish: (_ctx, extra) => {
+        logged = extra
+      },
+    },
+    stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
+    accountQuota: {},
+    apiKeyStore: {},
+    apiScheduler: {},
+    apiEndpointStore: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfigPath: routingFile,
+    routingConfig: { compatibility: {}, failover: {} },
+    failoverRunner: {
+      async run(opts) {
+        prepared = await opts.applyAttempt(opts.canonicalBody, selected)
+        return { ok: false, status: 503, body: { error: { type: 'server_error', code: 'x', message: 'stop' } } }
+      },
+    },
+    groupsRepo: { rateMultiplier: () => 1 },
+  })
+  const req = {
+    method: 'POST',
+    url: '/v1/messages',
+    headers: { authorization: 'Bearer master', 'user-agent': 'claude-cli/2.1.241 (external, cli)' },
+    apiKeyKind: 'master',
+    once() {},
+    off() {},
+  }
+  try {
+    await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
+    response.finish?.()
+    const sent = sessionIdFromOutboundBody(prepared.body) || prepared.meta.sessionId
+    assert.ok(sent)
+    assert.equal(logged.session_id, 'caller-sess')
+    assert.equal(logged.outbound_session_id, sent)
+    assert.notEqual(logged.outbound_session_id, 'caller-sess')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+for (const previousVm of [null, 'vm-01']) {
+  test(`queued OAuth turns reuse the outbound session ${previousVm ? 'after a VM move' : 'on first bind'}`, async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-queued-session-'))
+    const routingFile = path.join(root, 'routing.json')
+    fs.writeFileSync(routingFile, JSON.stringify({ compatibility: {} }))
+    const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+    const key = sticky.canonicalSessionKey('queued-caller')
+    if (previousVm) {
+      sticky.bind(key, { accountId: 'account-1', vmId: previousVm, sessionId: 'previous-outbound' })
+    }
+    const vm = { id: 'vm-02', claude: { mode: 'oauth' } }
+    const selected = {
+      ok: true,
+      vmId: vm.id,
+      accountId: 'account-1',
+      vm,
+      exec: { vmId: vm.id, vm, homeDir: path.join(root, 'home'), oauth: { account_uuid: 'account-1' } },
+    }
+    const runner = new FailoverRunner({
+      scheduler: { selectAndReserve: async () => selected, markSuccess() {} },
+      stickyRouter: sticky,
+    })
+    let releaseFirst
+    let enteredFirst
+    let enteredSecond
+    const firstGate = new Promise((resolve) => {
+      releaseFirst = resolve
+    })
+    const firstReady = new Promise((resolve) => {
+      enteredFirst = resolve
+    })
+    const secondReady = new Promise((resolve) => {
+      enteredSecond = resolve
+    })
+    t.after(() => {
+      releaseFirst()
+      sticky.db.close()
+      fs.rmSync(root, { recursive: true, force: true })
+    })
+    const sent = []
+    const logged = []
+    let runs = 0
+    let requests = 0
+    const handler = createHandleProtocol({
+      json: (res, status, body) => {
+        res.status = status
+        return body
+      },
+      writeSSEHeaders() {},
+      readBody: async () => ({
+        model: 'claude-haiku-4-5',
+        stream: false,
+        max_tokens: 32,
+        messages: [
+          { role: 'user', content: 'Continue this diagnostic conversation with the same device and session.' },
+        ],
+        metadata: { user_id: JSON.stringify({ device_id: 'queued-device', session_id: 'queued-caller' }) },
+      }),
+      requireAuth: () => true,
+      cfg: {
+        rewrite: { enabled: false },
+        intercept: { rules: [] },
+        distill: { enabled: false },
+        limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000, stream_idle_timeout_ms: 2000 },
+        paths: { data: path.join(root, 'data'), project: root },
+      },
+      requestLog: {
+        start: () => ({ request_id: `queued-${++requests}`, mode: 'normal', t0: Date.now() }),
+        finish: (_ctx, extra) => logged.push(extra.outbound_session_id),
+      },
+      stickyRouter: sticky,
+      accountQuota: {},
+      apiKeyStore: {},
+      apiScheduler: {},
+      apiEndpointStore: {},
+      stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+      routingConfigPath: routingFile,
+      routingConfig: { compatibility: {}, failover: {} },
+      groupsRepo: { rateMultiplier: () => 1 },
+      failoverRunner: {
+        async run(opts) {
+          const index = ++runs
+          if (index === 2) enteredSecond()
+          return runner.run({
+            ...opts,
+            applyAttempt: async (body, candidate, extra) => {
+              if (index === 1) {
+                enteredFirst()
+                await firstGate
+              }
+              return opts.applyAttempt(body, candidate, { ...extra, attemptStartedAt: index * 1000 })
+            },
+            callAttempt: async ({ body }) => {
+              sent.push(sessionIdFromOutboundBody(body))
+              return {
+                ok: true,
+                status: 200,
+                terminalState: 'verified',
+                body: {
+                  type: 'message',
+                  role: 'assistant',
+                  content: [{ type: 'text', text: 'continued' }],
+                  stop_reason: 'end_turn',
+                },
+              }
+            },
+          })
+        },
+      },
+    })
+    async function invoke() {
+      const res = {
+        ...fakeResponse(),
+        on: (event, fn) => {
+          if (event === 'finish') res.finish = fn
+        },
+      }
+      const req = {
+        method: 'POST',
+        url: '/v1/messages',
+        headers: { authorization: 'Bearer master', 'user-agent': 'claude-cli/2.1.293 (external, cli)' },
+        apiKeyKind: 'master',
+        once() {},
+        off() {},
+      }
+      await handler.handleProtocol(req, res, 'anthropic.messages', '/v1/messages')
+      res.finish?.()
+      assert.equal(res.status, 200)
+    }
+    const first = invoke()
+    await firstReady
+    const second = invoke()
+    await secondReady
+    releaseFirst()
+    await Promise.all([first, second])
+    await invoke()
+    assert.notEqual(sent[0], 'queued-caller')
+    assert.notEqual(sent[0], 'previous-outbound')
+    assert.deepEqual(sent, [sent[0], sent[0], sent[0]])
+    assert.deepEqual(logged, [sent[0], sent[0], sent[0]])
+    assert.equal(sticky.resolve(key).sessionId, sent[0])
+    assert.equal(sticky.resolve(key).vmId, vm.id)
+  })
+}
+
+async function runManagedKeyHop(root, result) {
+  const routingFile = path.join(root, 'routing.json')
+  fs.writeFileSync(routingFile, JSON.stringify({ compatibility: {} }))
+  const vm = { id: 'vm-01', claude: { mode: 'oauth' } }
+  const selected = {
+    vmId: vm.id,
+    accountId: 'account-1',
+    vm,
+    exec: { vmId: vm.id, vm, homeDir: path.join(root, 'home'), oauth: { account_uuid: 'account-1' } },
+  }
+  const charges = []
+  const logged = []
+  const response = { ...fakeResponse(), on: (event, fn) => event === 'finish' && (response.finish = fn) }
+  const handler = createHandleProtocol({
+    json: (_res, status, body) => {
+      response.status = status
+      return body
+    },
+    writeSSEHeaders() {},
+    readBody: async () => ({ model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hello' }] }),
+    requireAuth: () => true,
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000, stream_idle_timeout_ms: 2000 },
+      paths: { data: root, project: root },
+    },
+    requestLog: { start: () => ({ request_id: 'key-billing', mode: 'normal' }), finish: (_c, row) => logged.push(row) },
+    stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
+    accountQuota: { ingestHeaders() {} },
+    apiKeyStore: {
+      acquire: () => ({ ok: true }),
+      release() {},
+      recordUsage: (key, usage, opts) => charges.push({ key, usage, opts }),
+    },
+    apiScheduler: {},
+    apiEndpointStore: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfigPath: routingFile,
+    routingConfig: { compatibility: {}, failover: {} },
+    failoverRunner: {
+      async run(opts) {
+        await opts.applyAttempt(opts.canonicalBody, selected)
+        return result
+      },
+    },
+    groupsRepo: { rateMultiplier: () => 2 },
+  })
+  const req = {
+    method: 'POST',
+    url: '/v1/messages',
+    headers: { authorization: 'Bearer sk-vm-x', 'user-agent': 'claude-cli/2.1.241 (external, cli)' },
+    apiKeyKind: 'managed',
+    apiKeyRecord: { id: 'key-1', group_id: 1 },
+    once() {},
+    off() {},
+  }
+  await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
+  response.finish?.()
+  return { charges, logged }
+}
+
+test('a managed key is charged exactly once for a hop billed inline', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-key-inline-'))
+  try {
+    const usage = { input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 5000 }
+    const { charges, logged } = await runManagedKeyHop(root, {
+      ok: false,
+      status: 503,
+      accountId: 'account-1',
+      usage,
+      body: { error: { type: 'server_error', code: 'x', message: 'stop' } },
+    })
+    assert.equal(charges.length, 1)
+    assert.equal(charges[0].opts.rateMultiplier, 2)
+    assert.equal(charges[0].opts.officialCost, logged[0].total_cost)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -522,6 +827,30 @@ test('inbound session and device keys match across API keys at the protocol entr
   }
 })
 
+test('the protocol entry hands the device seat key to the pool, independent of the API key', async () => {
+  const { dir, router } = realStickyRouter()
+  try {
+    const turn = {
+      messages: [{ role: 'user', content: 'please refactor the scheduler module and explain every single change' }],
+    }
+    const a = await captureRunOpts({
+      body: sessionBody({ device_id: 'dev-seat', session_id: 'sess-seat' }, turn),
+      stickyRouter: router,
+      apiKeyRecord: { id: 'key-a', group_id: 1 },
+    })
+    const b = await captureRunOpts({
+      body: sessionBody({ device_id: 'dev-seat', session_id: 'sess-other' }, turn),
+      stickyRouter: router,
+      apiKeyRecord: { id: 'key-b', group_id: 1 },
+    })
+    assert.equal(a.skipSessionSeat, false)
+    assert.equal(a.seatKey, 'seat:dev:dev-seat')
+    assert.equal(b.seatKey, a.seatKey)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('shared API key keeps different devices apart at the protocol entry', async () => {
   const { dir, router } = realStickyRouter()
   try {
@@ -642,7 +971,9 @@ test('Claude Code sub-agent hops run as child sessions of the main session', asy
     const nested = await agentHop('agent-c', 'agent-a')
 
     assert.equal(main.stickyKey, 'sess:main-sess')
-    assert.equal(main.windowKey, undefined)
+    // A one-shot short turn ('hello') holds no seat even with a device id.
+    assert.equal(main.skipSessionSeat, true)
+    assert.equal(main.seatKey, null)
     // Each agent queues on its own session, never behind the main one.
     const keys = [main.stickyKey, a.stickyKey, b.stickyKey, nested.stickyKey]
     assert.equal(new Set(keys).size, keys.length)
@@ -650,8 +981,6 @@ test('Claude Code sub-agent hops run as child sessions of the main session', asy
     assert.deepEqual(a.stickyKeys, [a.stickyKey])
     for (const child of [a, b, nested]) {
       assert.match(child.stickyKey, /^sess:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
-      // Session seat counts against the main session; placement follows its VM.
-      assert.equal(child.windowKey, 'sess:main-sess')
       assert.equal(child.familyKey, 'family2:main-sess')
       assert.equal(child.familyVmId, 'vm-cc')
       assert.equal(child.deviceKey, main.deviceKey)
@@ -703,5 +1032,141 @@ test('one-shot test call skips the session seat but keeps its sticky key', async
     assert.equal(turn.skipSessionSeat, false)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Responses API backend keeps parallel done-only tools in one stream state', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-tools-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const items = [0, 1].map((index) => ({
+    type: 'function_call',
+    id: `fc_${index}`,
+    call_id: `call_${index}`,
+    name: 'edit',
+    arguments: JSON.stringify({ path: `${index}.txt` }),
+  }))
+  const events = [
+    ...items.map((item, index) => ({
+      type: 'response.output_item.added',
+      output_index: index,
+      item: { ...item, arguments: '' },
+    })),
+    ...items.map((item, index) => ({
+      type: 'response.function_call_arguments.done',
+      output_index: index,
+      item_id: item.id,
+      arguments: item.arguments,
+    })),
+    { type: 'response.completed', response: { output: items } },
+  ]
+  const kernel = http.createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n')
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  let wire = ''
+  const res = {
+    headersSent: false,
+    write: (chunk) => {
+      wire += chunk
+    },
+  }
+  try {
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res,
+      protocol: 'openai.chat',
+      clientStream: true,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'edit' }] },
+      inbound: {},
+      converters: {
+        writeSSEHeaders: () => {
+          res.headersSent = true
+        },
+      },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'openai', protocol: 'openai', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'gpt-5.4',
+        }),
+      },
+    })
+    assert.equal(result.ok, true)
+    const chunks = wire
+      .split('\n\n')
+      .filter((line) => line.startsWith('data: {'))
+      .map((line) => JSON.parse(line.slice(6)))
+    const calls = chunks.flatMap((chunk) => chunk.choices[0].delta.tool_calls || [])
+    for (let index = 0; index < items.length; index++) {
+      const tool = calls.filter((call) => call.index === index)
+      assert.equal(tool.find((call) => call.id)?.id, items[index].call_id)
+      assert.deepEqual(JSON.parse(tool.map((call) => call.function?.arguments || '').join('')), {
+        path: `${index}.txt`,
+      })
+    }
+    assert.equal(chunks.at(-1).choices[0].finish_reason, 'tool_calls')
+    assert.equal(wire.split('data: [DONE]').length - 1, 1)
+  } finally {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('Responses API backend returns 502 for conflicting tool arguments when the client is not streaming', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-tools-ns-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const events = [
+    {
+      type: 'response.output_item.added',
+      output_index: 0,
+      item: { type: 'function_call', id: 'fc_0', call_id: 'call_0', name: 'edit', arguments: '' },
+    },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_0', delta: '{"path":"a' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_0', arguments: '{"path":"b.txt"}' },
+    { type: 'response.completed', response: { output: [] } },
+  ]
+  const kernel = http.createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n')
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  try {
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res: { headersSent: false, write: () => {} },
+      protocol: 'anthropic.messages',
+      clientStream: false,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'edit' }] },
+      inbound: {},
+      converters: { writeSSEHeaders: () => {} },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'openai', protocol: 'openai', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'gpt-5.4',
+        }),
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.status, 502)
+    assert.equal(result.body.error.code, 'tool_arguments_mismatch')
+  } finally {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
   }
 })

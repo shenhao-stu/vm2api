@@ -1,1 +1,0 @@
-import{n as e}from"./dataplane-contract-Dgtrdsss.js";var t=`rust`,n=[{value:`auto`,label:`自动（继承 rust）`},{value:`rust`,label:e}];function r(e,t){return e===`auto`||e===`rust`?e:e===`go`?`rust`:t}function i(e){return e===`auto`?``:`rust`}function a(t){return t===`go`?e:n.find(e=>e.value===t)?.label||`未知`}export{r as i,a as n,i as r,t};

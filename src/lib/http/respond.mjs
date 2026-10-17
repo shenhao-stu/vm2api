@@ -82,6 +82,27 @@ export function readBody(req, maxBytes) {
   })
 }
 
+/**
+ * Node 的 WHATWG URL 会拒绝未加括号的 IPv6、非 ASCII Host、空 Host。
+ * 安装探活打的是 127.0.0.1，浏览器若用这类 Host 打开 /cc，旧代码在进路由前就 500。
+ * Host 解析失败时仍用路径路由；路径本身非法才返回 null。
+ */
+export function parseRequestUrl(req) {
+  const raw = req?.url || '/'
+  const host = String(req?.headers?.host || '').trim()
+  const bases = []
+  if (host) bases.push(`http://${host}`)
+  bases.push('http://127.0.0.1')
+  for (const base of bases) {
+    try {
+      return new URL(raw, base)
+    } catch {
+      // try the next base
+    }
+  }
+  return null
+}
+
 export function readRawBody(req, maxBytes) {
   return collectBody(req, maxBytes)
 }
@@ -112,6 +133,7 @@ export function createRespond(cfg, options = {}) {
       'x-kin-rewrite': cfg.rewrite.enabled ? 'on' : 'off',
     })
     if (res._kinRequestId) headers['x-request-id'] = res._kinRequestId
+    if (body?.error?.details?.retryable === false) headers['x-should-retry'] = 'false'
     res.writeHead(status, headers)
     res.end(data)
   }

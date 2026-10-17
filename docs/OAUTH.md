@@ -4,11 +4,11 @@
 
 ```text
 sessionKey（默认 Setup Token）或授权码
-   │ 必须先有 VM + 槽位 SOCKS5（禁止 direct fallback）
+   │ 必须先有 VM + 槽位出口：SOCKS5，或本地出口 px-local（宿主机默认路由直连）；未绑定一律拒绝
    ▼
 bin/kin-oauth-auth（控制面 spawn；OAuth 源码只在本地构建）
    │ sessionKey → /api/organizations → 完整 scope authorize → token
-   │ bootstrap 读取 oauth_account，并 PATCH Grove 账号设置
+   │ bootstrap（entrypoint=claude-code&model=claude-opus-5-5）读取 oauth_account；不再 PATCH Grove
    ▼
 槽 ~/.claude/credentials.json   ← 活票只在这里（含 email / account_uuid / org_uuid）
    │ host RefreshIfNeeded（推理临期 或 面板显式 refresh）
@@ -23,16 +23,22 @@ commitImportedOauth → 仅完整 OAuth 运行模式排队官方 Claude Code 初
 
 ## 导入门控
 
-三条入口都要求槽位已存在且绑定可用 SOCKS5。生产忽略 `require_proxy: false`（仅测试 mock 可绕过）。
+三条入口都要求槽位已存在且绑定可用出口：远程 SOCKS5，或本地出口 `px-local`。本地出口没有 SOCKS URL，控制面传 `proxy_url: ""`，换票、bootstrap 都走宿主机默认路由直连（GPT 槽沿用 DEPLOY.md 里的部署代理）；未绑定传 `null`，仍报 `proxy_required`。生产忽略 `require_proxy: false`（仅测试 mock 可绕过）。
 
 | 入口 | 路径 | 说明 |
 |------|------|------|
-| sessionKey（默认 Setup Token） | `POST /api/panel/vms/import` `{ type: "setup-token", sessionKey }` | `sk-ant-sid*` 经槽位 SOCKS5 申请完整 OAuth scope（profile、inference、sessions、MCP、文件），采集 bootstrap 身份并 PATCH Grove；落盘后以 Setup Token 运行模式执行，不跑官方初装。 |
-| 已有 OAuth → Setup Token | `POST /api/panel/vms/:id/oauth/to-setup-token` | 读 worker 活票，仅切换运行模式；保留 access、refresh、真实过期时间和全部实际 scope。不会凭空增加权限，也不会删 scope。 |
-| 授权链接 | `POST /api/panel/vms/:id/oauth/generate-auth-url` | CAI、Claude Code、Setup Token flavor 都请求完整 OAuth scope。Setup Token flavor 仍只改变运行模式；服务端 PKCE，30min；无代理不能生成 URL。 |
-| 粘贴授权码 | `POST /api/panel/vms/:id/oauth/exchange-code` | 经槽 SOCKS5 换票，再执行 bootstrap 与 Grove PATCH，最后 `commitImportedOauth`。 |
+| sessionKey（默认 Setup Token） | `POST /api/panel/vms/import` `{ type: "setup-token", sessionKey }` | `sk-ant-sid*` 经槽位 SOCKS5 申请完整 OAuth scope（profile、inference、sessions、MCP、文件），采集 bootstrap 身份；落盘后以 Setup Token 运行模式执行，不跑官方初装。 |
+| 已有 OAuth → Setup Token | `POST /api/panel/vms/:id/oauth/to-setup-token` | 读 worker 活票，仅切换运行模式；保留 access、refresh、真实过期时间和全部实际 scope。不会凭空增加权限，也不会删 scope。官方一年期 token（`official-setup-token`）不能转。 |
+| 官方 `claude setup-token` | 槽内 PTY / 粘贴一年期 oat | 只有 `user:inference`、无 refresh。落盘 `credential_mode=official-setup-token`，与面板转换的完整 Setup Token 区分。 |
+| 授权链接 | `POST /api/panel/vms/:id/oauth/generate-auth-url` | CAI、Claude Code、Setup Token flavor 都请求完整 OAuth scope。Setup Token flavor 仍只改变运行模式；服务端 PKCE，30min；未绑定出口不能生成 URL，本地出口可以。 |
 
-换出的 access/refresh 只写入 credentials.json。`vm.json` / DB 只留 `has_access` / `has_refresh` / email / expiry / generation。Claude 面板默认选 Setup Token + Cookie。
+换出的 access/refresh 只写入 credentials.json；导入时文档顶层和 `claudeAiOauth` 都写 `kinGeneration`，文件仍是 `0444`。`vm.json` / DB 只留 `has_access` / `has_refresh` / email / expiry / generation。Claude 面板默认选 Setup Token + Cookie。
+
+完整 OAuth 授权链接（`cai` / `claude_code`）的粘贴码按 sub2api 换票规则处理：`code#state` 只将 `#` 后的上游返回值作为 token 请求的 `state`；只有 code 时不发送 `state`，不补生成链接时的 nonce。手动粘贴不是浏览器自动回调，code 与授权会话仍由 PKCE verifier 绑定，30 分钟期限与 VM 绑定检查不变。`setup_token` flavor、Cookie 换票和官方 Setup Token 流程不变。该修复只改控制面，现有 `kin-oauth-auth` 已支持可选 `state`，无需重编或 `wrap-cli/sync`。
+
+Cookie authorize 的组织 UUID 同时出现在 `/v1/oauth/{uuid}/authorize` 路径和 JSON 的 `organization_uuid` 字段；只有路径 UUID 不够，上游会返回 400 `Invalid request format`。
+
+SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交阶段先启动节点槽并同步凭据；远端配置与票据均按 UTF-8/Buffer 的字节长度分块写入 SFTP，0600 临时文件原子替换，不跟随目标符号链接。节点启动失败不代表上游授权失败。
 
 ## 刷新规则
 
@@ -48,6 +54,7 @@ commitImportedOauth → 仅完整 OAuth 运行模式排队官方 Claude Code 初
 8. `invalid_grant` 先重读 generation，识别其他路径已完成的竞争刷新。
 9. 上游 401 **不** force-refresh（端点拒票 ≠ 过期；硬刷会把还能用的 grant 烧成 `invalid_grant`）。
 10. 目录 / 模型列表 **不** hop worker `/v1/models`。
+11. 槽内 cli-node（kernel 拉起的 native 槽、面板运维终端里的 `claude`、初装 hello / `/usage` / 常驻、`setup-token`）带 `CLAUDE_CODE_HOST_REFRESH=1` 和 `CLAUDE_CODE_VERSION`：临期或 401 时只重读 `credentials.json`，不请求 token 端点，不写回凭证。否则它与 host 同用一个轮换 RT，后到的一方拿 `invalid_grant`，且其写回会丢掉 `kinGeneration`。
 
 过期且无 refresh 的槽不入调度池。面板「网页可用」与调度选槽同一套资格。
 
@@ -81,7 +88,7 @@ commitImportedOauth → 仅完整 OAuth 运行模式排队官方 Claude Code 初
 
 1. wipe 初装文件  
 2. 物化 `~/.claude/.credentials.json`（worker 活票）  
-3. 官方 CLI 经 HTTP CONNECT → 槽 SOCKS5 跑 `hello`  
+3. 槽内 cli-node（`~/.kin/cli-node`，与 kernel 同一构建，不再另装官方 Claude Code）跑 `hello`；缺 cli-node 时报错，先 `wrap-cli/sync`  
 4. 槽内 CLI `/usage` 写 5h/7d/Fable 刻度，失败再试 2 次。账号等级只用成功且完整的官方 `/usage` 判定 Pro/Max
 5. 后置播种（含强制 env：`DISABLE_TELEMETRY` 等按 seed_policy）  
 6. `~/.claude.json` 的 userID/machineID 写入槽位指纹；清 leftover `.claude/.claude.json`  

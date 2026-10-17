@@ -2,6 +2,8 @@
 
 对齐 `src/lib/protocol/*`、`src/lib/identity/crs-persona.mjs`、`src/server.mjs` 的 `handleProtocol`。日期 2026-08-26。
 
+进槽前的封控拦截不在本文，见 [RISK.md](RISK.md)。
+
 上游 hop 始终 `stream:true`。客户端 SSE 透传；非流或 `x-kin-delivery: verified` 则缓冲到 `message_stop` 再聚合。
 
 ## 官方 Claude Code 判定
@@ -15,7 +17,7 @@
 | tools | 不能是 OpenAI `{type:function}` / `tool_choice.type=function`。`/v1/messages` 上这种 tools 会先转 Anthropic，但仍判非官方 |
 | system | 含 `x-anthropic-billing-header:`、官方 `cc_entrypoint`（`cli` / `sdk-cli` / `vscode` / `cowork` / `desktop`，不含 `local-agent`）、或官方身份行（含 `You are Claude Code` / `Claude Agent SDK` 变体） |
 
-四闸不全 → 非官方，走人设。虚拟机测试 / 能力探针入站会先铺 4 块官方 system + 官方 UA，因此分类为 `claude_code_official`。压测 UA 仍是第三方。
+四闸不全 → 非官方，走人设。虚拟机测试入站会先铺 4 块官方 system + 官方 UA，因此分类为 `claude_code_official`。
 
 ## 非官方人设
 
@@ -50,7 +52,7 @@ cli-hop 的 kin 分支只组装 `billing →（identity 布局的身份句）→
 
 遗留 `persona_inject=rewrite|overwrite|append|none` 仍可用，但不是仓库配置默认值。`rewrite` 使用 KIN 短 agent + env；`overwrite` 使用完整 agent_prompt + continuation + Environment。system提示词页保存时三档写回 `official_prompt` / `official_full` / `zero`；自定义才保留旧 inject。
 
-权威开关是 `routing.json` 的 `compatibility.persona_preset`（system提示词）与 `cache_ttl`（设置 → 协议）。`vms/<id>/run/kernel.json` 不是第二套面板：面板保存、槽位「跟随全局」、外部改写 `routing.json`，或虚拟机环境保存时区之后，才把解析结果投影进去（`persona_preset`、`system_layout`、`default_cache_ttl`、`timezone`）。`system_layout` 只有 `zero` 与 `identity`（`official` / `official_full` / `custom` 都是 `identity`）。字节没变不重写。kernel 热读该文件，不必重启槽。Codex 槽不写。手改 `kernel.json` 会在下一次投影时被盖掉。
+权威开关是 `routing.json` 的 `compatibility.persona_preset`（system提示词）与 `cache_ttl`（面板不再提供修改入口，直接改 `routing.json`；缺省 `1h`）。`vms/<id>/run/kernel.json` 不是第二套面板：面板保存、槽位「跟随全局」、外部改写 `routing.json`，或虚拟机环境保存时区之后，才把解析结果投影进去（`persona_preset`、`system_layout`、`default_cache_ttl`、`timezone`）。`system_layout` 只有 `zero` 与 `identity`（`official` / `official_full` / `custom` 都是 `identity`）。字节没变不重写。kernel 热读该文件，不必重启槽。Codex 槽不写。手改 `kernel.json` 会在下一次投影时被盖掉。
 
 面板预览表达 Node 给出的模板内容；cli-hop 最终线序以上述 CLI-owned 前缀为准，不把 Node 对象预览当成最终 wire 抓包。更新 CLI 二进制后需要替换槽内副本并重启相应 kernel/CLI；配置热读不能让旧进程自动加载新 ELF。删除旧环境文本后首次前缀会冷写，后续 cache_read 数值须实测，不能保证必然不低于旧值。0注入 + 常驻约束关闭 + 无调用方 agent 的真实模型可见输出须单独验收。
 
@@ -72,19 +74,19 @@ Go worker JSON 透传，不必因人设重建 worker。
 
 非官方缺省还可补 `output_config.effort=high`，**不覆盖**已有 thinking / max_tokens。最新 main 在 unofficial 缺 `thinking.display` 时补 `omitted`。
 
-压测默认预算 32000。虚拟机测试未传 `max_tokens` 时用模型策略 `max_tokens_default`，再不行用 64（健康探测 hello 同口径）。
+虚拟机测试未传 `max_tokens` 时用模型策略 `max_tokens_default`，再不行用 64（健康探测 hello 同口径）。
 
 ## beta 与 1M
 
 - 存盘的 `kin-cc-headers.json` **只**留 `anthropic-version` / `anthropic-beta`。UA、stainless、session、accept-language 只出槽位指纹 + 代码 pin。
-- 出站 UA 锁 `claude-cli/2.1.284 (external, sdk-cli)`。Stainless 仍是 `js` / `Linux` / `x64` / `node` / `v26.3.0` / `0.112.1`，`retry-count=0`，`timeout=600`。
+- 出站 UA 锁 `claude-cli/2.1.293 (external, sdk-cli)`。Stainless 仍是 `js` / `Linux` / `x64` / `node` / `v26.3.0` / `0.112.1`，`retry-count=0`，`timeout=600`。
 - 非官方裸模型 **不注入、不重放** `context-1m-2025-08-07`。入站末尾 `[1m]`（如 `claude-sonnet-5[1m]`）在矩阵允许时注入该 beta（官方/非官方都算）。
 - 官方 CC：矩阵 `betas.pass_context_1m` 决定透传/剥离；未入库时回退 `defaults.context_1m_whitelist`（seed：`sonnet-5*`）。同一 `[1m]` 后缀在允许时也会注入。
 - 出站 `model` 去掉 `[1m]` 后缀。
 - 缺 `context-management` beta 时剥掉 body 同名字段。
 - 缺 beta 时不带对应高级字段；短 beta 按 mimicry 集合补齐（官方路径）。
 
-模型目录权威是面板 `model_policy`（`GET/PUT /api/panel/model-policy`）。`GET /v1/models` 与 `validateOfficialModel` 读这份集合，**禁止** hop 槽位 `/internal/v1/models`。
+模型目录权威是面板 `model_policy`（`GET/PUT /api/panel/model-policy`）。`GET /v1/models` 与 `validateOfficialModel` 读这份集合，**禁止** hop 槽位 `/internal/v1/models`。`GET /v1/models` 只列出该 key 的 `group_type` 能调度的模型：`openai` 只列 GPT，`anthropic` 只列 Claude，`all` 与 master 两者都列。
 
 ## web_search
 
@@ -106,22 +108,25 @@ Rikka / 客户端 `search_web`、`scrape_web` **不是** Anthropic 自带搜索�
 
 ## thinking 历史与签名
 
-出站前 `stripInvalidThinkingBlocks` 丢两类历史 thinking 块，**顺序是先文本后签名**：
+出站前 `stripInvalidThinkingBlocks` 保留可回放的历史思维块：
 
-1. `thinking` 文本为空的（非官方被补 `display: omitted` 后 haiku 只回签名不回文本，这类块出站前就没了）
-2. 签名短于 24 字符或是 dummy 的（`hasUsableThinkingSignature`，兜第三方截断的 SSE 签名）
+1. `thinking` 即使文本为空，只要有完整签名也保留；这是 `display: omitted` 的正常响应形态。
+2. Opus / Sonnet / Haiku 5.5 按 sub2api：非空且非 dummy 的签名都算有效，不看长度；`redacted_thinking` 有 `data` 就留，没有 `data` 时再看签名。历史里只要有一块无效，整段 thinking / `redacted_thinking` 都拆掉，只留正文；拆完没有内容的轮删掉。全部有效时不拆。
+3. 更早的型号仍逐块过滤：签名短于 24、空签名、dummy 签名删掉，合法签名块留下。`redacted_thinking` 不看 `data`，只在签名达到 24 字符时留。
+4. 保留路径（cli-hop 首跳，以及默认 HTTP hop）不走上面的拆链。缺少 `signature` 字段的 `thinking` 补空字段，已有字段不改写。
 
-HTTP hop 与 cli-hop（`prepareCliHopBody`）共用内容预过滤，但职责不同。cli-hop 的 Node 清除 caller `cache_control` 后写入最后消息及 `messages.length>=4` 时倒数第二 user 的断点，TTL 用入站会话已 pin 值。native Claude Code CLI 每个 job 热读 slot `kernel.json` 做 persona 布局，自产 system/tools 标记必须沿用同一请求 TTL，不得再从面板独立决策。Rust kernel 只认证、转发和流式传输，不再重打 last。Node 出站 JSON 不是最终 wire。HTTP hop 仍可由 Node 按自己的路由策略整流缓存。
+HTTP hop 与 cli-hop（`prepareCliHopBody`）共用内容预过滤，但职责不同。cli-hop 的首个出站 hop 保留已有 thinking 指纹块，并为缺字段的 thinking 补 `signature: ""`；只有签名修复重试的 `repaired` hop 才清除这些块。Node 清除 caller `cache_control` 后写入最后消息及 `messages.length>=4` 时倒数第二 user 的断点，TTL 用入站会话已 pin 值。native Claude Code CLI 每个 job 热读 slot `kernel.json` 做 persona 布局，自产 system/tools 标记必须沿用同一请求 TTL，不得再从面板独立决策。Rust kernel 只认证、转发和流式传输，不再重打 last。Node 出站 JSON 不是最终 wire。HTTP hop 仍可由 Node 按自己的路由策略整流缓存。
 
-长度够的签名原样转发，由 Anthropic 验。上游**严格验签名自身完整性**：乱码签名回 400 `Invalid \`signature\` in \`thinking\` block`。但签名**不与 thinking 文本绑定、也不与模型绑定** —— 真签名配改写过的文本、或 sonnet 的签名打到 opus / haiku，上游都 200（2026-08-28 实测，见 `测试结果/2026-08-28-thinking-signature/`）。
+长度够的签名原样转发，由 Anthropic 验。5.5 的非 dummy 签名也原样转发，不按 24 字符预过滤。签名是 opaque 加密内容，当前模型 / 账户 / 会话前缀不匹配时可能被丢弃或返回 400 `Invalid \`signature\` in \`thinking\` block`。网关不伪造真实签名，只在面板 / cli-hop 保留路径补齐缺失字段。切换账号时不改写已有签名；`cli-node` 仍按现有登录 / fallback 逻辑清理签名块。
 
-HTTP hop 那个 400 默认原样透传。`routing.failover.signature_repair=true`（设置页「探测 → 签名修复」）才走 `signature_repairable` 的 `repair-and-retry`（剥 thinking 历史 + 删 `body.thinking` 后重试一次），客户端只看到 200。**cli-hop / rust 槽始终走这一次同槽降级重试**（预过滤挡不住换票或长乱码签）；重试不得再补 `thinking.adaptive`。
+`routing.failover.signature_repair=true`（设置页「探测 → 签名修复」）才走 `signature_repairable` 的 `repair-and-retry`（剥 thinking 历史 + 删 `body.thinking` 后重试一次），客户端只看到 200。关闭时包括 cli-hop 在内都原样透传 400；`cli-node` 自身行为不受该面板开关改变。
 
 ## 健康探测缓存
 
 `routing.health_probe`：
 
 - **`enabled` 默认 `false`**：不开就没有定时探测、也没有缓存回放，第三方探活按普通推理落到真实槽位
+- **`probe_all_slots` 默认 `false`**：关闭时定时探测在首个成功槽后停止（early-stop）；开启后每个间隔对所有可调度槽各探一次（`concurrency` 上限、工作时段、冷却、凭证排除仍生效），列表顺序中首个成功仍写入缓存
 - 开启后才做定时真实 Messages（默认 10min）。hello 通过 `personaMode=overwrite` 生成完整 agent_prompt + continuation + Environment，并携带官方 UA / metadata 经站点 `/v1/messages` 官方通道钉槽发送
 - 匹配的第三方短请求（`hi`/`hello`/`ping`/`test`/`健康`，无 system/tools、小 `max_tokens`）在占并发前回放缓存的官方 Messages 体（真实 `id` / `content` / `usage`），不本地合成 `msg_health_*`
 - `cache_ttl_sec` 默认 900；`cache_models` 空=拦全部入站模型
@@ -135,7 +140,7 @@ HTTP hop 那个 400 默认原样透传。`routing.failover.signature_repair=true
 - `device_id`：64 hex 原样出站（创建生成值或官方 `machineID`）。遗留 UUID 槽仍 sha256。官方初装成功后存储值被 `~/.claude.json` `machineID` 覆盖
 - `session_id`：官方 CC 保留调用方原值；非官方用 CRS hash
 - `metadata.user_id`：官方 `userID` + 凭证 email（不读残留 `.claude/.claude.json`）
-- guest locale / tz 进 fingerprint；`/etc/machine-id` 是 `guest_machine_id`（systemd 32 hex）；出站 hostname 是 `<distro>-<4hex>`
+- guest locale / tz 进 fingerprint；`/etc/machine-id` 是 `guest_machine_id`（systemd 32 hex）。新槽主机名与 machine-id 来自私有 `kin-computer`，不再限定 `<distro>-<4hex>`；已有容器启动时保留原身份。本机新建容器发布计算机身份挂载，远端槽位仍使用原有身份传输路径。
 
 ## 相关头
 

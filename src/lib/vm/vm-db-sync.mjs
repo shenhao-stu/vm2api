@@ -22,6 +22,7 @@ import path from 'node:path'
 import { isDbOpen, getDb } from '../db/database.mjs'
 import { VmsRepo } from '../db/repos/vms-repo.mjs'
 import { setVmWriteHook, atomicWriteJson, isVmRecordFile } from './vm-file.mjs'
+import { repairSlotSmbios, repairVmProxyCliEnabled } from './vm-registry.mjs'
 
 let _repo = null
 let _watcher = null
@@ -67,6 +68,14 @@ export function removeVmFromDb(id) {
   const r = repo()
   if (!r || !id) return false
   return r.remove(id)
+}
+
+/** Forget settings.active_vm so startup reconcile does not rewrite active.json. */
+export function clearActiveVmFromDb() {
+  const r = repo()
+  if (!r) return false
+  r.clearActiveVmId()
+  return true
 }
 
 /**
@@ -143,6 +152,16 @@ export function initVmDbSync(projectRoot, { watch = true } = {}) {
     if (isVmJsonPath(filePath)) syncVmFile(filePath)
   })
   const result = reconcileVms(projectRoot)
+  try {
+    result.proxy_cli_repaired = repairVmProxyCliEnabled(projectRoot).length
+  } catch {
+    result.proxy_cli_repaired = 0
+  }
+  try {
+    result.smbios_repaired = repairSlotSmbios(projectRoot).length
+  } catch {
+    result.smbios_repaired = 0
+  }
   if (watch) startVmWatch(projectRoot)
   return result
 }

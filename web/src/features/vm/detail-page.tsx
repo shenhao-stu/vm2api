@@ -13,7 +13,6 @@ import {
   concInfo,
   fableCap,
   rpmInfo,
-  sessionCapOf,
   vmCost,
   weeklySplitInfo,
 } from '@/lib/fable-status'
@@ -49,6 +48,7 @@ import { PlatformChip, SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { StatusMark } from '@/components/status-mark'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import { proxiesForVmBind } from '@/features/proxies/proxy-sort'
 import { proxiesQueryOptions } from '@/features/proxies/queries'
 import { routingQueryOptions } from '@/features/settings/queries'
 import { VmAccountTab } from '@/features/vm/detail-account-tab'
@@ -60,12 +60,15 @@ import { VmTestTab } from '@/features/vm/detail-test-tab'
 import { NodeChip } from '@/features/vm/node-chip'
 import { probeOutcome, type ProbeCheck } from '@/features/vm/probe-status'
 import { vmQueryOptions, vmSeedQueryOptions } from '@/features/vm/queries'
+import { RuntimeChip } from '@/features/vm/runtime-chip'
 import {
   SchedulableSwitch,
   vmSchedulableProps,
 } from '@/features/vm/schedulable-switch'
 import { SeedPolicyCard } from '@/features/vm/seed-policy-card'
+import { usePoolSeatStream } from '@/features/vm/use-pool-seat-stream'
 import { useVmTestChat } from '@/features/vm/use-vm-test-chat'
+import { VmTestSchedule } from '@/features/vm/vm-test-schedule'
 
 function postVm<T = unknown>(id: string, path: string, body?: unknown) {
   return api<T>(`/api/panel/vms/${encodeURIComponent(id)}${path}`, {
@@ -83,6 +86,7 @@ export function VmDetailPage() {
   const detail = useQuery(vmQueryOptions(id))
   const seed = useQuery(vmSeedQueryOptions(id))
   const routing = useQuery(routingQueryOptions())
+  usePoolSeatStream()
 
   const [tab, setTab] = useState('overview')
 
@@ -176,16 +180,13 @@ export function VmDetailPage() {
   })
   const pool = proxies.data?.proxies || []
   const boundId = String(proxy.id || vm.proxy_id || '')
-  const free = pool.filter((p) => {
-    if (!p.enabled || p.status === 'dead' || p.blocked_reason) return false
-    const ids = p.bound_vm_ids || (p.bound_vm_id ? [p.bound_vm_id] : [])
-    return !ids.includes(id) && ids.length < (p.bind_limit || 5)
-  })
+  // 本地代理固定第一。已绑到本槽的留在下拉里，否则正在用它时列表里没有。
+  const free = proxiesForVmBind(pool, id, 5, vm.node_id ?? null)
   const pol =
     (seed.data?.seed_policy as Record<string, unknown> | undefined) || {}
   const syncTelemetry =
     (routing.data?.official_cc as { sync_telemetry?: boolean } | undefined)
-      ?.sync_telemetry !== false
+      ?.sync_telemetry === true
   const quotaSrc = {
     utilization_5h: acc.utilization_5h ?? vm.utilization_5h,
     utilization_7d: acc.utilization_7d ?? vm.utilization_7d,
@@ -199,7 +200,6 @@ export function VmDetailPage() {
   const split = weeklySplitInfo(
     (acc.weekly_split ? acc : vm) as Record<string, unknown>
   )
-  const sess = sessionCapOf(vm)
   const conc = concInfo(vm, dash.data?.routing?.tiers, fableCap(dash.data))
   const rpm = rpmInfo(vm, acc)
   const todayReadCache = Number(
@@ -215,12 +215,7 @@ export function VmDetailPage() {
       vm.tokens_in ??
       0
   )
-  const todayHit = cacheHitPct(
-    todayInput,
-    todayReadCache,
-    todayWriteCache,
-    isCodexVm(vm) ? 'openai' : 'anthropic'
-  )
+  const todayHit = cacheHitPct(todayInput, todayReadCache, todayWriteCache)
   const credType = credTypeOf(vm)
   const officialCc = supportsOfficialCc(vm)
   const canRefresh = canRefreshCredential(vm)
@@ -267,6 +262,7 @@ export function VmDetailPage() {
             </Select>
           ) : null}
           <PlatformChip vm={vm} />
+          <RuntimeChip vm={vm} className='text-[11px]' />
           <NodeChip nodeId={vm.node_id} className='text-[11px]' />
           <StatusMark tone={accountStatus(vm)} variant='pill' />
           {claudeTier(vm).key !== 'none' ? (
@@ -331,7 +327,6 @@ export function VmDetailPage() {
             now={now}
             cost={cost}
             split={split}
-            sess={sess}
             conc={conc}
             rpm={rpm}
             costByModel={data.billing?.by_model}
@@ -365,6 +360,7 @@ export function VmDetailPage() {
             proxy={proxy}
             boundId={boundId}
             free={free}
+            pool={pool}
             bindId={bindId}
             onBindIdChange={setBindId}
             onUnbind={() =>
@@ -411,9 +407,11 @@ export function VmDetailPage() {
           />
           <VmTestTab
             {...test}
+            vm={vm}
             credType={credType}
             isCodex={isCodexVm(vm)}
             dataplane={vm.resolved_dataplane}
+            schedule={<VmTestSchedule vm={vm} {...test} />}
           />
           <VmOpsTab
             vm={vm}
@@ -424,6 +422,7 @@ export function VmDetailPage() {
             refreshBlocked={refreshBlocked}
             savingTimezone={saveTimezone.isPending}
             onAction={(path, body) => act.mutate({ path, body })}
+            onRefresh={() => void refreshAll()}
             onTimezoneSave={(timezone) => saveTimezone.mutate({ timezone })}
             onTimezoneFollowProxy={() =>
               saveTimezone.mutate({ timezone_follow_proxy: true })
@@ -436,14 +435,20 @@ export function VmDetailPage() {
           />
           <TabsContent value='seed' className='space-y-3 pt-4'>
             <p className='text-sm text-muted-foreground'>
-              官方 Claude Code 初装之后的后置覆写。开=删键 · 关=写 1。
+              官方 Claude Code 初装之后的后置覆写。遥测只看这一只开关。
             </p>
-            <SeedPolicyCard
-              policy={pol}
-              saving={saveSeed.isPending}
-              syncTelemetry={syncTelemetry}
-              onSave={(next) => saveSeed.mutate(next)}
-            />
+            {seed.data ? (
+              <SeedPolicyCard
+                policy={pol}
+                saving={saveSeed.isPending}
+                syncTelemetry={syncTelemetry}
+                onSave={(next) => saveSeed.mutate(next)}
+              />
+            ) : (
+              <p className='text-sm text-muted-foreground'>
+                {seed.isError ? '种子策略读取失败' : '读取种子策略…'}
+              </p>
+            )}
           </TabsContent>
         </Tabs>
         <ConfirmDialog

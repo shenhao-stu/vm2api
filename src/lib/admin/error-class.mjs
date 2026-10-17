@@ -26,6 +26,9 @@ const CODE_MAP = {
   missing_api_key: 'auth',
   api_key_disabled: 'auth',
   api_key_expired: 'auth',
+  key_group_mismatch: 'request',
+  vm_pool_unavailable: 'request',
+  claude_code_only: 'request',
   invalid_json: 'request',
   body_too_large: 'request',
   empty_body: 'request',
@@ -45,11 +48,17 @@ const CODE_MAP = {
   upstream_rate_limit: 'rate_limit',
   quota_5h_safety: 'quota',
   quota_7d_safety: 'quota',
+  quota_guard_request_too_large: 'quota',
   api_key_quota_exhausted: 'quota',
   concurrency_limit: 'quota',
   api_key_concurrency_limit: 'quota',
   pool_overloaded: 'overloaded',
   pool_wait_queue_full: 'overloaded',
+  pool_queue_timeout: 'overloaded',
+  pool_overload_cooldown: 'overloaded',
+  pool_rate_limited: 'rate_limit',
+  fable_requires_max: 'rate_limit',
+  user_concurrency_limit: 'quota',
   account_pool_exhausted: 'unavailable',
   api_pool_exhausted: 'unavailable',
   no_eligible_accounts: 'unavailable',
@@ -57,6 +66,9 @@ const CODE_MAP = {
   server_overloaded: 'overloaded',
   upstream_overloaded: 'overloaded',
   slot_busy: 'overloaded',
+  // Kernel restarting / slot restore: platform side, not provider overload.
+  kernel_unavailable: 'other',
+  restore_in_progress: 'other',
   wrap_connection_error: 'other',
   upstream_timeout: 'timeout',
   stream_incomplete: 'timeout',
@@ -73,6 +85,7 @@ const CODE_MAP = {
   distill_blocked: 'distill',
   refusal_guard: 'refusal',
   content_filter_refusal: 'refusal',
+  policy_blocked: 'refusal',
 }
 
 export const IGNORED_ERROR_CODES = new Set([
@@ -103,12 +116,22 @@ export const SLA_OK_ERROR_CODES = new Set([
   'api_key_rate_limit',
   'quota_5h_safety',
   'quota_7d_safety',
+  'quota_guard_request_too_large',
   'api_key_quota_exhausted',
   'concurrency_limit',
   'api_key_concurrency_limit',
   'distill_blocked',
   'refusal_guard',
   'content_filter_refusal',
+  'policy_blocked',
+  'key_group_mismatch',
+  'vm_pool_unavailable',
+  'claude_code_only',
+  // Pool queue full / timeout moved from 429 to 529; SLA keeps counting them as it did at 429.
+  'pool_overloaded',
+  'pool_wait_queue_full',
+  'pool_queue_timeout',
+  'pool_overload_cooldown',
 ])
 
 export function ignoredErrorSqlList() {
@@ -147,6 +170,19 @@ export function ingressAuthSql() {
   )`
 }
 
+/**
+ * The muted `auth` class, matching `classifyRequestError`: a slotless 401/403 is ingress auth
+ * unless its code already names another class. Policy refusals (claude_code_only,
+ * key_group_mismatch, distill_blocked…) are 403s too and must stay visible.
+ */
+function mutedAuthSql() {
+  const classified = Object.keys(CODE_MAP)
+    .filter((code) => CODE_MAP[code] !== 'auth')
+    .map((code) => `'${code}'`)
+    .join(',')
+  return `(${ingressAuthSql()} AND IFNULL(error_code, '') NOT IN (${classified}))`
+}
+
 export function excludeErrorClassSql(classes) {
   const list = Array.isArray(classes)
     ? classes
@@ -156,7 +192,7 @@ export function excludeErrorClassSql(classes) {
         .filter(Boolean)
   const parts = []
   for (const id of list) {
-    if (id === 'auth') parts.push(`NOT (${ingressAuthSql()})`)
+    if (id === 'auth') parts.push(`NOT ${mutedAuthSql()}`)
   }
   return parts.length ? `(${parts.join(' AND ')})` : ''
 }
@@ -212,7 +248,8 @@ export function classifyRequestError(row = {}) {
     } else if (status === 401 || status === 403 || /oauth|reimport|revoked/.test(text)) {
       id = isOauthCredentialFailure(row, text, code) ? 'credential' : 'auth'
     } else if (status === 429) id = 'rate_limit'
-    else if (status === 529 || status === 503 || /overload|no eligible|负载过高/.test(text)) id = 'overloaded'
+    else if (status === 529 || /overload|负载过高/.test(text)) id = 'overloaded'
+    else if (status === 503 || /no eligible/.test(text)) id = 'unavailable'
     else if (status === 400 || status === 422) id = 'request'
     else if (status >= 500) id = 'upstream'
     else id = 'other'

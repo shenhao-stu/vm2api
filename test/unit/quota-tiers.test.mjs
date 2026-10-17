@@ -39,7 +39,9 @@ test('normalizeTiers reads limit_5h and aliases old safety_ratio', () => {
   })
   assert.equal(fromOld.pro.limit_5h, 0.7)
   assert.equal(fromOld.pro.limit_7d, 0.6)
-  assert.equal(fromOld.pro.max_sessions, 0)
+  const legacy = normalizeTiers({ pro: { max_sessions: 3, session_idle_min: 9 } })
+  assert.equal(Object.hasOwn(legacy.pro, 'max_sessions'), false)
+  assert.equal(Object.hasOwn(legacy.pro, 'session_idle_min'), false)
 })
 
 test('resolveTierKey maps unknown to default', () => {
@@ -72,6 +74,18 @@ test('buildRouting returns tiers so the panel can re-render a save', () => {
   assert.equal(data.tiers.max.max_concurrency, 4)
 })
 
+test('buildRouting returns normalized vm defaults', () => {
+  const data = buildRouting({
+    routingConfig: { sticky: {}, quota: {}, concurrency: {} },
+    stickyRouter: { stats: () => ({ active_sessions: 0 }) },
+  }).data
+  assert.equal(data.vm.default_runtime, 'docker')
+  assert.equal(data.vm.memory, '512m')
+  assert.equal(data.vm.vcpus, 2)
+  assert.equal(data.vm.disk_gb, 20)
+  assert.equal(data.vm.allow_tcg, false)
+})
+
 test('buildRouting exposes effective Codex routing to the panel', () => {
   const data = buildRouting({
     routingConfig: { codex: { clients: { official_codex: 'allow' } } },
@@ -86,7 +100,7 @@ test('canAccept uses per-tier 5h and weekly lines', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),
     config: {
-      quota: { block_on_5h: true, block_on_7d: true },
+      quota: { block_on_5h: true, block_on_7d: true, gate_overshoot: 0 },
       tiers: {
         default: { max_concurrency: 2, safety_ratio: 0.85, weekly_safety_ratio: 0.8, warn_ratio: 0.75 },
         pro: { max_concurrency: 2, safety_ratio: 0.85, weekly_safety_ratio: 0.8, warn_ratio: 0.75 },
@@ -115,7 +129,8 @@ test('reloadConfig picks up saved weekly line without process restart shape', ()
   const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
   q.ensure({ account_id: 'p' })
   q.setAccountTier('p', 'pro')
-  q.ingestHeaders('p', { 'anthropic-ratelimit-unified-7d-utilization': '0.82' })
+  // Pro default 7d line 0.80 + default 0.05 overshoot.
+  q.ingestHeaders('p', { 'anthropic-ratelimit-unified-7d-utilization': '0.86' })
   assert.equal(q.canAccept('p').reason, 'quota_7d_safety')
   q.reloadConfig({
     quota: { block_on_5h: true, block_on_7d: true },
@@ -183,9 +198,9 @@ test('saving Pro 5h=80% lands on policyFor limit_5h', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),
     config: {
-      quota: { block_on_5h: true, block_on_7d: true },
+      quota: { block_on_5h: true, block_on_7d: true, gate_overshoot: 0 },
       tiers: normalizeTiers({
-        pro: { limit_5h: 0.8, limit_7d: 0.8, max_concurrency: 2, max_sessions: 0 },
+        pro: { limit_5h: 0.8, limit_7d: 0.8, max_concurrency: 2 },
       }),
     },
   })
@@ -196,13 +211,13 @@ test('saving Pro 5h=80% lands on policyFor limit_5h', () => {
   assert.equal(q.canAccept('pro-80').reason, 'quota_5h_safety')
 })
 
-test('Pro 95% blocks at the line and refuses a second in-flight call inside 5 points', () => {
+test('Pro 95% runs one call at a time from 90% and blocks at line + overshoot', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),
     config: {
       quota: { block_on_5h: true, block_on_7d: true },
       tiers: normalizeTiers({
-        pro: { limit_5h: 0.95, limit_7d: 0.95, max_concurrency: 4, max_sessions: 0 },
+        pro: { limit_5h: 0.95, limit_7d: 0.95, max_concurrency: 4 },
       }),
     },
   })
@@ -214,21 +229,26 @@ test('Pro 95% blocks at the line and refuses a second in-flight call inside 5 po
   })
   assert.equal(q.canAccept('pro-95').ok, true)
   q.inflight.set('pro-95', 1)
-  assert.equal(q.canAccept('pro-95').reason, 'quota_5h_safety')
+  assert.equal(q.canAccept('pro-95').reason, 'quota_band_inflight')
   q.inflight.set('pro-95', 0)
   q.ingestHeaders('pro-95', {
     'anthropic-ratelimit-unified-5h-utilization': '0.96',
     'anthropic-ratelimit-unified-5h-status': 'allowed',
   })
+  assert.equal(q.canAccept('pro-95').ok, true, 'past the line but inside the 5% overshoot')
+  q.ingestHeaders('pro-95', {
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+  })
   assert.equal(q.canAccept('pro-95').reason, 'quota_5h_safety')
 })
 
-test('reloadConfig applies conc rpm sessions without rewriting account rows', () => {
+test('reloadConfig applies conc and rpm without rewriting account rows', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),
     config: {
       quota: { block_on_5h: true, block_on_7d: true },
-      tiers: { default: { max_concurrency: 2, max_rpm: 0, max_sessions: 0 } },
+      tiers: { default: { max_concurrency: 2, max_rpm: 0 } },
     },
   })
   q.ensure({ account_id: 'live' })
@@ -237,16 +257,10 @@ test('reloadConfig applies conc rpm sessions without rewriting account rows', ()
   assert.equal(q.rpmLimitFor(acc), 0)
   q.reloadConfig({
     quota: { block_on_5h: true, block_on_7d: true },
-    tiers: { default: { max_concurrency: 8, max_rpm: 12, max_sessions: 2, session_idle_min: 5 } },
+    tiers: { default: { max_concurrency: 8, max_rpm: 12 } },
   })
   assert.equal(q.limitFor(q.repo.get('live')), 8)
   assert.equal(q.rpmLimitFor(q.repo.get('live')), 12)
-  q.sessions.touch('live', 's1')
-  q.sessions.release('live', 's1')
-  q.sessions.touch('live', 's2')
-  q.sessions.release('live', 's2')
-  assert.equal(q.canAccept('live', { sessionKey: 's3' }).reason, 'session_limit')
-  assert.equal(q.canAccept('live', { sessionKey: 's1' }).ok, true)
 })
 
 test('manual conc and rpm pins ignore live tier', () => {

@@ -396,9 +396,107 @@ test('nested Responses cached_tokens reaches the request log cache column', asyn
       },
     },
   })
-  assert.equal(logBag.input_tokens, 120)
+  assert.equal(logBag.input_tokens, 112)
   assert.equal(logBag.output_tokens, 9)
   assert.equal(logBag.cache_read_tokens, 8)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('request log first_token_ms uses firstTokenAt minus injected ingress t0', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-ttft-'))
+  writeGptVm(root, 'vm-gpt-a')
+  const res = {
+    headersSent: false,
+    write() {
+      this.headersSent = true
+    },
+    end() {
+      this.ended = true
+    },
+  }
+  const t0 = 1_700_000_000_000
+  const logBag = {}
+  await handleCodexProtocol({
+    req: { headers: {} },
+    res,
+    protocol: 'openai.responses',
+    ctx: { body: { model: 'gpt-5.4', input: [], stream: true } },
+    inbound: { stream: true },
+    logBag,
+    stats: { errors: 0, requests: 0, by_route: {} },
+    json: (_res, status, body) => {
+      res.statusCode = status
+      res.body = body
+      return body
+    },
+    writeSSEHeaders() {
+      res.headersSent = true
+    },
+    routing: {},
+    projectRoot: root,
+    requestStartedAt: t0,
+    ops: {
+      writeCodexKernelConfig() {},
+      ensureCodexKernel: async () => ({ ok: true }),
+      streamCodexKernel: async () => ({
+        ok: true,
+        status: 200,
+        terminalState: 'verified',
+        ttftMs: 300,
+        firstTokenAt: t0 + 1500,
+        usage: { input_tokens: 4, output_tokens: 1 },
+      }),
+    },
+  })
+  assert.equal(logBag.first_token_ms, 1500)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('request log first_token_ms falls back to hop ttftMs without firstTokenAt', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-ttft-fb-'))
+  writeGptVm(root, 'vm-gpt-a')
+  const res = {
+    headersSent: false,
+    write() {
+      this.headersSent = true
+    },
+    end() {
+      this.ended = true
+    },
+  }
+  const logBag = {}
+  await handleCodexProtocol({
+    req: { headers: {} },
+    res,
+    protocol: 'openai.responses',
+    ctx: { body: { model: 'gpt-5.4', input: [], stream: true } },
+    inbound: { stream: true },
+    logBag,
+    stats: { errors: 0, requests: 0, by_route: {} },
+    json: (_res, status, body) => {
+      res.statusCode = status
+      res.body = body
+      return body
+    },
+    writeSSEHeaders() {
+      res.headersSent = true
+    },
+    routing: {},
+    projectRoot: root,
+    requestStartedAt: 1_700_000_000_000,
+    ops: {
+      writeCodexKernelConfig() {},
+      ensureCodexKernel: async () => ({ ok: true }),
+      streamCodexKernel: async () => ({
+        ok: true,
+        status: 200,
+        terminalState: 'verified',
+        ttftMs: 300,
+        usage: { input_tokens: 4, output_tokens: 1 },
+      }),
+    },
+  })
+  assert.equal(logBag.first_token_ms, 300)
   fs.rmSync(root, { recursive: true, force: true })
 })
 
@@ -451,7 +549,7 @@ test('incomplete Responses stream still bills tokens from the completed event', 
       },
     },
   })
-  assert.equal(logBag.input_tokens, 40)
+  assert.equal(logBag.input_tokens, 35)
   assert.equal(logBag.output_tokens, 2)
   assert.equal(logBag.cache_read_tokens, 5)
   assert.equal(logBag.usage.service_tier, 'priority')
@@ -644,6 +742,43 @@ test('#A04: the fifth GPT slot is reached after four slots fail over', async () 
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+test('uncommitted 503 server_error fails over to the next GPT slot', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-503-'))
+  for (const id of ['vm-gpt-a', 'vm-gpt-b']) writeGptVm(root, id)
+  const seen = []
+  const logBag = {}
+  const out = await handleCodexProtocol(
+    codexArgs(
+      root,
+      {
+        ensureCodexKernel: async () => ({ ok: true }),
+        streamCodexKernel: async ({ exec, onEvent }) => {
+          seen.push(exec.vm.id)
+          if (seen.length === 1) {
+            return {
+              ok: false,
+              status: 503,
+              committed: false,
+              body: { error: { type: 'server_error', code: 'server_error', message: 'busy' } },
+            }
+          }
+          await onEvent('data: {"type":"response.completed"}')
+          return { ok: true, status: 200, terminalState: 'verified' }
+        },
+      },
+      { logBag },
+    ),
+  )
+  assert.equal(out.status, 200)
+  assert.equal(seen.length, 2)
+  assert.notEqual(seen[0], seen[1])
+  assert.equal(logBag.attempt_count, 2)
+  rt.resetOpenAIAccountRuntime()
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
 test('#A11: an OpenAI pool that stays full answers 429 pool_overloaded', async () => {
   const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
   rt.resetOpenAIAccountRuntime()
@@ -658,6 +793,10 @@ test('#A11: an OpenAI pool that stays full answers 429 pool_overloaded', async (
   const held = rt.tryAcquireOpenAISlot(vmId, { concurrency: 1 })
   const args = codexArgs(root, { ensureCodexKernel: async () => ({ ok: true }) })
   args.routing = { pool: { fallback_wait_timeout_ms: 1000 } }
+  const headers = {}
+  args.res.setHeader = (name, value) => {
+    headers[name] = value
+  }
   // Waiter timers are unref'd so a systemd process can idle-exit. Keep one
   // ref'd handle so this isolated file cannot drain before the 1s deadline.
   const keepAlive = setTimeout(() => {}, 15_000)
@@ -666,9 +805,40 @@ test('#A11: an OpenAI pool that stays full answers 429 pool_overloaded', async (
     assert.equal(out.status, 429)
     assert.equal(out.body.error.code, 'pool_overloaded')
     assert.equal(out.body.error.message, '号池负载过高，稍后再试')
+    assert.ok(Number(headers['retry-after']) >= 1)
   } finally {
     clearTimeout(keepAlive)
     held.release()
+    rt.resetOpenAIAccountRuntime()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('an all-rest OpenAI pool answers 503 with Retry-After for the next window', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-rest-'))
+  const vmId = 'vm-gpt-rest'
+  writeGptVm(root, vmId)
+  const file = path.join(root, 'vms', `${vmId}.json`)
+  // A UTC window opening 2–3h from now: `now` is always outside.
+  const pad = (n) => String(n).padStart(2, '0')
+  const hour = new Date().getUTCHours()
+  const active_hours = { start: `${pad((hour + 3) % 24)}:00`, end: `${pad((hour + 5) % 24)}:00`, timezone: 'UTC' }
+  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), policy: { active_hours } }))
+  const args = codexArgs(root, { ensureCodexKernel: async () => ({ ok: true }) })
+  const headers = {}
+  args.res.setHeader = (name, value) => {
+    headers[name] = value
+  }
+  try {
+    const out = await handleCodexProtocol(args)
+    assert.equal(out.status, 503)
+    assert.equal(out.body.error.code, 'pool_unavailable')
+    assert.equal(out.body.error.details.reason, 'pool_resting')
+    const secs = Number(headers['retry-after'])
+    assert.ok(secs > 2 * 3600 && secs <= 3 * 3600, `retry-after=${secs}`)
+  } finally {
     rt.resetOpenAIAccountRuntime()
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -739,6 +909,48 @@ test('codex rebuild outbound session is not the inbound session', async () => {
   assert.equal(envelopes[0].body.prompt_cache_key, session.session_id)
   assert.equal(envelopes[0].body.conversation_id, undefined)
   assert.equal(envelopes[0].body.session_id, undefined)
+  sticky.db?.close?.()
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('codex kernel envelope preserves official routing headers without client auth', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-routing-headers-'))
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  writeGptVm(root, 'vm-gpt-a')
+  const { envelopes } = await hopCodex({
+    root,
+    stickyRouter: sticky,
+    headers: {
+      authorization: 'Bearer sub2api-key',
+      originator: 'Codex Desktop',
+      'openai-beta': 'responses_websockets=2026-02-06',
+      'session-id': 'session:t',
+      'thread-id': 'thread:t',
+      'x-client-request-id': 'request:t',
+      'x-codex-beta-features': 'remote_compaction_v2',
+      'x-codex-turn-metadata': '{"thread_id":"t"}',
+      'x-codex-window-id': 'window:2',
+      'x-openai-internal-codex-responses-lite': 'true',
+    },
+    body: { model: 'gpt-6.1-sol', input: 'hi', stream: false, service_tier: 'fast' },
+  })
+  const session = envelopes[0].session
+  assert.deepEqual(envelopes[0].headers, {
+    originator: 'Codex Desktop',
+    'openai-beta': 'responses_websockets=2026-02-06',
+    'session-id': session.session_id,
+    'thread-id': 'thread:t',
+    'x-client-request-id': 'request:t',
+    'x-codex-beta-features': 'remote_compaction_v2',
+    'x-codex-turn-metadata': '{"thread_id":"t"}',
+    'x-codex-window-id': 'window:2',
+    'x-openai-internal-codex-responses-lite': 'true',
+    'x-codex-routing-hint': 'model=gpt-6.1-sol;tier=priority',
+  })
+  assert.notEqual(envelopes[0].headers['session-id'], 'session:t')
+  assert.equal(envelopes[0].headers['session-id'], session.session_id)
+  assert.equal(envelopes[0].headers.authorization, undefined)
+  assert.equal(envelopes[0].body.service_tier, 'priority')
   sticky.db?.close?.()
   fs.rmSync(root, { recursive: true, force: true })
 })
@@ -850,4 +1062,153 @@ test('codex passthrough keeps the inbound session and cache key', async () => {
   assert.equal(envelopes[0].body.conversation_id, inbound)
   sticky.db?.close?.()
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('codex passthrough without an inbound session derives a stable fallback session', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-pass-fallback-'))
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  writeGptVm(root, 'vm-gpt-a')
+  const opener = (question) => ({
+    model: 'gpt-5.4',
+    stream: false,
+    input: [
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: '<system-reminder>Today: 2026-10-04; cwd: /work/demo</system-reminder>' },
+          { type: 'input_text', text: question },
+        ],
+      },
+    ],
+  })
+  const routing = { sticky: { outbound_session: 'passthrough' } }
+  const first = await hopCodex({ root, stickyRouter: sticky, routing, body: opener('会话 A 的问题') })
+  const again = await hopCodex({ root, stickyRouter: sticky, routing, body: opener('会话 A 的问题') })
+  const other = await hopCodex({ root, stickyRouter: sticky, routing, body: opener('会话 B 的问题') })
+  const sessionId = first.envelopes[0].session.session_id
+  assert.match(sessionId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  assert.equal(again.envelopes[0].session.session_id, sessionId)
+  assert.notEqual(other.envelopes[0].session.session_id, sessionId)
+  sticky.db?.close?.()
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('openai.responses stream names each kernel SSE frame after its payload type', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-sse-names-'))
+  writeGptVm(root, 'vm-gpt-a')
+  const writes = []
+  const res = {
+    headersSent: false,
+    write(chunk) {
+      this.headersSent = true
+      writes.push(String(chunk))
+    },
+    end() {},
+  }
+  await handleCodexProtocol({
+    req: { headers: {} },
+    res,
+    protocol: 'openai.responses',
+    ctx: { path: '/v1/responses', body: { model: 'gpt-5.5', input: 'hi', stream: true } },
+    inbound: { stream: true },
+    logBag: {},
+    stats: { errors: 0, requests: 0, by_route: {} },
+    json: (_res, status, body) => {
+      res.statusCode = status
+      res.body = body
+      return body
+    },
+    writeSSEHeaders() {
+      res.headersSent = true
+    },
+    routing: {},
+    projectRoot: root,
+    ops: {
+      writeCodexKernelConfig() {},
+      ensureCodexKernel: async () => ({ ok: true }),
+      streamCodexKernel: async ({ onEvent }) => {
+        // kin-codex-kernel labels every frame "event: response"
+        for (const line of [
+          'event: response',
+          'data: {"type":"response.created","response":{"id":"resp_1"}}',
+          '',
+          'event: response',
+          'data: {"type":"response.output_text.delta","delta":"pong"}',
+          '',
+          'event: response',
+          'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}',
+          '',
+        ]) {
+          await onEvent(line)
+        }
+        return { ok: true, status: 200, terminalState: 'verified' }
+      },
+    },
+  })
+  const out = writes.join('')
+  assert.doesNotMatch(out, /^event: response$/m)
+  assert.match(out, /^event: response\.created\ndata: \{"type":"response\.created"/m)
+  assert.match(out, /^event: response\.output_text\.delta\ndata: /m)
+  assert.match(out, /^event: response\.completed\ndata: /m)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('tool argument disagreement terminates the client stream instead of recording token usage as success', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-args-'))
+  writeGptVm(root, 'vm-gpt-tools')
+  let wire = ''
+  const res = {
+    headersSent: false,
+    write: (chunk) => {
+      wire += chunk
+    },
+    end() {},
+  }
+  const stats = { errors: 0, requests: 0, by_route: {} }
+  const logBag = {}
+  try {
+    await handleCodexProtocol({
+      req: { headers: {}, apiKeyKind: 'user' },
+      res,
+      protocol: 'openai.chat',
+      ctx: { body: { model: 'gpt-5.4', messages: [{ role: 'user', content: 'edit' }], stream: true } },
+      inbound: { stream: true },
+      logBag,
+      stats,
+      projectRoot: root,
+      routing: {},
+      json: (_res, status, body) => {
+        throw new Error(`Unexpected JSON ${status}: ${JSON.stringify(body)}`)
+      },
+      writeSSEHeaders: () => {
+        res.headersSent = true
+      },
+      ops: {
+        writeCodexKernelConfig() {},
+        ensureCodexKernel: async () => ({ ok: true }),
+        streamCodexKernel: async ({ onEvent }) => {
+          for (const event of [
+            {
+              type: 'response.output_item.added',
+              output_index: 0,
+              item: { type: 'function_call', call_id: 'call_a', id: 'fc_a', name: 'edit', arguments: '' },
+            },
+            { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"path":' },
+            { type: 'response.function_call_arguments.done', output_index: 0, arguments: '{"other":true}' },
+            { type: 'response.completed', response: { usage: { input_tokens: 20, output_tokens: 3 } } },
+          ])
+            await onEvent(`data: ${JSON.stringify(event)}`)
+          return { ok: true, status: 200, usage: { input_tokens: 20, output_tokens: 3 }, terminalState: 'verified' }
+        },
+      },
+    })
+    assert.match(wire, /"code":"tool_arguments_mismatch"/)
+    assert.doesNotMatch(wire, /"finish_reason":"tool_calls"/)
+    assert.equal(stats.errors, 1)
+    assert.equal(logBag.error_code, 'tool_arguments_mismatch')
+    assert.equal(logBag.upstream_status, 502)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })

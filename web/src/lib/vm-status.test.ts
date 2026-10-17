@@ -9,7 +9,11 @@ import {
   fleetCounts,
   fleetGroup,
   isRestrictedSchedule,
+  localProxyOptsFromProxy,
+  localProxyText,
   poolStatus,
+  proxyHostLabel,
+  proxyNamedLabel,
   restrictionCopy,
   scheduleStateLabel,
   vmCircuit,
@@ -488,6 +492,89 @@ describe('unit circuit', () => {
     })
     expect(poolStatus(vm).key).toBe('off')
   })
+
+  it('quota limit and gate win over an open circuit', () => {
+    const open = circuit({
+      state: 'open',
+      failures: 3,
+      open_until: Date.now() + 5000,
+    })
+    const hard = liveVm({
+      schedule_state: 'restricted',
+      restriction_reason: 'quota_7d_header',
+      availability: {
+        key: 'quota',
+        usable: true,
+        text: '7d 限制',
+        reason: 'quota_7d_header',
+      },
+      circuit: open,
+    })
+    expect(poolStatus(hard)).toMatchObject({ key: 'quota', text: '7d 限制' })
+    const gate = liveVm({
+      schedule_state: 'restricted',
+      restriction_reason: 'quota_5h_safety',
+      availability: {
+        key: 'quota',
+        usable: true,
+        text: '5h 限制',
+        reason: 'quota_5h_safety',
+      },
+      circuit: open,
+    })
+    expect(poolStatus(gate)).toMatchObject({ key: 'quota', text: '5h 限制' })
+  })
+
+  it('open circuit wins over near-gate and seats full', () => {
+    const vm = liveVm({
+      availability: { key: 'drain', usable: true, text: '7d 临近闸线' },
+      seats_used: 4,
+      seats_max: 4,
+      circuit: circuit({
+        state: 'open',
+        failures: 3,
+        open_until: Date.now() + 5000,
+      }),
+    })
+    expect(poolStatus(vm).key).toBe('circuit')
+  })
+})
+
+describe('near-gate and seats-full are not restrictions', () => {
+  it('paints near-gate as caution, keeps it in the pool group', () => {
+    const vm = liveVm({
+      schedule_state: 'on',
+      availability: { key: 'drain', usable: true, text: '7d 临近闸线' },
+    })
+    expect(poolStatus(vm)).toMatchObject({
+      key: 'drain',
+      text: '7d 临近闸线',
+      cls: 'caution',
+    })
+    expect(accountStatus(vm).cls).toBe('caution')
+    expect(fleetGroup(vm)).toBe('pool')
+  })
+
+  it('shows seats full last and keeps the VM in the pool group', () => {
+    const full = liveVm({
+      schedule_state: 'on',
+      availability: { key: 'ok', usable: true, text: '可用' },
+      seats_used: 4,
+      seats_max: 4,
+    })
+    expect(poolStatus(full)).toMatchObject({ key: 'seats', text: '席位满' })
+    expect(fleetGroup(full)).toBe('pool')
+    expect(poolStatus({ ...full, seats_used: 3 }).key).toBe('pool')
+    const drainFull = {
+      ...full,
+      availability: {
+        key: 'drain' as const,
+        usable: true,
+        text: '5h 临近闸线',
+      },
+    }
+    expect(poolStatus(drainFull).key).toBe('drain')
+  })
 })
 
 describe('GPT plan label follows OpenAI plan_type', () => {
@@ -509,5 +596,103 @@ describe('GPT plan label follows OpenAI plan_type', () => {
     )
     expect(tone.key).toBe('codex')
     expect(tone.label).toBe('Business')
+  })
+})
+
+describe('proxyNamedLabel', () => {
+  it('shows the slot proxy name in front of the endpoint', () => {
+    expect(
+      proxyNamedLabel({ host: '127.0.0.1', port: 20881, label: '台湾彰化' })
+    ).toBe('台湾彰化 · 127.0.0.1:20881')
+  })
+
+  it('keeps the bare endpoint for unnamed or missing proxies', () => {
+    expect(proxyNamedLabel({ host: '127.0.0.1', port: 20881 })).toBe(
+      '127.0.0.1:20881'
+    )
+    expect(proxyNamedLabel(undefined)).toBe('—')
+  })
+})
+
+describe('localProxyText', () => {
+  it('hides node names from tenants', () => {
+    expect(localProxyText()).toBe('local代理')
+    expect(localProxyText({ revealNode: false, nodeName: '东京-01' })).toBe(
+      'local代理'
+    )
+    expect(
+      proxyHostLabel({ id: 'px-local', kind: 'local', host: 'local' })
+    ).toBe('local代理')
+  })
+
+  it('labels the control plane and extension nodes for admin', () => {
+    expect(localProxyText({ revealNode: true })).toBe('当前VPS local代理')
+    expect(localProxyText({ revealNode: true, nodeName: null })).toBe(
+      '当前VPS local代理'
+    )
+    expect(localProxyText({ revealNode: true, nodeName: '东京-01' })).toBe(
+      '东京-01local代理'
+    )
+  })
+
+  it('uses node_name on the proxy when the API revealed it', () => {
+    expect(
+      localProxyOptsFromProxy({
+        id: 'px-local',
+        kind: 'local',
+        node_name: '东京-01',
+        node_id: 'node-a',
+      })
+    ).toEqual({
+      nodeName: '东京-01',
+      nodeId: 'node-a',
+      revealNode: true,
+    })
+    expect(
+      proxyHostLabel({
+        id: 'px-local',
+        kind: 'local',
+        host: 'local',
+        node_name: null,
+      })
+    ).toBe('当前VPS local代理')
+    expect(
+      proxyHostLabel({
+        id: 'px-local',
+        kind: 'local',
+        host: 'local',
+        node_name: '东京-01',
+      })
+    ).toBe('东京-01local代理')
+  })
+})
+
+describe('rest period (working window) is scheduling, not cooldown or credential', () => {
+  const resting = liveVm({
+    schedule_state: 'restricted',
+    restriction_reason: 'rest_period',
+    availability: {
+      key: 'rest',
+      usable: true,
+      text: '休息时段',
+      reason: 'rest_period',
+    },
+  })
+
+  it('pool status shows rest with the caution tone, not cool', () => {
+    expect(poolStatus(resting)).toMatchObject({
+      key: 'rest',
+      text: '休息时段',
+      cls: 'caution',
+    })
+    expect(accountStatus(resting).cls).toBe('caution')
+  })
+
+  it('groups as restricted', () => {
+    expect(fleetGroup(resting)).toBe('restricted')
+  })
+
+  it('credential cell still answers the credential question', () => {
+    expect(credentialStatus(resting).key).not.toBe('rest')
   })
 })

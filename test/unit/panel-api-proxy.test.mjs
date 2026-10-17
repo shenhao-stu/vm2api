@@ -3,7 +3,13 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildDashboard, buildVmDetail, buildVmList, summarizeProxyPool } from '../../src/lib/admin/panel-api.mjs'
+import {
+  buildDashboard,
+  buildVmDetail,
+  buildVmList,
+  publicAllocatedProxy,
+  summarizeProxyPool,
+} from '../../src/lib/admin/panel-api.mjs'
 import { ProxyPool } from '../../src/lib/vm/proxy-pool.mjs'
 
 function tmpDir(prefix = 'kin-panel-') {
@@ -71,6 +77,7 @@ test('dashboard and vm detail merge pool health onto bound VM', async () => {
   bound.geo_city = 'Shinjuku'
   bound.geo_timezone = 'Asia/Tokyo'
   bound.geo_checked_at = '2026-01-01T00:00:00Z'
+  bound.label = '东京-2'
   pool.save()
   pool.stopScheduler()
 
@@ -93,6 +100,7 @@ test('dashboard and vm detail merge pool health onto bound VM', async () => {
   assert.equal(vm.proxy.status, 'ok')
   assert.equal(vm.proxy.latency_ms, 12)
   assert.equal(vm.proxy.host, '10.8.8.8')
+  assert.equal(vm.proxy.label, '东京-2', '槽位代理带上池里的实时名称')
   assert.equal(vm.proxy.geo.timezone, 'Asia/Tokyo')
   assert.equal(vm.proxy.geo.country_code, 'JP')
   assert.equal(vm.proxy.url, undefined)
@@ -109,6 +117,32 @@ test('dashboard and vm detail merge pool health onto bound VM', async () => {
   assert.equal(detail.data.proxy.status, 'ok')
   assert.equal(detail.data.proxy.geo.timezone, 'Asia/Tokyo')
   assert.equal(detail.data.proxy_pool.bound, 1)
+})
+
+test('dashboard and vm list report the slot form and fixed machine spec', async () => {
+  const project = tmpDir()
+  fs.mkdirSync(path.join(project, 'data'), { recursive: true })
+  const machine = { memory: '2g', vcpus: 4, disk_gb: 40 }
+  writeVm(project, { id: 'vm-kvm', status: 'stopped', runtime: { type: 'kvm' }, machine, claude: {} })
+  writeVm(project, { id: 'vm-old', status: 'stopped', claude: {} })
+  const cfg = { paths: { project }, rewrite: { enabled: false }, base_url: 'http://127.0.0.1' }
+  const quota = fakeQuota()
+  const dash = await buildDashboard({
+    cfg,
+    accountQuota: quota,
+    stickyRouter: { stats: () => ({ active_sessions: 0 }) },
+    routingConfig: {},
+    stats: {},
+  })
+  const listed = await buildVmList({ cfg, accountQuota: quota, routingConfig: {} })
+  for (const items of [dash.data.vms, listed.data.items]) {
+    const kvm = items.find((item) => item.id === 'vm-kvm')
+    assert.equal(kvm.runtime_type, 'kvm')
+    assert.deepEqual(kvm.machine, machine)
+    const old = items.find((item) => item.id === 'vm-old')
+    assert.equal(old.runtime_type, 'docker', 'slots without runtime predate KVM and are containers')
+    assert.equal(old.machine, null)
+  }
 })
 
 test('dead bound proxy blocks credential import', async () => {
@@ -286,4 +320,130 @@ test('VM list exposes the Claude unit circuit and reset closes it', async (t) =>
   assert.equal(reset.data.circuit.state, 'closed')
   assert.equal(reset.data.circuit.failures, 0)
   assert.equal(resetVmCircuit({ cfg, id: 'nope' }).status, 404)
+})
+
+test('local proxy node labels are present for admin and absent for tenant', async (t) => {
+  const project = tmpDir()
+  const dataDir = path.join(project, 'data')
+  fs.mkdirSync(dataDir, { recursive: true })
+  t.after(() => fs.rmSync(project, { recursive: true, force: true }))
+
+  writeVm(project, {
+    id: 'vm-ctrl',
+    name: 'ctrl',
+    status: 'stopped',
+    proxy: { id: 'px-local', host: 'local', scheme: 'local' },
+    claude: {},
+  })
+  writeVm(project, {
+    id: 'vm-tokyo',
+    name: 'tokyo',
+    status: 'stopped',
+    node_id: 'node-a',
+    proxy: { id: 'px-local', host: 'local', scheme: 'local' },
+    claude: {},
+  })
+  writeVm(project, {
+    id: 'vm-tenant',
+    name: 'tenant',
+    status: 'stopped',
+    node_id: 'node-a',
+    owner_user_id: 'user-1',
+    proxy: { id: 'px-local', host: 'local', scheme: 'local' },
+    claude: {},
+  })
+
+  const vms = [
+    { id: 'vm-ctrl' },
+    { id: 'vm-tokyo', node_id: 'node-a' },
+    { id: 'vm-tenant', node_id: 'node-a', owner_user_id: 'user-1' },
+  ]
+  const pool = new ProxyPool({
+    dataDir,
+    vmNodeOf: (vmId) => vms.find((vm) => vm.id === vmId)?.node_id || null,
+  })
+  t.after(() => pool.stopScheduler())
+  pool.ensureLocal()
+  // A generic px-local bind lands each slot on its own VPS's local row.
+  assert.equal(pool.bind('px-local', 'vm-ctrl').proxy.id, 'px-local')
+  assert.equal(pool.bind('px-local', 'vm-tokyo').proxy.id, 'px-local-node-a')
+  assert.equal(pool.bind('px-local', 'vm-tenant').proxy.id, 'px-local-node-a')
+
+  const nodes = [{ id: 'node-a', label: '东京-01' }]
+  const adminSnap = pool.panelSnapshot({ role: 'admin', vms, nodes })
+  const local = adminSnap.proxies.find((p) => p.id === 'px-local')
+  assert.ok(local)
+  assert.equal(local.node_id, null)
+  assert.equal(local.node_name, null)
+  assert.deepEqual(local.bound_vm_ids, ['vm-ctrl'])
+  const tokyoRow = adminSnap.proxies.find((p) => p.id === 'px-local-node-a')
+  assert.ok(tokyoRow)
+  assert.equal(tokyoRow.node_id, 'node-a')
+  assert.equal(tokyoRow.node_name, '东京-01')
+  assert.deepEqual(tokyoRow.bound_vm_ids, ['vm-tokyo', 'vm-tenant'])
+
+  const tenantSnap = pool.panelSnapshot({ role: 'user', ownerUserId: 'user-1', vms, nodes })
+  assert.equal(
+    tenantSnap.proxies.find((p) => p.id === 'px-local'),
+    undefined,
+  )
+  const tenantLocal = tenantSnap.proxies.find((p) => p.id === 'px-local-node-a')
+  assert.ok(tenantLocal)
+  assert.equal(tenantLocal.node_name, undefined)
+  assert.equal(tenantLocal.bound_nodes, undefined)
+  assert.deepEqual(tenantLocal.bound_vm_ids, ['vm-tenant'])
+
+  const cfg = { paths: { project }, rewrite: { enabled: false }, base_url: 'http://127.0.0.1' }
+  const quota = fakeQuota()
+  const listed = await buildVmList({
+    cfg,
+    accountQuota: quota,
+    routingConfig: {},
+    proxyPool: pool,
+    clusterNodes: nodes,
+    role: 'admin',
+  })
+  const tokyo = listed.data.items.find((item) => item.id === 'vm-tokyo')
+  assert.equal(tokyo.node_name, '东京-01')
+  assert.equal(tokyo.proxy.node_name, '东京-01')
+  const ctrl = listed.data.items.find((item) => item.id === 'vm-ctrl')
+  assert.equal(ctrl.node_name, undefined)
+  assert.equal(ctrl.proxy.node_name, null)
+
+  const tenantList = await buildVmList({
+    cfg,
+    accountQuota: quota,
+    routingConfig: {},
+    proxyPool: pool,
+    clusterNodes: nodes,
+    role: 'user',
+    ownerUserId: 'user-1',
+  })
+  assert.equal(tenantList.data.items.length, 1)
+  const tenantVm = tenantList.data.items[0]
+  assert.equal(tenantVm.id, 'vm-tenant')
+  assert.equal(tenantVm.node_name, undefined)
+  assert.equal(tenantVm.proxy.node_name, undefined)
+
+  const adminAlloc = publicAllocatedProxy(
+    pool,
+    { id: 'px-local', kind: 'local' },
+    {
+      nodeId: 'node-a',
+      role: 'admin',
+      nodes,
+    },
+  )
+  assert.equal(adminAlloc.node_name, '东京-01')
+  const tenantAlloc = publicAllocatedProxy(
+    pool,
+    { id: 'px-local', kind: 'local' },
+    {
+      nodeId: 'node-a',
+      role: 'user',
+      nodes,
+    },
+  )
+  assert.equal(tenantAlloc.node_name, undefined)
+  assert.equal(tenantAlloc.bound_vm_ids, undefined)
 })

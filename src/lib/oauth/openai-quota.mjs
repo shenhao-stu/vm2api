@@ -4,12 +4,19 @@
  * without auto-reset, spark shadow, or agent-identity recovery.
  */
 import crypto from 'node:crypto'
-import { getVm } from '../vm/vm-registry.mjs'
+import { getVm, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
-import { boundProxyUrl, isLocalEgressProxy } from '../vm/egress.mjs'
+import { isLocalEgressProxy } from '../vm/egress.mjs'
+import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { readCodexAccounts, upsertCodexAccount, persistCodexQuotaSnapshot } from '../vm/codex-slot.mjs'
-import { buildCodexUsageView, extraToCodexSnapshot, normalizeCodexLimits } from '../protocol/codex-usage.mjs'
-import { CODEX_OAUTH_ORIGINATOR, makeSocksFetch, refreshCodexAccessToken } from '../protocol/codex-models.mjs'
+import {
+  buildCodexUsageView,
+  extraToCodexSnapshot,
+  normalizeCodexCredits,
+  normalizeCodexLimits,
+} from '../protocol/codex-usage.mjs'
+import { CODEX_OAUTH_ORIGINATOR, makeProxyFetch, refreshCodexAccessToken } from '../protocol/codex-models.mjs'
+import { openaiIdentityFromJwt } from './openai-jwt.mjs'
 
 export const CHATGPT_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
 export const CHATGPT_RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
@@ -37,12 +44,7 @@ function firstString(...values) {
 }
 
 function accountIdFromToken(accessToken) {
-  try {
-    const payload = JSON.parse(Buffer.from(String(accessToken).split('.')[1], 'base64url'))
-    return firstString(payload?.['https://api.openai.com/auth']?.chatgpt_account_id)
-  } catch {
-    return ''
-  }
+  return firstString(openaiIdentityFromJwt(accessToken).chatgpt_account_id)
 }
 
 export function buildOpenaiQuotaHeaders({ accessToken, accountId, fedRamp = false } = {}) {
@@ -249,7 +251,7 @@ async function loadSlot(projectRoot, vmId) {
   if (!access && !refresh) {
     return { ok: false, error: 'no_oauth_token', message: 'GPT 槽没有 OAuth 凭证', status: 400 }
   }
-  const proxyUrl = boundProxyUrl(vm.proxy)
+  const proxyUrl = hostProxyUrlForVm(vm)
   return {
     ok: true,
     vm,
@@ -263,7 +265,7 @@ async function loadSlot(projectRoot, vmId) {
 }
 
 async function quotaFetch(url, { method = 'GET', headers, body, proxyUrl, fetchImpl, timeoutMs, direct = false } = {}) {
-  const fetchFn = fetchImpl || makeSocksFetch(proxyUrl, timeoutMs || OPENAI_QUOTA_TIMEOUT_MS)
+  const fetchFn = fetchImpl || makeProxyFetch(proxyUrl, timeoutMs || OPENAI_QUOTA_TIMEOUT_MS)
   if (!fetchImpl && !proxyUrl && !direct)
     return { ok: false, error: 'proxy_required', message: 'GPT 槽未绑定 SOCKS5', status: 400 }
   try {
@@ -304,19 +306,20 @@ async function rotateIfNeeded(slot, projectRoot, vmId, fetchImpl) {
   return { ...slot, access: tok.access_token, refresh: tok.refresh_token || slot.refresh }
 }
 
-function publicUsage(extra, resetCredits, usagePayload = {}) {
+function publicUsage(extra, resetCredits, credits, usagePayload = {}) {
   const view = buildCodexUsageView(extraToCodexSnapshot(extra))
   return {
     usage: view,
     quota: view.quota,
     windows: view.windows,
     reset_credits: resetCredits,
+    credits,
     plan_type: usagePayload.plan_type || usagePayload.planType || null,
     email: usagePayload.email || null,
   }
 }
 
-async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId } = {}) {
+async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId, policy = null } = {}) {
   if (!slot.proxyUrl && !fetchImpl && !slot.direct) {
     return fail('proxy_required', 'GPT 槽未绑定 SOCKS5', 400)
   }
@@ -378,26 +381,31 @@ async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId
     detailCredits,
   )
   const persistable = resetCredits.available_count <= 0 || resetCredits.credits.length > 0 ? resetCredits : null
+  const credits = normalizeCodexCredits(pack.usage.payload?.credits)
   persistCodexQuotaSnapshot(projectRoot, vmId, {
     extra,
+    credits,
     planType: pack.usage.payload?.plan_type || pack.usage.payload?.planType,
     ...(persistable ? { resetCredits: persistable } : {}),
   })
+  syncCodexQuotaSchedule(projectRoot, getVm(projectRoot, vmId), {
+    policy,
+  })
   return {
     ok: true,
-    ...publicUsage(extra, persistable || resetCredits, pack.usage.payload || {}),
+    ...publicUsage(extra, persistable || resetCredits, credits, pack.usage.payload || {}),
     fetched_at: resetCredits.fetched_at,
     warning: persistable ? undefined : 'reset_credit_cache_refresh_failed',
   }
 }
 
-export async function queryOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = true } = {}) {
+export async function queryOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = true, policy = null } = {}) {
   const slot = await loadSlot(projectRoot, vmId)
   if (!slot.ok) return slot
-  return queryUpstream(slot, { fetchImpl, rotate, projectRoot, vmId })
+  return queryUpstream(slot, { fetchImpl, rotate, projectRoot, vmId, policy })
 }
 
-export async function resetOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = true } = {}) {
+export async function resetOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = true, policy = null } = {}) {
   const slot = await loadSlot(projectRoot, vmId)
   if (!slot.ok) return slot
   if (!slot.proxyUrl && !fetchImpl && !slot.direct) return fail('proxy_required', 'GPT 槽未绑定 SOCKS5', 400)
@@ -439,7 +447,7 @@ export async function resetOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = 
     })
   }
 
-  const after = await queryUpstream(current, { fetchImpl, rotate: false, projectRoot, vmId })
+  const after = await queryUpstream(current, { fetchImpl, rotate: false, projectRoot, vmId, policy })
   if (!after.ok) {
     return {
       ok: true,
@@ -447,6 +455,7 @@ export async function resetOpenaiQuota({ projectRoot, vmId, fetchImpl, rotate = 
       code: res.payload?.code || 'ok',
       windows_reset: int(res.payload?.windows_reset ?? res.payload?.windowsReset) || 0,
       reset_credits: null,
+      credits: null,
       usage: null,
       quota: null,
       windows: [],

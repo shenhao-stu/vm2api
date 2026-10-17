@@ -1,1 +1,0 @@
-var e=`Rust · cli-hop`,t=`运输固定 Rust cli-hop。cli-node + kernel 是默认（一进程 20 native 槽）；cc-node + kernel 用同一份 wrap kernel；crag + cc-node 用 crag kernel，claude_bin 指向仓内 cc-node。`;function n(e){return e===`crag`?`crag + cc-node`:e===`cc`?`cc-node + kernel`:`cli-node + kernel`}export{e as n,n as r,t};

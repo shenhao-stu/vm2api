@@ -124,11 +124,18 @@ def write_all(fd: int, data: bytes) -> bool:
 
 
 def build_argv() -> list[str]:
+    raw = os.environ.get("KIN_DOCKER_ARGV", "").strip()
+    if raw:
+        argv = json.loads(raw)
+        if not isinstance(argv, list) or not argv or argv[0] != "exec":
+            raise SystemExit(2)
+        return ["docker", *argv]
     container = os.environ["KIN_CONTAINER"]
     uid = os.environ["KIN_UID"]
     gid = os.environ["KIN_GID"]
     tz = os.environ.get("TZ", "UTC")
     lang = os.environ.get("LANG", "en_US.UTF-8")
+    cli = os.environ["KIN_CLI_BIN"]
     return [
         "docker", "exec", "-it",
         "-u", f"{uid}:{gid}",
@@ -138,6 +145,11 @@ def build_argv() -> list[str]:
         "-e", f"LANG={lang}",
         "-e", f"LC_ALL={lang}",
         "-e", "PATH=/home/kincli/.local/bin:/usr/bin:/bin",
+        "-e", "CLAUDE_CODE_HOST_REFRESH=1",
+        "-e", f"CLAUDE_CODE_VERSION={os.environ.get('KIN_CLI_VERSION', '2.1.293')}",
+        "-e", "USER_TYPE=external",
+        # The slot cli-node guard spares host-run setup-token sessions.
+        "-e", "KIN_SETUP_TOKEN=1",
         "-e", "CLAUDE_CODE_USE_BEDROCK=0",
         "-e", "CLAUDE_CODE_USE_VERTEX=0",
         "-e", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=0",
@@ -152,7 +164,7 @@ def build_argv() -> list[str]:
         "-e", "LINES=40",
         "-w", "/home/kincli",
         container,
-        "/home/kincli/.local/bin/claude",
+        cli,
         "setup-token",
     ]
 

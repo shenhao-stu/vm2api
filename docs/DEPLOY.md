@@ -28,7 +28,9 @@ VM2API_DB_SECRET='再一串'
 
 不是一个父容器里多个子进程。
 
-原生 Claude 槽默认内存上限为 `1g`，可用 `KIN_VM_MEMORY` 显式覆盖。常驻 native host 与临时官方 CLI 同时运行会超过旧的 `500m` 上限；额度 API 探测本身不应额外启动推理 CLI。已有容器不会因控制面升级自动扩大限制，可在核对宿主余量后使用 `docker update --memory 1g --memory-swap 1g kin-<槽>`，不重建容器。
+槽位默认内存上限为 `512m`，在面板「规格」或 `routing.json` 的 `vm.memory` 配置（`256m` / `512m` / `1g` / `2g` / `4g` / `8g` / `16g`）。创建时可按槽覆盖，结果写在该槽 `vm.machine.memory`。已不再读取 `KIN_VM_MEMORY`。低于 1G 时，常驻 native host 与临时官方 CLI 同时运行可能 OOM；额度 API 探测本身不应额外启动推理 CLI。已有容器不会因控制面升级自动改内存，可在核对宿主余量后使用 `docker update --memory 1g --memory-swap 1g kin-<槽>`，不重建容器。
+
+KVM 槽需要宿主 `/dev/kvm` 可读写（控制面在容器内时，用一次 `--device /dev/kvm` 的探测容器确认）。runner 降权给槽位用户跑 QEMU 时会带上 `/dev/kvm` 的设备组，属组与槽位主 GID 不同也能用。已有 KVM 槽要更新 `kin-kvm-*` 镜像并重建一次。没有 KVM 时不要在生产打开 `vm.allow_tcg`：那是 TCG 软件模拟，仅供测试。
 
 出现 `native stdin: Broken pipe` 时同时检查容器 OOM 事件与 CLI 子进程，不能只看 Rust PID 1 是否存活。CLI 退出或输出管道关闭后，内核必须清零 `cli_pid` / `ready_slots`、终止在途请求并拒绝新任务，由宿主 watchdog 恢复槽；不重放已发送的推理请求。
 
@@ -52,6 +54,10 @@ sudo bash /opt/vm2api/deploy/install.sh changelog
 
 保留 `.env` / `vms/` / `data/`。不要 `docker rm` 槽。一键更新会自动把新版 `share/wrap-cli`（包括 `kin-kernel.bin`）同步到所有槽并重启槽内 dataplane；如需暂时跳过可加 `--no-sync-wrap`。管理台 **设置 → 关于** 可复制同一条命令、看 changelog。指定版本：`--version v1.2.22`。
 
+首次登录后，在「用户」中找到当前管理员，点击「改密码」设置至少 8 位的新密码。默认密码管理员也会写入用户列表；修改后数据库密码优先，重启或更新不会被 `.env` 中的旧密码覆盖。
+
+**ARM64 主机（实验性）**：同一条命令按 `uname -m` 自动选择 `vX.Y.Z-arm64` 控制面镜像并准备 QEMU（slot 仍是 amd64）。`--version` 可带 `-amd64` / `-arm64` 后缀，须与宿主一致。详见 [ARM64.md](ARM64.md)。
+
 **手动（同样只拉镜像）：**
 
 ```bash
@@ -69,6 +75,12 @@ curl -sS --noproxy '*' http://127.0.0.1:8787/health
 `bin/` 与 `share/wrap-cli` 由镜像入口写入挂载目录，`src/config` 缺文件时用镜像内默认值补齐。
 槽位系统镜像优先 `docker pull ghcr.io/dofastted/kin-os-*`，拉不到时在建槽阶段用仓内 Dockerfile 兜底构建（启动不阻塞）。
 
+**新建槽位的闭源依赖**：`kin-computer` 只分发编译后二进制，不公开源码。它由 `deploy/payload.json` 固定大小与 SHA256，随 Release 和控制面镜像交付；镜像入口自动安装到 `bin/kin-computer`，无需额外挂载私有源码目录。源码直接运行前执行 `npm run fetch:payload`；默认读取仓库的 `bin/kin-computer`，也可用 `KIN_COMPUTER_BIN` 指定绝对路径。二进制为 linux amd64，按 Ubuntu 22.04 / GLIBC 2.35 构建，Debian 12 与 Ubuntu 24.04 可向上兼容；ARM64 控制面通过 QEMU 运行。Docker 身份生成还需 Bash 和 Python 3（控制面镜像已安装）。缺失时面板建槽返回 HTTP 400 `computer_service_missing`，生成失败返回 `computer_create_failed`。已有容器启动不会重新发布身份或改写主机名。
+
+`v1.3.176` 原镜像未包含该依赖；补传 Release 附件不会改变旧镜像。继续使用该镜像时，需将附件安装到挂载的 `bin/kin-computer`，在 `.env` 设置 `KIN_COMPUTER_BIN=/opt/vm2api/bin/kin-computer` 后重新创建控制面容器以载入环境变量（不要重建槽位容器）。
+
+集群节点已有目标槽镜像标签时跳过传输；仅在缺少云端基础系统时拉取它，母机只上传程序层。此优化不代表远端槽位已接入本机容器的全部计算机身份挂载。
+
 **源码模式（自己改代码时）：**
 
 ```bash
@@ -77,7 +89,9 @@ cd /opt/vm2api && cp .env.example .env && chmod 600 .env
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
-一键脚本对应 `--from-source`；目录里有 `.git` 时 `upgrade` 自动走源码分支。二进制在仓内 `bin/`，必须 **755**。
+一键脚本对应 `--from-source`；目录里有 `.git` 时 `upgrade` 自动走源码分支。仓库只有源码：镜像构建内编控制台与 Go helper，并按 `deploy/payload.json` 从 payload Release 下载、校验 kernel / CLI / kin-computer，构建机要能访问 GitHub。镜像入口再把它们写进挂载的 `bin/` 与 `share/`。
+
+2026-10-11 起仓库历史已重写以移除构建产物，所有 tag 的提交号都变了。旧的源码安装用新版 `deploy/install.sh upgrade`（脚本已改为 `git fetch --force --tags`），不要用旧面板的一键更新做这次迁移。
 
 升级到 **v1.2.22** 见下面「已部署机升级到 1.2.22」。更新控制面和槽内 kernel，但不要 `docker rm` 槽。
 
@@ -133,9 +147,11 @@ docker exec kin-<槽> curl -sS -o /dev/null -w '%{http_code}\n' --max-time 10 ht
 
 能解析且打印 HTTP 状态码（如 `404`）即通。两条都超时就是仍被拦截。本地出口（`px-local`）不经过 `kin-egress`，不需要这一步。
 
+本地出口上的 GPT 槽位：控制面进程环境里有 `HTTPS_PROXY`（其次 `https_proxy`、`ALL_PROXY`、`all_proxy`；`HTTP_PROXY` 不算）时，Codex kernel 推理和目录同步、额度、token 刷新、OAuth 换票都走这个代理，代理不通就失败，不回落直连；`NO_PROXY` 对它不生效。没设就直连。本地出口上的 Claude 槽位始终直连。
+
 ## 上线后
 
-1. 打开 `/cc#/login`，用管理台密码登录（未配置时为 `admin` / `123456`）。
+1. 打开 `/cc` 是欢迎页，右上角「登录」进入登录页 `/cc#/login`（未配置时为 `admin` / `123456`）。首次登录回到欢迎页，下方首配清单按真实状态列出改密码、出口、槽位账号、可调度、密钥、首个请求，每步可跳面板或文档；点「跳过引导」后再登录直接进总览，用户菜单「欢迎与引导」可重新打开。
 2. 代理池：添加本地出口，或导入 SOCKS5。
 3. 建槽、绑出口、启动。没出口会停在 `stopped`。
 4. 在槽里导入凭证，再用 `sk-vm-…` 或 master key 打 `POST /v1/messages`。
@@ -147,8 +163,8 @@ docker exec kin-<槽> curl -sS -o /dev/null -w '%{http_code}\n' --max-time 10 ht
 Node 听 `:8787`。HTTPS 放在 nginx。
 
 ```nginx
-# 集群页终端是 WebSocket：必须透传 Upgrade，并直连 Node（前面若有会丢 Upgrade 的网关，也要绕过）。
-location ~ ^/api/panel/cluster/nodes/[^/]+/shell$ {
+# 集群页 / 槽位运维终端是 WebSocket：必须透传 Upgrade，并直连 Node（前面若有会丢 Upgrade 的网关，也要绕过）。
+location ~ ^/api/panel/(cluster/nodes|vms)/[^/]+/shell$ {
   proxy_pass http://127.0.0.1:8787;
   proxy_http_version 1.1;
   proxy_set_header Host $host;
@@ -169,15 +185,15 @@ location / {
 }
 ```
 
-`Connection ""` 会剥掉 Upgrade，终端握手拿不到 101，面板里一直连不上；所以 shell 路径单独放在前面。
+`Connection ""` 会剥掉 Upgrade，终端握手拿不到 101，面板里一直连不上；所以 shell 路径单独放在前面。生产机的 Go 前门在 `:8787`、Node 在 `:8788`，这条 location 必须 `proxy_pass` 到 Node。症状和核对命令见 [nginx-shell.md](nginx-shell.md)。
 
 ## 本机 Node（备选）
 
-仓内已有 `bin/kin-*`。还要 `npm ci`、`pnpm -C web install --frozen-lockfile && npm run build:web`，以及占位 `vms/active.json`。单元：[deploy/vm2api.service](deploy/vm2api.service)。细节见 [BUILD.md](BUILD.md)。
+`npm run fetch:payload` 拉 `bin/kin-{kernel,codex-kernel,oauth-auth}` 与 `share/`；`npm run build:egress && npm run build:worker`；`npm ci`、`pnpm -C web install --frozen-lockfile && npm run build:web`；以及占位 `vms/active.json`。单元：[deploy/vm2api.service](deploy/vm2api.service)。细节见 [BUILD.md](BUILD.md)。
 
 ## 一键安装 / 更新
 
-`deploy/install.sh` 默认拉 ghcr 预构建镜像，不在目标机编译。控制台是仓内 `web/dist`，打进镜像，不再在镜像构建里跑 `pnpm build`。`--from-source` 也只拷贝这份预编译产物。不碰已有非空 `.env` 字段、`vms/`、`data/`，不 `docker rm` 槽。
+`deploy/install.sh` 默认拉 ghcr 预构建镜像，不在目标机编译，只下载 `docker-compose.yml`、`.env.example`、`VERSION`、`CHANGELOG.md`、`deploy/install.sh`（ARM64 另加 `deploy/prepare-arm64.py`）。`--from-source` 在目标机按 `Dockerfile` 多阶段构建：编 `web/dist` 与 Go helper，按 `deploy/payload.json` 下载 payload。不碰已有非空 `.env` 字段、`vms/`、`data/`，不 `docker rm` 槽。
 
 ### 两类安装错误
 
@@ -195,7 +211,7 @@ docker compose up -d --build
 
 **2. 管理台「Missing credentials」/「鉴权失效，请重新登录」**
 
-打开登录页，不要直接进总览：`http://<ip>:8787/cc#/login`。未配置时账密是 `admin` / `123456`。已有密码：`grep '^VM2API_ADMIN_PASSWORD=' /opt/vm2api/.env`。
+打开登录页 `http://<ip>:8787/cc#/login`。未配置时账密是 `admin` / `123456`。已有密码：`grep '^VM2API_ADMIN_PASSWORD=' /opt/vm2api/.env`。
 
 ```bash
 # 安装
@@ -211,7 +227,7 @@ sudo bash /opt/vm2api/deploy/install.sh upgrade --version v1.2.22
 sudo bash /opt/vm2api/deploy/install.sh check
 ```
 
-面板：`GET /api/panel/version`、`GET /api/panel/changelog`、`POST /api/panel/update`（`{ confirm: true }` 才会在已挂 `docker.sock` 的机器上拉起升级助手）。容器里没有宿主机 git 仓时返回 `409 host_upgrade_required`，响应里带同一条 curl 命令。
+面板：`GET /api/panel/version`、`GET /api/panel/changelog`、`POST /api/panel/update`。确认更新后，控制面会通过已挂载的 `docker.sock` 自省当前 Compose 项目和全部配置文件，拉起独立升级助手。助手记录更新前正常运行的槽位，按源码/镜像模式更新，保留已有 `src/config` 配置并 `--force-recreate` 控制面；通过健康检查、版本接口和槽位详情接口确认后端版本正确、此前健康的槽内内核仍能通过控制面鉴权，完成后才报告成功。忙碌但进程健康的槽位不视为故障；更新前已故障或停止的槽位不计入本次回归检查。助手失败时保留 `docker logs vm2api-upgrade-<project>`；容器里没有可识别的 Compose 服务时返回 `409 host_upgrade_required`，响应里带同一条 curl 命令。槽位内核健康检查不调用模型，不消耗上游额度。
 
 ## 已部署机升级到 1.2.22
 

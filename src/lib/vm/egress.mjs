@@ -15,17 +15,43 @@ import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
 
 export const EGRESS_BIN = process.env.KIN_EGRESS_BIN || '/opt/kin-gateway/bin/kin-egress'
 export const LOCAL_EGRESS_ID = 'px-local'
+const LOCAL_EGRESS_NODE_PREFIX = `${LOCAL_EGRESS_ID}-`
+
+/**
+ * Local egress is one pool row per VPS: `px-local` for the control plane,
+ * `px-local-<nodeId>` for each cluster node. Bind capacity, probe and geo are
+ * then per machine, while every local row on a host shares the same docker
+ * bridge (see egressArtifactId).
+ */
+export function localEgressIdForNode(nodeId) {
+  const key = String(nodeId || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, '')
+  return key ? `${LOCAL_EGRESS_NODE_PREFIX}${key}` : LOCAL_EGRESS_ID
+}
+
+export function isLocalEgressId(proxyId) {
+  const id = String(proxyId || '').trim()
+  return id === LOCAL_EGRESS_ID || id.startsWith(LOCAL_EGRESS_NODE_PREFIX)
+}
+
+/** Node a local row belongs to; null for the control plane (or a non-local id). */
+export function localEgressNodeId(proxyId) {
+  const id = String(proxyId || '').trim()
+  return id.startsWith(LOCAL_EGRESS_NODE_PREFIX) ? id.slice(LOCAL_EGRESS_NODE_PREFIX.length) || null : null
+}
 
 export function isLocalEgressProxy(proxy) {
   if (!proxy || typeof proxy !== 'object') return false
   const id = String(proxy.id || '').trim()
+  if (isLocalEgressId(id)) return true
   const scheme = String(proxy.scheme || proxy.kind || '')
     .trim()
     .toLowerCase()
   const host = String(proxy.host || '')
     .trim()
     .toLowerCase()
-  return id === LOCAL_EGRESS_ID || scheme === 'local' || host === 'local'
+  return scheme === 'local' || host === 'local'
 }
 
 /** Remote SOCKS (url or host:port) or local egress. Empty URL is not "unbound". */
@@ -64,14 +90,19 @@ export function proxyKey(proxyId) {
     .replace(/[^a-zA-Z0-9_-]/g, '')
 }
 
+// Each host has a single local masquerade bridge, whichever per-node local row a slot holds.
+function egressArtifactId(proxyId) {
+  return isLocalEgressId(proxyId) ? LOCAL_EGRESS_ID : proxyId
+}
+
 export function networkName(proxyId) {
-  const id = proxyKey(proxyId)
+  const id = proxyKey(egressArtifactId(proxyId))
   return id ? `kin-eg-${id}` : ''
 }
 
 /** Linux iface max 15 chars. */
 export function bridgeName(proxyId) {
-  const hex = proxyKey(proxyId)
+  const hex = proxyKey(egressArtifactId(proxyId))
     .replace(/^px-/, '')
     .replace(/[^a-zA-Z0-9]/g, '')
     .slice(0, 12)
@@ -79,7 +110,7 @@ export function bridgeName(proxyId) {
 }
 
 export function chainName(proxyId) {
-  const hex = proxyKey(proxyId)
+  const hex = proxyKey(egressArtifactId(proxyId))
     .replace(/^px-/, '')
     .replace(/[^a-zA-Z0-9]/g, '')
     .slice(0, 12)
@@ -87,7 +118,7 @@ export function chainName(proxyId) {
 }
 
 export function portsForProxy(proxyId) {
-  const s = proxyKey(proxyId)
+  const s = proxyKey(egressArtifactId(proxyId))
   let h = 2166136261
   for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619)
   const n = (h >>> 0) % 8000
@@ -102,6 +133,27 @@ export function gatewayFromSubnet(subnet) {
 export function iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
   const tcp = String(tcpPort)
   const dns = String(dnsPort)
+  // REDIRECT delivers bridge traffic to host INPUT. Allow only this proxy's
+  // subnet and helper ports, ahead of host default-reject rules (e.g. Oracle).
+  const inputRules = [
+    [
+      '-i',
+      bridge,
+      '-s',
+      subnet,
+      '-d',
+      subnet,
+      '-p',
+      'tcp',
+      '-m',
+      'multiport',
+      '--dports',
+      `${tcp},${dns}`,
+      '-j',
+      'ACCEPT',
+    ],
+    ['-i', bridge, '-s', subnet, '-d', subnet, '-p', 'udp', '--dport', dns, '-j', 'ACCEPT'],
+  ]
   return {
     add: [
       ['-t', 'nat', '-N', chain],
@@ -112,6 +164,10 @@ export function iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
       ['-t', 'nat', '-A', chain, '-p', 'tcp', '--dport', '53', '-j', 'REDIRECT', '--to-ports', dns],
       ['-t', 'nat', '-A', chain, '-p', 'udp', '--dport', '53', '-j', 'REDIRECT', '--to-ports', dns],
       ['-t', 'nat', '-A', chain, '-p', 'tcp', '-j', 'REDIRECT', '--to-ports', tcp],
+      ...inputRules.flatMap((rule) => [
+        ['-t', 'filter', '-C', 'INPUT', ...rule],
+        ['-t', 'filter', '-I', 'INPUT', '1', ...rule],
+      ]),
       ['-t', 'filter', '-C', 'FORWARD', '-i', bridge, '!', '-d', subnet, '-j', 'DROP'],
       ['-t', 'filter', '-I', 'FORWARD', '1', '-i', bridge, '!', '-d', subnet, '-j', 'DROP'],
     ],
@@ -120,6 +176,7 @@ export function iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
       ['-t', 'nat', '-F', chain],
       ['-t', 'nat', '-X', chain],
       ['-t', 'filter', '-D', 'FORWARD', '-i', bridge, '!', '-d', subnet, '-j', 'DROP'],
+      ...inputRules.map((rule) => ['-t', 'filter', '-D', 'INPUT', ...rule]),
     ],
   }
 }
@@ -170,6 +227,25 @@ function readPid(file) {
     return Number(fs.readFileSync(file, 'utf8').trim())
   } catch {
     return 0
+  }
+}
+
+function ownsEgressProcess(pid, configPath) {
+  if (!pidAlive(pid)) return false
+  try {
+    // PID files survive container restarts; a live PID may belong to another
+    // process or another proxy. Verify both before reusing or signaling it.
+    const exe = fs.readlinkSync(`/proc/${pid}/exe`).replace(/ \(deleted\)$/, '')
+    const args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')
+    const configIndex = args.indexOf('-config')
+    if (path.basename(exe) !== 'kin-egress' || configIndex <= 0 || !args[configIndex + 1]) return false
+    const argument = args[configIndex + 1]
+    const actualConfig = path.isAbsolute(argument)
+      ? path.resolve(argument)
+      : path.resolve(fs.readlinkSync(`/proc/${pid}/cwd`), argument)
+    return actualConfig === path.resolve(configPath)
+  } catch {
+    return false
   }
 }
 export function inspectEgressNetwork(proxyId, run = docker) {
@@ -259,13 +335,30 @@ export const DNS_UPSTREAMS = Object.freeze([
 export const DNS_PRIMARY_AUTO = 'auto'
 
 export function validDnsPrimary(value) {
-  return value === DNS_PRIMARY_AUTO || DNS_UPSTREAMS.includes(value)
+  if (value === DNS_PRIMARY_AUTO || DNS_UPSTREAMS.includes(value)) return true
+  // The upstream chain is comma-delimited. Reject URL forms that URL() would
+  // silently normalize or that cannot be carried unchanged to kin-egress.
+  if (typeof value !== 'string' || /[\s\x00-\x1f\x7f\\,#]/.test(value)) return false
+  if (/%(?![a-f0-9]{2})/i.test(value)) return false
+  const authority = /^https:\/\/(\[[^\]]+\]|[^/:?#]+)(?::([0-9]+))?(?:[/?]|$)/.exec(value)
+  if (!authority || authority[1].includes('@')) return false
+  if (authority[2] != null && (Number(authority[2]) < 1 || Number(authority[2]) > 65535)) return false
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'https:' || !url.hostname || url.username || url.password || url.hash) return false
+    // URL() validates bracketed IPv6 literals and numeric IPv4 addresses.
+    if (authority[1].startsWith('[')) return true
+    const host = authority[1].replace(/\.$/, '')
+    return host.length <= 253 && host.split('.').every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label))
+  } catch {
+    return false
+  }
 }
 
 // Operator picks which DNS to try first; the rest stay behind it as fallback.
 // 'auto' -> '' so kin-egress uses its built-in order.
 export function dnsUpstreamChain(primary) {
-  if (!DNS_UPSTREAMS.includes(primary)) return ''
+  if (primary === DNS_PRIMARY_AUTO || !validDnsPrimary(primary)) return ''
   return [primary, ...DNS_UPSTREAMS.filter((u) => u !== primary)].join(',')
 }
 
@@ -278,6 +371,11 @@ export function configuredDnsUpstream() {
   }
 }
 
+export function configuredDnsEmptyTypes() {
+  if (!isDbOpen()) return []
+  return new SettingsRepo(getDb()).get('proxy_pool_config')?.dns_disable_svcb_https === true ? [64, 65] : []
+}
+
 export function startEgressProcess({
   projectRoot,
   proxyId,
@@ -287,6 +385,8 @@ export function startEgressProcess({
   listenHost,
   bin = EGRESS_BIN,
   dnsUpstream = '',
+  dnsEmptyTypes = [],
+  domainForward = false,
 }) {
   const blocked = proxyBlockedReason({ url: proxyUrl })
   if (blocked) return { ok: false, error: blocked }
@@ -298,14 +398,16 @@ export function startEgressProcess({
   const listenTcp = `${listenHost}:${tcpPort}`
   const listenDns = `${listenHost}:${dnsPort}`
   const existing = readPid(pidFile)
-  if (existing && pidAlive(existing)) {
+  if (ownsEgressProcess(existing, cfgPath)) {
     try {
       const old = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
       if (
         old.listen_tcp === listenTcp &&
         old.listen_dns === listenDns &&
         old.proxy_url === proxyUrl &&
-        (old.dns_upstream || '') === dnsUpstream
+        (old.dns_upstream || '') === dnsUpstream &&
+        JSON.stringify(old.dns_empty_types || []) === JSON.stringify(dnsEmptyTypes) &&
+        !!old.domain_forward === !!domainForward
       ) {
         return { ok: true, pid: existing, reused: true, configPath: cfgPath }
       }
@@ -324,6 +426,8 @@ export function startEgressProcess({
     listen_dns: listenDns,
   }
   if (dnsUpstream) cfg.dns_upstream = dnsUpstream
+  if (dnsEmptyTypes.length) cfg.dns_empty_types = dnsEmptyTypes
+  if (domainForward) cfg.domain_forward = true
   fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 })
   const child = spawn(bin, ['-config', cfgPath], {
     detached: true,
@@ -338,14 +442,14 @@ export function stopEgressProcess(projectRoot, proxyId) {
   const dir = egressRunDir(projectRoot, proxyId)
   const pidFile = path.join(dir, 'egress.pid')
   const pid = readPid(pidFile)
-  if (pid && pidAlive(pid)) {
+  if (ownsEgressProcess(pid, path.join(dir, 'egress.json'))) {
     try {
       process.kill(pid, 'SIGTERM')
     } catch (error) {
       if (error.code !== 'ESRCH') return { ok: false, error: `egress_stop_failed: ${error.code || error.message}` }
     }
     // Keep the PID while termination is pending so policy reconciliation can verify/retry it.
-    if (pidAlive(pid)) return { ok: true }
+    if (ownsEgressProcess(pid, path.join(dir, 'egress.json'))) return { ok: true }
   }
   try {
     fs.rmSync(pidFile, { force: true })
@@ -358,7 +462,9 @@ export function stopEgressProcess(projectRoot, proxyId) {
 export function inspectEgressProcess(projectRoot, proxyId) {
   const dir = egressRunDir(projectRoot, proxyId)
   const pid = readPid(path.join(dir, 'egress.pid'))
-  if (!pid || !pidAlive(pid)) return { ok: false, pid: pid || null, reason: 'not_running' }
+  if (!ownsEgressProcess(pid, path.join(dir, 'egress.json'))) {
+    return { ok: false, pid: pid || null, reason: 'not_running' }
+  }
   let listenTcp = ''
   try {
     listenTcp = String(JSON.parse(fs.readFileSync(path.join(dir, 'egress.json'), 'utf8')).listen_tcp || '')
@@ -387,6 +493,23 @@ export function boundProxyUrl(proxy) {
   if (isLocalEgressProxy(proxy)) return ''
   assertProxyAllowed(proxy)
   return socksProxyUrl(proxy)
+}
+
+// reqwest's order for an https destination; HTTP_PROXY only covers http:// destinations.
+const LOCAL_PROXY_ENV_KEYS = Object.freeze(['HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy'])
+
+/**
+ * Deployment proxy behind a local Codex slot. A host-launched Codex kernel would
+ * read these variables on its own while node-fetch ignores them, splitting one
+ * account across two exits; Node resolves the URL once and hands the kernel the
+ * same value. NO_PROXY does not apply: the exit is chosen per slot, not per host.
+ */
+export function localEgressProxyUrl(env = process.env) {
+  for (const key of LOCAL_PROXY_ENV_KEYS) {
+    const value = String(env?.[key] || '').trim()
+    if (value) return value.replace(/^socks5:\/\//i, 'socks5h://')
+  }
+  return ''
 }
 
 function waitListen(host, port, timeoutMs = 8000) {
@@ -441,7 +564,12 @@ export function ensureLocalProxyEgress(proxy, { runDocker = docker } = {}) {
 export function ensureProxyEgress(
   projectRoot,
   proxy,
-  { runDocker = docker, runIptables = iptables, dnsUpstream = configuredDnsUpstream() } = {},
+  {
+    runDocker = docker,
+    runIptables = iptables,
+    dnsUpstream = configuredDnsUpstream(),
+    dnsEmptyTypes = configuredDnsEmptyTypes(),
+  } = {},
 ) {
   if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, { runDocker })
   const blocked = proxyBlockedReason(proxy)
@@ -470,6 +598,8 @@ export function ensureProxyEgress(
     dnsPort: ports.dns,
     listenHost,
     dnsUpstream,
+    dnsEmptyTypes,
+    domainForward: proxy?.domain_forward === true,
   })
   if (!started.ok) return started
   if (!waitListen(listenHost, ports.tcp))
@@ -492,6 +622,8 @@ export function ensureProxyEgress(
 }
 
 export function stopProxyEgress(projectRoot, proxyId, { subnet, runDocker = docker, runIptables = iptables } = {}) {
+  // A node's local row owns nothing here; its bridge name is the control plane's px-local one.
+  if (localEgressNodeId(proxyId)) return { ok: true, skipped: 'node_local' }
   const net = inspectEgressNetwork(proxyId, runDocker)
   const plan = iptablesPlan({
     chain: chainName(proxyId),

@@ -25,6 +25,18 @@ function withCacheControl(node, source) {
   return { ...node, cache_control: control }
 }
 
+function eagerFlagOf(source) {
+  if (typeof source?.eager_input_streaming === 'boolean') return source.eager_input_streaming
+  if (typeof source?.function?.eager_input_streaming === 'boolean') return source.function.eager_input_streaming
+  return undefined
+}
+
+function withEagerInputStreaming(node, source) {
+  const eager = eagerFlagOf(source)
+  if (typeof eager !== 'boolean' || !node || typeof node !== 'object') return node
+  return { ...node, eager_input_streaming: eager }
+}
+
 /** No aliases. Model must already be an official Claude id (validated upstream). */
 export function mapModel(m, { allowMap = false } = {}) {
   const s = String(m || '').trim()
@@ -76,14 +88,17 @@ export function openaiToolsToClaude(tools) {
     if (t.type === 'function' && t.function) {
       if (!t.function.name) continue
       out.push(
-        withCacheControl(
-          {
-            name: t.function.name,
-            description: t.function.description || '',
-            input_schema: t.function.parameters || { type: 'object', properties: {} },
-            ...(typeof t.function.strict === 'boolean' ? { strict: t.function.strict } : {}),
-          },
-          t.function.cache_control ? t.function : t,
+        withEagerInputStreaming(
+          withCacheControl(
+            {
+              name: t.function.name,
+              description: t.function.description || '',
+              input_schema: t.function.parameters || { type: 'object', properties: {} },
+              ...(typeof t.function.strict === 'boolean' ? { strict: t.function.strict } : {}),
+            },
+            t.function.cache_control ? t.function : t,
+          ),
+          t,
         ),
       )
       continue
@@ -95,13 +110,16 @@ export function openaiToolsToClaude(tools) {
     const name = t.name || t.function?.name
     if (!name) continue
     out.push(
-      withCacheControl(
-        {
-          name,
-          description: t.description || '',
-          input_schema: t.input_schema || t.parameters || { type: 'object', properties: {} },
-          ...(typeof t.strict === 'boolean' ? { strict: t.strict } : {}),
-        },
+      withEagerInputStreaming(
+        withCacheControl(
+          {
+            name,
+            description: t.description || '',
+            input_schema: t.input_schema || t.parameters || { type: 'object', properties: {} },
+            ...(typeof t.strict === 'boolean' ? { strict: t.strict } : {}),
+          },
+          t,
+        ),
         t,
       ),
     )

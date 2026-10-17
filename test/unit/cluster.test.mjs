@@ -27,7 +27,8 @@ function frame(kind, text) {
 
 /** sshd that accepts only password `pw` for user `u`. */
 async function startServer() {
-  const hostKey = utils.generateKeyPairSync('ed25519')
+  // ssh2 1.17 emits a malformed ed25519 OpenSSH key ~0.4% of the time; ECDSA keys parse every time.
+  const hostKey = utils.generateKeyPairSync('ecdsa', { bits: 256 })
   const server = new Server({ hostKeys: [hostKey.private] }, (conn) => {
     conn.on('authentication', (ctx) => {
       if (ctx.method === 'password' && ctx.username === 'u' && ctx.password === 'pw') return ctx.accept()
@@ -50,7 +51,7 @@ test('backoff doubles from 1s, caps at 60s, and jitters within ±20%', () => {
 })
 
 test('host key digest matches ssh-keygen SHA256 fingerprint', (t) => {
-  const key = utils.generateKeyPairSync('ed25519')
+  const key = utils.generateKeyPairSync('ecdsa', { bits: 256 })
   let expected
   try {
     expected = execFileSync('ssh-keygen', ['-lf', '-'], { input: `${key.public}\n` })

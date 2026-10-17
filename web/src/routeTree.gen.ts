@@ -11,7 +11,9 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as AuthenticatedRouteRouteImport } from './routes/_authenticated/route'
 import { Route as LoginRouteImport } from './routes/login'
+import { Route as WelcomeRouteImport } from './routes/welcome'
 import { Route as AuthenticatedIndexRouteImport } from './routes/_authenticated/index'
+import { Route as AuthenticatedAnthropicRouteImport } from './routes/_authenticated/anthropic'
 import { Route as AuthenticatedApiRouteImport } from './routes/_authenticated/api'
 import { Route as AuthenticatedBillingRouteImport } from './routes/_authenticated/billing'
 import { Route as AuthenticatedClusterRouteImport } from './routes/_authenticated/cluster'
@@ -21,14 +23,13 @@ import { Route as AuthenticatedKeysRouteImport } from './routes/_authenticated/k
 import { Route as AuthenticatedLogsRouteImport } from './routes/_authenticated/logs'
 import { Route as AuthenticatedModelsRouteImport } from './routes/_authenticated/models'
 import { Route as AuthenticatedOverviewRouteImport } from './routes/_authenticated/overview'
-import { Route as AuthenticatedProtocolRouteImport } from './routes/_authenticated/protocol'
 import { Route as AuthenticatedProxiesRouteImport } from './routes/_authenticated/proxies'
+import { Route as AuthenticatedRiskRouteImport } from './routes/_authenticated/risk'
+import { Route as AuthenticatedSpecsRouteImport } from './routes/_authenticated/specs'
+import { Route as AuthenticatedStatisticsRouteImport } from './routes/_authenticated/statistics'
 import { Route as AuthenticatedSystemRouteImport } from './routes/_authenticated/system'
-import { Route as AuthenticatedUsageRouteImport } from './routes/_authenticated/usage'
 import { Route as AuthenticatedUsersRouteImport } from './routes/_authenticated/users'
 import { Route as AuthenticatedWrapRouteImport } from './routes/_authenticated/wrap'
-import { Route as AuthenticatedLoadtestIndexRouteImport } from './routes/_authenticated/loadtest/index'
-import { Route as AuthenticatedLoadtestTabRouteImport } from './routes/_authenticated/loadtest/$tab'
 import { Route as AuthenticatedSettingsIndexRouteImport } from './routes/_authenticated/settings/index'
 import { Route as AuthenticatedSettingsTabRouteImport } from './routes/_authenticated/settings/$tab'
 import { Route as AuthenticatedVmIndexRouteImport } from './routes/_authenticated/vm/index'
@@ -43,9 +44,19 @@ const LoginRoute = LoginRouteImport.update({
   path: '/login',
   getParentRoute: () => rootRouteImport,
 } as any)
+const WelcomeRoute = WelcomeRouteImport.update({
+  id: '/welcome',
+  path: '/welcome',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const AuthenticatedIndexRoute = AuthenticatedIndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => AuthenticatedRouteRoute,
+} as any)
+const AuthenticatedAnthropicRoute = AuthenticatedAnthropicRouteImport.update({
+  id: '/anthropic',
+  path: '/anthropic',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
 const AuthenticatedApiRoute = AuthenticatedApiRouteImport.update({
@@ -93,24 +104,29 @@ const AuthenticatedOverviewRoute = AuthenticatedOverviewRouteImport.update({
   path: '/overview',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
-const AuthenticatedProtocolRoute = AuthenticatedProtocolRouteImport.update({
-  id: '/protocol',
-  path: '/protocol',
-  getParentRoute: () => AuthenticatedRouteRoute,
-} as any)
 const AuthenticatedProxiesRoute = AuthenticatedProxiesRouteImport.update({
   id: '/proxies',
   path: '/proxies',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
+const AuthenticatedRiskRoute = AuthenticatedRiskRouteImport.update({
+  id: '/risk',
+  path: '/risk',
+  getParentRoute: () => AuthenticatedRouteRoute,
+} as any)
+const AuthenticatedSpecsRoute = AuthenticatedSpecsRouteImport.update({
+  id: '/specs',
+  path: '/specs',
+  getParentRoute: () => AuthenticatedRouteRoute,
+} as any)
+const AuthenticatedStatisticsRoute = AuthenticatedStatisticsRouteImport.update({
+  id: '/statistics',
+  path: '/statistics',
+  getParentRoute: () => AuthenticatedRouteRoute,
+} as any)
 const AuthenticatedSystemRoute = AuthenticatedSystemRouteImport.update({
   id: '/system',
   path: '/system',
-  getParentRoute: () => AuthenticatedRouteRoute,
-} as any)
-const AuthenticatedUsageRoute = AuthenticatedUsageRouteImport.update({
-  id: '/usage',
-  path: '/usage',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
 const AuthenticatedUsersRoute = AuthenticatedUsersRouteImport.update({
@@ -123,18 +139,6 @@ const AuthenticatedWrapRoute = AuthenticatedWrapRouteImport.update({
   path: '/wrap',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
-const AuthenticatedLoadtestIndexRoute =
-  AuthenticatedLoadtestIndexRouteImport.update({
-    id: '/loadtest/',
-    path: '/loadtest/',
-    getParentRoute: () => AuthenticatedRouteRoute,
-  } as any)
-const AuthenticatedLoadtestTabRoute =
-  AuthenticatedLoadtestTabRouteImport.update({
-    id: '/loadtest/$tab',
-    path: '/loadtest/$tab',
-    getParentRoute: () => AuthenticatedRouteRoute,
-  } as any)
 const AuthenticatedSettingsIndexRoute =
   AuthenticatedSettingsIndexRouteImport.update({
     id: '/settings/',
@@ -161,6 +165,8 @@ const AuthenticatedVmIdRoute = AuthenticatedVmIdRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof AuthenticatedIndexRoute
   '/login': typeof LoginRoute
+  '/welcome': typeof WelcomeRoute
+  '/anthropic': typeof AuthenticatedAnthropicRoute
   '/api': typeof AuthenticatedApiRoute
   '/billing': typeof AuthenticatedBillingRoute
   '/cluster': typeof AuthenticatedClusterRoute
@@ -170,21 +176,22 @@ export interface FileRoutesByFullPath {
   '/logs': typeof AuthenticatedLogsRoute
   '/models': typeof AuthenticatedModelsRoute
   '/overview': typeof AuthenticatedOverviewRoute
-  '/protocol': typeof AuthenticatedProtocolRoute
   '/proxies': typeof AuthenticatedProxiesRoute
+  '/risk': typeof AuthenticatedRiskRoute
+  '/specs': typeof AuthenticatedSpecsRoute
+  '/statistics': typeof AuthenticatedStatisticsRoute
   '/system': typeof AuthenticatedSystemRoute
-  '/usage': typeof AuthenticatedUsageRoute
   '/users': typeof AuthenticatedUsersRoute
   '/wrap': typeof AuthenticatedWrapRoute
-  '/loadtest/$tab': typeof AuthenticatedLoadtestTabRoute
   '/settings/$tab': typeof AuthenticatedSettingsTabRoute
   '/vm/$id': typeof AuthenticatedVmIdRoute
-  '/loadtest/': typeof AuthenticatedLoadtestIndexRoute
   '/settings/': typeof AuthenticatedSettingsIndexRoute
   '/vm/': typeof AuthenticatedVmIndexRoute
 }
 export interface FileRoutesByTo {
   '/login': typeof LoginRoute
+  '/welcome': typeof WelcomeRoute
+  '/anthropic': typeof AuthenticatedAnthropicRoute
   '/api': typeof AuthenticatedApiRoute
   '/billing': typeof AuthenticatedBillingRoute
   '/cluster': typeof AuthenticatedClusterRoute
@@ -194,17 +201,16 @@ export interface FileRoutesByTo {
   '/logs': typeof AuthenticatedLogsRoute
   '/models': typeof AuthenticatedModelsRoute
   '/overview': typeof AuthenticatedOverviewRoute
-  '/protocol': typeof AuthenticatedProtocolRoute
   '/proxies': typeof AuthenticatedProxiesRoute
+  '/risk': typeof AuthenticatedRiskRoute
+  '/specs': typeof AuthenticatedSpecsRoute
+  '/statistics': typeof AuthenticatedStatisticsRoute
   '/system': typeof AuthenticatedSystemRoute
-  '/usage': typeof AuthenticatedUsageRoute
   '/users': typeof AuthenticatedUsersRoute
   '/wrap': typeof AuthenticatedWrapRoute
   '/': typeof AuthenticatedIndexRoute
-  '/loadtest/$tab': typeof AuthenticatedLoadtestTabRoute
   '/settings/$tab': typeof AuthenticatedSettingsTabRoute
   '/vm/$id': typeof AuthenticatedVmIdRoute
-  '/loadtest': typeof AuthenticatedLoadtestIndexRoute
   '/settings': typeof AuthenticatedSettingsIndexRoute
   '/vm': typeof AuthenticatedVmIndexRoute
 }
@@ -212,6 +218,8 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_authenticated': typeof AuthenticatedRouteRouteWithChildren
   '/login': typeof LoginRoute
+  '/welcome': typeof WelcomeRoute
+  '/_authenticated/anthropic': typeof AuthenticatedAnthropicRoute
   '/_authenticated/api': typeof AuthenticatedApiRoute
   '/_authenticated/billing': typeof AuthenticatedBillingRoute
   '/_authenticated/cluster': typeof AuthenticatedClusterRoute
@@ -221,17 +229,16 @@ export interface FileRoutesById {
   '/_authenticated/logs': typeof AuthenticatedLogsRoute
   '/_authenticated/models': typeof AuthenticatedModelsRoute
   '/_authenticated/overview': typeof AuthenticatedOverviewRoute
-  '/_authenticated/protocol': typeof AuthenticatedProtocolRoute
   '/_authenticated/proxies': typeof AuthenticatedProxiesRoute
+  '/_authenticated/risk': typeof AuthenticatedRiskRoute
+  '/_authenticated/specs': typeof AuthenticatedSpecsRoute
+  '/_authenticated/statistics': typeof AuthenticatedStatisticsRoute
   '/_authenticated/system': typeof AuthenticatedSystemRoute
-  '/_authenticated/usage': typeof AuthenticatedUsageRoute
   '/_authenticated/users': typeof AuthenticatedUsersRoute
   '/_authenticated/wrap': typeof AuthenticatedWrapRoute
   '/_authenticated/': typeof AuthenticatedIndexRoute
-  '/_authenticated/loadtest/$tab': typeof AuthenticatedLoadtestTabRoute
   '/_authenticated/settings/$tab': typeof AuthenticatedSettingsTabRoute
   '/_authenticated/vm/$id': typeof AuthenticatedVmIdRoute
-  '/_authenticated/loadtest/': typeof AuthenticatedLoadtestIndexRoute
   '/_authenticated/settings/': typeof AuthenticatedSettingsIndexRoute
   '/_authenticated/vm/': typeof AuthenticatedVmIndexRoute
 }
@@ -240,6 +247,8 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/login'
+    | '/welcome'
+    | '/anthropic'
     | '/api'
     | '/billing'
     | '/cluster'
@@ -249,21 +258,22 @@ export interface FileRouteTypes {
     | '/logs'
     | '/models'
     | '/overview'
-    | '/protocol'
     | '/proxies'
+    | '/risk'
+    | '/specs'
+    | '/statistics'
     | '/system'
-    | '/usage'
     | '/users'
     | '/wrap'
-    | '/loadtest/$tab'
     | '/settings/$tab'
     | '/vm/$id'
-    | '/loadtest/'
     | '/settings/'
     | '/vm/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/login'
+    | '/welcome'
+    | '/anthropic'
     | '/api'
     | '/billing'
     | '/cluster'
@@ -273,23 +283,24 @@ export interface FileRouteTypes {
     | '/logs'
     | '/models'
     | '/overview'
-    | '/protocol'
     | '/proxies'
+    | '/risk'
+    | '/specs'
+    | '/statistics'
     | '/system'
-    | '/usage'
     | '/users'
     | '/wrap'
     | '/'
-    | '/loadtest/$tab'
     | '/settings/$tab'
     | '/vm/$id'
-    | '/loadtest'
     | '/settings'
     | '/vm'
   id:
     | '__root__'
     | '/_authenticated'
     | '/login'
+    | '/welcome'
+    | '/_authenticated/anthropic'
     | '/_authenticated/api'
     | '/_authenticated/billing'
     | '/_authenticated/cluster'
@@ -299,17 +310,16 @@ export interface FileRouteTypes {
     | '/_authenticated/logs'
     | '/_authenticated/models'
     | '/_authenticated/overview'
-    | '/_authenticated/protocol'
     | '/_authenticated/proxies'
+    | '/_authenticated/risk'
+    | '/_authenticated/specs'
+    | '/_authenticated/statistics'
     | '/_authenticated/system'
-    | '/_authenticated/usage'
     | '/_authenticated/users'
     | '/_authenticated/wrap'
     | '/_authenticated/'
-    | '/_authenticated/loadtest/$tab'
     | '/_authenticated/settings/$tab'
     | '/_authenticated/vm/$id'
-    | '/_authenticated/loadtest/'
     | '/_authenticated/settings/'
     | '/_authenticated/vm/'
   fileRoutesById: FileRoutesById
@@ -317,6 +327,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   AuthenticatedRouteRoute: typeof AuthenticatedRouteRouteWithChildren
   LoginRoute: typeof LoginRoute
+  WelcomeRoute: typeof WelcomeRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -335,11 +346,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LoginRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/welcome': {
+      id: '/welcome'
+      path: '/welcome'
+      fullPath: '/welcome'
+      preLoaderRoute: typeof WelcomeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/_authenticated/': {
       id: '/_authenticated/'
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof AuthenticatedIndexRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/anthropic': {
+      id: '/_authenticated/anthropic'
+      path: '/anthropic'
+      fullPath: '/anthropic'
+      preLoaderRoute: typeof AuthenticatedAnthropicRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/api': {
@@ -405,13 +430,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedOverviewRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
-    '/_authenticated/protocol': {
-      id: '/_authenticated/protocol'
-      path: '/protocol'
-      fullPath: '/protocol'
-      preLoaderRoute: typeof AuthenticatedProtocolRouteImport
-      parentRoute: typeof AuthenticatedRouteRoute
-    }
     '/_authenticated/proxies': {
       id: '/_authenticated/proxies'
       path: '/proxies'
@@ -419,18 +437,32 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedProxiesRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
+    '/_authenticated/risk': {
+      id: '/_authenticated/risk'
+      path: '/risk'
+      fullPath: '/risk'
+      preLoaderRoute: typeof AuthenticatedRiskRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/specs': {
+      id: '/_authenticated/specs'
+      path: '/specs'
+      fullPath: '/specs'
+      preLoaderRoute: typeof AuthenticatedSpecsRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
+    '/_authenticated/statistics': {
+      id: '/_authenticated/statistics'
+      path: '/statistics'
+      fullPath: '/statistics'
+      preLoaderRoute: typeof AuthenticatedStatisticsRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
     '/_authenticated/system': {
       id: '/_authenticated/system'
       path: '/system'
       fullPath: '/system'
       preLoaderRoute: typeof AuthenticatedSystemRouteImport
-      parentRoute: typeof AuthenticatedRouteRoute
-    }
-    '/_authenticated/usage': {
-      id: '/_authenticated/usage'
-      path: '/usage'
-      fullPath: '/usage'
-      preLoaderRoute: typeof AuthenticatedUsageRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/users': {
@@ -445,20 +477,6 @@ declare module '@tanstack/react-router' {
       path: '/wrap'
       fullPath: '/wrap'
       preLoaderRoute: typeof AuthenticatedWrapRouteImport
-      parentRoute: typeof AuthenticatedRouteRoute
-    }
-    '/_authenticated/loadtest/': {
-      id: '/_authenticated/loadtest/'
-      path: '/loadtest'
-      fullPath: '/loadtest/'
-      preLoaderRoute: typeof AuthenticatedLoadtestIndexRouteImport
-      parentRoute: typeof AuthenticatedRouteRoute
-    }
-    '/_authenticated/loadtest/$tab': {
-      id: '/_authenticated/loadtest/$tab'
-      path: '/loadtest/$tab'
-      fullPath: '/loadtest/$tab'
-      preLoaderRoute: typeof AuthenticatedLoadtestTabRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
     '/_authenticated/settings/': {
@@ -493,6 +511,7 @@ declare module '@tanstack/react-router' {
 }
 
 interface AuthenticatedRouteRouteChildren {
+  AuthenticatedAnthropicRoute: typeof AuthenticatedAnthropicRoute
   AuthenticatedApiRoute: typeof AuthenticatedApiRoute
   AuthenticatedBillingRoute: typeof AuthenticatedBillingRoute
   AuthenticatedClusterRoute: typeof AuthenticatedClusterRoute
@@ -502,22 +521,22 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedLogsRoute: typeof AuthenticatedLogsRoute
   AuthenticatedModelsRoute: typeof AuthenticatedModelsRoute
   AuthenticatedOverviewRoute: typeof AuthenticatedOverviewRoute
-  AuthenticatedProtocolRoute: typeof AuthenticatedProtocolRoute
   AuthenticatedProxiesRoute: typeof AuthenticatedProxiesRoute
+  AuthenticatedRiskRoute: typeof AuthenticatedRiskRoute
+  AuthenticatedSpecsRoute: typeof AuthenticatedSpecsRoute
+  AuthenticatedStatisticsRoute: typeof AuthenticatedStatisticsRoute
   AuthenticatedSystemRoute: typeof AuthenticatedSystemRoute
-  AuthenticatedUsageRoute: typeof AuthenticatedUsageRoute
   AuthenticatedUsersRoute: typeof AuthenticatedUsersRoute
   AuthenticatedWrapRoute: typeof AuthenticatedWrapRoute
   AuthenticatedIndexRoute: typeof AuthenticatedIndexRoute
-  AuthenticatedLoadtestTabRoute: typeof AuthenticatedLoadtestTabRoute
   AuthenticatedSettingsTabRoute: typeof AuthenticatedSettingsTabRoute
   AuthenticatedVmIdRoute: typeof AuthenticatedVmIdRoute
-  AuthenticatedLoadtestIndexRoute: typeof AuthenticatedLoadtestIndexRoute
   AuthenticatedSettingsIndexRoute: typeof AuthenticatedSettingsIndexRoute
   AuthenticatedVmIndexRoute: typeof AuthenticatedVmIndexRoute
 }
 
 const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
+  AuthenticatedAnthropicRoute: AuthenticatedAnthropicRoute,
   AuthenticatedApiRoute: AuthenticatedApiRoute,
   AuthenticatedBillingRoute: AuthenticatedBillingRoute,
   AuthenticatedClusterRoute: AuthenticatedClusterRoute,
@@ -527,17 +546,16 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedLogsRoute: AuthenticatedLogsRoute,
   AuthenticatedModelsRoute: AuthenticatedModelsRoute,
   AuthenticatedOverviewRoute: AuthenticatedOverviewRoute,
-  AuthenticatedProtocolRoute: AuthenticatedProtocolRoute,
   AuthenticatedProxiesRoute: AuthenticatedProxiesRoute,
+  AuthenticatedRiskRoute: AuthenticatedRiskRoute,
+  AuthenticatedSpecsRoute: AuthenticatedSpecsRoute,
+  AuthenticatedStatisticsRoute: AuthenticatedStatisticsRoute,
   AuthenticatedSystemRoute: AuthenticatedSystemRoute,
-  AuthenticatedUsageRoute: AuthenticatedUsageRoute,
   AuthenticatedUsersRoute: AuthenticatedUsersRoute,
   AuthenticatedWrapRoute: AuthenticatedWrapRoute,
   AuthenticatedIndexRoute: AuthenticatedIndexRoute,
-  AuthenticatedLoadtestTabRoute: AuthenticatedLoadtestTabRoute,
   AuthenticatedSettingsTabRoute: AuthenticatedSettingsTabRoute,
   AuthenticatedVmIdRoute: AuthenticatedVmIdRoute,
-  AuthenticatedLoadtestIndexRoute: AuthenticatedLoadtestIndexRoute,
   AuthenticatedSettingsIndexRoute: AuthenticatedSettingsIndexRoute,
   AuthenticatedVmIndexRoute: AuthenticatedVmIndexRoute,
 }
@@ -548,6 +566,7 @@ const AuthenticatedRouteRouteWithChildren =
 const rootRouteChildren: RootRouteChildren = {
   AuthenticatedRouteRoute: AuthenticatedRouteRouteWithChildren,
   LoginRoute: LoginRoute,
+  WelcomeRoute: WelcomeRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

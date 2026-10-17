@@ -11,88 +11,63 @@ import { detectInboundPlatform } from '../protocol/platform-detect.mjs'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
 import { ErrorType, ErrorCode, makeError } from './errors.mjs'
 
-export const DISTILL_BLOCK_MESSAGE = '不允许蒸馏'
-
 const HIGH_EFFORT = new Set(['high', 'xhigh', 'max'])
-const CONTEST_RE = /prove that|\\boxed|\baime\b|olympiad|\bgpqa\b|which of the following|livecodebench|amc[_\s-]?aime/i
 
 /** Transport wrapper used by normal agent sessions. Not a harvest needle. */
 export const ENVELOPE_NEEDLES = Object.freeze(['Persistable response items'])
 
-/** Memory-extractor / rollout-harvest wrappers. Always distill, even at 4096 tokens. */
-export const HARVEST_NEEDLES = Object.freeze([
-  'Memory-stage-one extractor',
-  'MUST return strict JSON only',
-  'MUST distill reusable',
-  'MUST extract durable memory',
-  'durable rollout knowledge',
-  'You MUST extract durable memory now',
-])
-
 /**
- * Distillation and chain-of-thought extraction.
- * Hard block, including official Claude Code and zero inject.
- * Bare "distill" is not enough: chemistry ("distill the solvent") must pass.
- * Bare 思维链 / 请分步解答 must pass; the verb has to be extract/export/distill.
+ * Deterministic distill regexes live in HARD_POLICY_RULES (category distill).
+ * This list stays empty so a saved distill config cannot grow a second copy.
+ * Harvest wrappers, needles, fingerprints, and structure thresholds come from
+ * distill-rules.json — the risk-audit panel — and are not reinserted here.
  */
-export const HARD_DISTILL_PATTERNS = Object.freeze([
-  String.raw`\b(?:knowledge|model|teacher|student)\s+distill(?:ation|ing)?\b`,
-  String.raw`\bdistill(?:ation|ing)?\s+(?:of\s+)?(?:(?:the|your|a|an|reusable|durable|rollout|hidden|internal|full|complete)\s+)?(?:reasoning(?:\s+traces?)?|chain[- ]of[- ]thoughts?|teacher(?:\s+model)?)\b`,
-  String.raw`\b(?:extract|export|dump|reveal|harvest|exfiltrate)(?:ing|ed|ion|s)?\s+(?:(?:the|your|a|an|full|hidden|internal|complete|raw|durable|entire)\s+){0,4}(?:chain[- ]of[- ]thoughts?|reasoning\s+traces?|hidden\s+reasoning|internal\s+reasoning|internal\s+monologues?)\b`,
-  String.raw`\b(?:chain[- ]of[- ]thought|reasoning\s+trace)\s+extraction\b`,
-  String.raw`(?:知识蒸馏|模型蒸馏|思维链蒸馏|推理蒸馏|思考链蒸馏)`,
-  String.raw`(?:提取|导出|抽取|蒸馏|收割|扒取)\s*(?:出|取)?\s*(?:你的|本人的|完整|全部|隐藏|内部)?\s*(?:的)?\s*(?:思维链|思考链|推理链)`,
-  String.raw`(?:思维链|思考链|推理链)\s*(?:的)?\s*(?:提取|导出|抽取|蒸馏|收割)`,
-  String.raw`(?:提取|导出|抽取)\s*(?:出)?\s*(?:隐藏|内部)\s*(?:的)?\s*(?:推理|思维|思考)`,
-])
-
-export const DEFAULT_DISTILL_RULES = {
-  enabled: true,
-  skip_official: true,
-  skip_zero: true,
-  error: {
-    status: 403,
-    type: ErrorType.PERMISSION,
-    code: ErrorCode.DISTILL_BLOCKED,
-    message: DISTILL_BLOCK_MESSAGE,
-  },
-  structure: {
-    min_max_tokens: 8192,
-    require_no_tools: true,
-    require_single_turn: true,
-  },
-  needles: [
-    '<think>',
-    '</think>',
-    '<answer>',
-    '<|begin_of_thought|>',
-    '<|end_of_thought|>',
-    '<|begin_of_solution|>',
-    'Return your final response within \\boxed{}',
-    'Generate an executable Python function generated from the given prompt',
-    'systematic long thinking process',
-    'as an internal monologue',
-    'Please reason step by step, and put your final answer within \\boxed{}',
-    'Respond in the following format: <think>',
-    ...HARVEST_NEEDLES,
-  ],
-  patterns: [...HARD_DISTILL_PATTERNS],
-  fingerprints: [
-    'Let  $a,b,A,B$  be given reals. We consider the function defined by',
-    'The graph of the function $y=\\cos x - \\sin x$ has a line of symmetry given by',
-    'Prove that if $\\alpha, \\beta, \\gamma$ are the angles of a triangle, then',
-    "Jia walks from home to Yi's house. At the same time, Yi rides a bicycle",
-    'Colonoscopy reveals a fungating hemorrhagic mass in the ascending colon',
-    'reactant: Cc1ccc2c(cnn2C2CCCCO2)c1B1OC(C)(C)C(C)(C)O1',
-    'What is the area, in square units, of an isosceles right triangle with a hypotenuse of 20 units?',
-  ],
-}
+export const HARD_DISTILL_PATTERNS = Object.freeze([])
 
 const DEFAULT_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../config/distill-rules.json')
 
 export function defaultDistillFile() {
   return DEFAULT_FILE
 }
+
+function blankDistillRules() {
+  return {
+    enabled: true,
+    skip_official: true,
+    skip_zero: true,
+    error: {
+      status: 403,
+      type: ErrorType.PERMISSION,
+      code: ErrorCode.DISTILL_BLOCKED,
+      message: '',
+    },
+    structure: {
+      min_max_tokens: 1,
+      require_no_tools: true,
+      require_single_turn: true,
+      contest_pattern: '',
+    },
+    hard_needles: [],
+    needles: [],
+    patterns: [],
+    fingerprints: [],
+  }
+}
+
+let factoryCache = null
+
+/** Shipped panel file. Used only when a field is omitted, never to override an explicit value. */
+function factoryRules() {
+  if (factoryCache) return factoryCache
+  try {
+    const data = JSON.parse(fs.readFileSync(DEFAULT_FILE, 'utf8'))
+    factoryCache = normalizeDistillRules(data, { fill: false })
+  } catch {
+    factoryCache = blankDistillRules()
+  }
+  return factoryCache
+}
+export const DEFAULT_DISTILL_RULES = factoryRules()
 
 export function normalizeText(s) {
   return String(s || '')
@@ -107,15 +82,17 @@ function contentToText(content) {
   if (Array.isArray(content)) {
     return content
       .map((part) => {
-        if (typeof part === 'string') return part
-        if (part && typeof part.text === 'string') return part.text
-        if (part && typeof part.content === 'string') return part.content
-        return ''
+        if (part && part.type === 'tool_result') return ''
+        return contentToText(part)
       })
       .filter(Boolean)
       .join('\n')
   }
-  if (content && typeof content.text === 'string') return content.text
+  if (!content || typeof content !== 'object') return ''
+  if (typeof content.text === 'string') return content.text
+  // Responses items nest their parts one level deeper: message -> content -> input_text.
+  if (typeof content.content === 'string') return content.content
+  if (Array.isArray(content.content)) return contentToText(content.content)
   return ''
 }
 
@@ -123,6 +100,9 @@ function systemText(body) {
   if (!body || typeof body !== 'object') return ''
   if (typeof body.system === 'string') return body.system
   if (Array.isArray(body.system)) return contentToText(body.system)
+  // Responses carries the client system prompt as `instructions`.
+  if (typeof body.instructions === 'string') return body.instructions
+  if (Array.isArray(body.instructions)) return contentToText(body.instructions)
   return ''
 }
 
@@ -137,16 +117,36 @@ function messageRoleTexts(body, roles) {
   return out.filter(Boolean)
 }
 
+/** Responses `input`: a plain string, or items whose roleless or user-role parts carry the prompt. */
+function responsesInputTexts(input) {
+  if (typeof input === 'string') return input ? [input] : []
+  if (!Array.isArray(input)) return []
+  const out = []
+  for (const item of input) {
+    if (typeof item === 'string') {
+      if (item) out.push(item)
+      continue
+    }
+    if (!item || typeof item !== 'object') continue
+    const role = typeof item.role === 'string' ? item.role.toLowerCase() : ''
+    if (role && role !== 'user') continue
+    const text = contentToText(item.content === undefined ? item : item.content)
+    if (text) out.push(text)
+  }
+  return out
+}
+
 function userTexts(body) {
   if (!body || typeof body !== 'object') return []
   const out = messageRoleTexts(body, ['user'])
-  if (typeof body.input === 'string') out.push(body.input)
-  else if (Array.isArray(body.input)) out.push(contentToText(body.input))
+  out.push(...responsesInputTexts(body.input))
   return out.filter(Boolean)
 }
 
-export function extractPrompt(inbound, body) {
+export function extractPrompt(inbound, body, opts = {}) {
   const users = [...userTexts(inbound), ...userTexts(body)]
+  const latestOnly = !!opts.latestOnly
+  const scanUsers = latestOnly && users.length ? [users[users.length - 1]] : users
   const systems = [
     systemText(inbound),
     systemText(body),
@@ -155,8 +155,8 @@ export function extractPrompt(inbound, body) {
   ].filter(Boolean)
   return {
     system: systems[0] || '',
-    user: users[0] || '',
-    joined: [...systems, ...users].join('\n'),
+    user: latestOnly ? scanUsers[0] || '' : users[0] || '',
+    joined: [...systems, ...scanUsers].join('\n'),
   }
 }
 
@@ -176,7 +176,7 @@ function maxTokensOf(body) {
 }
 
 /** OpenAI platform models (gpt-*) never hit distill. Claude paths stay on the existing rules. */
-function isOpenaiPlatformModel(inbound, body) {
+export function isOpenaiPlatformModel(inbound, body) {
   const model = body?.model ?? inbound?.model
   const platform = detectInboundPlatform(model)
   return platform.ok === true && platform.platform === 'openai'
@@ -191,12 +191,15 @@ export function extractStructure(inbound, body) {
   }
 }
 
-function inboundWantsThinkingText(inbound) {
+function inboundWantsThinkingText(inbound, minBudget) {
+  const floor = Number(minBudget)
   const t = inbound?.thinking
   if (t && typeof t === 'object') {
     if (String(t.display || '').toLowerCase() === 'summarized') return true
     const budget = Number(t.budget_tokens || 0)
-    if (String(t.type || '').toLowerCase() === 'enabled' && budget >= 8192) return true
+    if (String(t.type || '').toLowerCase() === 'enabled' && Number.isFinite(floor) && floor > 0 && budget >= floor) {
+      return true
+    }
   }
   const effort = inbound?.reasoning_effort || inbound?.reasoning?.effort
   if (effort && HIGH_EFFORT.has(String(effort).toLowerCase())) return true
@@ -205,12 +208,23 @@ function inboundWantsThinkingText(inbound) {
 }
 
 function isHarvest(inbound, structure, rules) {
-  const st = rules.structure || DEFAULT_DISTILL_RULES.structure
+  const st = rules.structure || {}
   if (st.require_no_tools && structure.tools_count > 0) return false
   if (st.require_single_turn && structure.messages_count > 1) return false
-  const minTok = Number(st.min_max_tokens || 8192)
+  const minTok = Number(st.min_max_tokens)
+  if (!Number.isFinite(minTok) || minTok <= 0) return false
   if (structure.max_tokens != null && Number(structure.max_tokens) < minTok) return false
-  return inboundWantsThinkingText(inbound)
+  return inboundWantsThinkingText(inbound, minTok)
+}
+
+function contestTest(pattern, text) {
+  const source = String(pattern || '').trim()
+  if (!source || source.length > 400) return false
+  try {
+    return new RegExp(source, 'i').test(text || '')
+  } catch {
+    return false
+  }
 }
 
 function matchFingerprints(text, fingerprints) {
@@ -262,41 +276,65 @@ function asStringList(v, fallback) {
   return v.map((x) => String(x || '').trim()).filter(Boolean)
 }
 
-function clampStatus(n) {
+function clampStatus(n, fallback = 403) {
   const s = Number(n)
-  if (!Number.isFinite(s) || s < 400 || s > 599) return 403
-  return Math.floor(s)
+  const fb = Number(fallback)
+  const safe = Number.isFinite(fb) && fb >= 400 && fb <= 599 ? Math.floor(fb) : 403
+  return !Number.isFinite(s) || s < 400 || s > 599 ? safe : Math.floor(s)
 }
 
-export function normalizeDistillRules(raw) {
+function positiveInt(value, fallback) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return fallback
+  return Math.floor(n)
+}
+
+function resolveHardNeedles(src, listed, base) {
+  if (Array.isArray(src.hard_needles)) return asStringList(src.hard_needles, [])
+  const factoryHard = base?.hard_needles || []
+  if (!Array.isArray(src.needles)) return factoryHard.slice()
+  const have = new Set(listed.map((item) => item.toLowerCase()))
+  return factoryHard.filter((item) => have.has(item.toLowerCase()))
+}
+
+export function normalizeDistillRules(raw, options = {}) {
+  const fill = options.fill !== false
   const src = raw && typeof raw === 'object' ? raw : {}
+  const base = fill ? factoryRules() : blankDistillRules()
   const err = src.error && typeof src.error === 'object' ? src.error : {}
   const st = src.structure && typeof src.structure === 'object' ? src.structure : {}
-  const message = String(err.message || DISTILL_BLOCK_MESSAGE).trim() || DISTILL_BLOCK_MESSAGE
-  const needles = asStringList(src.needles, DEFAULT_DISTILL_RULES.needles)
-  const harvestMissing = HARVEST_NEEDLES.filter(
-    (needle) => !needles.some((item) => String(item).toLowerCase() === needle.toLowerCase()),
-  )
-  const patterns = asStringList(src.patterns, DEFAULT_DISTILL_RULES.patterns).slice(0, 80)
-  const patternMissing = HARD_DISTILL_PATTERNS.filter((pattern) => !patterns.includes(pattern))
+  const message = err.message == null ? base.error.message : String(err.message).trim()
+  const listed = asStringList(src.needles, fill ? base.needles : [])
+  const hardNeedles = resolveHardNeedles(src, listed, fill ? base : null)
+  const hardSet = new Set(hardNeedles.map((item) => item.toLowerCase()))
+  const patterns = asStringList(src.patterns, fill ? base.patterns : []).slice(0, 80)
   return {
-    enabled: src.enabled !== false,
-    skip_official: src.skip_official !== false,
-    skip_zero: src.skip_zero !== false,
+    enabled: src.enabled == null ? base.enabled : src.enabled !== false,
+    skip_official: src.skip_official == null ? base.skip_official : src.skip_official !== false,
+    skip_zero: src.skip_zero == null ? base.skip_zero : src.skip_zero !== false,
     error: {
-      status: clampStatus(err.status ?? 403),
-      type: String(err.type || ErrorType.PERMISSION),
-      code: String(err.code || ErrorCode.DISTILL_BLOCKED),
+      status: clampStatus(err.status == null ? base.error.status : err.status, base.error.status),
+      type: String(err.type || base.error.type || ErrorType.PERMISSION),
+      code: String(err.code || base.error.code || ErrorCode.DISTILL_BLOCKED),
       message: message.slice(0, 200),
     },
     structure: {
-      min_max_tokens: Math.max(256, Number(st.min_max_tokens || 8192) || 8192),
-      require_no_tools: st.require_no_tools !== false,
-      require_single_turn: st.require_single_turn !== false,
+      min_max_tokens: positiveInt(
+        st.min_max_tokens == null ? base.structure.min_max_tokens : st.min_max_tokens,
+        base.structure.min_max_tokens,
+      ),
+      require_no_tools:
+        st.require_no_tools == null ? base.structure.require_no_tools !== false : st.require_no_tools !== false,
+      require_single_turn:
+        st.require_single_turn == null
+          ? base.structure.require_single_turn !== false
+          : st.require_single_turn !== false,
+      contest_pattern: st.contest_pattern == null ? base.structure.contest_pattern : String(st.contest_pattern).trim(),
     },
-    needles: [...needles, ...harvestMissing],
-    patterns: [...patterns, ...patternMissing],
-    fingerprints: asStringList(src.fingerprints, DEFAULT_DISTILL_RULES.fingerprints),
+    hard_needles: hardNeedles,
+    needles: listed.filter((item) => !hardSet.has(item.toLowerCase())),
+    patterns,
+    fingerprints: asStringList(src.fingerprints, fill ? base.fingerprints : []),
   }
 }
 
@@ -309,6 +347,7 @@ function typeProblems(body) {
   if (body.skip_zero != null && typeof body.skip_zero !== 'boolean') {
     problems.push('skip_zero 必须是布尔')
   }
+  if (body.hard_needles != null && !Array.isArray(body.hard_needles)) problems.push('hard_needles 必须是数组')
   if (body.needles != null && !Array.isArray(body.needles)) problems.push('needles 必须是数组')
   if (body.patterns != null && !Array.isArray(body.patterns)) problems.push('patterns 必须是数组')
   if (body.fingerprints != null && !Array.isArray(body.fingerprints)) {
@@ -319,6 +358,7 @@ function typeProblems(body) {
 
 function sizeProblems(body) {
   const problems = []
+  if (Array.isArray(body.hard_needles) && body.hard_needles.length > 200) problems.push('hard_needles 最多 200 条')
   if (Array.isArray(body.needles) && body.needles.length > 200) problems.push('needles 最多 200 条')
   if (Array.isArray(body.patterns) && body.patterns.length > 50) problems.push('patterns 最多 50 条')
   if (Array.isArray(body.patterns)) {
@@ -354,8 +394,31 @@ function errorProblems(err) {
   return problems
 }
 
+function structureProblems(body) {
+  const st = body.structure
+  if (st == null) return []
+  if (typeof st !== 'object') return ['structure 必须是对象']
+  const problems = []
+  if (st.min_max_tokens != null) {
+    const n = Number(st.min_max_tokens)
+    if (!Number.isFinite(n) || n <= 0) problems.push('min_max_tokens 必须是正数')
+  }
+  if (st.contest_pattern != null) {
+    const source = String(st.contest_pattern).trim()
+    if (source.length > 400) problems.push('contest_pattern 最长 400')
+    else if (source) {
+      try {
+        new RegExp(source, 'i')
+      } catch {
+        problems.push('contest_pattern 不是有效正则')
+      }
+    }
+  }
+  return problems
+}
+
 export function validateDistillPatch(body = {}) {
-  return [...typeProblems(body), ...sizeProblems(body), ...errorProblems(body.error)]
+  return [...typeProblems(body), ...sizeProblems(body), ...errorProblems(body.error), ...structureProblems(body)]
 }
 
 export function loadDistillRules(file) {
@@ -371,12 +434,27 @@ export function loadDistillRules(file) {
 export function saveDistillRules(file, patch) {
   const cur = loadDistillRules(file)
   const src = patch && typeof patch === 'object' ? patch : {}
-  const next = normalizeDistillRules({
+  const merged = {
     ...cur,
     ...src,
     error: { ...cur.error, ...(src.error || {}) },
     structure: { ...cur.structure, ...(src.structure || {}) },
-  })
+  }
+  // Old clients only had `needles`. A phrase removed from that list is removed
+  // from the harvest list too. A client that sends `hard_needles` owns the list.
+  if (!Object.prototype.hasOwnProperty.call(src, 'hard_needles') && Array.isArray(src.needles)) {
+    const submitted = new Set(
+      src.needles
+        .map((item) =>
+          String(item || '')
+            .trim()
+            .toLowerCase(),
+        )
+        .filter(Boolean),
+    )
+    merged.hard_needles = (cur.hard_needles || []).filter((item) => submitted.has(String(item).trim().toLowerCase()))
+  }
+  const next = normalizeDistillRules(merged)
   atomicWriteJson(file, next)
   return next
 }
@@ -400,8 +478,8 @@ export function detectDistill(ctx = {}, rules) {
   const r = normalizeDistillRules(rules)
   if (!r.enabled) return { action: 'pass', hits: [] }
   if (isOpenaiPlatformModel(ctx.inbound, ctx.body)) return { action: 'pass', hits: [] }
-  const prompt = extractPrompt(ctx.inbound, ctx.body)
-  const harvestNeedle = matchNeedles(prompt.joined, HARVEST_NEEDLES)
+  const prompt = extractPrompt(ctx.inbound, ctx.body, { latestOnly: true })
+  const harvestNeedle = matchNeedles(prompt.joined, r.hard_needles)
   if (harvestNeedle) {
     return {
       action: 'block',
@@ -428,7 +506,7 @@ export function detectDistill(ctx = {}, rules) {
   const needle = matchNeedles(prompt.joined, r.needles)
   if (needle) hits.push({ layer: 'content', rule: 'needle', evidence: needle })
 
-  const contest = CONTEST_RE.test(prompt.joined)
+  const contest = contestTest(r.structure.contest_pattern, prompt.joined)
   const harvest = contest && isHarvest(ctx.inbound, structure, r)
   if (harvest) hits.push({ layer: 'structure', rule: 'harvest', evidence: 'contest+harvest' })
 

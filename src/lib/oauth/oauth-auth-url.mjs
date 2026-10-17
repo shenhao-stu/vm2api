@@ -1,8 +1,9 @@
 /**
  * Browser OAuth-link import.
  * CAI (sub2api) and official Claude Code share PKCE + paste-code,
- * then exchange via the current VM's SOCKS5 egress.
- * Local/direct control-plane egress is not allowed for OAuth auth.
+ * then exchange via the current VM's SOCKS5 egress. A slot bound to local
+ * egress (`px-local`) arrives as `proxyUrl: ''`: its exit is the host default
+ * route, so the exchange goes direct. `null` still means unbound and is refused.
  */
 import crypto from 'node:crypto'
 import { exchangeTokenViaCookieAuth } from './cookie-auth.mjs'
@@ -82,6 +83,7 @@ function fail(code, message) {
 }
 
 function normalizeSocks(proxyUrl) {
+  if (proxyUrl === '') return ''
   const s = String(proxyUrl || '').trim()
   if (!s) return null
   return s.replace(/^socks5:\/\//i, 'socks5h://')
@@ -182,7 +184,7 @@ export async function exchangeAuthCode({ sessionId, code, proxyUrl, vmId, fetchI
   }
   const parsed = parseAuthCode(code)
   if (!parsed.code) throw fail('code_required', '请粘贴授权码')
-  if (parsed.state && parsed.state !== session.state)
+  if (session.flavor === 'setup_token' && parsed.state && parsed.state !== session.state)
     throw fail('state_mismatch', '授权 state 不匹配，请重新生成授权链接')
   const px = proxyUrl ?? session.proxyUrl
   if (px == null) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
@@ -205,13 +207,10 @@ export async function exchangeAuthCode({ sessionId, code, proxyUrl, vmId, fetchI
     }
   }
 
-  const token = await exchangeCodeForToken(
-    parsed.code,
-    session.codeVerifier,
-    parsed.state || session.state,
-    px,
-    session,
-  )
+  // Full OAuth paste codes carry the provider's exchange state, not necessarily
+  // the authorize nonce. PKCE still binds the code to this VM's live session.
+  const exchangeState = session.flavor === 'setup_token' ? parsed.state || session.state : parsed.state
+  const token = await exchangeCodeForToken(parsed.code, session.codeVerifier, exchangeState, px, session)
   sessions.delete(sessionId)
   const expiresIn = Number(token.expires_in || 0)
   const now = Math.floor(Date.now() / 1000)
@@ -228,6 +227,7 @@ export async function exchangeAuthCode({ sessionId, code, proxyUrl, vmId, fetchI
       email_address: identity.email,
       account_uuid: identity.account_uuid,
       org_uuid: identity.org_uuid,
+      subscription_type: identity.subscription_type,
       source: session.source || 'oauth-auth-url',
       flavor: session.flavor || 'cai',
     },

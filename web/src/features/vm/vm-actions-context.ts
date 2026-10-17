@@ -7,6 +7,7 @@ export type VmActions = {
   openTest: (vm: Vm) => void
   openStats: (vm: Vm) => void
   openReauth: (vm: Vm) => void
+  openRecovery: (vm: Vm) => void
   refreshToken: (vm: Vm) => void
   recover: (vm: Vm) => void
   /** 正在刷新令牌 / 恢复状态的槽位 id，用于禁用重复点击。 */
@@ -15,6 +16,10 @@ export type VmActions = {
   /** 未提供时菜单不渲染对应项。 */
   reset?: (vm: Vm) => void
   remove?: (vm: Vm) => void
+  /** admin：打开分配租户对话框 / 收回确认。 */
+  openAssignOwner?: (vm: Vm) => void
+  reclaimOwner?: (vm: Vm) => void
+  ownerBusyId?: string | null
 }
 
 export const VmActionsContext = createContext<VmActions | null>(null)

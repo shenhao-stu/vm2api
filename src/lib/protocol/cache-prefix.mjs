@@ -86,6 +86,27 @@ function snapshotBody(body) {
   }
 }
 
+function comparePrefix(previous, current) {
+  if (!previous) return { turn: 1, break: null }
+  const turn = (previous.turn || 0) + 1
+  if (previous.tools !== current.tools) return { turn, break: { section: 'tools', kind: 'structure' } }
+  if (previous.system !== current.system) return { turn, break: { section: 'system', kind: 'text' } }
+  const prevHashes = previous.messages.map((message) => message.hash)
+  const currHashes = current.messages.map((message) => message.hash)
+  const index = firstDivergence(prevHashes, currHashes)
+  if (index >= 0) {
+    return {
+      turn,
+      break: {
+        section: 'messages',
+        index,
+        kind: classifyParts(previous.messages[index], current.messages[index]),
+      },
+    }
+  }
+  return { turn, break: null }
+}
+
 function classifyParts(previous, current) {
   if (!previous || !current) return 'structure'
   if (previous.role !== current.role || previous.parts.length !== current.parts.length) return 'structure'
@@ -145,9 +166,23 @@ export function describeCacheContinuity({
 }
 
 /**
- * Record `body` as the latest turn of `sessionKey` and compare it with the
- * previous one. Returns null for an unkeyed request; otherwise the turn number
- * and the first section (tools → system → messages) that no longer matches.
+ * Compare `body` with the stored turn of `sessionKey` without recording.
+ * `confirmed` is true only after a successful hop called confirmCachePrefix.
+ */
+export function peekCachePrefix(sessionKey, body, now = Date.now()) {
+  const key = String(sessionKey || '').trim()
+  if (!key || !body || typeof body !== 'object') return null
+  const current = snapshotBody(body)
+  const hit = sessions.get(key)
+  const previous = hit && now - hit.at < SESSION_IDLE_MS ? hit : null
+  const compared = comparePrefix(previous, current)
+  return { ...compared, confirmed: !!previous?.confirmed }
+}
+
+/**
+ * Record `body` as an attempted turn of `sessionKey`. The stored snapshot is
+ * unconfirmed until confirmCachePrefix: a failed/rejected hop must not make
+ * the next estimate treat the session as warm.
  */
 export function trackCachePrefix(sessionKey, body, now = Date.now()) {
   const key = String(sessionKey || '').trim()
@@ -155,27 +190,21 @@ export function trackCachePrefix(sessionKey, body, now = Date.now()) {
   const current = snapshotBody(body)
   const hit = sessions.get(key)
   const previous = hit && now - hit.at < SESSION_IDLE_MS ? hit : null
+  const compared = comparePrefix(previous, current)
   sessions.delete(key)
-  sessions.set(key, { ...current, turn: (previous?.turn || 0) + 1, at: now })
+  sessions.set(key, { ...current, turn: compared.turn, at: now, confirmed: false })
   if (sessions.size > SESSION_LIMIT) sessions.delete(sessions.keys().next().value)
-  const turn = (previous?.turn || 0) + 1
-  if (!previous) return { turn, break: null }
-  if (previous.tools !== current.tools) return { turn, break: { section: 'tools', kind: 'structure' } }
-  if (previous.system !== current.system) return { turn, break: { section: 'system', kind: 'text' } }
-  const prevHashes = previous.messages.map((message) => message.hash)
-  const currHashes = current.messages.map((message) => message.hash)
-  const index = firstDivergence(prevHashes, currHashes)
-  if (index >= 0) {
-    return {
-      turn,
-      break: {
-        section: 'messages',
-        index,
-        kind: classifyParts(previous.messages[index], current.messages[index]),
-      },
-    }
-  }
-  return { turn, break: null }
+  return { turn: compared.turn, break: compared.break }
+}
+
+/** Mark the latest attempted snapshot as a confirmed cache write/read. */
+export function confirmCachePrefix(sessionKey, now = Date.now()) {
+  const key = String(sessionKey || '').trim()
+  if (!key) return false
+  const hit = sessions.get(key)
+  if (!hit || now - hit.at >= SESSION_IDLE_MS) return false
+  hit.confirmed = true
+  return true
 }
 
 export function clearCachePrefixSessions() {

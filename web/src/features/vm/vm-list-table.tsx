@@ -4,7 +4,7 @@ import type { Vm } from '@/types/panel-vm'
 import type { StatusTone } from '@/types/status'
 import { GripVertical, RotateCcw } from 'lucide-react'
 import { expiresAtToMs, fmtResetClock } from '@/lib/fable-status'
-import { fmtNum, fmtUsd } from '@/lib/format'
+import { fmtNum } from '@/lib/format'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
 import { isCodexVm, slotNameLabel } from '@/lib/vm-kind'
@@ -12,16 +12,12 @@ import {
   credentialStatus,
   fleetGroup,
   poolStatus,
+  seatTitle,
   vmCircuitTitle,
   vmCooldown,
   vmCooldownTitle,
 } from '@/lib/vm-status'
-import {
-  vmTodayStats,
-  vmTotalCost,
-  vmWeekOutcome,
-  type VmWeekOutcome,
-} from '@/lib/vm-usage'
+import { vmTodayStats, vmWeekOutcome, type VmWeekOutcome } from '@/lib/vm-usage'
 import { useNow } from '@/hooks/use-now'
 import { Button } from '@/components/ui/button'
 import {
@@ -34,6 +30,7 @@ import { StatusMark } from '@/components/status-mark'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
 import { NodeChip } from '@/features/vm/node-chip'
 import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
+import { RuntimeChip } from '@/features/vm/runtime-chip'
 import {
   SchedulableSwitch,
   vmSchedulableProps,
@@ -43,13 +40,18 @@ import {
   useStatusBarShow,
   type StatusBarShow,
 } from '@/features/vm/status-bar-options'
-import { VmUsageWindows } from '@/features/vm/usage-windows'
+import {
+  METRIC_ROW,
+  VmCostLedger,
+  VmUsageWindows,
+} from '@/features/vm/usage-windows'
 import {
   useVmColumnOrder,
   type VmColumnKey,
 } from '@/features/vm/use-vm-column-order'
 import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
+import { VmOwnerLine } from '@/features/vm/vm-owner-line'
 
 /** 列的宽度与弹性；顺序由 `useVmColumnOrder` 决定，不写死在这里。 */
 const COL_CLS: Record<VmColumnKey | 'actions', string> = {
@@ -57,9 +59,9 @@ const COL_CLS: Record<VmColumnKey | 'actions', string> = {
   sched: 'min-w-[62px] flex-[0.3]',
   type: 'min-w-[120px] flex-[0.75]',
   status: 'min-w-[140px] flex-[1.1]',
-  req: 'min-w-[200px] flex-[1.2]',
-  usage: 'min-w-[262px] flex-[1.7]',
-  cost: 'min-w-[84px] flex-[0.55]',
+  req: 'min-w-[124px] flex-[0.7]',
+  usage: 'min-w-[208px] flex-[1.3]',
+  cost: 'min-w-[212px] flex-[1.1]',
   actions: 'w-[44px] shrink-0 pr-2',
 }
 
@@ -124,10 +126,7 @@ function PriorityChip({ vm }: { vm: Vm }) {
   const valid = Number.isInteger(level) && level >= 0
   const text = valid ? `优先级-${level}` : '优先级-—'
   const mode = vm.schedule_level_mode === 'manual' ? '手动' : '自动'
-  const weight = Number(vm.weight)
-  const title = Number.isFinite(weight)
-    ? `${mode}调度等级 · WRR ${weight}`
-    : `${mode}调度等级`
+  const title = `${mode}调度等级`
   return (
     <span
       className='inline-flex rounded border border-border/70 px-1.5 py-0.5 font-mono text-[11px] leading-none font-semibold text-muted-foreground tabular-nums'
@@ -188,9 +187,29 @@ function CountPill({ tone, n }: { tone: 'ok' | 'bad'; n: number }) {
   )
 }
 
+/** 实时席位占用（预调度席位簿）；Codex 行没有席位。 */
+function SeatTag({ vm }: { vm: Vm }) {
+  if (vm.seats_max == null) return null
+  const used = Number(vm.seats_used) || 0
+  const queued = Number(vm.queue_depth) || 0
+  if (!used && !queued) return null
+  return (
+    <span
+      className={cn(
+        'shrink-0 text-[11px] text-muted-foreground tabular-nums',
+        queued > 0 && 'text-[color:var(--status-warn)]'
+      )}
+      title={seatTitle(vm)}
+    >
+      席位 {used}/{vm.seats_max}
+      {queued ? ` · 排队 ${queued}` : ''}
+    </span>
+  )
+}
+
 function StatusCell({ vm, show }: { vm: Vm; show: StatusBarShow }) {
   const tone = poolStatus(vm)
-  const inflight = Number(vm.inflight) || Number(vm.session_active) || 0
+  const inflight = Number(vm.inflight) || 0
   const health = healthModel(vm)
   const showInflight =
     inflight > 0 &&
@@ -210,6 +229,7 @@ function StatusCell({ vm, show }: { vm: Vm; show: StatusBarShow }) {
               {inflight}
             </span>
           ) : null}
+          <SeatTag vm={vm} />
         </div>
       ) : null}
       {show.bar ? (
@@ -241,7 +261,7 @@ function StatusCell({ vm, show }: { vm: Vm; show: StatusBarShow }) {
   )
 }
 
-/** 今日与 7D 合并：上行今日花费与量，下行 7D 成功 / 失败。 */
+/** 只放次数：今日请求与 7D 成功 / 失败。行高与用量窗口、成本账逐行对齐。 */
 function RequestCell({
   vm,
   accounts,
@@ -252,35 +272,31 @@ function RequestCell({
   week: VmWeekOutcome
 }) {
   const s = vmTodayStats(vm, accounts)
-  const idle = s.req <= 0 && s.tok <= 0 && s.today <= 0
   return (
-    <div className='min-w-0 space-y-1'>
+    <div className='grid min-w-0 gap-1'>
       <div
-        className='flex flex-wrap items-baseline gap-x-1.5 font-mono text-xs tabular-nums'
-        title={
-          idle
-            ? undefined
-            : `入 ${fmtNum(s.inn)} · 出 ${fmtNum(s.out)} · 缓存 ${fmtNum(s.read)}/${fmtNum(s.write)}`
-        }
+        className={cn(
+          'flex items-center gap-1.5 font-mono text-xs tabular-nums',
+          METRIC_ROW
+        )}
       >
-        <span className='w-6 shrink-0 font-sans text-[11px] text-muted-foreground'>
+        <span className='w-7 shrink-0 font-sans text-xs font-medium text-muted-foreground'>
           今日
         </span>
-        {idle ? (
-          <span className='text-muted-foreground'>—</span>
+        {s.req > 0 ? (
+          <span className='font-medium'>
+            {fmtNum(s.req)}
+            <span className='font-normal text-muted-foreground'> req</span>
+          </span>
         ) : (
-          <>
-            <span className='font-medium text-[color:var(--status-ok)]'>
-              {fmtUsd(s.today, 2)}
-            </span>
-            <span className='text-muted-foreground'>
-              {fmtNum(s.req)} req · {fmtNum(s.tok)} tok
-            </span>
-          </>
+          <span className='text-[color:var(--text-tertiary)]'>—</span>
         )}
       </div>
-      <div className='flex items-center gap-1.5'>
-        <span className='w-6 shrink-0 text-[11px] text-muted-foreground'>
+      <div
+        className={cn('flex items-center gap-1.5', METRIC_ROW)}
+        title='7D 窗口：成功 / 失败'
+      >
+        <span className='w-7 shrink-0 text-xs font-medium text-muted-foreground'>
           7D
         </span>
         <WeekPills week={week} />
@@ -311,29 +327,6 @@ function WeekPills({ week }: { week: VmWeekOutcome }) {
   )
 }
 
-/** 成本列：7d 花费 + 账号累计。累计取 `/usage` 账号行，`/vms` 本身不带费用。 */
-function CostCell({
-  vm,
-  accounts,
-  week,
-}: {
-  vm: Vm
-  accounts?: UsageAccountRow[]
-  week: VmWeekOutcome
-}) {
-  return (
-    <div
-      className='space-y-0.5 font-mono text-xs tabular-nums'
-      title='官方价结算：7d 窗口 / 账号累计'
-    >
-      <div>7d {fmtUsd(week.cost, 2)}</div>
-      <div className='text-muted-foreground'>
-        Σ {fmtUsd(vmTotalCost(vm, accounts), 2)}
-      </div>
-    </div>
-  )
-}
-
 /** pro / max（GPT 为套餐名）跟着账号走，放在账号名同一行。 */
 function TierBadge({ vm }: { vm: Vm }) {
   if (isCodexVm(vm)) return <OpenaiPlanBadge vm={vm} />
@@ -361,6 +354,7 @@ function SlotCell({ vm }: { vm: Vm }) {
       <SlotIdentity vm={vm} compact className='text-sm font-medium' />
       <div className='flex min-w-0 items-center gap-1.5'>
         <TierBadge vm={vm} />
+        <RuntimeChip vm={vm} />
         <NodeChip nodeId={vm.node_id} />
         <span
           className='min-w-0 truncate text-[11px] text-muted-foreground'
@@ -369,6 +363,10 @@ function SlotCell({ vm }: { vm: Vm }) {
           {name}
         </span>
       </div>
+      <VmOwnerLine
+        vm={vm}
+        className='truncate text-[10.5px] text-muted-foreground'
+      />
     </div>
   )
 }
@@ -410,15 +408,13 @@ const COLUMNS: Record<
   },
   usage: {
     label: '用量窗口',
-    cell: ({ vm, accounts }) => (
-      <VmUsageWindows vm={vm} accounts={accounts} quiet quotaActions />
+    cell: ({ vm, now }) => (
+      <VmUsageWindows vm={vm} now={now} quiet quotaActions />
     ),
   },
   cost: {
     label: '成本',
-    cell: ({ vm, accounts, week }) => (
-      <CostCell vm={vm} accounts={accounts} week={week} />
-    ),
+    cell: ({ vm, accounts }) => <VmCostLedger vm={vm} accounts={accounts} />,
   },
 }
 
@@ -456,7 +452,7 @@ export function VmTable({
   }
   return (
     <div className='overflow-x-auto rounded-lg border border-border/60'>
-      <div className='min-w-[1100px]'>
+      <div className='min-w-[1180px]'>
         <div className='sticky top-0 z-10 flex h-8 items-center border-b bg-muted/30 pl-1.5 text-xs font-medium tracking-wide text-muted-foreground'>
           {columns.order.map((key) => {
             const dragging = dragKey === key

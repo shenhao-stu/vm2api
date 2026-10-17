@@ -120,11 +120,15 @@ test('runVmTestChat loopbacks /v1/messages with x-kin-vm pin and never calls a w
   assert.ok(!result.log.some((l) => /Go slot worker|streamGoWorker|callGoWorker/i.test(l.message)))
 })
 
-test('testChatCredentialMode treats inference-only as setup-token', () => {
+test('testChatCredentialMode treats inference-only as official-setup-token', () => {
   assert.equal(testChatCredentialMode({ claude: { mode: 'setup-token' } }), 'setup-token')
-  assert.equal(testChatCredentialMode({ claude: { mode: 'oauth', scope: 'user:inference' } }), 'setup-token')
+  assert.equal(testChatCredentialMode({ claude: { mode: 'oauth', scope: 'user:inference' } }), 'official-setup-token')
   assert.equal(testChatCredentialMode({ claude: { mode: 'oauth', scope: 'user:profile user:inference' } }), 'oauth')
   assert.equal(testChatCredentialMode({ claude: { mode: 'apikey' } }), 'apikey')
+  assert.equal(
+    testChatCredentialMode({ claude: { mode: 'setup-token', source: 'claude-setup-token', scope: 'user:inference' } }),
+    'official-setup-token',
+  )
 })
 
 test('runVmTestChat uses unofficial inbound for setup-token', async (t) => {
@@ -157,7 +161,7 @@ test('runVmTestChat uses unofficial inbound for setup-token', async (t) => {
   })
 
   assert.equal(result.ok, false)
-  assert.equal(result.credential_mode, 'setup-token')
+  assert.equal(result.credential_mode, 'official-setup-token')
   assert.equal(result.debug.inbound_class, 'cli_hop_passthrough')
   assert.equal(calls[0].headers['user-agent'], 'kin-console-test/1.0')
   assert.equal(calls[0].headers['anthropic-beta'], undefined)
@@ -185,10 +189,11 @@ test('health probe mode uses the full official Claude Code prompt', () => {
     rewrite: true,
   })
   assert.equal(inbound.system.length, 4)
-  assert.equal(inbound.system[1].text, CRS_OFFICIAL_SYSTEM)
-  assert.equal(inbound.system[2].text, CRS_OFFICIAL_AGENT_PROMPT)
+  assert.equal(inbound.system[0].text, CRS_OFFICIAL_SYSTEM)
+  assert.equal(inbound.system[1].text, CRS_OFFICIAL_AGENT_PROMPT)
+  assert.deepEqual(inbound.system[1].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.match(inbound.system[2].text, /# Environment/)
   assert.deepEqual(inbound.system[2].cache_control, { type: 'ephemeral', ttl: '1h' })
-  assert.match(inbound.system[3].text, /# Environment/)
   assert.equal(isOfficialClaudeCodeTraffic(headers, inbound), true)
 })
 

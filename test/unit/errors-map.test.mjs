@@ -4,8 +4,10 @@ import {
   mapUpstreamError,
   rewritePoolErrorForClient,
   poolErrorKind,
+  retryAfterSeconds,
   isWrapConnectionError,
   isUsagePolicyErrorMessage,
+  makeRefusalGuardError,
   isAssistantMessageBody,
   isCompleteAssistantMessage,
   isIncompleteAssistantMessage,
@@ -25,13 +27,15 @@ test('an empty pool is a 503 "no available account", never a load message', () =
   assert.equal(mapped.body.error.details, undefined)
 })
 
-test('real capacity exhaustion is a 429 pool_overloaded', () => {
-  for (const code of ['pool_overloaded', 'pool_wait_queue_full']) {
-    const mapped = mapUpstreamError(429, { error: { type: 'rate_limit_error', code, message: 'busy' } })
-    assert.equal(mapped.status, 429, code)
-    assert.equal(mapped.body.error.type, 'rate_limit_error', code)
+test('real capacity exhaustion and queue timeout are a 529 overloaded_error with retry-after', () => {
+  for (const code of ['pool_overloaded', 'pool_wait_queue_full', 'pool_queue_timeout']) {
+    const mapped = mapUpstreamError(529, { error: { type: 'overloaded_error', code, message: 'busy' } })
+    assert.equal(mapped.status, 529, code)
+    assert.equal(mapped.body.error.type, 'overloaded_error', code)
     assert.equal(mapped.body.error.code, 'pool_overloaded', code)
     assert.equal(mapped.body.error.message, CLIENT_POOL_BUSY_MESSAGE, code)
+    assert.ok(mapped.retryAfterSec >= 1, code)
+    assert.equal(poolErrorKind(code), 'overloaded', code)
   }
 })
 
@@ -233,6 +237,34 @@ test('incomplete_response maps to HTTP 502', () => {
   assert.equal(mapped.body.error.code, 'incomplete_response')
 })
 
+test('kernel-reported failure codes reach the client as themselves', () => {
+  for (const [code, status] of [
+    ['upstream_network_error', 502],
+    ['upstream_stream_interrupted', 502],
+    ['upstream_empty_stream', 502],
+    ['cli_error', 502],
+    ['kernel_unavailable', 503],
+    ['upstream_error', 502],
+  ]) {
+    const mapped = mapUpstreamError(200, { error: { type: 'api_error', code, message: 'cause' } })
+    assert.equal(mapped.status, status, code)
+    assert.equal(mapped.body.error.code, code)
+  }
+})
+
+test('structured upstream causes outrank text heuristics and preserve actual HTTP status', () => {
+  for (const [status, code, message] of [
+    [502, 'upstream_network_error', 'Connection error.'],
+    [500, 'upstream_error', 'fixture server failure'],
+    [404, 'upstream_invalid_request', 'fixture missing model'],
+    [504, 'upstream_timeout', 'upstream body read failed'],
+  ]) {
+    const mapped = mapUpstreamError(status, { error: { type: 'api_error', code, message } })
+    assert.equal(mapped.status, status)
+    assert.equal(mapped.body.error.code, code)
+  }
+})
+
 test('wrap Connection error is not upstream', () => {
   assert.equal(isWrapConnectionError('provider error: provider error: Connection error.'), true)
   const mapped = mapUpstreamError(200, {
@@ -244,27 +276,91 @@ test('wrap Connection error is not upstream', () => {
   assert.notEqual(mapped.body.error.type, 'upstream_error')
 })
 
-test('Claude Code AUP wrap error stays 502, not content_filter 403', () => {
+test('Claude Code AUP API Error is a non-retryable 400 policy rejection, not a login error', () => {
   const msg =
     'provider error: provider error: API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup). Try rephrasing the request'
   assert.equal(isUsagePolicyErrorMessage(msg), true)
-  const mapped = mapUpstreamError(502, {
-    type: 'error',
-    error: { type: 'api_error', message: msg },
-  })
-  assert.equal(mapped.status, 502)
-  assert.notEqual(mapped.body.error.code, 'content_filter_refusal')
+  for (const status of [400, 502]) {
+    const mapped = mapUpstreamError(status, {
+      type: 'error',
+      error: { type: 'api_error', message: msg },
+    })
+    assert.equal(mapped.status, 400)
+    assert.equal(mapped.body.error.code, 'refusal_guard')
+    assert.equal(mapped.body.error.type, 'policy_blocked')
+    assert.notEqual(mapped.body.error.code, 'content_filter_refusal')
+    assert.notEqual(mapped.body.error.code, 'upstream_invalid_request')
+  }
 })
 
-test('kernel slot_busy is overloaded, not upstream', () => {
+test('real authentication failures keep their HTTP status and are not policy refusals', () => {
+  const policyText =
+    'Claude Code is unable to respond to this request, which appears to violate our Usage Policy (https://www.anthropic.com/legal/aup).'
+  for (const status of [401, 403]) {
+    const mapped = mapUpstreamError(status, {
+      error: { type: 'authentication_error', message: status === 401 ? policyText : 'Expired OAuth credentials' },
+    })
+    assert.equal(mapped.status, status)
+    assert.equal(mapped.body.error.code, 'upstream_auth_error')
+    assert.notEqual(mapped.body.error.code, 'refusal_guard')
+  }
+})
+
+test('mapping an existing refusal error retains its block kind and safe device source', () => {
+  for (const blockedBy of ['exact', 'similar', 'device']) {
+    const original = makeRefusalGuardError({
+      requestId: 'current',
+      blockedBy,
+      sourceRequestId: '36e239bf-7e70-4a79-80fd-c8a717ff464b',
+    })
+    assert.deepEqual(mapUpstreamError(original.status, original.body), original)
+  }
+})
+
+test('kernel slot_busy on the last hop is pool capacity: 529 with Retry-After', () => {
   const mapped = mapUpstreamError(503, {
     type: 'error',
     error: { type: 'worker_error', code: 'slot_busy', message: 'rust kernel has no free slot' },
   })
-  assert.equal(mapped.status, 503)
+  assert.equal(mapped.status, 529)
   assert.equal(mapped.body.error.type, 'overloaded_error')
-  assert.equal(mapped.body.error.code, 'slot_busy')
-  assert.match(mapped.body.error.message, /no free slot/)
+  assert.equal(mapped.body.error.code, 'pool_overloaded')
+  assert.ok(mapped.retryAfterSec >= 1)
+})
+
+test('upstream 429 / 529 hand their Retry-After to the client; 529 always has one', () => {
+  const limited = mapUpstreamError(
+    429,
+    { type: 'error', error: { type: 'rate_limit_error', message: 'slow down' } },
+    { 'retry-after': '17' },
+  )
+  assert.equal(limited.status, 429)
+  assert.equal(limited.retryAfterSec, 17)
+  const bare = mapUpstreamError(429, { type: 'error', error: { type: 'rate_limit_error', message: 'slow down' } })
+  assert.equal(bare.retryAfterSec, undefined)
+  const overloaded = mapUpstreamError(529, { type: 'error', error: { type: 'overloaded_error', message: 'busy' } })
+  assert.equal(overloaded.status, 529)
+  assert.equal(overloaded.retryAfterSec, 1)
+})
+
+test('retryAfterSeconds reads delta seconds and HTTP dates', () => {
+  const now = Date.parse('2026-10-06T00:00:00Z')
+  assert.equal(retryAfterSeconds('2.2', now), 3)
+  assert.equal(retryAfterSeconds('Tue, 06 Oct 2026 00:00:30 GMT', now), 30)
+  assert.equal(retryAfterSeconds('0', now), null)
+  assert.equal(retryAfterSeconds('', now), null)
+  assert.equal(retryAfterSeconds('soon', now), null)
+})
+
+test('pool-wide cooldowns: 529 overload cooldown is capacity, 429 cooldown is a 429', () => {
+  const capacity = rewritePoolErrorForClient(null, { error: { code: 'pool_overload_cooldown' } })
+  assert.equal(capacity.status, 529)
+  assert.equal(capacity.body.error.code, 'pool_overloaded')
+  const limited = rewritePoolErrorForClient(null, { error: { code: 'pool_rate_limited' } })
+  assert.equal(limited.status, 429)
+  assert.equal(limited.body.error.type, 'rate_limit_error')
+  assert.equal(limited.body.error.code, 'upstream_rate_limit')
+  assert.ok(limited.retryAfterSec >= 1)
 })
 
 test('poolErrorKind separates capacity from nothing-eligible and leaves upstream errors alone', () => {

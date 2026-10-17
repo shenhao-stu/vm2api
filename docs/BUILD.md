@@ -1,6 +1,20 @@
 # 版本与构建
 
-linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel,oauth-auth}`、`share/wrap-cli` 和 `web/dist` 进 git。kernel / wrap / 控制台都是预编译产物，clone 或拉镜像即可部署，镜像构建不再跑 `pnpm build`。GitHub Release 仍挂一份 ELF。改了 `web/` 要重新 `pnpm -C web build` 并提交 `web/dist`。
+git 里只有源码。`bin/`、`web/dist`、`share/crag` 与 `share/wrap-cli` 里的 ELF / glibc 都不进 git：
+
+- `web/dist`、`kin-worker`、`kin-egress` 由源码编译（镜像构建内、CI 内或本机 `npm run build:*`）。
+- 闭源或预编译的槽位产物（`kin-kernel`、`kin-codex-kernel`、`kin-oauth-auth`、`cli-node`、`cc-node`、crag kernel、glibc 2.39 shim）放在独立的 payload Release，由 [`deploy/payload.json`](../deploy/payload.json) 按 sha256 / 大小钉住。`npm run fetch:payload` 下载并校验到 `bin/` / `share/`；镜像构建同样按清单下载，校验不过即失败。
+
+换 payload：把新文件放到本机对应路径，然后
+
+```bash
+node scripts/fetch-payload.mjs --pin payload-YYYY.MM.DD     # 重算清单 sha256 / 大小并指向新 Release
+node scripts/fetch-payload.mjs --stage /tmp/payload          # 按 asset 名导出
+gh release create payload-YYYY.MM.DD /tmp/payload/* --prerelease --latest=false \
+  --title "slot payload YYYY.MM.DD" --notes "Pinned by deploy/payload.json"
+```
+
+再提交 `deploy/payload.json`。payload Release 必须 `--prerelease --latest=false`：一键脚本与面板按 `releases/latest` 找应用版本。
 
 ## 版本怎么记
 
@@ -8,10 +22,9 @@ linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel,oauth-auth}`、`share/wr
 |---|---|---|
 | 仓库根 `VERSION` | 人改 | 对外 semver，和 tag 对齐 |
 | git tag `v*` | 人打 | 触发 Release 工作流 |
-| `package.json` `"version"` | 人改 | 和 `VERSION` 相同 |
-| `VERSION.txt` artifact | `.github/workflows/version.yml` 在 main 推送后 | 当时 `GITHUB_SHA` 前 7 位，给人对照部署，**不会**写回 git |
+| Actions run 的 commit SHA | GitHub | 对照源码与构建；不再单独上传 `VERSION.txt` |
 
-发版当天三处一起改：`VERSION`、`package.json`、[CHANGELOG.md](../CHANGELOG.md)，再打 annotated tag。`Dockerfile` 把 `VERSION` 和 `CHANGELOG.md` 拷进控制面镜像，面板才能读当前版本。一键脚本 `deploy/install.sh` 按 GitHub Release tag 升级，不改这三个文件。
+`VERSION` 是唯一应用版本来源；`package.json` / lockfile 不再重复记录版本。发版当天改 `VERSION` 和 [CHANGELOG.md](../CHANGELOG.md)，再打 annotated tag。`Dockerfile` 把这两个文件拷进控制面镜像，面板才能读当前版本。一键脚本 `deploy/install.sh` 按 GitHub Release tag 升级，不改版本文件。
 
 ## 打一个 Release
 
@@ -22,18 +35,30 @@ git tag -a v1.2.22 -m "vm2api v1.2.22"
 git push origin v1.2.22
 ```
 
-`v*` tag 推上去之后，Actions 在 `ubuntu-latest` 编 Go linux amd64，并挂仓内预编译 kernel / wrap ELF 到该 tag 的 Release：
+`v*` tag 推上去之后，Actions 在 `ubuntu-latest` 编 Go linux amd64，按 `deploy/payload.json` 拉 payload，并把这些 ELF 一并挂到该 tag 的 Release（面板按版本 Release 的同名附件下载 kernel / CLI）：
 
 | 文件 | 角色 |
 |---|---|
-| `kin-kernel` | Claude Code 槽内核（仓内预编译，推理必带） |
+| `kin-kernel` | Claude Code 槽内核（payload，推理必带） |
 | `kin-egress` | 远程 SOCKS5 透明网关 |
 | `kin-worker` | **只** `telemetry`，不是 hop |
-| `kin-codex-kernel` | Codex 槽；仓内预编译 |
+| `kin-codex-kernel` | Codex 槽（payload） |
 | `kin-oauth-auth` | OAuth / Setup Token 换票服务二进制；源码不随部署上传 |
+| `kin-kernel-crag` / `cli-node` / `cc-node` | crag kernel 与槽内 wrap CLI（payload） |
+
 没有 tag、只点 workflow_dispatch 时，产物进 artifact，不会建 Release。
 
-装到机器上（Compose 部署可跳过，仓内 `bin/` 已有同名文件）：
+控制面镜像（amd64 `Dockerfile` 与 `deploy/Dockerfile.arm64-control`）是多阶段构建：在镜像里编 `web/dist` 和 Go helper，按清单下载 payload。artifact 保留 7 天，正式 Release assets 不受此期限影响。
+
+槽位 OS 镜像由 `.github/workflows/guest-images.yml` 独立发布：main 上 `docker/kin-os/`、`docker/kin-kvm/` 或该 workflow 有变化时触发，也可手动运行。四种系统并行构建，各用独立缓存；普通应用发版不再重复构建槽位 OS / KVM runner 镜像。
+
+KVM runner 镜像（`ghcr.io/dofastted/kin-kvm-{ubuntu,debian,arch,fedora}`）在同一 workflow 的 `kvm` job 构建：单 Dockerfile `docker/kin-kvm/` + `ARG CLOUD_IMAGE_URL`（官方 cloud image URL 见 `src/lib/vm/os-catalog.mjs` 的 `kvm.cloud_image`）。本机构建：
+
+```bash
+node docker/kin-kvm/build.mjs ubuntu          # 与 kin-os 同语义：--force / --pull / --pull-only / 过滤器
+```
+
+装到机器上（Compose 部署可跳过，镜像入口会把镜像内的同名文件写进挂载的 `bin/`）：
 
 ```bash
 install -m 755 kin-kernel kin-egress kin-worker kin-codex-kernel kin-oauth-auth /opt/vm2api/bin/
@@ -41,16 +66,17 @@ install -m 755 kin-kernel kin-egress kin-worker kin-codex-kernel kin-oauth-auth 
 
 然后按 [DEPLOY.md](DEPLOY.md) 指环境变量。槽进程不是 root：权限必须是 `755`，不要 `700`。
 
-控制面镜像：`docker compose build` 拷仓内 `bin/kin-*` 与 `share/wrap-cli`（见 [DEPLOY.md](DEPLOY.md#docker-compose)）。槽位 `kin-os/*` 首次启动编 ubuntu，或 `node docker/kin-os/build.mjs`。
+控制面镜像：`docker compose -f docker-compose.yml -f docker-compose.build.yml build` 在镜像内编控制台与 Go helper 并下载 payload，构建机需要能访问 GitHub Release（见 [DEPLOY.md](DEPLOY.md#docker-compose)）。槽位 `kin-os/*` 首次启动编 ubuntu，或 `node docker/kin-os/build.mjs`；KVM 槽编 `kin-kvm-*`，或 `node docker/kin-kvm/build.mjs`。
 
 ## 本机构建
 
-依赖：Node 22、Go 1.25、pnpm 10、python3（官方 CLI PTY 脚本）。OAuth 换票由控制面 spawn `bin/kin-oauth-auth` 完成；`auth.js` 只保留在本地构建目录，不上传到控制面。kernel / wrap CLI 用仓内 ELF，不要在本机 cargo / 重编 Claude Code。
+依赖：Node 22、Go 1.25、pnpm 10、python3（官方 CLI PTY 脚本）。OAuth 换票由控制面 spawn `bin/kin-oauth-auth` 完成；`auth.js` 只保留在本地构建目录，不上传到控制面。kernel / wrap CLI 用 payload ELF，不要在本机 cargo / 重编 Claude Code。
 
 ```bash
 npm ci
 pnpm -C web install --frozen-lockfile
 
+npm run fetch:payload     # bin/kin-{kernel,codex-kernel,oauth-auth}、share/wrap-cli、share/crag
 npm run build:egress      # bin/kin-egress
 npm run build:web         # web/dist
 npm run build:worker      # bin/kin-worker（telemetry）
@@ -85,7 +111,7 @@ npm run test:web          # 要先 pnpm -C web install
 node --check src/server.mjs
 ```
 
-CI（`.github/workflows/test.yml`）在 push / PR 上跑：Node unit、Go、预编译 kernel ELF 检查、web 测试和构建。
+CI（`.github/workflows/test.yml`）在 main push / PR 上运行，也可手动触发：Node 格式、源码及脚本语法与 unit（先拉 payload、编 `kin-egress`）；`worker/` 和 `api-kernel/` 的 gofmt、race test、vet 和命令编译；payload 清单校验与 linux amd64 ELF 检查；web 格式、测试、类型检查和构建。Node 22、Go 1.25、pnpm 10 与部署要求一致，依赖缓存分别以对应 lockfile / `go.sum` 为键。
 
 ## 升级一台已部署的机
 
@@ -105,8 +131,8 @@ curl -sS --noproxy '*' http://127.0.0.1:8787/health
 **本机 Node + systemd**
 
 1. `git pull` 或检出目标 tag。
-2. `npm ci`；有 web 改动则 `pnpm -C web install --frozen-lockfile && npm run build:web`。
-3. 换仓内 `bin/` 和 `share/wrap-cli` ELF（`install -m 755`），再调用 `POST /api/panel/wrap-cli/sync` 并传 `{"restart":true}`。同步优先仓内 `bin/kin-kernel`。
+2. `npm ci`；`pnpm -C web install --frozen-lockfile && npm run build:web`；`npm run build:egress && npm run build:worker`。
+3. `npm run fetch:payload` 换 `bin/` 和 `share/` ELF，再调用 `POST /api/panel/wrap-cli/sync` 并传 `{"restart":true}`。同步优先 `bin/kin-kernel`。
 4. `node --check src/server.mjs`。
 5. `systemctl restart vm2api` **一次**。确认 `/health`。
 

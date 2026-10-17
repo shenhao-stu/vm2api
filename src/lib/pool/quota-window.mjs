@@ -7,6 +7,8 @@
  * sent anything in the current window.
  */
 
+import { zonedParts, zonedWallToMs } from '../core/timezone.mjs'
+
 export const WINDOW_5H_MS = 5 * 3600_000
 export const WINDOW_7D_MS = 7 * 24 * 3600_000
 
@@ -39,35 +41,6 @@ export function parseResetMs(reset) {
 }
 
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
-
-/** Wall-clock parts of `ms` in `timeZone`. */
-function zonedParts(ms, timeZone) {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone,
-    hourCycle: 'h23',
-    year: 'numeric',
-    month: 'numeric',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: 'numeric',
-    second: 'numeric',
-  }).formatToParts(new Date(ms))
-  const out = {}
-  for (const part of parts) if (part.type !== 'literal') out[part.type] = Number(part.value)
-  return out
-}
-
-/** Epoch ms for a wall-clock time in `timeZone` (DST-safe, two passes). */
-function zonedWallToMs({ year, month, day, hour, minute }, timeZone) {
-  const wall = Date.UTC(year, month - 1, day, hour, minute)
-  let ms = wall
-  for (let i = 0; i < 2; i++) {
-    const seen = zonedParts(ms, timeZone)
-    const seenWall = Date.UTC(seen.year, seen.month - 1, seen.day, seen.hour, seen.minute)
-    ms += wall - seenWall
-  }
-  return ms
-}
 
 /**
  * Claude CLI limit text carries no header, only `resets 11am (America/New_York)`
@@ -120,6 +93,17 @@ export function isPlanLimitMessage(message) {
   const text = String(message || '')
   if (/extra usage required/i.test(text)) return false
   return /hit your (?:\w+ )?limit|out of extra usage/i.test(text)
+}
+
+/**
+ * Whether a finished request proves the account's own plan window is spent.
+ * A 429 the pool synthesized itself (`fable_requires_max`, `pool_rate_limited`)
+ * never reached the provider, so it says nothing about the account's quota.
+ */
+export function isAccountQuotaExhausted(result = {}, limitText = '') {
+  if (!result || result.ok) return false
+  if (isPlanLimitMessage(limitText)) return true
+  return Number(result.status) === 429 && result.via !== 'pool-failover'
 }
 
 /**

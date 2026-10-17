@@ -10,6 +10,7 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -31,12 +32,15 @@ import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
 import { FleetPulse } from '@/features/vm/fleet-pulse'
 import { VmListSkeleton } from '@/features/vm/list-skeleton'
 import { vmsListQueryOptions } from '@/features/vm/queries'
+import { usePoolSeatStream } from '@/features/vm/use-pool-seat-stream'
 import { VmActionsProvider } from '@/features/vm/vm-actions-provider'
+import { VmRack } from '@/features/vm/vm-rack'
+import type { RackSize } from '@/features/vm/vm-rack-blade'
+import type { VmZoneFilter } from '@/features/vm/vm-rack-model'
 import {
   filterVms,
   KindFilterChips,
   sortVms,
-  VmCards,
   VmTable,
   type VmKindFilter,
   type VmSortKey,
@@ -45,23 +49,69 @@ import {
 const SORT_CHIPS = [
   ['status', '状态'],
   ['name', '名称'],
-  ['remain', '5h 剩余'],
+  ['remain', '5H 剩余'],
   ['today', '今日花费'],
+  ['cost7', '7D 费用'],
+  ['total', '总计费用'],
   ['cache', '缓存命中'],
 ] as const
+
+const SIZES: [RackSize, string, string][] = [
+  ['s', '小', '小卡：一屏看全队'],
+  ['m', '中', '中卡：日常巡检'],
+  ['l', '大', '大卡：逐台核对'],
+]
+
+const LS_VIEW = 'vm-list-view'
+const LS_SIZE = 'vm-rack-size'
+
+function readPref<T extends string>(
+  key: string,
+  allowed: readonly T[],
+  fallback: T
+): T {
+  try {
+    const v = localStorage.getItem(key)
+    return allowed.includes(v as T) ? (v as T) : fallback
+  } catch {
+    return fallback
+  }
+}
+
+function writePref(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value)
+  } catch {
+    // 隐私模式 / 配额满：本次会话内仍按内存状态生效。
+  }
+}
 
 export function VmListPage() {
   const me = useQuery(meQueryOptions())
   const vmsQ = useQuery(vmsListQueryOptions(5000))
+  usePoolSeatStream()
   const usage = useQuery({
     ...usageQueryOptions(5000),
     enabled: me.data?.role !== 'user',
   })
   const qc = useQueryClient()
   const [q, setQ] = useState('')
-  const [filter, setFilter] = useState('all')
+  const [filter, setFilter] = useState<VmZoneFilter>('all')
   const [kind, setKind] = useState<VmKindFilter>('all')
-  const [view, setView] = useState<'grid' | 'list'>('list')
+  const [view, setViewState] = useState(() =>
+    readPref(LS_VIEW, ['grid', 'list'] as const, 'grid')
+  )
+  const [size, setSizeState] = useState(() =>
+    readPref(LS_SIZE, ['s', 'm', 'l'] as const, 'l')
+  )
+  const setView = (next: 'grid' | 'list') => {
+    setViewState(next)
+    writePref(LS_VIEW, next)
+  }
+  const setSize = (next: RackSize) => {
+    setSizeState(next)
+    writePref(LS_SIZE, next)
+  }
   const [sort, setSort] = useState<VmSortKey>('status')
   const [dir, setDir] = useState<'asc' | 'desc'>('asc')
   const [resetTarget, setResetTarget] = useState<Vm | null>(null)
@@ -95,6 +145,7 @@ export function VmListPage() {
     onError: (error: Error) => toast.error(error.message),
   })
   const vms: Vm[] = vmsQ.data?.items || []
+  const poolQueue = vmsQ.data?.pool_queue
   const accounts = usage.data?.accounts
   const canCreate =
     me.data?.role === 'admin' ||
@@ -105,10 +156,27 @@ export function VmListPage() {
   return (
     <PageHeader
       title={VIEW_TITLES.vm}
+      description='槽位和账号用量。按服务器分机架、按状态分区；未探测的额度不会冒充可用。'
       fluid
       extra={
-        canCreate ? (
-          <Button onClick={() => setCreateOpen(true)}>创建</Button>
+        poolQueue || canCreate ? (
+          <div className='flex items-center gap-3'>
+            {poolQueue ? (
+              <span
+                className={cn(
+                  'text-xs text-muted-foreground tabular-nums',
+                  poolQueue.global_queue_depth > 0 &&
+                    'text-[color:var(--status-warn)]'
+                )}
+                title='还没落到任何 VM、在等新席位的 Claude 请求数 / 允许排队数量（上限按全部排队请求计，含各 VM 上的排队，见状态列）'
+              >
+                全局排队 {poolQueue.global_queue_depth}/{poolQueue.queue_max}
+              </span>
+            ) : null}
+            {canCreate ? (
+              <Button onClick={() => setCreateOpen(true)}>创建</Button>
+            ) : null}
+          </div>
         ) : undefined
       }
     >
@@ -166,6 +234,30 @@ export function VmListPage() {
               {dir === 'asc' ? <ArrowUpNarrowWide /> : <ArrowDownWideNarrow />}
             </Button>
             <Separator orientation='vertical' className='mx-1 h-5' />
+            {view === 'grid' ? (
+              <div
+                role='group'
+                aria-label='卡片大小'
+                className='inline-flex gap-0.5 rounded-lg bg-muted p-0.5'
+              >
+                {SIZES.map(([key, label, title]) => (
+                  <button
+                    key={key}
+                    type='button'
+                    title={title}
+                    aria-pressed={size === key}
+                    onClick={() => setSize(key)}
+                    className={cn(
+                      'h-7 min-w-8 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground',
+                      size === key &&
+                        'bg-card text-foreground shadow-[0_1px_2px_oklch(0_0_0/12%),0_0_0_1px_var(--border)]'
+                    )}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            ) : null}
             <Button
               size='sm'
               variant={view === 'list' ? 'default' : 'outline'}
@@ -201,7 +293,13 @@ export function VmListPage() {
         >
           {list.length ? (
             view === 'grid' ? (
-              <VmCards vms={list} accounts={accounts} />
+              <VmRack
+                vms={list}
+                accounts={accounts}
+                filter={filter}
+                size={size}
+                onCreate={canCreate ? () => setCreateOpen(true) : undefined}
+              />
             ) : (
               <VmTable vms={list} accounts={accounts} />
             )
@@ -285,7 +383,7 @@ export function VmListPage() {
                 </span>
               </p>
               <p className='mt-2 text-destructive'>
-                删除槽位不可恢复：容器、家目录、凭证与代理绑定一并清除。活跃槽位需先切换活跃再删。
+                删除槽位不可恢复：容器、家目录、凭证与代理绑定一并清除。还有其他槽位时，活跃槽位需先切换活跃再删。
               </p>
             </>
           ) : (

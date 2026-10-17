@@ -1,9 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { readGuestIdentity } from '../../src/lib/vm/guest-identity-reader.mjs'
+import { promisify } from 'node:util'
+import { READ_IDENTITY, parseGuestHardware, readGuestIdentity } from '../../src/lib/vm/guest-identity-reader.mjs'
 import { collectSlotIdentity } from '../../src/lib/vm/guest-identity.mjs'
 
 const guestOutput = [
@@ -51,11 +53,67 @@ test('collects Docker guest identity without either worker or kernel socket', as
   assert.ok(saved.runtime.identity_collected_at)
 })
 
-test('rejects unsupported runtimes without reading host identity', async () => {
-  const result = await readGuestIdentity({ vmId: 'vm-01', vm: { runtime: { type: 'kvm' } } }, '', {
-    run: () => assert.fail('must not run Docker for KVM'),
+test('falls back to uname -n when the guest has no hostname command', async () => {
+  // A shell function shadows PATH, standing in for kin-os-arch which lacks `hostname`.
+  const script = `hostname() { return 127; }\n${READ_IDENTITY}`
+  const result = await readGuestIdentity({ vmId: 'vm-03', vm: { runtime: { type: 'docker' } } }, '', {
+    run: (_command, args, opts) => {
+      assert.equal(args.at(-1), READ_IDENTITY)
+      return promisify(execFile)('sh', ['-c', script], opts)
+    },
   })
-  assert.equal(result.body.error.code, 'guest_identity_unsupported')
+  assert.equal(result.ok, true)
+  assert.equal(result.body.identity.hostname, (await promisify(execFile)('uname', ['-n'])).stdout.trim())
+})
+
+test('collects kvm guest identity via kin-guest-exec', async () => {
+  const result = await readGuestIdentity({ vmId: 'vm-01', vm: { id: 'vm-01', runtime: { type: 'kvm' } } }, '', {
+    run: async (command, args) => {
+      assert.equal(command, 'docker')
+      assert.deepEqual(args.slice(0, 4), ['exec', 'kin-01', '/usr/local/bin/kin-guest-exec', '--'])
+      assert.equal(args.at(-1), READ_IDENTITY)
+      return { stdout: guestOutput }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.body.identity.runtime_kind, 'kvm')
+  assert.equal(result.body.identity.hostname, 'guest-01')
+})
+
+test('kvm collect-identity waits longer for guest ssh', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'guest-kvm-timeout-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(root, 'vms'))
+  const vm = { id: 'vm-01', runtime: { type: 'kvm' }, fingerprint: {} }
+  fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify(vm))
+  let seen
+  const result = await collectSlotIdentity(root, vm, {
+    callGet: async (_exec, _path, options) => {
+      seen = options.timeoutMs
+      return {
+        ok: true,
+        status: 200,
+        body: {
+          identity: {
+            schema_version: '1',
+            runtime_kind: 'kvm',
+            hostname: 'guest-01',
+            os_id: 'ubuntu',
+            os_pretty: 'Ubuntu 24.04 LTS',
+            kernel_release: '6.8.0',
+            arch: 'x86_64',
+            machine_id: 'guest-machine',
+            timezone: 'UTC',
+            locale: 'en_US.UTF-8',
+            goos: 'linux',
+          },
+        },
+      }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(seen, 20_000)
+  assert.equal(result.runtime_kind, 'kvm')
 })
 
 test('reports stopped containers, timeouts and incomplete output as failures', async () => {
@@ -73,4 +131,95 @@ test('reports stopped containers, timeouts and incomplete output as failures', a
   }
   const invalid = await readGuestIdentity({ vmId: 'vm-01' }, '', { run: async () => ({ stdout: 'partial' }) })
   assert.equal(invalid.body.error.code, 'guest_identity_invalid')
+})
+
+const hardwareJson = JSON.stringify({
+  cpu_model: 'Intel(R) Xeon(R) CPU',
+  cpu_cores: 4,
+  memory_bytes: 4294967296,
+  root_disk: '/dev/vda2',
+  mac: '52:54:00:11:22:33',
+  dmi: {
+    manufacturer: 'Dell Inc.',
+    product: 'OptiPlex 7090',
+    version: '1.0',
+    family: 'OptiPlex',
+    serial: 'ABC123',
+    uuid: '11111111-2222-3333-4444-555555555555',
+  },
+  shell: 'bash',
+  package_managers: 'apt',
+  runtimes: 'node,python',
+})
+
+const guestOutputWithHardware = [
+  'guest-01',
+  'ubuntu',
+  'Ubuntu "24.04" LTS',
+  '6.8.0',
+  'aarch64',
+  'guest-machine',
+  'UTC',
+  'en_US.UTF-8',
+  hardwareJson,
+  '',
+].join('\0')
+
+test('parses optional hardware JSON and ignores invalid extra field', () => {
+  const hw = parseGuestHardware(hardwareJson)
+  assert.equal(hw.cpu_model, 'Intel(R) Xeon(R) CPU')
+  assert.equal(hw.cpu_cores, 4)
+  assert.equal(hw.memory_bytes, 4294967296)
+  assert.equal(hw.dmi.product, 'OptiPlex 7090')
+  assert.equal(hw.package_managers, 'apt')
+  assert.equal(parseGuestHardware(''), null)
+  assert.equal(parseGuestHardware('{'), null)
+})
+
+test('collects guest hardware JSON without breaking required identity fields', async () => {
+  const result = await readGuestIdentity({ vmId: 'vm-01', vm: { runtime: { type: 'docker' } } }, '', {
+    run: async () => ({ stdout: guestOutputWithHardware }),
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.body.identity.hostname, 'guest-01')
+  assert.equal(result.body.identity.hardware.cpu_model, 'Intel(R) Xeon(R) CPU')
+  assert.equal(result.body.identity.hardware.cpu_cores, 4)
+  assert.equal(result.body.identity.hardware.mac, '52:54:00:11:22:33')
+  assert.equal(result.body.identity.hardware.dmi.manufacturer, 'Dell Inc.')
+  assert.equal(result.body.identity.hardware.shell, 'bash')
+  assert.ok(result.body.identity.hardware.observed_at)
+})
+
+test('invalid optional hardware JSON does not fail identity collection', async () => {
+  const stdout = [
+    'guest-01',
+    'ubuntu',
+    'Ubuntu 24.04',
+    '6.8.0',
+    'x86_64',
+    'guest-machine',
+    'UTC',
+    'en_US.UTF-8',
+    '{',
+    '',
+  ].join('\0')
+  const result = await readGuestIdentity({ vmId: 'vm-01' }, '', { run: async () => ({ stdout }) })
+  assert.equal(result.ok, true)
+  assert.equal(result.body.identity.hostname, 'guest-01')
+  assert.equal(result.body.identity.hardware, undefined)
+})
+
+test('READ_IDENTITY hardware probes survive missing optional commands', async () => {
+  const script = `hostname() { return 127; }\nnproc() { return 127; }\n${READ_IDENTITY}`
+  const result = await readGuestIdentity({ vmId: 'vm-04', vm: { runtime: { type: 'docker' } } }, '', {
+    run: (_command, args, opts) => {
+      assert.equal(args.at(-1), READ_IDENTITY)
+      return promisify(execFile)('sh', ['-c', script], opts)
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.ok(result.body.identity.hostname)
+  assert.equal(typeof result.body.identity.hardware, 'object')
+  assert.ok(result.body.identity.hardware.memory_bytes > 0)
+  assert.ok(result.body.identity.hardware.cpu_cores > 0)
 })

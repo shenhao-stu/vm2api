@@ -1,6 +1,6 @@
 import { Link } from '@tanstack/react-router'
-import { REPO_URL } from '@/config/repo'
-import { ArrowUpRight, Menu, X } from 'lucide-react'
+import { DOCS_URL, REPO_URL } from '@/config/repo'
+import { ArrowUpRight, BookOpen, Menu, X } from 'lucide-react'
 import { IconGithub } from '@/assets/brand-icons'
 import { Logo } from '@/assets/logo'
 import { cn } from '@/lib/utils'
@@ -17,6 +17,9 @@ const CHIP_CLASS =
 const CHIP_LINK_CLASS =
   'cursor-pointer hover:border-primary/45 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground'
 
+// 版本号单独占一行且不截断：发布号可能带预发布/构建后缀，截断会丢失关键信息。
+const VERSION_CHIP_CLASS = 'h-auto min-h-10 gap-2 py-1.5 text-base'
+
 export function AppTitle({ version }: { version?: string }) {
   const { setOpenMobile } = useSidebar()
   return (
@@ -29,7 +32,7 @@ export function AppTitle({ version }: { version?: string }) {
             aria-label='vm2api 概览'
             className='flex min-w-0 flex-1 items-center gap-2.5 rounded-lg outline-hidden focus-visible:ring-2 focus-visible:ring-sidebar-ring'
           >
-            <span className='grid size-10 shrink-0 place-items-center rounded-lg bg-primary text-primary-foreground shadow-sm ring-1 ring-primary/30 group-data-[collapsible=icon]:size-8'>
+            <span className='grid size-10 shrink-0 place-items-center rounded-xl bg-slate-950 text-white shadow-md ring-1 ring-cyan-500/35 group-data-[collapsible=icon]:size-8'>
               <Logo
                 aria-hidden
                 className='size-5 group-data-[collapsible=icon]:size-4'
@@ -46,22 +49,38 @@ export function AppTitle({ version }: { version?: string }) {
           </Link>
           <ToggleSidebar className='group-data-[collapsible=icon]:hidden' />
         </div>
-        <div className='mt-2.5 grid grid-cols-[minmax(0,1fr)_auto] gap-1.5 group-data-[collapsible=icon]:hidden'>
+        <div className='mt-2.5 grid gap-1.5 group-data-[collapsible=icon]:hidden'>
           <VersionChip version={version?.replace(/^v/i, '')} />
-          <a
-            href={REPO_URL}
-            target='_blank'
-            rel='noreferrer'
-            title='github.com/dofastted/vm2api'
-            className={cn(CHIP_CLASS, CHIP_LINK_CLASS)}
-          >
-            <IconGithub aria-hidden className='size-4 shrink-0' />
-            GitHub
-            <ArrowUpRight
-              aria-hidden
-              className='size-3.5 shrink-0 opacity-60'
-            />
-          </a>
+          <div className='flex gap-1.5'>
+            <a
+              href={REPO_URL}
+              target='_blank'
+              rel='noreferrer'
+              title='github.com/dofastted/vm2api'
+              className={cn(CHIP_CLASS, CHIP_LINK_CLASS)}
+            >
+              <IconGithub aria-hidden className='size-4 shrink-0' />
+              GitHub
+              <ArrowUpRight
+                aria-hidden
+                className='size-3.5 shrink-0 opacity-60'
+              />
+            </a>
+            <a
+              href={DOCS_URL}
+              target='_blank'
+              rel='noreferrer'
+              title='项目入门'
+              className={cn(CHIP_CLASS, CHIP_LINK_CLASS)}
+            >
+              <BookOpen aria-hidden className='size-4 shrink-0' />
+              文档
+              <ArrowUpRight
+                aria-hidden
+                className='size-3.5 shrink-0 opacity-60'
+              />
+            </a>
+          </div>
         </div>
       </SidebarMenuItem>
     </SidebarMenu>
@@ -71,11 +90,9 @@ export function AppTitle({ version }: { version?: string }) {
 function VersionChip({ version }: { version?: string }) {
   if (!version) {
     return (
-      <span className={CHIP_CLASS}>
+      <span className={cn(CHIP_CLASS, VERSION_CHIP_CLASS)}>
         <span className='size-2 shrink-0 rounded-full bg-sidebar-foreground/30' />
-        <span className='truncate font-mono text-sidebar-foreground/60'>
-          版本 —
-        </span>
+        <span className='font-mono text-sidebar-foreground/60'>版本 —</span>
       </span>
     )
   }
@@ -85,12 +102,16 @@ function VersionChip({ version }: { version?: string }) {
       target='_blank'
       rel='noreferrer'
       title={`v${version} 发布说明`}
-      className={cn(CHIP_CLASS, CHIP_LINK_CLASS)}
+      className={cn(CHIP_CLASS, CHIP_LINK_CLASS, VERSION_CHIP_CLASS)}
     >
-      <span className='size-2 shrink-0 rounded-full bg-primary shadow-[0_0_0_3px] shadow-primary/20' />
-      <span className='truncate font-mono font-semibold tabular-nums'>
+      <span className='size-2.5 shrink-0 rounded-full bg-primary shadow-[0_0_0_3px] shadow-primary/20' />
+      <span className='font-mono font-semibold break-all tabular-nums'>
         v{version}
       </span>
+      <ArrowUpRight
+        aria-hidden
+        className='ms-auto size-4 shrink-0 opacity-60'
+      />
     </a>
   )
 }

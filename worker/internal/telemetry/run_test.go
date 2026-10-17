@@ -151,8 +151,11 @@ func TestRunReloadsTelemetryWithoutRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "worker.json")
 	stamp := time.Now()
+	id1 := strings.Repeat("ab", 32)
+	id2 := strings.Repeat("cd", 32)
 	write := func(enabled bool, device string) {
-		raw := fmt.Sprintf(`{"telemetry":{"enabled":%t,"betas":"thinking-binding-controls-2026-08-01","identity":{"device_id":%q,"platform":"linux","cli_version":"2.1.278","env":{"version":"2.1.278","platform":"linux"}}}}`, enabled, device)
+		cpu := "CPU-" + device[:2]
+		raw := fmt.Sprintf(`{"telemetry":{"enabled":%t,"betas":"thinking-binding-controls-2026-08-01","identity":{"user_id":%q,"platform":"linux","cli_version":"2.1.278","env":{"version":"2.1.278","platform":"linux","shell":"zsh","cpu_model":%q,"cpu_cores":8,"memory_bytes":8589934592}}}}`, enabled, device, cpu)
 		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -161,7 +164,7 @@ func TestRunReloadsTelemetryWithoutRestart(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write(true, "dev-1")
+	write(true, id1)
 	var bodies atomic.Value
 	bodies.Store("")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -190,7 +193,7 @@ func TestRunReloadsTelemetryWithoutRestart(t *testing.T) {
 		Sleep: func(context.Context, time.Duration) bool {
 			ticks++
 			if ticks == 1 {
-				write(true, "dev-2")
+				write(true, id2)
 				return true
 			}
 			return false
@@ -200,10 +203,16 @@ func TestRunReloadsTelemetryWithoutRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := bodies.Load().(string)
-	if !strings.Contains(got, "dev-2") || !strings.Contains(got, "thinking-binding-controls-2026-08-01") {
+	if !strings.Contains(got, id2) || !strings.Contains(got, `"shell":"zsh"`) {
 		t.Fatalf("reloaded body missing new identity: %s", got)
+	}
+	if strings.Contains(got, "thinking-binding-controls-2026-08-01") {
+		t.Fatalf("betas were uploaded: %s", got)
 	}
 	if strings.Contains(got, "2.1.241") {
 		t.Fatalf("stale version in %s", got)
+	}
+	if !strings.Contains(got, `"cpu_model":"CPU-cd"`) || !strings.Contains(got, `"memory_bytes":8589934592`) {
+		t.Fatalf("reloaded body missing hardware: %s", got)
 	}
 }

@@ -15,18 +15,14 @@ hypervisor/*.env
 **/.env.*
 !.env.example
 *.bak*
-bin/*
-!bin/kin-kernel
-!bin/kin-egress
-!bin/kin-worker
-!bin/kin-codex-kernel
-!bin/kin-oauth-auth
-!share/wrap-cli/
-!share/wrap-cli/**
-share/wrap-cli/cli-dist/
-share/wrap-cli/bun
-!share/crag/
-!share/crag/**
+# Build output and slot payloads stay out of git. Go helpers and web/dist build
+# from source; the rest is pinned in deploy/payload.json (npm run fetch:payload).
+/bin/
+/web/dist/
+/share/crag/
+/share/wrap-cli/*
+!/share/wrap-cli/kin-kernel
+!/share/wrap-cli/SAMPLE.json
 .workflow/
 __pycache__/
 crates/
@@ -55,12 +51,25 @@ patches/
 # local scratch and unpublished artifacts
 /.tmp/
 /.tmp-*
+/tmp/
 /AGENTS.md
 /docs/benchmarks.zip
+/docs/benchmarks/*
+!/docs/benchmarks/README.md
+!/docs/benchmarks/2026-09-09-clean-suite.md
+!/docs/benchmarks/2026-09-09-clean-suite/
 /worker/bin/
 /issues/
 /plan/
 
 # local-only; not part of the published tree
+/pnpm-lock.yaml
+/pnpm-workspace.yaml
 /web/pnpm-workspace.yaml
 /src/lib/oauth/auth.js
+/docs/auto-mode
+/docs/jev.md
+
+.omp
+/dist/
+share/wrap-cli/dist/

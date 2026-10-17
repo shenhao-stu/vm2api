@@ -4,7 +4,6 @@ import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm, VmUsageStatsRank } from '@/types/panel-vm'
 import {
   BarChart3,
-  Boxes,
   Calculator,
   ClipboardList,
   Clock,
@@ -29,7 +28,7 @@ import {
 import { fmtMs, fmtNum, fmtUsd } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { accountStatus, vmRunning } from '@/lib/vm-status'
-import { fmtHitPct, vmTodayStats, vmTotalCost } from '@/lib/vm-usage'
+import { fmtHitPct, vmTodayStats, vmWeekOutcome } from '@/lib/vm-usage'
 import {
   Dialog,
   DialogContent,
@@ -42,14 +41,14 @@ import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
 import { VmCostByModel } from '@/features/vm/detail-cost-by-model'
 import { vmQueryOptions } from '@/features/vm/queries'
-import { VmUsageWindows } from '@/features/vm/usage-windows'
+import { VmUsagePanel } from '@/features/vm/usage-windows'
 import {
   summarizeUsageStats,
   type StatsDayPoint,
 } from '@/features/vm/vm-stats-model'
 
 /** tokens 量级大，K / M / B 缩写比千分位好读。 */
-function fmtTokens(n: number): string {
+export function fmtTokens(n: number): string {
   if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`
   if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`
   if (n >= 1e3) return `${(n / 1e3).toFixed(2)}K`
@@ -87,7 +86,7 @@ const ACCENT = {
 } as const
 
 /** 顶部四张渐变指标卡：大数字 + 一行口径说明。 */
-function MetricCard({
+export function MetricCard({
   accent,
   icon,
   label,
@@ -125,7 +124,7 @@ function MetricCard({
 }
 
 /** 带彩色图标头的信息卡，行内左标签右数值。 */
-function InfoCard({
+export function InfoCard({
   tone,
   icon,
   title,
@@ -166,7 +165,7 @@ function InfoCard({
   )
 }
 
-function ChartCard({
+export function ChartCard({
   title,
   meta,
   children,
@@ -227,7 +226,7 @@ function TrendTip({
 }
 
 /** 双轴趋势：面积是费用（左轴），折线是请求数（右轴）。 */
-function TrendChart({ points }: { points: StatsDayPoint[] }) {
+export function TrendChart({ points }: { points: StatsDayPoint[] }) {
   return (
     <div className='h-60'>
       <ResponsiveContainer width='100%' height='100%'>
@@ -321,7 +320,7 @@ function TrendChart({ points }: { points: StatsDayPoint[] }) {
 }
 
 /** 环形图 + 右侧明细表：占比按请求数，表里同时给 tokens 与费用。 */
-function DistributionChart({
+export function DistributionChart({
   rows,
   empty,
 }: {
@@ -414,7 +413,7 @@ function DistributionChart({
 }
 
 /** 入站路径分布：横向条比表格更容易一眼看出主次。 */
-function EndpointBars({ rows }: { rows: VmUsageStatsRank[] }) {
+export function EndpointBars({ rows }: { rows: VmUsageStatsRank[] }) {
   const max = Math.max(1, ...rows.map((r) => r.requests))
   if (!rows.length) {
     return (
@@ -456,11 +455,7 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
   const usage = billing?.usage_stats ?? null
   const view = summarizeUsageStats(usage)
   const today = vmTodayStats(vm, accounts)
-  // 详情接口的累计口径与账号计费一致，拿到就用它；没拿到回落到列表侧的取值。
-  const totalCost = Math.max(
-    Number(billing?.total_cost) || 0,
-    vmTotalCost(vm, accounts)
-  )
+  const week = vmWeekOutcome(vm, accounts)
 
   return (
     <div className='space-y-3 pb-1'>
@@ -487,10 +482,7 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
       </div>
 
       <section className='rounded-xl border bg-card px-3.5 py-3'>
-        <div className='mb-1.5 text-xs font-medium text-muted-foreground'>
-          用量窗口
-        </div>
-        <VmUsageWindows vm={vm} accounts={accounts} quotaActions />
+        <VmUsagePanel vm={vm} accounts={accounts} />
       </section>
 
       {detail.isLoading ? (
@@ -514,7 +506,7 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
               icon={<Coins />}
               label={`${view.summary.days} 天费用`}
               value={fmtUsd(view.summary.cost, 2)}
-              hint={`账号累计 ${fmtUsd(totalCost, 2)}`}
+              hint={`${view.summary.activeDays} / ${view.summary.days} 天有请求`}
             />
             <MetricCard
               accent='blue'
@@ -603,19 +595,7 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             />
           </div>
 
-          <div className='grid gap-3 lg:grid-cols-3'>
-            <InfoCard
-              tone='bg-teal-500/15 text-teal-600 dark:text-teal-400'
-              icon={<Boxes />}
-              title='累计 Tokens'
-              rows={[
-                { label: '总量', value: fmtTokens(view.summary.tokens) },
-                {
-                  label: '日均',
-                  value: fmtTokens(Math.round(view.summary.avgDailyTokens)),
-                },
-              ]}
-            />
+          <div className='grid gap-3 lg:grid-cols-2'>
             <InfoCard
               tone='bg-rose-500/15 text-rose-600 dark:text-rose-400'
               icon={<Gauge />}
@@ -637,22 +617,16 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             <InfoCard
               tone='bg-lime-500/15 text-lime-600 dark:text-lime-400'
               icon={<ClipboardList />}
-              title='7 天结果'
+              title='7D 请求'
               rows={[
                 {
                   label: '成功',
-                  value: fmtNum(
-                    view.points
-                      .slice(-7)
-                      .reduce((n, p) => n + p.requests - p.errors, 0)
-                  ),
+                  value: week.known ? fmtNum(week.success) : '—',
                   strong: 'text-[color:var(--status-ok)]',
                 },
                 {
                   label: '失败',
-                  value: fmtNum(
-                    view.points.slice(-7).reduce((n, p) => n + p.errors, 0)
-                  ),
+                  value: week.known ? fmtNum(week.fail) : '—',
                   strong: 'text-[color:var(--status-bad)]',
                 },
               ]}

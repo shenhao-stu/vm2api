@@ -415,7 +415,12 @@ test('a caller breakpoint on system reaches the wire through the official person
       identity: IDENTITY,
       model: inbound.model,
     })
-    assert.equal(breakpoints(persona).length, 0, 'persona still drops the caller marker')
+    const personaHits = breakpoints(persona)
+    assert.ok(personaHits.length >= 1, 'official persona must keep a cache boundary on the agent prefix')
+    assert.ok(
+      personaHits.some((h) => h.where.startsWith('system[') && h.ttl === '1h'),
+      'agent slot carries 1h global cache instead of dropping caller breakpoints',
+    )
     const envelope = prepareOutboundEnvelope({
       canonicalBody: persona,
       inbound,
@@ -428,7 +433,6 @@ test('a caller breakpoint on system reaches the wire through the official person
       homeDir: dir,
     })
     const hits = breakpoints(envelope.body)
-    assert.ok(hits.length >= 1, 'outbound body must carry at least one breakpoint')
     assert.ok(
       hits.some((h) => h.where.startsWith('system[')),
       'the system prefix must be cacheable',
@@ -481,6 +485,27 @@ test('a real Claude Code body behind a rewritten UA is claimed', () => {
       metadata: { user_id: OFFICIAL_USER_ID },
       messages: [{ role: 'user', content: 'hi' }],
     }),
+    true,
+  )
+})
+
+test('a relay that keeps the billing block is claimed even without user_id', () => {
+  assert.equal(
+    isProxiedOfficialClaudeCode(
+      {
+        model: 'claude-opus-5-5',
+        system: [
+          {
+            type: 'text',
+            text: 'x-anthropic-billing-header: cc_version=2.1.280.096; cc_entrypoint=cli; cch=58481;',
+          },
+          { type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." },
+          { type: 'text', text: '<project-context>\n<workstation>\n- OS: linux\n' },
+        ],
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+      { 'user-agent': 'Go-http-client/1.1', 'anthropic-beta': 'claude-code-20250219' },
+    ),
     true,
   )
 })

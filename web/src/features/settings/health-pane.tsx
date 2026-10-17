@@ -161,6 +161,18 @@ function HealthCacheCard({
             aria-label='探测间隔'
           />
         </SettingRow>
+        <SettingRow
+          label='全号轮询'
+          desc='每个间隔对所有可调度槽各探一次（受并发上限、工作时段、冷却与凭证排除约束）。列表中首个成功的结果仍写入健康缓存；关闭时探测到第一个可用槽即停止。'
+        >
+          <Switch
+            checked={probe.probe_all_slots === true}
+            onCheckedChange={(checked) =>
+              onProbeChange({ probe_all_slots: checked })
+            }
+            aria-label='全号轮询'
+          />
+        </SettingRow>
         <SettingRow label='缓存有效期' desc='秒，过期后探测请求照常进入调度'>
           <Input
             className='w-28'
@@ -255,9 +267,10 @@ function SignatureRepairCard({
             200。
           </p>
           <p>
-            关闭则把 400 原样透传 ——
-            探测伪造签名时需要这个真实结果。其它修复（搜索 / 预填 / 工具配对 /
-            schema / 自适应）不受此开关影响。
+            关闭则保留同账号的 thinking / signature
+            块（缺少字段时补齐空字段），把 400 原样透传；切账号的清理和 cli-node
+            自身行为不受此开关改变。 其它修复（搜索 / 预填 / 工具配对 / schema /
+            自适应）不受此开关影响。
           </p>
         </div>
         <Switch

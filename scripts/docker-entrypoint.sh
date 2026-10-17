@@ -15,20 +15,9 @@ if [ -d /opt/vm2api/image-config ]; then
   done
 fi
 
-if [ ! -f "$ROOT/vms/active.json" ]; then
-  printf '%s\n' '{ "active_vm": "vm-01" }' > "$ROOT/vms/active.json"
-fi
-if [ ! -f "$ROOT/vms/vm-01.json" ]; then
-  cat > "$ROOT/vms/vm-01.json" <<'EOF'
-{
-  "id": "vm-01",
-  "name": "vm-01",
-  "status": "stopped",
-  "schedulable": false,
-  "policy": { "maxConcurrency": 2 }
-}
-EOF
-fi
+# No seeded vm-01. A fresh fleet is empty. Seeding an active placeholder made
+# the only slot undeletable: DELETE refuses the active VM, and the next start
+# would recreate the files.
 
 ensure_bin() {
   name="$1"
@@ -50,6 +39,7 @@ ensure_bin kin-egress
 ensure_bin kin-worker
 ensure_bin kin-codex-kernel
 ensure_bin kin-oauth-auth
+ensure_bin kin-computer
 KERNEL="${KIN_KERNEL_BIN:-$ROOT/bin/kin-kernel}"
 if [ ! -x "$KERNEL" ]; then
   echo "vm2api: $KERNEL missing or not executable after image-bin copy. Rebuild with docker compose build, or put linux amd64 Release files in $ROOT/bin." >&2
@@ -76,6 +66,17 @@ if [ -d /opt/vm2api/image-wrap-cli ]; then
       mv -f "$dest.new" "$dest"
     fi
   done
+fi
+# The crag kernel no longer comes from a repo checkout; refresh it from the image like the wrap ELFs.
+if [ -f /opt/vm2api/image-crag/kin-kernel ]; then
+  mkdir -p "$ROOT/share/crag"
+  dest="$ROOT/share/crag/kin-kernel"
+  if [ ! -f "$dest" ] || ! cmp -s /opt/vm2api/image-crag/kin-kernel "$dest"; then
+    cp /opt/vm2api/image-crag/kin-kernel "$dest.new"
+    chmod 755 "$dest.new"
+    mv -f "$dest.new" "$dest"
+    WRAP_CHANGED=1
+  fi
 fi
 
 if [ ! -S /var/run/docker.sock ]; then

@@ -1,6 +1,6 @@
 /**
- * Official `claude setup-token` on a slot: start Claude Code, extract the
- * CAI authorize URL, feed the pasted code, persist the 1-year oat (no refresh).
+ * `claude setup-token` on a slot via its cli-node: start Claude Code, extract
+ * the CAI authorize URL, feed the pasted code, persist the 1-year oat (no refresh).
  */
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
@@ -9,7 +9,12 @@ import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { containerName } from '../vm/vm-runtime.mjs'
 import { AUTH_SCHEME_BEARER } from './auth-scheme.mjs'
-import { officialCcUidGid, officialCcHome, officialCcBin } from './official-cc-bootstrap.mjs'
+import { officialCcUidGid, officialCcHome, officialCcHostCli } from './official-cc-bootstrap.mjs'
+import { CONTAINER_CLI_NODE_BIN } from '../vm/slot-engine.mjs'
+import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
+import { slotExecArgv } from '../vm/slot-exec.mjs'
+import { getVm } from '../vm/vm-registry.mjs'
+import { slotHost } from '../vm/slot-host.mjs'
 
 export const SETUP_TOKEN_SESSION_TTL_MS = 30 * 60 * 1000
 export const SETUP_TOKEN_SOURCE = 'claude-setup-token'
@@ -96,8 +101,8 @@ export function officialSetupTokenToOauth(token, extra = {}) {
     throw fail('setup_token_invalid', '需要官方 claude setup-token 打印的一年期 sk-ant-oat01-…')
   }
   return {
-    type: 'setup-token',
-    mode: 'setup-token',
+    type: 'official-setup-token',
+    mode: 'official-setup-token',
     access_token: access,
     refresh_token: '',
     expires_at: Date.now() + 365 * 24 * 60 * 60 * 1000,
@@ -167,7 +172,7 @@ export function isPersistentSetupTokenSession(session, { force = false } = {}) {
   return !!(session.alive && session.auth_url && !session.expired)
 }
 
-export async function stopClaudeSetupTokenSession(projectRoot, vmId) {
+export async function stopClaudeSetupTokenSession(projectRoot, vmId, { spawn = spawnSync } = {}) {
   const dir = setupTokenSessionDir(projectRoot, vmId)
   const ptyPid = readPidFile(path.join(dir, 'pty.pid'))
   const childPid = readPidFile(path.join(dir, 'child.pid'))
@@ -178,22 +183,20 @@ export async function stopClaudeSetupTokenSession(projectRoot, vmId) {
       } catch {}
     }
   }
+  const vm = { ...(getVm(projectRoot, vmId) || {}), id: vmId }
   try {
-    spawnSync(
+    const env = slotHost(vm).dockerEnv()
+    spawn(
       'docker',
-      [
-        'exec',
-        containerName(vmId),
-        'sh',
-        '-lc',
-        "pkill -f '/home/kincli/.local/bin/claude setup-token' >/dev/null 2>&1 || true",
-      ],
+      slotExecArgv(vm, ['sh', '-lc', `pkill -f '${CONTAINER_CLI_NODE_BIN} setup-token' >/dev/null 2>&1 || true`]),
       {
         stdio: 'ignore',
         timeout: 5000,
+        ...(env ? { env } : {}),
       },
     )
   } catch {}
+
   const deadline = Date.now() + 3000
   while (Date.now() < deadline) {
     if (![ptyPid, childPid].some((pid) => pid && pidAlive(pid))) break
@@ -229,12 +232,9 @@ async function waitFor(fn, timeoutMs, intervalMs = 200) {
 }
 
 function ensureCli(projectRoot, vmId) {
-  const home = officialCcHome(projectRoot, vmId)
-  const bin = officialCcBin(home)
-  if (!fs.existsSync(bin)) {
-    throw fail('official_cli_missing', '当前槽没有官方 Claude Code，请先完成官方初装')
+  if (!fs.existsSync(officialCcHostCli(officialCcHome(projectRoot, vmId)))) {
+    throw fail('cli_node_missing', '当前槽没有 cli-node，请先同步 wrap-cli')
   }
-  return { home, bin }
 }
 
 export async function startClaudeSetupTokenSession({ vm, projectRoot, force = false } = {}) {
@@ -271,6 +271,36 @@ export async function startClaudeSetupTokenSession({ vm, projectRoot, force = fa
   const expiresAt = createdAt + SETUP_TOKEN_SESSION_TTL_MS
   const ids = officialCcUidGid(vmId)
   const ptyScript = path.join(scriptsDir(), 'claude-setup-token-pty.py')
+  const execArgv = slotExecArgv(vm, [CONTAINER_CLI_NODE_BIN, 'setup-token'], {
+    user: `${ids.uid}:${ids.gid}`,
+    env: [
+      'HOME=/home/kincli',
+      'TMPDIR=/home/kincli/.cache/tmp',
+      `TZ=${vm.timezone || vm.fingerprint?.timezone || 'UTC'}`,
+      `LANG=${vm.locale || vm.fingerprint?.locale || 'en_US.UTF-8'}`,
+      `LC_ALL=${vm.locale || vm.fingerprint?.locale || 'en_US.UTF-8'}`,
+      'PATH=/home/kincli/.local/bin:/usr/bin:/bin',
+      'CLAUDE_CODE_HOST_REFRESH=1',
+      `CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION}`,
+      'USER_TYPE=external',
+      'KIN_SETUP_TOKEN=1',
+      'CLAUDE_CODE_USE_BEDROCK=0',
+      'CLAUDE_CODE_USE_VERTEX=0',
+      'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=0',
+      'DISABLE_TELEMETRY=1',
+      'DO_NOT_TRACK=1',
+      'ANTHROPIC_BASE_URL=',
+      'ANTHROPIC_API_KEY=',
+      'ANTHROPIC_AUTH_TOKEN=',
+      'CLAUDE_CODE_OAUTH_TOKEN=',
+      'TERM=xterm-256color',
+      'COLUMNS=220',
+      'LINES=40',
+    ],
+    workdir: '/home/kincli',
+    interactive: true,
+    tty: true,
+  })
   const child = spawn('python3', [ptyScript], {
     env: {
       PATH: process.env.PATH || '/usr/bin:/bin',
@@ -282,12 +312,15 @@ export async function startClaudeSetupTokenSession({ vm, projectRoot, force = fa
       KIN_CONTAINER: containerName(vmId),
       KIN_UID: String(ids.uid),
       KIN_GID: String(ids.gid),
+      KIN_CLI_BIN: CONTAINER_CLI_NODE_BIN,
+      KIN_CLI_VERSION: OFFICIAL_CLI_VERSION,
       KIN_SESSION_DIR: dir,
       KIN_SESSION_ID: sessionId,
       KIN_VM_ID: vmId,
       KIN_CREATED_AT: String(createdAt),
       KIN_EXPIRES_AT: String(expiresAt),
       KIN_SESSION_TTL_MS: String(SETUP_TOKEN_SESSION_TTL_MS),
+      KIN_DOCKER_ARGV: JSON.stringify(execArgv),
     },
     detached: true,
     stdio: 'ignore',

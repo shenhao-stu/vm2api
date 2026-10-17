@@ -8,7 +8,6 @@ import { CRS_OFFICIAL_SYSTEM, DEFAULT_CLI_VERSION } from '../identity/crs-person
 import { formatMetadataUserId } from '../identity/vm-identity.mjs'
 
 export const CLAUDE_CLI_UA = `claude-cli/${DEFAULT_CLI_VERSION} (external, sdk-cli)`
-export const LOADTEST_UA = 'kin-console-loadtest/1.0'
 
 export function claudeCodeInboundHeaders({ sessionId, accept = 'text/event-stream' } = {}) {
   const headers = {
@@ -19,7 +18,7 @@ export function claudeCodeInboundHeaders({ sessionId, accept = 'text/event-strea
     'x-stainless-os': 'Linux',
     'x-stainless-arch': 'x64',
     'x-stainless-runtime': 'node',
-    'x-stainless-package-version': '0.112.1',
+    'x-stainless-package-version': '0.128.0',
     'x-stainless-runtime-version': 'v26.3.0',
     accept,
   }
@@ -63,8 +62,4 @@ export function claudeCodeInboundBody({
   }
   if (thinking) body.thinking = thinking
   return body
-}
-
-export function isLoadtestUa(ua = '') {
-  return /^kin-console-(loadtest|test)\//i.test(String(ua || ''))
 }

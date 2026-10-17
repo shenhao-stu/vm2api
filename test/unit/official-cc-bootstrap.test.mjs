@@ -14,6 +14,7 @@ import {
   readOfficialCcStatus,
   officialCcShouldForceRefresh,
   buildOfficialCcDockerArgs,
+  officialCcTurnSucceeded,
   DEFAULT_HELLO_PROMPT,
   DEFAULT_USAGE_PROMPT,
   OFFICIAL_USAGE_RETRIES,
@@ -29,11 +30,8 @@ import {
   restoreOfficialCcResident,
   restoreOfficialCcResidents,
   listOfficialCcVmIds,
-  repairOfficialClaudeBinLink,
-  repairProjectOfficialClaudeBins,
   officialCcQuotaSucceeded,
   finalizeOfficialCcTelemetry,
-  buildOfficialCcResidentDockerArgs,
 } from '../../src/lib/oauth/official-cc-bootstrap.mjs'
 
 test('uid follows vm index', () => {
@@ -121,7 +119,12 @@ test('docker args use hello//usage bypassPermissions without CONNECT proxy', () 
     false,
   )
   assert.ok(args.includes('ANTHROPIC_BASE_URL='))
-  assert.ok(!args.some((item) => String(item).includes('8787')))
+  // Bootstrap must not race the host Go Refresher. cli-node reads this name.
+  assert.ok(args.includes('CLAUDE_CODE_HOST_REFRESH=1'))
+  assert.ok(args.includes('CLAUDE_CODE_VERSION=2.1.293'))
+  assert.ok(args.includes('USER_TYPE=external'))
+  assert.equal(args.includes('CI=1'), false)
+  assert.equal(args[args.indexOf('kin-30') + 1], '/home/kincli/.kin/cli-node')
   const usageArgs = buildOfficialCcDockerArgs({
     vmId: 'vm-30',
     uid: 10030,
@@ -133,6 +136,18 @@ test('docker args use hello//usage bypassPermissions without CONNECT proxy', () 
   // plain json envelope drops.
   assert.equal(usageArgs[usageArgs.indexOf('--output-format') + 1], 'stream-json')
   assert.ok(usageArgs.includes('--verbose'))
+})
+
+test('official hello success requires a parsed result, empty stdout is a failure', () => {
+  assert.equal(officialCcTurnSucceeded({ code: 0, raw: '', slash: false }), false)
+  assert.equal(officialCcTurnSucceeded({ code: 0, raw: 'not json', slash: false }), false)
+  assert.equal(officialCcTurnSucceeded({ code: 0, raw: JSON.stringify({ is_error: true }), slash: false }), false)
+  assert.equal(
+    officialCcTurnSucceeded({ code: 0, raw: JSON.stringify({ type: 'result', is_error: false }), slash: false }),
+    true,
+  )
+  assert.equal(officialCcTurnSucceeded({ code: 0, raw: '{"type":"result"}\n', slash: true }), true)
+  assert.equal(officialCcTurnSucceeded({ code: 0, raw: '', slash: true }), false)
 })
 
 test('guest docker gateway is not container localhost', () => {
@@ -214,7 +229,7 @@ test('normalizeOfficialCcConfig fills defaults and clamps', () => {
   const okTimeout = normalizeOfficialCcConfig({ timeout_ms: 60000, memory: '4g' })
   assert.equal(okTimeout.timeout_ms, 60000)
   assert.equal(okTimeout.memory, '4g')
-  assert.equal(normalizeOfficialCcConfig({}).sync_telemetry, true)
+  assert.equal(normalizeOfficialCcConfig({}).sync_telemetry, false)
   assert.equal(normalizeOfficialCcConfig({ sync_telemetry: false }).sync_telemetry, false)
   assert.equal(normalizeOfficialCcConfig({}).resident, false)
   assert.equal(normalizeOfficialCcConfig({}).inference, 'cli-hop')
@@ -222,61 +237,9 @@ test('normalizeOfficialCcConfig fills defaults and clamps', () => {
   assert.equal(normalizeOfficialCcConfig({ resident: true }).resident, true)
 })
 
-test('resident docker args stay interactive without CONNECT proxy', () => {
-  const args = buildOfficialCcResidentDockerArgs({
-    vmId: 'vm-51',
-    uid: 10051,
-    gid: 987,
-    timezone: 'America/Chicago',
-    locale: 'en_US.UTF-8',
-  })
-  assert.ok(args.includes('kin-51'))
-  assert.ok(args.includes('-d'))
-  assert.ok(args.includes('-t'))
-  assert.equal(
-    args.some((item) => String(item).includes('HTTP_PROXY') || String(item).includes('HTTPS_PROXY')),
-    false,
-  )
-  assert.equal(args[args.length - 1], '/home/kincli/.local/bin/claude')
-  assert.ok(!args.includes('-p'))
-  assert.ok(!args.includes('--print'))
-  assert.ok(!args.includes('hello'))
-  assert.ok(!args.includes('CI=1'))
-})
-
 test('official quota success accepts parsed /usage windows', () => {
   assert.equal(officialCcQuotaSucceeded({ ok: true, source: 'official-cc-usage-cli' }), true)
   assert.equal(officialCcQuotaSucceeded({ ok: false }), false)
-})
-
-test('repairOfficialClaudeBinLink retargets host-dangling /home/kincli links', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-bin-'))
-  const bin = path.join(dir, '.local', 'bin', 'claude')
-  const ver = path.join(dir, '.local', 'share', 'claude', 'versions', '2.1.241')
-  fs.mkdirSync(path.dirname(bin), { recursive: true })
-  fs.mkdirSync(path.dirname(ver), { recursive: true })
-  fs.writeFileSync(ver, '#!/bin/sh\n')
-  fs.symlinkSync('/home/kincli/.local/share/claude/versions/2.1.241', bin)
-  const fixed = repairOfficialClaudeBinLink(dir)
-  assert.equal(fixed.ok, true)
-  assert.equal(fixed.repaired, true)
-  assert.equal(fs.readlinkSync(bin), path.join('..', 'share', 'claude', 'versions', '2.1.241'))
-  fs.rmSync(dir, { recursive: true, force: true })
-})
-
-test('repairProjectOfficialClaudeBins only rewrites dangling guest links', () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-fleet-'))
-  const home = path.join(root, 'vms', 'vm-13', 'cli-home')
-  const bin = path.join(home, '.local', 'bin', 'claude')
-  const ver = path.join(home, '.local', 'share', 'claude', 'versions', '2.1.241')
-  fs.mkdirSync(path.dirname(bin), { recursive: true })
-  fs.mkdirSync(path.dirname(ver), { recursive: true })
-  fs.writeFileSync(ver, '#!/bin/sh\n')
-  fs.symlinkSync('/home/kincli/.local/share/claude/versions/2.1.241', bin)
-  const items = repairProjectOfficialClaudeBins(root)
-  assert.equal(items.length, 1)
-  assert.equal(items[0].repaired, true)
-  fs.rmSync(root, { recursive: true, force: true })
 })
 
 test('applyOfficialCcConfig prefers explicit opts over routing', () => {
@@ -301,7 +264,7 @@ test('applyOfficialCcConfig prefers explicit opts over routing', () => {
   assert.equal(o.memory, '1g')
   assert.equal(o.resident, false)
 
-  assert.equal(o.syncTelemetry, true)
+  assert.equal(o.syncTelemetry, false)
   assert.equal(applyOfficialCcConfig({}, { sync_telemetry: false }).syncTelemetry, false)
 })
 
@@ -319,8 +282,18 @@ test('loadOfficialCcConfig reads routing.json official_cc', () => {
   assert.equal(cfg.hello_prompt, 'ping')
   assert.equal(cfg.memory, '4g')
   assert.equal(cfg.wipe, true)
-  assert.equal(cfg.sync_telemetry, true)
+  assert.equal(cfg.sync_telemetry, false)
   fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('settings persist keeps sync_telemetry explicit on and off', () => {
+  const on = normalizeOfficialCcConfig({ enabled: true, wipe: true })
+  assert.equal(on.sync_telemetry, false)
+  const off = normalizeOfficialCcConfig({ ...on, sync_telemetry: false })
+  assert.equal(off.sync_telemetry, false)
+  const back = normalizeOfficialCcConfig({ ...off, sync_telemetry: true, wipe: false })
+  assert.equal(back.sync_telemetry, true)
+  assert.equal(back.wipe, false)
 })
 
 test('schedule skips when auto init is disabled', () => {
@@ -488,7 +461,7 @@ test('finalizeOfficialCcTelemetry reloads the engine-aware slot after writing id
   assert.equal(vm.seed_policy.do_not_track, false)
   const worker = JSON.parse(fs.readFileSync(path.join(runDir, 'worker.json'), 'utf8'))
   assert.equal(worker.telemetry.enabled, true)
-  assert.equal(worker.telemetry.identity.device_id, machine)
+  assert.equal(worker.telemetry.identity.device_id, user)
   assert.equal(worker.telemetry.identity.user_id, user)
   assert.equal(worker.telemetry.identity.source, 'official-cc-init')
   assert.equal(fs.existsSync(path.join(runDir, 'telemetry.touch')), true)
@@ -531,7 +504,7 @@ test('finalize without official IDs keeps sidecar off', async () => {
 
 test('settings persist keeps sync_telemetry explicit on and off', () => {
   const on = normalizeOfficialCcConfig({ enabled: true, wipe: true })
-  assert.equal(on.sync_telemetry, true)
+  assert.equal(on.sync_telemetry, false)
   const off = normalizeOfficialCcConfig({ ...on, sync_telemetry: false })
   assert.equal(off.sync_telemetry, false)
   const back = normalizeOfficialCcConfig({ ...off, sync_telemetry: true, wipe: false })
@@ -543,7 +516,7 @@ test('repo routing.json and the Vite console expose init telemetry sync', () => 
   const here = path.dirname(fileURLToPath(import.meta.url))
   const gw = path.resolve(here, '../..')
   const routing = JSON.parse(fs.readFileSync(path.join(gw, 'src/config/routing.json'), 'utf8'))
-  assert.equal(routing.official_cc.sync_telemetry, true)
+  assert.equal(routing.official_cc.sync_telemetry, false)
   assert.equal(routing.official_cc.resident, false)
   assert.equal(routing.official_cc.inference, 'cli-hop')
   assert.equal(routing.official_cc.memory, '500m')
@@ -565,8 +538,8 @@ test('repo routing.json and the Vite console expose init telemetry sync', () => 
   assert.match(card, /此槽已初装过/)
 })
 
-function writeOfficialClaudeBin(home) {
-  const bin = path.join(home, '.local', 'bin', 'claude')
+function writeSlotCliNode(home) {
+  const bin = path.join(home, '.kin', 'cli-node')
   fs.mkdirSync(path.dirname(bin), { recursive: true })
   fs.writeFileSync(bin, '#!/bin/sh\nexit 0\n')
 }
@@ -575,7 +548,7 @@ test('resident restore skips incomplete, disabled, and already-running slots', (
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-restore-'))
   const vmId = 'vm-13'
   const home = writeCompletedOfficialHome(root, vmId)
-  writeOfficialClaudeBin(home)
+  writeSlotCliNode(home)
   fs.writeFileSync(
     path.join(root, 'vms', `${vmId}.json`),
     JSON.stringify({
@@ -619,7 +592,7 @@ test('cli-hop slots do not restore official resident PTY', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-clihop-'))
   const vmId = 'vm-05'
   const home = writeCompletedOfficialHome(root, vmId)
-  writeOfficialClaudeBin(home)
+  writeSlotCliNode(home)
   fs.writeFileSync(
     path.join(root, 'vms', `${vmId}.json`),
     JSON.stringify({ id: vmId, official_cc_inference: 'cli-hop', inference_engine: 'rust' }),
@@ -636,7 +609,7 @@ test('cli-hop slots do not restore official resident PTY', () => {
 test('Node boot restores dead residents without another hello', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-boot-'))
   const live = writeCompletedOfficialHome(root, 'vm-30')
-  writeOfficialClaudeBin(live)
+  writeSlotCliNode(live)
   fs.writeFileSync(path.join(root, 'vms', 'vm-30.json'), JSON.stringify({ id: 'vm-30', inference_engine: 'go' }))
   const empty = writeCompletedOfficialHome(root, 'vm-31')
   writeOfficialCcStatus(empty, { status: 'error', hello_ok: false, step: 'hello' })

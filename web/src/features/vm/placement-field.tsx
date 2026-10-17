@@ -11,6 +11,7 @@ import type {
   PreflightCheck,
   SlotImageJob,
 } from '@/types/panel-cluster'
+import type { RuntimeType } from '@/types/panel-vm'
 import { RefreshCw } from 'lucide-react'
 import { toast } from 'sonner'
 import { importErrorMessage } from '@/lib/import-errors'
@@ -67,7 +68,10 @@ export type Placement = {
 /**
  * 创建槽位的「目标节点」状态。不可见时 `nodeId=''`，创建行为与没有集群时完全一致。
  */
-export function usePlacement(kernel: string): Placement {
+export function usePlacement(
+  kernel: string,
+  runtimeType: RuntimeType = 'docker'
+): Placement {
   const me = useQuery(meQueryOptions())
   const isAdmin = me.data?.role === 'admin'
   const nodes = useQuery({
@@ -78,7 +82,9 @@ export function usePlacement(kernel: string): Placement {
   const [picked, setPicked] = useState('')
   // 选中的节点被移除后退回本机，避免发一个已不存在的 node_id。
   const nodeId = items.some((n) => n.id === picked) ? picked : ''
-  const preflight = useQuery(nodePreflightQueryOptions(nodeId, kernel))
+  const preflight = useQuery(
+    nodePreflightQueryOptions(nodeId, kernel, runtimeType)
+  )
   return {
     visible: items.length > 0,
     nodes: items,
@@ -134,12 +140,11 @@ function NodeOption({ node }: { node: ClusterApiNode }) {
 export function PlacementField({
   placement,
   kernel,
-  gptBlocked,
+  runtimeType = 'docker',
 }: {
   placement: Placement
   kernel: string
-  /** GPT 槽只能建在本机：选了远端时直接提示，不等后端 400。 */
-  gptBlocked: boolean
+  runtimeType?: RuntimeType
 }) {
   const { visible, nodes, nodeId, setNodeId, preflight } = placement
   if (!visible) return null
@@ -164,11 +169,6 @@ export function PlacementField({
       </Select>
       {nodeId ? (
         <div className='space-y-2 rounded-md border p-2'>
-          {gptBlocked ? (
-            <p className='text-xs text-[color:var(--status-bad)]'>
-              远端节点暂不支持 GPT 槽，请改选本机。
-            </p>
-          ) : null}
           <div className='flex items-center justify-between gap-2'>
             <span className='text-xs text-muted-foreground'>
               {preflight.isFetching
@@ -204,6 +204,7 @@ export function PlacementField({
             <SlotImagePrep
               nodeId={nodeId}
               kernel={kernel}
+              runtimeType={runtimeType}
               imageRef={preflight.data.image.ref}
               initialJob={preflight.data.image.job}
               onReady={() => void preflight.refetch()}
@@ -218,12 +219,14 @@ export function PlacementField({
 function SlotImagePrep({
   nodeId,
   kernel,
+  runtimeType,
   imageRef,
   initialJob,
   onReady,
 }: {
   nodeId: string
   kernel: string
+  runtimeType: RuntimeType
   imageRef: string
   initialJob: SlotImageJob | null
   onReady: () => void
@@ -235,7 +238,7 @@ function SlotImagePrep({
   const running = job?.status === 'running'
 
   const start = useMutation({
-    mutationFn: () => startSlotImageBuild(nodeId, kernel),
+    mutationFn: () => startSlotImageBuild(nodeId, kernel, runtimeType),
     onSuccess: (next) => qc.setQueryData(jobOptions.queryKey, next),
     onError: (e: Error) => toast.error(importErrorMessage(e)),
   })

@@ -16,7 +16,7 @@
  */
 
 export const PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero', 'custom'])
-export const DEFAULT_PERSONA_PRESET = 'official'
+export const DEFAULT_PERSONA_PRESET = 'official_full'
 export const OVERLAY_PRESETS = Object.freeze(['off', 'official', 'minimal', 'custom'])
 export const DEFAULT_OVERLAY_PRESET = 'off'
 
@@ -85,8 +85,8 @@ export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
       text: '{{identity}}',
     }),
     Object.freeze({
-      id: 'caller_agent',
-      note: '常驻约束 + 调用方 agent prompt，都空则整块丢弃。2.1.263 起 1h global',
+      id: 'agent',
+      note: '常驻约束 + 调用方官方提示词。空则丢弃。1h 断点在本块，排在会变的第5段之前。',
       drop_if_empty: true,
       type: 'text',
       text: '{{agent_standing}}{{caller_agent}}',
@@ -101,7 +101,7 @@ export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
     }),
     Object.freeze({
       id: 'caller_system',
-      note: '调用方 --append-system-prompt 剩余 system，原文追加不清洗',
+      note: '第5段可选。只放顶层 system。role=system 留在消息列表。空则丢弃',
       drop_if_empty: true,
       type: 'text',
       text: '{{caller_system}}',
@@ -159,7 +159,7 @@ export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
       id: 'agent_slot',
       hide: true,
       type: 'text',
-      text: '{{agent_standing}}{{caller_agent}}',
+      text: '{{agent_standing}}',
       cache_control: Object.freeze({ type: 'ephemeral', ttl: '1h' }),
     }),
     Object.freeze({
@@ -171,6 +171,7 @@ export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
     }),
     Object.freeze({
       id: 'caller_system',
+      note: '第5段可选。调用方 system 都写这里，空则丢弃',
       drop_if_empty: true,
       type: 'text',
       text: '{{caller_system}}',
@@ -356,14 +357,37 @@ function renderText(text, vars) {
 }
 
 /**
+ * A preset switch injects standing text even when a saved template dropped
+ * `{{agent_standing}}`. Built-in templates already have the placeholder.
+ */
+function withStandingSlot(blocks, standingText) {
+  if (!Array.isArray(blocks) || !String(standingText ?? '').trim()) return blocks
+  if (blocks.some((block) => String(block?.text || '').includes('{{agent_standing}}'))) return blocks
+  const idx = blocks.findIndex((block) => {
+    const id = String(block?.id || '')
+    const text = String(block?.text || '')
+    return /agent/i.test(id) || text.includes('{{caller_agent}}') || text.includes('{{agent_official}}')
+  })
+  const copy = blocks.map((block) => ({ ...block }))
+  if (idx < 0) {
+    copy.splice(Math.min(copy.length, 2), 0, { id: 'agent_standing', type: 'text', text: '{{agent_standing}}' })
+    return copy
+  }
+  const existing = String(copy[idx].text || '')
+  copy[idx].text = existing.replace(/\u200b/g, '').trim() ? `{{agent_standing}}${existing}` : '{{agent_standing}}'
+  return copy
+}
+
+/**
  * Meta keys off, type forced to text. Blank drop_if_empty blocks are dropped;
  * other blank blocks keep their slot as a zero-width space because upstream
  * rejects empty text (0注入 agent slot with standing off and no caller agent).
  */
 export function renderPersonaTemplate(blocks, vars = {}) {
-  if (!Array.isArray(blocks)) return []
+  const source = withStandingSlot(blocks, vars?.agent_standing)
+  if (!Array.isArray(source)) return []
   const out = []
-  for (const block of blocks) {
+  for (const block of source) {
     if (!block || typeof block !== 'object') continue
     const text = renderText(block.text, vars)
     const blank = !text.trim()
