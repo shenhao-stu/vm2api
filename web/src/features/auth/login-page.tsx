@@ -13,6 +13,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { ThemeSwitch } from '@/components/theme-switch'
 import { onboardingQueryOptions } from '@/features/welcome/queries'
+import { panelRedirectHref } from './redirect'
 
 /** Standalone sign-in page; layout follows the newapi /sign-in screen. */
 export function LoginPage() {
@@ -41,6 +42,12 @@ export function LoginPage() {
         base: hideBase ? '' : base.trim().replace(/\/$/, '') || apiBase(),
       })
       signIn(result.token, result.user)
+      toast.success('登录成功')
+      const next = panelRedirectHref(search.redirect)
+      if (next) {
+        await navigate({ href: next })
+        return
+      }
       let needsWelcome = false
       try {
         const onboarding = await queryClient.fetchQuery(
@@ -50,20 +57,8 @@ export function LoginPage() {
       } catch {
         needsWelcome = false
       }
-      toast.success('登录成功')
       if (needsWelcome) {
         await navigate({ to: '/welcome', search: { setup: true } })
-        return
-      }
-      // `redirect` is a router href (`/vm/x?tab=y`); never bounce back into the public pages.
-      const next = search.redirect
-      if (
-        next &&
-        next.startsWith('/') &&
-        !next.startsWith('//') &&
-        !/^\/(welcome|login)\b/.test(next)
-      ) {
-        await navigate({ href: next })
         return
       }
       await navigate({ to: '/overview' })

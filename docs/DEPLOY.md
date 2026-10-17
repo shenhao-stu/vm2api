@@ -187,6 +187,24 @@ location / {
 
 `Connection ""` 会剥掉 Upgrade，终端握手拿不到 101，面板里一直连不上；所以 shell 路径单独放在前面。生产机的 Go 前门在 `:8787`、Node 在 `:8788`，这条 location 必须 `proxy_pass` 到 Node。症状和核对命令见 [nginx-shell.md](nginx-shell.md)。
 
+若增加请求限流，控制台静态文件 `/assets/` 必须使用独立配额。一次冷启动会并发加载多份 JS/CSS 分包；与 API 共用较小的 burst 会让分包返回 429，动态导入失败后页面显示通用“500”，也会挤占正常 API 请求额度。可在 `http` 级配置独立静态限流区，并在上述 `server` 内增加：
+
+```nginx
+# http 级；容量按实际静态流量调整。
+limit_req_zone $binary_remote_addr zone=vm2api_assets:2m rate=60r/s;
+
+# server 级；静态资源使用同一后端。
+location ^~ /assets/ {
+  limit_req zone=vm2api_assets burst=120 nodelay;
+  proxy_pass http://127.0.0.1:8787;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header Connection "";
+}
+```
+
+登录与推理接口继续使用各自的限流和鉴权。部署后应以浏览器实际加载的资源集合并发验证静态请求均为 200，同时核验无密钥 API 请求仍为 401；只检查 `/console` 的 HTML 返回 200 无法发现分包加载失败。
+
 ## 本机 Node（备选）
 
 `npm run fetch:payload` 拉 `bin/kin-{kernel,codex-kernel,oauth-auth}` 与 `share/`；`npm run build:egress && npm run build:worker`；`npm ci`、`pnpm -C web install --frozen-lockfile && npm run build:web`；以及占位 `vms/active.json`。单元：[deploy/vm2api.service](deploy/vm2api.service)。细节见 [BUILD.md](BUILD.md)。
