@@ -323,12 +323,29 @@ export function anthropicBetaTokensContains(header, token) {
     .includes(token)
 }
 
+/** The stable system-message feature covers text, not beta turn controls or tool changes. */
+function hasOnlyPlainMidSystemMessages(messages) {
+  if (!Array.isArray(messages)) return true
+  return messages.every((message) => {
+    const role = String(message?.role || '')
+      .trim()
+      .toLowerCase()
+    if (role !== 'system' && role !== 'developer') return true
+    if (message.clear_at != null || message.output_config != null) return false
+    const content = message.content
+    return (
+      typeof content === 'string' ||
+      (Array.isArray(content) && content.every((block) => typeof block === 'string' || block?.type === 'text'))
+    )
+  })
+}
+
 /**
  * Keep context_management only when the beta is present.
  * Haiku (and any hop without prompt-caching-scope) must drop cache_control.scope
  * or Anthropic 400s Extra inputs.
- * Haiku / hops without mid-conversation-system must lift messages[].role=system
- * or Anthropic 400s `role 'system' is not supported on this model`.
+ * Unsupported models must lift messages[].role=system to avoid a model error.
+ * Supported models need no beta for plain text; extended turns retain the legacy gate.
  */
 export function sanitizeAnthropicBodyForBetaTokens(body = {}, anthropicBetaHeader = '') {
   if (!body || typeof body !== 'object') return body
@@ -353,7 +370,8 @@ export function sanitizeAnthropicBodyForBetaTokens(body = {}, anthropicBetaHeade
   }
   const allowMidSystem =
     modelSupportsMidConversationSystem(out.model) &&
-    anthropicBetaTokensContains(anthropicBetaHeader, MID_CONVERSATION_SYSTEM_BETA)
+    (anthropicBetaTokensContains(anthropicBetaHeader, MID_CONVERSATION_SYSTEM_BETA) ||
+      hasOnlyPlainMidSystemMessages(out.messages))
   if (
     !allowMidSystem &&
     Array.isArray(out.messages) &&

@@ -15,7 +15,9 @@
 | UA | `^claude-cli/\d+\.\d+\.\d+`（sub2api 同款前缀；vscode / cowork / desktop 都算） |
 | `metadata.user_id` | 合法官方 user id |
 | tools | 不能是 OpenAI `{type:function}` / `tool_choice.type=function`。`/v1/messages` 上这种 tools 会先转 Anthropic，但仍判非官方 |
-| system | 含 `x-anthropic-billing-header:`、官方 `cc_entrypoint`（`cli` / `sdk-cli` / `vscode` / `cowork` / `desktop`，不含 `local-agent`）、或官方身份行（含 `You are Claude Code` / `Claude Agent SDK` 变体） |
+| system | 含 `x-anthropic-billing-header:`、官方 `cc_entrypoint`（`cli` / `sdk-cli` / `vscode` / `cowork` / `desktop`；`local-agent` 另需 Desktop 客户端标记）、或官方身份行（含 `You are Claude Code` / `Claude Agent SDK` 变体） |
+
+`local-agent` 同时用于 Claude Desktop 和第三方工具，因此仅 billing 入口名不能证明来源。Desktop 请求的 UA 还须同时含 `local-agent` 与合法版本的 `agent-sdk` token，并携带 `anthropic-client-platform: desktop_app` 和三段数字版本的 `anthropic-client-version`，才继续上述四闸。明确的 Oh My Pi 提示词标记仍被拒绝；body-only relay 的 `local-agent` 保持非官方。开启 `claude_code_only` 时，还须通过既有完整客户端头、session 一致性和 billing/UA 版本一致性检查；`count_tokens` 保持既有仅客户端头检查约定。这些指纹用于兼容性分类，不能替代 API 鉴权。
 
 四闸不全 → 非官方，走人设。虚拟机测试入站会先铺 4 块官方 system + 官方 UA，因此分类为 `claude_code_official`。
 
@@ -45,6 +47,8 @@
 - `persona_hide_presets`：整档 usage 遮罩（billing / identity / agent / Environment 等 `hide:true` 块）。缺 key 时依次回落旧全局 `persona_hides`、该档模板的 `hide` 标记（默认 zero 开、其余关）。槽位单独指定人设时读该槽位档的开关；cli-hop 0注入 关掉后 CLI billing + Environment 计入 usage。
 
 cli-hop 的 kin 分支只组装 `billing →（identity 布局的身份句）→ # Environment\n - Timezone: <kernel.json timezone> → Node/caller leftover`。它剥离重复 billing、身份句、`# Environment` 和 Kin/Crag 自产 persona，不再追加槽内 cwd、Platform、Notes 或默认 agent prompt。leftover 各块原文（包括首尾空白）按原顺序以双换行拼接；调用方真正的 `You are an agent for Claude Code...` 和 `Notes:` 不会被当作自产内容删除。常驻约束若启用，仍在 leftover 的 agent prompt 顶部。billing 的 `isSubagent: true`、`splitSysPromptPrefix` 断点与既有缓存 TTL 策略不因本修复改变。
+
+支持模型的纯文本中途 `system` 轮次不要求旧 `mid-conversation-system-2026-04-07` beta，顶层 system 与前缀保持不变。Sonnet 5 / 不支持的 4.x 仍按既有逻辑提升到顶层。若同一请求含 `clear_at`、`output_config` 或非文本 system 内容，仍保留原有整请求 beta 门控；本次不扩展工具变更或控制轮次能力。
 
 调用方 `messages[].role=system` 和 tools / `tool_choice` 保留；`overlay_preset=off` 不挂 prompt-leak / identity / no-tools reminder。
 

@@ -1,6 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { isClaudeCodeFamilyRequest } from '../../src/lib/identity/claude-code-only.mjs'
+import {
+  applyCrsUnofficialPersona,
+  isOfficialClaudeCodeTraffic,
+  isProxiedOfficialClaudeCode,
+} from '../../src/lib/identity/crs-persona.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { handleUserCountTokens } from '../../src/lib/protocol/user-count-tokens.mjs'
 import { validatePersonaRoutingPatch } from '../../src/lib/admin/panel-api.mjs'
@@ -30,6 +35,20 @@ const OFFICIAL_BODY = {
   metadata: { user_id: USER_ID },
   messages: [{ role: 'user', content: 'hi' }],
 }
+const DESKTOP_HEADERS = {
+  ...CLI_HEADERS,
+  'user-agent': 'claude-cli/2.1.299 (external, local-agent, agent-sdk/0.3.299)',
+  'anthropic-client-platform': 'desktop_app',
+  'anthropic-client-version': '2.42304.0',
+  'x-stainless-package-version': '0.128.0',
+}
+const DESKTOP_BODY = {
+  ...OFFICIAL_BODY,
+  system: [
+    { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.299.fa6; cc_entrypoint=local-agent; cch=ab;' },
+    { type: 'text', text: "You are Claude Code, built on Anthropic's Claude Agent SDK." },
+  ],
+}
 const THIRD_PARTY_BODY = {
   model: 'claude-sonnet-5',
   max_tokens: 4096,
@@ -55,6 +74,65 @@ test('Claude Code family recognition needs the full client fingerprint, not the 
   // Billing cc_version and UA version come from the same build.
   const otherVersion = { ...CLI_HEADERS, 'user-agent': 'claude-cli/2.1.280 (external, cli)' }
   assert.equal(isClaudeCodeFamilyRequest(otherVersion, OFFICIAL_BODY, NO_RELAY), false)
+})
+
+test('Claude Desktop local-agent with the complete fingerprint keeps its official identity', () => {
+  assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, DESKTOP_BODY, NO_RELAY), true)
+  assert.equal(isOfficialClaudeCodeTraffic(DESKTOP_HEADERS, DESKTOP_BODY), true)
+  assert.equal(applyCrsUnofficialPersona(DESKTOP_BODY, { headers: DESKTOP_HEADERS }), DESKTOP_BODY)
+  assert.equal(isProxiedOfficialClaudeCode(DESKTOP_BODY, DESKTOP_HEADERS), false)
+})
+
+test('Claude Desktop local-agent rejects incomplete fingerprints and inconsistent sessions or builds', () => {
+  for (const key of Object.keys(DESKTOP_HEADERS)) {
+    const { [key]: _drop, ...partial } = DESKTOP_HEADERS
+    assert.equal(isClaudeCodeFamilyRequest(partial, DESKTOP_BODY, NO_RELAY), false, key)
+  }
+  const invalidHeaders = [
+    { 'anthropic-client-platform': 'web_app' },
+    { 'anthropic-client-version': 'invalid' },
+    { 'user-agent': CLI_UA },
+    { 'user-agent': 'claude-cli/2.1.299 (external, local-agent)' },
+    { 'user-agent': 'claude-cli/2.1.299 (external, local-agent-extra, agent-sdk/0.3.299)' },
+    { 'user-agent': 'claude-cli/2.1.299 (external, local-agent, agent-sdk/0.3.299-extra)' },
+    { 'user-agent': 'claude-cli/2.1.298 (external, local-agent, agent-sdk/0.3.299)' },
+    { 'x-claude-code-session-id': '99999999-2222-4333-8444-555555555555' },
+  ]
+  for (const patch of invalidHeaders) {
+    assert.equal(isClaudeCodeFamilyRequest({ ...DESKTOP_HEADERS, ...patch }, DESKTOP_BODY, NO_RELAY), false)
+  }
+  assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, { ...DESKTOP_BODY, metadata: undefined }, NO_RELAY), false)
+  assert.equal(isClaudeCodeFamilyRequest({ 'user-agent': DESKTOP_HEADERS['user-agent'] }, DESKTOP_BODY), false)
+  // The default relay path must not turn a partial Desktop fingerprint into admission.
+  assert.equal(isClaudeCodeFamilyRequest({ 'user-agent': 'Go-http-client/1.1' }, DESKTOP_BODY), false)
+})
+
+test('Claude Desktop headers do not admit OMP prompts or OpenAI tool shapes', () => {
+  for (const marker of [
+    '<system-conventions>Oh My Pi</system-conventions>',
+    '<system-conventions><workstation>synthetic</workstation></system-conventions>',
+    'ROLE\n====\nsynthetic\nPROJECT\n=======\nsynthetic',
+    'pi coding harness',
+    'omp coding harness',
+  ]) {
+    const body = { ...DESKTOP_BODY, system: [...DESKTOP_BODY.system, { type: 'text', text: marker }] }
+    assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, body), false, marker)
+    assert.equal(isOfficialClaudeCodeTraffic(DESKTOP_HEADERS, body), false, marker)
+  }
+  for (const patch of [
+    { tools: [{ type: 'function', function: { name: 'synthetic' } }] },
+    { tool_choice: { type: 'function', function: { name: 'synthetic' } } },
+  ]) {
+    assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, { ...DESKTOP_BODY, ...patch }), false)
+  }
+})
+
+test('Claude Desktop count_tokens preserves the existing header-only contract', () => {
+  const body = { ...DESKTOP_BODY, metadata: undefined }
+  assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, body, { ...NO_RELAY, countTokens: true }), true)
+  assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, body, NO_RELAY), false)
+  const { 'x-app': _drop, ...partial } = DESKTOP_HEADERS
+  assert.equal(isClaudeCodeFamilyRequest(partial, body, { countTokens: true }), false)
 })
 
 test('Claude Code family recognition: relayed traffic follows detect_proxied_official_cc', () => {
@@ -187,6 +265,16 @@ test('switch on: third-party Claude requests are 403 before any account is picke
   // Official Claude Code never uses the OpenAI Chat entry, even with its headers.
   const chat = await runProtocol({ routing: ON, body: OFFICIAL_BODY, headers: CLI_HEADERS, protocol: 'openai.chat' })
   assert.deepEqual(chat, BLOCKED)
+})
+
+test('switch on: Claude Desktop reaches the scheduler with relay detection disabled', async () => {
+  const routing = { compatibility: { claude_code_only: true, detect_proxied_official_cc: false } }
+  assert.equal((await runProtocol({ routing, body: DESKTOP_BODY, headers: DESKTOP_HEADERS })).reached, true)
+  const body = {
+    ...DESKTOP_BODY,
+    system: [...DESKTOP_BODY.system, { type: 'text', text: '<system-conventions>Oh My Pi</system-conventions>' }],
+  }
+  assert.deepEqual(await runProtocol({ routing, body, headers: DESKTOP_HEADERS }), BLOCKED)
 })
 
 test('switch on: health probes are refused, never answered from the probe cache', async () => {

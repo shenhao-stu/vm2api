@@ -443,8 +443,7 @@ test('Haiku lifts messages role=system because the model rejects it', () => {
 })
 
 test('documented models keep mid-conversation role=system; Sonnet 5 and 4.x lift it', () => {
-  const header = `oauth-2025-04-20,${MID_CONVERSATION_SYSTEM_BETA}`
-  const roles = (model) =>
+  const roles = (model, header) =>
     sanitizeAnthropicBodyForBetaTokens(
       {
         model,
@@ -455,32 +454,34 @@ test('documented models keep mid-conversation role=system; Sonnet 5 and 4.x lift
       },
       header,
     ).messages.map((message) => message.role)
-  for (const model of [
-    'claude-fable-5',
-    'claude-fable-5-1',
-    'claude-fable-5.1[1m]',
-    'claude-mythos-5',
-    'claude-mythos-5-1',
-    'claude-opus-5-5',
-    'claude-opus-5',
-    'claude-opus-4-8',
-    'claude-sonnet-5-5',
-    'claude-haiku-5-5',
-  ]) {
-    assert.deepEqual(roles(model), ['user', 'system'], model)
-  }
-  for (const model of [
-    'claude-sonnet-5',
-    'claude-sonnet-5-fast',
-    'claude-opus-4-7',
-    'claude-sonnet-4-6',
-    'claude-mythos-preview',
-  ]) {
-    assert.deepEqual(roles(model), ['user'], model)
+  for (const header of ['', `oauth-2025-04-20,${MID_CONVERSATION_SYSTEM_BETA}`]) {
+    for (const model of [
+      'claude-fable-5',
+      'claude-fable-5-1',
+      'claude-fable-5.1[1m]',
+      'claude-mythos-5',
+      'claude-mythos-5-1',
+      'claude-opus-5-5',
+      'claude-opus-5',
+      'claude-opus-4-8',
+      'claude-sonnet-5-5',
+      'claude-haiku-5-5',
+    ]) {
+      assert.deepEqual(roles(model, header), ['user', 'system'], `${model}: ${header}`)
+    }
+    for (const model of [
+      'claude-sonnet-5',
+      'claude-sonnet-5-fast',
+      'claude-opus-4-7',
+      'claude-sonnet-4-6',
+      'claude-mythos-preview',
+    ]) {
+      assert.deepEqual(roles(model, header), ['user'], `${model}: ${header}`)
+    }
   }
 })
 
-test('Sonnet 5.5 without mid-conversation-system beta lifts role=system', () => {
+test('Sonnet 5.5 keeps plain mid-conversation system without a beta header', () => {
   const body = {
     model: 'claude-sonnet-5-5',
     system: [{ type: 'text', text: 'billing' }],
@@ -489,12 +490,74 @@ test('Sonnet 5.5 without mid-conversation-system beta lifts role=system', () => 
       { role: 'system', content: 'parked leftover' },
     ],
   }
-  const stripped = sanitizeAnthropicBodyForBetaTokens(body, 'oauth-2025-04-20,interleaved-thinking-2025-05-14')
-  assert.equal(
-    stripped.messages.some((message) => message.role === 'system'),
-    false,
-  )
-  assert.equal(stripped.system.at(-1).text, 'parked leftover')
+  const kept = sanitizeAnthropicBodyForBetaTokens(body, '')
+  assert.deepEqual(kept.messages, body.messages)
+  assert.deepEqual(kept.system, body.system)
+})
+
+test('plain system turns without beta preserve the cached prefix and caller input', () => {
+  for (const model of ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5']) {
+    for (const content of [
+      'Reminder after the first turn.',
+      [{ type: 'text', text: 'Reminder after the first turn.', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+    ]) {
+      const first = {
+        model,
+        system: [{ type: 'text', text: 'Stable shared system.' }],
+        messages: [
+          { role: 'user', content: 'Shared context.' },
+          { role: 'system', content },
+        ],
+      }
+      const second = {
+        ...structuredClone(first),
+        messages: [
+          ...structuredClone(first.messages),
+          { role: 'assistant', content: 'ok' },
+          { role: 'user', content: 'Continue.' },
+          { role: 'system', content: 'Reminder after the second turn.' },
+        ],
+      }
+      const before = structuredClone({ first, second })
+      const a = sanitizeAnthropicBodyForBetaTokens(first, '')
+      const b = sanitizeAnthropicBodyForBetaTokens(second, '')
+      assert.deepEqual(a.messages, first.messages)
+      assert.deepEqual(a.system, first.system)
+      assert.deepEqual(b.system, a.system)
+      assert.deepEqual(b.messages.slice(0, a.messages.length), a.messages)
+      assert.deepEqual({ first, second }, before)
+    }
+  }
+})
+
+test('mixed plain and extended system turns retain the legacy beta behavior', () => {
+  for (const extension of [
+    { content: 'Turn-scoped instruction.', clear_at: 0 },
+    { content: 'Effort instruction.', output_config: { effort: 'max' } },
+    { content: [{ type: 'tool_addition', tool: { type: 'tool_reference', name: 'synthetic' } }] },
+    { content: [{ type: 'tool_removal', tool: { type: 'tool_reference', name: 'synthetic' } }] },
+  ]) {
+    const body = {
+      model: 'claude-opus-5-5',
+      system: 'Stable system.',
+      messages: [
+        { role: 'user', content: 'First turn.' },
+        { role: 'system', content: 'Plain instruction.' },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'Next turn.' },
+        { role: 'system', ...extension },
+      ],
+    }
+    const before = structuredClone(body)
+    const ungated = sanitizeAnthropicBodyForBetaTokens(body, '')
+    assert.equal(
+      ungated.messages.some((message) => message.role === 'system'),
+      false,
+    )
+    const gated = sanitizeAnthropicBodyForBetaTokens(body, MID_CONVERSATION_SYSTEM_BETA)
+    assert.deepEqual(gated.messages, body.messages)
+    assert.deepEqual(body, before)
+  }
 })
 
 test('request policy strips OpenAI annotations on text and nested tool_result', () => {
