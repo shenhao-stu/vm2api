@@ -54,7 +54,7 @@ import {
 } from '../admin/health-probe.mjs'
 import { resolveInferenceBackend, runApiInference } from '../pool/api-protocol.mjs'
 import { classifyClaudeRequestPurpose, prepareClassifierBody, classifierRequestSummary } from './request-purpose.mjs'
-import { summarizeBody, redactHeaders, presentedApiKeyForLog } from '../admin/request-log.mjs'
+import { summarizeBody, redactHeaders } from '../admin/request-log.mjs'
 import { reasoningEffortOf, sessionIdForLog } from './log-fields.mjs'
 import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 import { keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
@@ -506,7 +506,7 @@ export function createHandleProtocol(deps) {
     if (!requireAuth(req, res)) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
       logBag.error_message = req.authError?.message || 'Invalid credentials'
-      logBag.api_key_presented = presentedApiKeyForLog(req.presentedApiKey)
+      logBag.api_key_presented = req.presentedApiKey
       return
     }
 
@@ -1665,7 +1665,7 @@ export function createHandleProtocol(deps) {
     if (!requireAuth(req, res)) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
       logBag.error_message = req.authError?.message || 'Invalid credentials'
-      logBag.api_key_presented = presentedApiKeyForLog(req.presentedApiKey)
+      logBag.api_key_presented = req.presentedApiKey
       return
     }
     let body

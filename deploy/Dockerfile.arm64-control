@@ -30,12 +30,17 @@ COPY deploy/payload.json deploy/payload.json
 COPY scripts/fetch-payload.mjs scripts/fetch-payload.mjs
 RUN node scripts/fetch-payload.mjs --dest /payload
 
+FROM --platform=linux/arm64 ${NODE_IMAGE} AS proxy
+COPY scripts/fetch-mihomo.mjs /fetch-mihomo.mjs
+RUN node /fetch-mihomo.mjs /mihomo arm64
+
 FROM --platform=linux/arm64 docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c AS dockercli
 FROM --platform=linux/arm64 ${NODE_IMAGE}
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates iptables iproute2 python3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=proxy /mihomo /usr/local/bin/mihomo
 WORKDIR /opt/vm2api
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
@@ -62,6 +67,7 @@ RUN chmod 755 /usr/local/bin/vm2api-entrypoint /opt/vm2api/image-bin/* \
     && cp -a /opt/vm2api/src/config /opt/vm2api/image-config \
     && mkdir -p /opt/vm2api/vms /opt/vm2api/data /opt/vm2api/bin /opt/vm2api/share
 ENV NODE_ENV=production \
+    VM2API_MIHOMO_BIN=/usr/local/bin/mihomo \
     HOST=127.0.0.1 \
     PORT=8787 \
     KIN_PROJECT_ROOT=/opt/vm2api \

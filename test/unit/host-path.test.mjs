@@ -51,7 +51,7 @@ test('self-inspection skips containers that do not carry the project tree', () =
   const seen = []
   const mounts = discoverSelfMounts({
     projectRoot: PROJECT,
-    sockPath: '/etc/hostname', // any existing path: stands in for a mounted docker.sock
+    sockPath: new URL(import.meta.url), // any existing file stands in for a mounted docker.sock
     names: ['not-us', 'vm2api'],
     dockerJson: (name) => {
       seen.push(name)

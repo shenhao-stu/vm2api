@@ -27,7 +27,7 @@ services:
       # 自省容器名；VM2API_HOST_ROOT 可显式覆盖宿主安装目录。
       VM2API_CONTAINER_NAME: ${VM2API_CONTAINER_NAME:-vm2api}
       VM2API_HOST_ROOT: ${VM2API_HOST_ROOT:-}
-      HOST: 0.0.0.0
+      HOST: ${HOST:-127.0.0.1}
       PORT: ${PORT:-8787}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

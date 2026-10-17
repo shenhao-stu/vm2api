@@ -1,3 +1,5 @@
+> 此分支支持 [代理订阅导入与安全部署](docs/PROXY_SUBSCRIPTIONS.md)：Clash/URI 节点、加密订阅状态、私有代理监听、管理员刷新；默认仅监听回环地址。
+
 <div align="center">
 
 # vm2api
@@ -216,7 +218,7 @@ docker compose pull && docker compose up -d
 
 服务启动后，系统暴露统一服务端口（默认 `8787`）：
 
-- **可视化管理面板**：`http://<您的IP>:8787/console`（默认账号：`admin` / 密码：`123456` 或自定义环境变量）
+- **可视化管理面板**：`http://<您的IP>:8787/console`（账号：`admin`；密码由安装脚本随机生成并写入私有 `.env`，直接运行容器时须自行设置）
 - **服务健康探活**：`GET http://<您的IP>:8787/health`
 - **Anthropic 协议调用**：`POST http://<您的IP>:8787/v1/messages`
 - **OpenAI 兼容协议**：`POST http://<您的IP>:8787/v1/chat/completions`

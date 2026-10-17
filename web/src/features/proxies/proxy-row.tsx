@@ -123,6 +123,7 @@ export function ProxyRow({
   // 本地代理只接它所在 VPS 上的槽位。
   const accepts =
     !!dragVm &&
+    !(proxy.managed_subscription && vmById.get(dragVm)?.node_id) &&
     bindable &&
     free > 0 &&
     !ids.includes(dragVm) &&
@@ -301,7 +302,11 @@ export function ProxyRow({
           ) : bindable && free > 0 ? (
             <ProxyBindPicker
               compact
-              vms={vms}
+              vms={
+                proxy.managed_subscription
+                  ? vms.filter((vm) => !vm.node_id)
+                  : vms
+              }
               boundHere={ids}
               ownerOf={ownerOf}
               free={free}
@@ -399,7 +404,10 @@ function RowMenu({
               <Copy />
               复制地址（含账密）
             </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => actions.onEdit(id)}>
+            <DropdownMenuItem
+              disabled={proxy.managed_subscription}
+              onSelect={() => actions.onEdit(id)}
+            >
               <Pencil />
               编辑 / 改名
             </DropdownMenuItem>
@@ -412,6 +420,7 @@ function RowMenu({
         <DropdownMenuSeparator />
         <DropdownMenuItem
           variant='destructive'
+          disabled={proxy.managed_subscription}
           onSelect={() => actions.onDelete(id)}
         >
           <Trash2 />

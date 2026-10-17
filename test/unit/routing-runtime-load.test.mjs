@@ -31,6 +31,38 @@ test('loadRoutingConfig fails when routing.json is invalid', () => {
   }
 })
 
+test('persistRoutingPatch preserves the deployment logging mode across panel updates', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-log-mode-'))
+  const previousMode = process.env.KIN_REQUEST_LOG_MODE
+  const appliedModes = []
+  try {
+    const runtime = createRoutingRuntime({
+      cfg: { paths: { project: root } },
+      routingConfigPath: path.join(root, 'routing.json'),
+      routingConfig: { logging: { mode: 'normal' }, concurrency: {}, tiers: {} },
+      stickyRouter: { reloadConfig() {} },
+      accountQuota: {
+        reloadConfig() {},
+        applyTierConcurrency() {},
+        applyTierRpm() {},
+        repo: { get: () => null },
+      },
+      requestLog: { setConfig: ({ mode }) => appliedModes.push(mode) },
+    })
+    process.env.KIN_REQUEST_LOG_MODE = 'normal'
+    runtime.persistRoutingPatch({ logging: { mode: 'debug' } })
+    process.env.KIN_REQUEST_LOG_MODE = 'off'
+    runtime.persistRoutingPatch({ logging: { mode: 'debug' } })
+    delete process.env.KIN_REQUEST_LOG_MODE
+    runtime.persistRoutingPatch({ logging: { mode: 'debug' } })
+    assert.deepEqual(appliedModes, ['normal', 'off', 'debug'])
+  } finally {
+    if (previousMode === undefined) delete process.env.KIN_REQUEST_LOG_MODE
+    else process.env.KIN_REQUEST_LOG_MODE = previousMode
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('applyVmSessionSlots updates only native admission policy', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-session-slots-'))
   const vms = path.join(root, 'vms')

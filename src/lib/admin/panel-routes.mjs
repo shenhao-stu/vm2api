@@ -1,3 +1,4 @@
+import { handleProxySubscriptions } from './proxy-subscription-routes.mjs'
 /**
  * /admin and /api/panel routes. Login / logout / me and { ok, data }
  * envelopes are unchanged; slot start/reload go through startSlotReady.
@@ -5158,6 +5159,30 @@ export function createPanelHandler(ctx) {
             },
           })
         }
+      }
+      if (p === '/api/panel/proxy-subscriptions' || p.startsWith('/api/panel/proxy-subscriptions/')) {
+        return handleProxySubscriptions({
+          req,
+          res,
+          url,
+          manager: ctx.proxySubscriptions,
+          readBody,
+          json,
+          role: panelIdentity(req).role,
+        })
+      }
+      if (
+        /^\/api\/panel\/proxies\/[^/]+$/.test(p) &&
+        ['PATCH', 'PUT', 'DELETE'].includes(req.method) &&
+        proxyPool.managedProxyIds?.has(p.split('/').pop())
+      ) {
+        return json(res, 409, {
+          ok: false,
+          error: {
+            code: 'subscription_managed',
+            message: '订阅节点请通过订阅刷新或删除；可在代理池中启用、禁用和绑定',
+          },
+        })
       }
       // ---- Proxy Pool ----
       if (req.method === 'GET' && p === '/api/panel/proxies') {

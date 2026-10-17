@@ -349,6 +349,11 @@ export class ProxyPool extends EventEmitter {
     try {
       this.state.config = { ...DEFAULT_CONFIG, ...(this.repo.getConfig({}) || {}) }
       this.state.proxies = this.repo.loadAll().map(hydrateProxy)
+      this.managedProxyIds = new Set(
+        this.state.proxies
+          .filter((proxy) => /^vm2api-sub-[a-f0-9]{16}-[a-f0-9]{16}$/.test(proxy.username || ''))
+          .map((proxy) => proxy.id),
+      )
     } catch {
       this.state = { config: { ...DEFAULT_CONFIG }, proxies: [] }
     }
@@ -470,7 +475,8 @@ export class ProxyPool extends EventEmitter {
       id: p.id,
       host: p.host,
       port: p.port,
-      label: p.label || null,
+      label: this.subscriptionLabels?.get(p.id) || p.label || null,
+      managed_subscription: this.managedProxyIds?.has(p.id) || false,
       has_auth: !!(p.username || p.password),
       status: p.status, // unknown | ok | fail | dead
       enabled: p.enabled,
@@ -714,6 +720,12 @@ export class ProxyPool extends EventEmitter {
    * Prefer an existing bind, then the VM's last proxy id, then a free allocate.
    */
   ensureBoundToVm(vmId, preferredId = null) {
+    const managed = this.state.proxies.find((p) => proxyHasVm(p, vmId) && this.managedProxyIds?.has(p.id))
+    if (
+      managed &&
+      (this._vmNodeOrUndefined(vmId) || !managed.enabled || managed.status === 'dead' || managed.status === 'fail')
+    )
+      return null
     if (!vmId) return null
     if (this.state.proxies.some((p) => proxyHasVm(p, vmId) && proxyBlockedReason(p, this.state.config.ipv6_enabled)))
       return null
@@ -730,6 +742,12 @@ export class ProxyPool extends EventEmitter {
 
   /** Allocate one healthy proxy with remaining capacity and bind to vmId */
   allocateForVm(vmId, { ownerUserId = null, role = 'admin' } = {}) {
+    const managed = this.state.proxies.find((p) => proxyHasVm(p, vmId) && this.managedProxyIds?.has(p.id))
+    if (
+      managed &&
+      (this._vmNodeOrUndefined(vmId) || !managed.enabled || managed.status === 'dead' || managed.status === 'fail')
+    )
+      return null
     if (!vmId) return null
     if (this.state.proxies.some((p) => proxyHasVm(p, vmId) && proxyBlockedReason(p, this.state.config.ipv6_enabled)))
       return null
@@ -745,6 +763,7 @@ export class ProxyPool extends EventEmitter {
       this.ensureLocalForNode(localEgressNodeId(localTarget))
     }
     const candidates = this.state.proxies.filter((p) => {
+      if (this.managedProxyIds?.has(p.id) && this._vmNodeOrUndefined(vmId)) return false
       if (isLocalEgressProxy(p) && p.id !== localTarget) return false
       if (!p.enabled || p.status === 'dead' || p.status === 'fail') return false
       if (proxyBlockedReason(p, this.state.config.ipv6_enabled)) return false
@@ -764,6 +783,8 @@ export class ProxyPool extends EventEmitter {
 
   bind(proxyId, vmId, { force = false } = {}) {
     const vm = String(vmId || '').trim()
+    if (this.managedProxyIds?.has(proxyId) && this._vmNodeOrUndefined(vm))
+      return { ok: false, error: 'subscription_local_only' }
     if (isLocalEgressId(proxyId) && vm) {
       // Local egress is the slot's own VPS route: a generic px-local request lands
       // on the slot's node row; another machine's local row is refused.
@@ -1401,6 +1422,11 @@ export class ProxyPool extends EventEmitter {
 
   /** For upstream: get socks URL for a VM */
   getProxyForVm(vmId) {
+    if (
+      this._vmNodeOrUndefined(vmId) &&
+      this.state.proxies.some((p) => proxyHasVm(p, vmId) && this.managedProxyIds?.has(p.id))
+    )
+      return null
     const p = this.state.proxies.find(
       (x) =>
         proxyHasVm(x, vmId) &&

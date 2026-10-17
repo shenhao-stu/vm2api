@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+if [ -z "${VM2API_ADMIN_PASSWORD:-${KIN_ADMIN_PASSWORD:-}}" ]; then
+  echo "vm2api: set VM2API_ADMIN_PASSWORD in the private .env file before starting." >&2
+  exit 1
+fi
+
 ROOT="${KIN_PROJECT_ROOT:-/opt/vm2api}"
 IMAGE_BIN="/opt/vm2api/image-bin"
 mkdir -p "$ROOT/vms" "$ROOT/data" "$ROOT/bin"
@@ -124,12 +129,6 @@ if [ -z "${VM2API_ADMIN_USER:-}" ]; then
   VM2API_ADMIN_USER=admin
   export VM2API_ADMIN_USER
   env_upsert_if_empty VM2API_ADMIN_USER admin "$ENVF"
-fi
-if [ -z "${VM2API_ADMIN_PASSWORD:-}" ]; then
-  VM2API_ADMIN_PASSWORD=123456
-  export VM2API_ADMIN_PASSWORD
-  env_upsert_if_empty VM2API_ADMIN_PASSWORD 123456 "$ENVF"
-  echo "vm2api: VM2API_ADMIN_PASSWORD was empty; using default admin / 123456 (change after login)." >&2
 fi
 if [ -z "${VM2API_API_KEY:-}" ] && [ -z "${KIN_API_KEY:-}" ]; then
   VM2API_API_KEY="$(rand_hex)"

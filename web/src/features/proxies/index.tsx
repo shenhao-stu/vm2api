@@ -48,6 +48,7 @@ import {
   sortedProxies,
 } from './proxy-sort'
 import { proxiesQueryOptions, useRefreshProxies } from './queries'
+import { SubscriptionPanel } from './subscription-panel'
 
 const PROBE_KEY = ['panel', 'proxies', 'probe'] as const
 const GEO_KEY = ['panel', 'proxies', 'geo'] as const
@@ -488,7 +489,10 @@ export function ProxiesPage() {
                 followProxyTimezone={cfg.follow_proxy_timezone !== false}
               />
             ) : (
-              <ProxyImportPanel hasLocal={list.some(proxyIsControlLocal)} />
+              <>
+                <ProxyImportPanel hasLocal={list.some(proxyIsControlLocal)} />
+                <SubscriptionPanel />
+              </>
             )}
           </div>
         </SheetContent>

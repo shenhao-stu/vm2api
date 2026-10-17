@@ -24,11 +24,16 @@ COPY deploy/payload.json deploy/payload.json
 COPY scripts/fetch-payload.mjs scripts/fetch-payload.mjs
 RUN node scripts/fetch-payload.mjs --dest /payload
 
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS proxy
+COPY scripts/fetch-mihomo.mjs /fetch-mihomo.mjs
+RUN node /fetch-mihomo.mjs /mihomo amd64
+
 FROM node:22-bookworm-slim
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates iptables iproute2 python3 \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=proxy /mihomo /usr/local/bin/mihomo
 WORKDIR /opt/vm2api
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
@@ -49,7 +54,8 @@ RUN chmod 755 /usr/local/bin/vm2api-entrypoint /opt/vm2api/image-bin/* \
   && cp -a /opt/vm2api/src/config /opt/vm2api/image-config \
   && mkdir -p /opt/vm2api/vms /opt/vm2api/data /opt/vm2api/bin /opt/vm2api/share
 ENV NODE_ENV=production \
-    HOST=0.0.0.0 \
+    VM2API_MIHOMO_BIN=/usr/local/bin/mihomo \
+    HOST=127.0.0.1 \
     PORT=8787 \
     KIN_PROJECT_ROOT=/opt/vm2api \
     KIN_DATA_DIR=/opt/vm2api/data \

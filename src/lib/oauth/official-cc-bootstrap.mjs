@@ -42,7 +42,7 @@ import {
 import { canOfficialCc, credentialModeOfVm } from './credential-mode.mjs'
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { inferTierFromOfficialStats, parseOfficialCcStats, tierFromOauthProfile } from './official-cc-stats.mjs'
-import { defaultSeedPolicy } from '../protocol/seed-policy.mjs'
+import { defaultSeedPolicy, deploymentTelemetryDisabled } from '../protocol/seed-policy.mjs'
 import { OFFICIAL_CLI_VERSION, loadVmIdentity, persistVmSettings } from '../identity/vm-identity.mjs'
 import { applyOfficialFingerprintToVm, readOfficialCcIdentity } from '../identity/official-fingerprint.mjs'
 import { writeSlotSeedFiles, inferProjectRootFromCliHome } from '../vm/slot-seed.mjs'
@@ -88,7 +88,7 @@ export function normalizeOfficialCcConfig(raw = {}) {
     wipe: src.wipe !== false,
     apply_seed: src.apply_seed !== false,
     reconcile_fingerprint: src.reconcile_fingerprint !== false,
-    sync_telemetry: src.sync_telemetry === true,
+    sync_telemetry: !deploymentTelemetryDisabled() && src.sync_telemetry === true,
     hello_prompt: hello || DEFAULT_HELLO_PROMPT,
     timeout_ms:
       Number.isFinite(timeout) && timeout >= 30_000 && timeout <= 15 * 60 * 1000
@@ -136,7 +136,8 @@ export function applyOfficialCcConfig(opts = {}, config = null) {
     wipe: opts.wipe !== undefined ? opts.wipe : cfg.wipe,
     reconcileFingerprint:
       opts.reconcileFingerprint !== undefined ? opts.reconcileFingerprint : cfg.reconcile_fingerprint,
-    syncTelemetry: opts.syncTelemetry !== undefined ? opts.syncTelemetry : cfg.sync_telemetry,
+    syncTelemetry:
+      !deploymentTelemetryDisabled() && (opts.syncTelemetry !== undefined ? opts.syncTelemetry : cfg.sync_telemetry),
     memory: opts.memory || cfg.memory,
     resident: opts.resident !== undefined ? opts.resident : cfg.resident,
     runTurn: opts.runTurn,

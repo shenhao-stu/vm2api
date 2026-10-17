@@ -11,7 +11,7 @@
  * (writes the previous data/request-logs/YYYY-MM-DD.jsonl format alongside).
  *
  * Env: KIN_REQUEST_LOG_MODE=off|normal|debug (default normal)
- * Per-request override: X-Kin-Debug: 1 or X-Kin-Log: debug|normal|off
+ * Request headers can reduce, but never increase, the configured capture level.
  */
 
 import fs from 'node:fs'
@@ -25,11 +25,11 @@ import { costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
 import { disjointOpenaiUsage } from '../protocol/openai-usage.mjs'
 import { REASONING_EFFORTS, sessionIdForLog } from '../protocol/log-fields.mjs'
 
-/** Persist the token a client actually sent — only for failed ingress auth. */
+/** Correlate failed authentication without persisting the supplied credential. */
 export function presentedApiKeyForLog(token) {
   const t = String(token || '').trim()
   if (!t || t.startsWith('kin-panel-')) return ''
-  return t.slice(0, 240)
+  return `sha256:${crypto.createHash('sha256').update(t).digest('hex')}`
 }
 
 const MODES = new Set(['off', 'normal', 'debug'])
@@ -344,15 +344,16 @@ function debugResponse(captured) {
 }
 
 export function resolveLogMode(envMode, req) {
-  const hdr = String(req?.headers?.['x-kin-log'] || '')
+  const configured = String(envMode || 'normal')
     .trim()
     .toLowerCase()
-  if (MODES.has(hdr)) return hdr
-  if (String(req?.headers?.['x-kin-debug'] || '') === '1') return 'debug'
-  const base = String(envMode || 'normal')
+  const base = MODES.has(configured) ? configured : 'normal'
+  const requested = String(req?.headers?.['x-kin-log'] || '')
     .trim()
     .toLowerCase()
-  return MODES.has(base) ? base : 'normal'
+  if (base === 'off' || requested === 'off') return 'off'
+  if (base === 'normal' || requested === 'normal') return 'normal'
+  return base
 }
 
 export function newRequestId(req) {

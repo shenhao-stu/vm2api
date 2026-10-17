@@ -16,8 +16,12 @@
  * literal. Other kill switches must be absent when telemetry is on.
  */
 
+export function deploymentTelemetryDisabled(env = process.env) {
+  return /^(1|true)$/i.test(String(env.VM2API_DISABLE_TELEMETRY || '').trim())
+}
+
 export function isTelemetryEnabled(pol = {}) {
-  return pol.telemetry_disabled === false
+  return !deploymentTelemetryDisabled() && pol.telemetry_disabled === false
 }
 
 /**

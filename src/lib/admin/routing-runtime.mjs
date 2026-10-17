@@ -451,7 +451,7 @@ export function createRoutingRuntime(ctx) {
     if (body.logging) {
       routingConfig.logging = normalizeLoggingConfig({ ...(routingConfig.logging || {}), ...body.logging })
       ctx.requestLog.setConfig({
-        mode: routingConfig.logging.mode,
+        mode: process.env.KIN_REQUEST_LOG_MODE || routingConfig.logging.mode,
         retainDays: routingConfig.logging.retain_days,
         debugRetainDays: routingConfig.logging.debug_retain_days,
         maxMb: routingConfig.logging.max_mb,

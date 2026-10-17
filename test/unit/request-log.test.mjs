@@ -21,11 +21,14 @@ function tmpStore(mode = 'normal') {
   return new RequestLogStore({ dataDir: dir, mode })
 }
 
-test('resolveLogMode: env + header overrides', () => {
+test('resolveLogMode: caller headers cannot increase server capture level', () => {
   assert.equal(resolveLogMode('normal', { headers: {} }), 'normal')
-  assert.equal(resolveLogMode('normal', { headers: { 'x-kin-debug': '1' } }), 'debug')
+  assert.equal(resolveLogMode('normal', { headers: { 'x-kin-debug': '1' } }), 'normal')
+  assert.equal(resolveLogMode('normal', { headers: { 'x-kin-log': 'debug' } }), 'normal')
   assert.equal(resolveLogMode('debug', { headers: { 'x-kin-log': 'off' } }), 'off')
-  assert.equal(resolveLogMode('off', { headers: { 'x-kin-log': 'normal' } }), 'normal')
+  assert.equal(resolveLogMode('off', { headers: { 'x-kin-log': 'normal' } }), 'off')
+  assert.equal(resolveLogMode('off', { headers: { 'x-kin-debug': '1' } }), 'off')
+  assert.equal(resolveLogMode('debug', { headers: { 'x-kin-log': 'normal' } }), 'normal')
 })
 
 test('newRequestId keeps incoming X-Request-ID', () => {
@@ -561,8 +564,8 @@ test('finish records washed Responses path over inbound chat path', () => {
   assert.equal(sum.protocol, 'openai.responses')
 })
 
-test('debug mode stores full redacted body', () => {
-  const store = tmpStore('normal')
+test('operator debug mode stores full redacted body', () => {
+  const store = tmpStore('debug')
   const req = { method: 'POST', headers: { 'x-kin-debug': '1', authorization: 'Bearer sk-kin-abc' }, socket: {} }
   const ctx = store.start(req, { protocol: 'openai.chat', pathName: '/v1/chat/completions' })
   assert.equal(ctx.mode, 'debug')
@@ -596,9 +599,10 @@ test('outbound bodies are stored only when the operator configured debug, not vi
   }
   for (const headers of [{ 'x-kin-debug': '1' }, { 'x-kin-log': 'debug' }]) {
     const forced = record(tmpStore('normal'), headers)
-    assert.deepEqual(forced.inbound_body, { model: 'm' })
-    assert.equal(forced.outbound_body, null)
-    assert.equal(forced.outbound_headers, null)
+    assert.equal(forced.log_mode, 'normal')
+    assert.equal(forced.inbound_body, undefined)
+    assert.equal(forced.outbound_body, undefined)
+    assert.equal(forced.outbound_headers, undefined)
   }
   const operator = record(tmpStore('debug'), {})
   assert.deepEqual(operator.outbound_body, outbound.body)
@@ -933,7 +937,7 @@ test('normalizeLoggingConfig defaults debug retain to 3 and caps at retain_days'
   assert.equal(b.max_mb, 512)
 })
 
-test('ingress 401 stores presented key + ip and can be excluded from the list', () => {
+test('ingress 401 stores only a credential fingerprint + ip and can be excluded from the list', () => {
   const store = tmpStore('normal')
   const ctx = store.start(
     {
@@ -952,19 +956,20 @@ test('ingress 401 stores presented key + ip and can be excluded from the list', 
   assert.equal(store.queryNormal({ status: 'error' }).total, 0)
   const listed = store.queryNormal({ status: 'error', include_muted: true })
   assert.equal(listed.total, 1)
-  assert.equal(listed.items[0].api_key_presented, 'sk-bad-key-plain')
+  assert.match(listed.items[0].api_key_presented, /^sha256:[a-f0-9]{64}$/)
+  assert.doesNotMatch(JSON.stringify(listed), /sk-bad-key-plain/)
   assert.equal(listed.items[0].ip, '203.0.113.9')
   assert.equal(listed.items[0].error_class, 'auth')
   assert.equal(store.queryNormal({ status: 'error', error_class: 'auth' }).total, 1)
   assert.equal(store.queryNormal({ status: 'error', exclude_error_class: 'auth' }).total, 0)
   const hits = store.windowStats().error_collection.ingress_hits
   assert.equal(hits.length, 1)
-  assert.equal(hits[0].api_key_presented, 'sk-bad-key-plain')
+  assert.equal(hits[0].api_key_presented, listed.items[0].api_key_presented)
   assert.equal(hits[0].ip, '203.0.113.9')
   assert.equal(hits[0].count, 1)
 })
 
-test('exportRows + csv/jsonl keep presented key and ip', () => {
+test('exportRows + csv/jsonl keep only credential fingerprint and ip', () => {
   const store = tmpStore('normal')
   const ctx = store.start(
     {
@@ -985,10 +990,12 @@ test('exportRows + csv/jsonl keep presented key and ip', () => {
   assert.equal(items[0].ip, '198.51.100.4')
   const csv = logsToCsv(items)
   assert.match(csv, /api_key_presented/)
-  assert.match(csv, /sk-export-plain/)
+  assert.doesNotMatch(csv, /sk-export-plain/)
+  assert.match(csv, /sha256:[a-f0-9]{64}/)
   assert.match(csv, /198\.51\.100\.4/)
   const jsonl = logsToJsonl(items)
-  assert.match(jsonl, /sk-export-plain/)
+  assert.doesNotMatch(jsonl, /sk-export-plain/)
+  assert.match(jsonl, /sha256:[a-f0-9]{64}/)
 })
 
 test('finish persists caller and outbound sessions (capped) and only known reasoning efforts', () => {

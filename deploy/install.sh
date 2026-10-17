@@ -35,7 +35,6 @@ NO_START=0
 SYNC_WRAP=1
 FROM_SOURCE=0
 DEFAULT_ADMIN_USER="admin"
-DEFAULT_ADMIN_PASSWORD="123456"
 WROTE_DEFAULT_PASSWORD=0
 HOST_ARCH=""
 REQUESTED_ARCH=""
@@ -272,7 +271,7 @@ env_get() {
   local name="$1"
   local envf="${2:-${INSTALL_DIR}/.env}"
   [ -f "$envf" ] || return 0
-  grep -E "^${name}=" "$envf" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "'" | tr -d '"' | tr -d '\r'
+  sed -n "s/^${name}=//p" "$envf" | tail -n1 | tr -d "'" | tr -d '"' | tr -d '\r'
 }
 
 env_set() {
@@ -325,7 +324,7 @@ guide_auth_error() {
   echo "  处理: 打开登录页，不要直接进总览"
   echo "    http://127.0.0.1:${port}/cc#/login"
   if [ "${WROTE_DEFAULT_PASSWORD:-0}" = 1 ]; then
-    echo "  默认账密: admin / 123456（本次写入的空密码默认值，登录后请改）"
+    echo "  已生成随机密码，保存在 ${INSTALL_DIR}/.env 的 VM2API_ADMIN_PASSWORD"
   else
     echo "  已有密码见:"
     echo "    grep '^VM2API_ADMIN_PASSWORD=' ${INSTALL_DIR}/.env"
@@ -342,7 +341,7 @@ print_login_banner() {
   info "探活:       curl -sS --noproxy '*' http://127.0.0.1:${port}/health"
   if [ "${WROTE_DEFAULT_PASSWORD:-0}" = 1 ]; then
     info "默认账号:   ${DEFAULT_ADMIN_USER}"
-    info "默认密码:   ${DEFAULT_ADMIN_PASSWORD}（仅空字段写入；请登录后尽快改）"
+    info "随机密码保存在 ${INSTALL_DIR}/.env 的 VM2API_ADMIN_PASSWORD"
   else
     info "管理台密码见 ${INSTALL_DIR}/.env 的 VM2API_ADMIN_PASSWORD"
   fi
@@ -381,9 +380,9 @@ ensure_env() {
   fi
   chmod 600 "$envf" || true
   env_set_if_empty VM2API_ADMIN_USER "$DEFAULT_ADMIN_USER" || true
-  if env_set_if_empty VM2API_ADMIN_PASSWORD "$DEFAULT_ADMIN_PASSWORD"; then
+  if env_set_if_empty VM2API_ADMIN_PASSWORD "$(gen_secret)"; then
     WROTE_DEFAULT_PASSWORD=1
-    ok "已补默认管理台账密  ${DEFAULT_ADMIN_USER} / ${DEFAULT_ADMIN_PASSWORD}（只填空，已有密码未改）"
+    ok "已将随机管理台密码写入受限 .env 文件（已有密码不变）"
   else
     info "保留已有管理台密码"
   fi
