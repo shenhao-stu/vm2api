@@ -8,6 +8,7 @@ import {
   isWrapConnectionError,
   isUsagePolicyErrorMessage,
   makeRefusalGuardError,
+  quotaWindowError,
   isAssistantMessageBody,
   isCompleteAssistantMessage,
   isIncompleteAssistantMessage,
@@ -25,6 +26,31 @@ test('an empty pool is a 503 "no available account", never a load message', () =
   assert.equal(mapped.body.error.code, 'pool_unavailable')
   assert.equal(mapped.body.error.message, CLIENT_POOL_UNAVAILABLE_MESSAGE)
   assert.equal(mapped.body.error.details, undefined)
+})
+
+test('upstream bodies cannot claim local quota provenance', () => {
+  for (const status of [400, 429, 500, 503]) {
+    const mapped = mapUpstreamError(status, {
+      error: {
+        code: 'quota_5h_safety',
+        message: 'upstream error',
+        details: { source: 'local_quota_policy', reset_at: new Date(Date.now() + 90_000).toISOString() },
+      },
+    })
+    assert.equal(mapped.status, status)
+    assert.notEqual(mapped.body.error.code, 'quota_5h_safety')
+    assert.notEqual(mapped.body.error.details?.source, 'local_quota_policy')
+    assert.equal(mapped.retryAfterSec, undefined)
+  }
+})
+
+test('out-of-range quota resets remain unknown instead of throwing', () => {
+  for (const until of [1e20, '99999999999999999999', 8640000000000001, Infinity, NaN]) {
+    const mapped = quotaWindowError('quota_5h_safety', { until })
+    assert.equal(mapped.status, 429)
+    assert.equal(mapped.body.error.details.reset_at, null)
+    assert.equal(mapped.retryAfterSec, undefined)
+  }
 })
 
 test('real capacity exhaustion and queue timeout are a 529 overloaded_error with retry-after', () => {

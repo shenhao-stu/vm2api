@@ -8,6 +8,8 @@ import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
+import { mapUpstreamError, rewritePoolErrorForClient } from '../../src/lib/core/errors.mjs'
+import { handleUserUsage } from '../../src/lib/protocol/user-count-tokens.mjs'
 import {
   applyCrsIdentityReplace,
   rebuildOutboundSession,
@@ -104,6 +106,254 @@ function scheduler(root, extras = {}) {
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
   })
 }
+
+test('a 90% 5h safety restriction reaches consumers as quota 429 with its reset', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.unlinkSync(path.join(root, 'vms', 'vm-02.json'))
+  const reset = new Date(Date.now() + 3600_000).toISOString()
+  const account = {
+    account_id: 'account-1',
+    unified: { headers: { '5h': { utilization: 0.9, status: 'allowed', reset } } },
+  }
+  const pool = scheduler(root, {
+    accountQuota: {
+      repo: { get: () => account },
+      policyFor: () => ({ limit_5h: 0.85, limit_7d: 0.85 }),
+      canAccept: () => ({ ok: true }),
+    },
+  })
+  let calls = 0
+  const result = await new FailoverRunner({ scheduler: pool }).run({
+    requestId: 'quota-safety-consumer',
+    canonicalBody: { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hi' }] },
+    model: 'claude-opus-5-5',
+    callAttempt: () => {
+      calls++
+      throw new Error('Quota-rejected request must not execute')
+    },
+  })
+  assert.equal(calls, 0)
+  assert.equal(result.status, 429)
+  assert.equal(result.body.error.code, 'quota_5h_safety')
+  assert.equal(result.body.error.details.source, 'local_quota_policy')
+  assert.equal(result.body.error.details.reset_at, reset)
+  assert.ok(result.retryAfterSec >= 3599 && result.retryAfterSec <= 3600)
+  const mapped = rewritePoolErrorForClient(
+    mapUpstreamError(
+      result.status,
+      result.body,
+      {},
+      {
+        localQuotaPolicy: result.localQuotaPolicy,
+      },
+    ),
+    result.body,
+  )
+  assert.equal(mapped.status, 429)
+  assert.equal(mapped.body.error.code, 'quota_5h_safety')
+  assert.equal(mapped.body.error.details.reset_at, reset)
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-01.json'))).schedulable, true)
+})
+
+function quotaConsumerFixture(t, windows, { second = null, gate = null } = {}) {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  if (!second) fs.unlinkSync(path.join(root, 'vms', 'vm-02.json'))
+  else {
+    const file = path.join(root, 'vms', 'vm-02.json')
+    const vm = JSON.parse(fs.readFileSync(file))
+    if (second === 'disabled') vm.schedulable = false
+    if (second === 'model') vm.policy.allowed_models = ['claude-sonnet-5-5']
+    fs.writeFileSync(file, JSON.stringify(vm))
+  }
+  const pool = scheduler(root, {
+    accountQuota: {
+      repo: {
+        get: (id) => ({
+          account_id: id,
+          unified: {
+            headers: id === 'account-1' ? windows : typeof second === 'object' ? second : {},
+          },
+        }),
+      },
+      policyFor: () => ({ limit_5h: 0.85, limit_7d: 0.85 }),
+      canAccept: () => gate || { ok: true },
+    },
+  })
+  return { root, pool }
+}
+
+async function runQuotaConsumer(pool, options = {}) {
+  let calls = 0
+  const result = await new FailoverRunner({ scheduler: pool }).run({
+    requestId: 'quota-consumer-boundary',
+    canonicalBody: { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hi' }] },
+    model: 'claude-opus-5-5',
+    ...options,
+    callAttempt: () => {
+      calls++
+      return {
+        ok: true,
+        status: 200,
+        terminalState: 'verified',
+        body: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'ok' }],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 1, output_tokens: 1 },
+        },
+      }
+    },
+  })
+  return { result, calls }
+}
+
+test('5h and 7d window gates preserve their distinct reasons on direct and seated paths', async (t) => {
+  for (const window of ['5h', '7d']) {
+    for (const status of ['allowed', 'rejected']) {
+      const reset = new Date(Date.now() + 90_000).toISOString()
+      const { pool } = quotaConsumerFixture(t, { [window]: { utilization: 0.9, status, reset } })
+      const { result, calls } = await runQuotaConsumer(pool, { seatKey: `seat-${window}-${status}` })
+      const code = `quota_${window}_${status === 'allowed' ? 'safety' : 'header'}`
+      assert.equal(calls, 0)
+      assert.equal(result.status, 429)
+      assert.equal(result.body.error.code, code)
+      assert.equal(result.body.error.details.window, window)
+      assert.equal(result.body.error.details.reset_at, reset)
+      assert.ok(result.retryAfterSec >= 89 && result.retryAfterSec <= 90)
+      const mapped = mapUpstreamError(result.status, result.body, {}, { localQuotaPolicy: result.localQuotaPolicy })
+      assert.equal(mapped.body.error.code, code)
+      assert.equal(mapped.body.error.details.source, 'local_quota_policy')
+    }
+  }
+})
+
+test('unknown quota resets do not invent Retry-After; elapsed windows are admitted', async (t) => {
+  for (const reset of [null, 'not-a-date']) {
+    const { pool } = quotaConsumerFixture(t, { '5h': { utilization: 0.9, status: 'allowed', reset } })
+    const { result, calls } = await runQuotaConsumer(pool)
+    assert.equal(calls, 0)
+    assert.equal(result.status, 429)
+    assert.equal(result.body.error.details.reset_at, null)
+    assert.equal(result.retryAfterSec, undefined)
+    assert.equal(
+      mapUpstreamError(result.status, result.body, {}, { localQuotaPolicy: result.localQuotaPolicy }).retryAfterSec,
+      undefined,
+    )
+  }
+  const { pool } = quotaConsumerFixture(t, {
+    '5h': { utilization: 0.9, status: 'allowed', reset: new Date(Date.now() - 60_000).toISOString() },
+  })
+  const { result, calls } = await runQuotaConsumer(pool)
+  assert.equal(result.status, 200)
+  assert.equal(calls, 1)
+})
+
+test('quota mixed with non-quota rejection stays unavailable; an eligible alternative still serves', async (t) => {
+  for (const second of ['disabled', 'model', 'ready']) {
+    const { pool } = quotaConsumerFixture(
+      t,
+      {
+        '5h': { utilization: 0.9, status: 'allowed', reset: new Date(Date.now() + 90_000).toISOString() },
+      },
+      { second },
+    )
+    const { result, calls } = await runQuotaConsumer(pool)
+    assert.equal(result.status, second === 'ready' ? 200 : 503, second)
+    assert.equal(calls, second === 'ready' ? 1 : 0, second)
+    if (second !== 'ready') {
+      assert.equal(result.body.error.code, 'account_pool_exhausted')
+      assert.equal(result.retryAfterSec, undefined)
+    }
+  }
+})
+
+test('an empty scoped inventory does not claim a quota restriction', async (t) => {
+  const { root, pool } = quotaConsumerFixture(t, {})
+  fs.unlinkSync(path.join(root, 'vms', 'vm-01.json'))
+  const { result, calls } = await runQuotaConsumer(pool)
+  assert.equal(result.status, 503)
+  assert.equal(result.body.error.code, 'account_pool_exhausted')
+  assert.equal(calls, 0)
+})
+
+test('the usage peek exposes the same quota 429 and Retry-After without probing upstream', async (t) => {
+  const reset = new Date(Date.now() + 90_000).toISOString()
+  const { pool } = quotaConsumerFixture(t, { '5h': { utilization: 0.9, status: 'allowed', reset } })
+  const headers = {}
+  let response
+  await handleUserUsage(
+    { headers: {}, apiKeyKind: 'master' },
+    {
+      setHeader: (name, value) => {
+        headers[name] = value
+      },
+    },
+    {
+      requireAuth: () => true,
+      poolScheduler: pool,
+      json: (_res, status, body) => {
+        response = { status, body }
+      },
+      probeAccount: () => {
+        throw new Error('Rejected usage peek must not probe upstream')
+      },
+    },
+  )
+  assert.equal(response.status, 429)
+  assert.equal(response.body.error.code, 'quota_5h_safety')
+  assert.equal(response.body.error.details.reset_at, reset)
+  assert.ok(Number(headers['retry-after']) >= 89 && Number(headers['retry-after']) <= 90)
+})
+
+test('quota-service CLI gates retain reset data while unrecognized reasons remain 503', async (t) => {
+  const reset = new Date(Date.now() + 90_000).toISOString()
+  for (const reason of ['quota_5h_cli', 'quota_7d_cli', 'quota_refresh_failed', 'quota_5h_unknown']) {
+    const { pool } = quotaConsumerFixture(t, {}, { gate: { ok: false, reason, detail: { reset } } })
+    const { result, calls } = await runQuotaConsumer(pool)
+    const known = reason.endsWith('_cli')
+    assert.equal(calls, 0)
+    assert.equal(result.status, known ? 429 : 503, reason)
+    assert.equal(result.body.error.code, known ? reason : 'account_pool_exhausted')
+    if (known) {
+      assert.equal(result.body.error.details.reset_at, reset)
+      assert.ok(result.retryAfterSec >= 89 && result.retryAfterSec <= 90)
+    } else assert.equal(result.retryAfterSec, undefined)
+  }
+})
+
+test('an all-quota pool reports the earliest known account reset', async (t) => {
+  const later = new Date(Date.now() + 180_000).toISOString()
+  const earlier = new Date(Date.now() + 90_000).toISOString()
+  const { pool } = quotaConsumerFixture(
+    t,
+    { '5h': { utilization: 0.9, status: 'allowed', reset: later } },
+    {
+      second: { '7d': { utilization: 0.9, status: 'allowed', reset: earlier } },
+    },
+  )
+  const { result, calls } = await runQuotaConsumer(pool)
+  assert.equal(calls, 0)
+  assert.equal(result.status, 429)
+  assert.equal(result.body.error.code, 'quota_7d_safety')
+  assert.equal(result.body.error.details.reset_at, earlier)
+  assert.ok(result.retryAfterSec >= 89 && result.retryAfterSec <= 90)
+})
+
+test('a Max account quota restriction is not mislabeled as missing Fable entitlement', async (t) => {
+  const reset = new Date(Date.now() + 90_000).toISOString()
+  const { pool } = quotaConsumerFixture(t, { '5h': { utilization: 0.9, status: 'allowed', reset } })
+  const model = 'claude-fable-5'
+  const { result, calls } = await runQuotaConsumer(pool, {
+    model,
+    canonicalBody: { model, messages: [{ role: 'user', content: 'hi' }] },
+  })
+  assert.equal(calls, 0)
+  assert.equal(result.status, 429)
+  assert.equal(result.body.error.code, 'quota_5h_safety')
+})
 
 test('scheduler skips a slot whose access is expired and has no refresh', async (t) => {
   const root = project()

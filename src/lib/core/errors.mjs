@@ -12,6 +12,7 @@
  *   }
  * }
  */
+import { quotaRejection } from '../pool/quota-rejection.mjs'
 
 export const ErrorType = {
   AUTH: 'authentication_error',
@@ -264,6 +265,30 @@ export function makeError({
   return { status, body: { error } }
 }
 
+/** Local admission policy: no claim that the provider returned HTTP 429. */
+export function quotaWindowError(reason, { until = null, requestId = null } = {}) {
+  const now = Date.now()
+  const quota = quotaRejection(reason, until, now)
+  if (!quota) return null
+  return {
+    localQuotaPolicy: true,
+    ...makeError({
+      type: ErrorType.RATE_LIMIT,
+      code: quota.reason,
+      status: 429,
+      message: `${quota.window} 额度保护已触发，当前没有可用账号。请等待额度窗口重置后重试。`,
+      details: {
+        source: 'local_quota_policy',
+        reason: quota.reason,
+        window: quota.window,
+        reset_at: quota.until ? new Date(quota.until).toISOString() : null,
+      },
+      request_id: requestId,
+    }),
+    ...(quota.until ? { retryAfterSec: Math.max(1, Math.ceil((quota.until - now) / 1000)) } : {}),
+  }
+}
+
 // Cancellation is decided by the request's own AbortSignal, never by transport
 // text: an upstream ECONNRESET or a local timeout is a real failure, not a cancel.
 const CLIENT_CANCEL_CODES = new Set(['client_cancelled', 'request_cancelled', 'client_aborted', 'selection_cancelled'])
@@ -404,7 +429,7 @@ export function incompleteAssistantClientError(result = {}) {
   }
 }
 
-export function mapUpstreamError(status, body, headers = {}) {
+export function mapUpstreamError(status, body, headers = {}, { localQuotaPolicy = false } = {}) {
   const upType = upstreamErrorType(body)
   const inboundCode = body?.error?.code || null
   if (
@@ -441,6 +466,13 @@ export function mapUpstreamError(status, body, headers = {}) {
       status: 429,
       details: body?.error?.details,
     })
+  }
+  if (status === 429 && localQuotaPolicy === true) {
+    const quota = quotaWindowError(inboundCode, {
+      until: body?.error?.details?.reset_at,
+      requestId: body?.error?.request_id,
+    })
+    if (quota) return quota
   }
 
   const poolKind = poolErrorKind(inboundCode, msg)

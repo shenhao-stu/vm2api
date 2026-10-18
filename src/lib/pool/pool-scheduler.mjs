@@ -50,6 +50,7 @@ import { resolveSessionSlots } from '../vm/slot-engine.mjs'
 import { SeatPlanner, rankSeatCandidates } from './seat-planner.mjs'
 import { GATE_DRAINING } from './quota-gate.mjs'
 import { activeHoursOf, evaluateActiveHours } from './active-hours.mjs'
+import { quotaRejection } from './quota-rejection.mjs'
 
 const WAIT_TIMEOUT_MIN_MS = 1000
 const WAIT_TIMEOUT_MAX_MS = 120000
@@ -188,6 +189,17 @@ function scopedSeatKey(seatKey, scope = PLATFORM_SCOPE) {
  * inside its operator rest window, whose open time rides along as retry_after.
  */
 function emptyPoolFailure(model, candidates, now = Date.now()) {
+  const quota = candidates?.quotaRejections || []
+  if (quota.length && !candidates.otherRejections) {
+    const first = quota.reduce((best, item) =>
+      item.until > now && (!(best.until > now) || item.until < best.until) ? item : best,
+    )
+    return {
+      reason: first.reason,
+      quota_until: first.until,
+      retry_after_ms: first.until > now ? first.until - now : null,
+    }
+  }
   if (isFableModel(model)) return { reason: 'fable_requires_max', retry_after_ms: null }
   if ((candidates?.rejections?.quota_guard_request_too_large || 0) > 0) {
     return { reason: 'quota_guard_request_too_large', retry_after_ms: null }
@@ -483,7 +495,7 @@ export class PoolScheduler extends EventEmitter {
       const waitAvailable = reserveMisses.length ? effectiveAvailable : available
       if (waitCandidates.length === 0) {
         const empty = emptyPoolFailure(model, candidates)
-        return { ...fail(empty.reason, waitCandidates, waitAvailable), retry_after_ms: empty.retry_after_ms }
+        return { ...fail(empty.reason, waitCandidates, waitAvailable), ...empty }
       }
       const waitPool = waitCandidates.filter(
         (candidate) => !isUnboundAuthCooldown(candidate, boundBefore, stickyCleared),
@@ -652,7 +664,7 @@ export class PoolScheduler extends EventEmitter {
             if (granted) return finish(granted)
             if (!candidates.length) {
               const empty = emptyPoolFailure(model, candidates)
-              return { ...fail(empty.reason), retry_after_ms: empty.retry_after_ms }
+              return { ...fail(empty.reason), ...empty }
             }
             if (!allowWait || now >= failoverDeadline) return fail('all_accounts_busy')
             const home = stickyVms
@@ -873,6 +885,8 @@ export class PoolScheduler extends EventEmitter {
     // that cause (pool_rate_limited / pool_overload_cooldown) instead of 503.
     candidates.cooldowns = { rate_limited: null, overloaded: null }
     candidates.rejections = { quota_guard_request_too_large: 0 }
+    candidates.quotaRejections = []
+    candidates.otherRejections = 0
     // Soonest working-window open across resting slots; an all-rest pool
     // reports it as retry_after so the client can time the next attempt.
     candidates.rest_until = null
@@ -900,6 +914,9 @@ export class PoolScheduler extends EventEmitter {
       })
       if (!eligibility.ok) {
         const kind = eligibility.reason
+        const quota = quotaRejection(kind, eligibility.until, now)
+        if (quota) candidates.quotaRejections.push(quota)
+        else candidates.otherRejections += 1
         if (kind === 'rate_limited' || kind === 'overloaded') {
           const until = Number(eligibility.until) || 0
           const prev = candidates.cooldowns[kind]
@@ -1043,7 +1060,7 @@ export class PoolScheduler extends EventEmitter {
           if (ev.key === 'cool') {
             // cooldown is a wait, not a hard skip — handled below
           } else {
-            return { ok: false, reason: ev.reason || ev.key || 'account_gated' }
+            return { ok: false, reason: ev.reason || ev.key || 'account_gated', until: ev.until }
           }
         }
         headroom = budgetHeadroom({ account: { ...account, last_used_at: lastUsedAt }, quota, policy, now })
@@ -1129,7 +1146,10 @@ export class PoolScheduler extends EventEmitter {
         if (quotaGate.reason === 'concurrency_limit') markWait('concurrency_limit')
         else if (quotaGate.reason === 'rpm_limit') markWait('rpm_limit', quotaGate.detail?.reset_at)
         else if (quotaGate.reason === 'quota_band_inflight') markWait('quota_band_inflight')
-        else return { ok: false, reason: quotaGate.reason || 'quota_gate' }
+        else {
+          const quota = quotaRejection(quotaGate.reason, quotaGate.detail?.reset, now)
+          return { ok: false, reason: quotaGate.reason || 'quota_gate', ...(quota ? { until: quota.until } : {}) }
+        }
       }
       gateZone = this.accountQuota.gateZoneOf?.(accountId, { tier: vmTierOf(vm) }) || null
     }
@@ -1352,7 +1372,7 @@ export class PoolScheduler extends EventEmitter {
     const candidates = await this.eligibleCandidates({ model, signal, ownerScope, keyScope })
     if (!candidates.length) {
       const empty = emptyPoolFailure(model, candidates)
-      return { ok: false, code: empty.reason, retry_after_ms: empty.retry_after_ms }
+      return { ok: false, code: empty.reason, ...empty }
     }
     const bound = stickyKey ? this.stickyRouter?.resolve?.(stickyKey) : null
     if (bound) {

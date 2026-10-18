@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { quotaWindowError } from '../../src/lib/core/errors.mjs'
 
 const MESSAGE = {
   model: 'claude-haiku-4-5',
@@ -37,6 +38,7 @@ function createResponse() {
     writableEnded: false,
     destroyed: false,
     chunks,
+    headers: {},
     writeHead(status) {
       this.statusCode = status
       this.headersSent = true
@@ -53,7 +55,9 @@ function createResponse() {
     },
     once() {},
     off() {},
-    setHeader() {},
+    setHeader(name, value) {
+      this.headers[name] = value
+    },
   }
   return res
 }
@@ -103,18 +107,43 @@ function createHandler({ root, routing, run, stream = true }) {
   })
 }
 
-async function invoke(handler, res) {
+async function invoke(handler, res, protocol = 'anthropic.messages') {
+  const route = protocol === 'anthropic.messages' ? '/v1/messages' : '/v1/chat/completions'
   const req = {
     method: 'POST',
-    url: '/v1/messages',
+    url: route,
     headers: { authorization: 'Bearer master', 'user-agent': 'claude-cli/2.1.187 (external, cli)' },
     apiKeyKind: 'master',
     once() {},
     off() {},
   }
-  await handler.handleProtocol(req, res, 'anthropic.messages', '/v1/messages')
+  await handler.handleProtocol(req, res, protocol, route)
   res.finish?.()
 }
+
+test('both public protocols preserve local quota reason and Retry-After before SSE headers', async (t) => {
+  for (const protocol of ['anthropic.messages', 'openai.chat']) {
+    for (const stream of [false, true]) {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-quota-response-'))
+      t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+      const res = createResponse()
+      const until = Date.now() + 90_000
+      const handler = createHandler({
+        root,
+        routing: { failover: { queue_keepalive_delay_ms: 60_000 } },
+        stream,
+        run: async () => ({ ...quotaWindowError('quota_5h_safety', { until }), ok: false, terminalState: 'exhausted' }),
+      })
+      await invoke(handler, res, protocol)
+      assert.equal(res.statusCode, 429, `${protocol} stream=${stream}`)
+      assert.equal(res.body.error.code, 'quota_5h_safety')
+      assert.equal(res.body.error.details.source, 'local_quota_policy')
+      assert.equal(res.body.error.details.reset_at, new Date(until).toISOString())
+      assert.ok(Number(res.headers['retry-after']) >= 89 && Number(res.headers['retry-after']) <= 90)
+      assert.equal(res.chunks.length, 0)
+    }
+  }
+})
 
 test('a Claude stream pings during the queue and reports a later failure as SSE error', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-queue-keepalive-'))

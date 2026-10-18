@@ -14,6 +14,7 @@ import {
   isIncompleteAssistantMessage,
   incompleteAssistantClientError,
   KERNEL_FAILURE_STATUS,
+  quotaWindowError,
 } from '../core/errors.mjs'
 import { hasRefreshPresence, readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
@@ -396,6 +397,8 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
   if (CAPACITY_SELECTION_REASONS.has(reason)) return poolOverloadedError(details)
   if (reason === 'pool_rate_limited') return poolRateLimitedError(details)
   if (reason === 'quota_guard_request_too_large') return quotaGuardTooLargeError(details)
+  const quota = quotaWindowError(reason, { until: selected?.quota_until })
+  if (quota) return { ...quota, ok: false, via: 'pool-failover', terminalState: 'exhausted' }
   const failed = poolError('account_pool_exhausted', 'No eligible Claude accounts remain', details)
   // An all-rest pool knows when the first working window opens.
   const retryMs = Number(details.retry_after_ms)

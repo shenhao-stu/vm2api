@@ -2,7 +2,14 @@
  * User protocol: POST /v1/messages/count_tokens and GET /v1/usage.
  * Peek only — never bind/unbind sticky or bill tokens_in.
  */
-import { makeError, mapUpstreamError, rewritePoolErrorForClient, ErrorType, ErrorCode } from '../core/errors.mjs'
+import {
+  makeError,
+  mapUpstreamError,
+  rewritePoolErrorForClient,
+  quotaWindowError,
+  ErrorType,
+  ErrorCode,
+} from '../core/errors.mjs'
 import { refusalGuardPolicy } from '../core/refusal-guard.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
@@ -134,6 +141,11 @@ export async function peekCurrentAccount({
 /** Same client contract as Messages: Fable gate 429, capacity 529 / pool-wide limit 429 with Retry-After, else 503. */
 function sendPoolFail(res, json, peeked) {
   const code = peeked?.code || 'no_eligible_accounts'
+  const quota = quotaWindowError(code, { until: peeked?.quota_until })
+  if (quota) {
+    if (quota.retryAfterSec) res.setHeader?.('retry-after', String(quota.retryAfterSec))
+    return json(res, quota.status, quota.body)
+  }
   if (code === ErrorCode.KEY_GROUP_MISMATCH) {
     const err = makeError({
       type: ErrorType.PERMISSION,

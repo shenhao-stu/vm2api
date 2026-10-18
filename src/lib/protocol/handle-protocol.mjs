@@ -236,7 +236,9 @@ export function createHandleProtocol(deps) {
     const originalMessage = result?.body?.error?.message || null
     const details = result?.body?.error?.details || {}
     const mapped = rewritePoolErrorForClient(
-      mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
+      mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}, {
+        localQuotaPolicy: result?.localQuotaPolicy === true,
+      }),
       result?.body,
     )
     const summary = formatPoolSelectionSummary(details)
