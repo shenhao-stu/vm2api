@@ -81,6 +81,7 @@ const CODE_MAP = {
   upstream_auth_error: 'credential',
   oauth_need_reimport: 'credential',
   oauth_refresh_failed: 'credential',
+  upstream_network_error: 'upstream',
   upstream_error: 'upstream',
   distill_blocked: 'distill',
   refusal_guard: 'refusal',
@@ -220,8 +221,10 @@ export function isIgnoredClientCancel(row = {}) {
 export function isErrorRow(row) {
   if (isIgnoredClientCancel(row)) return false
   const status = Number(row?.status) || 0
-  // HTTP 2xx already committed to the client. leftover error_code
-  // (stream_incomplete after first-byte message_start) must not paint 超时.
+  // SSE commits HTTP status before its outcome is known. A failed terminal
+  // state still represents a failed request even when the status is 200.
+  if (row?.final_state === 'incomplete' || row?.final_state === 'transport_error') return true
+  // Preserve successful or legacy 2xx rows with stale diagnostic fields.
   if (status > 0 && status < 400) return false
   return status >= 400 || !!row?.error_code
 }

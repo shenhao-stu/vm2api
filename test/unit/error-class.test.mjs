@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   classifyRequestError,
+  isErrorRow,
   collectErrors,
   enrichLogRow,
   excludeErrorClassSql,
@@ -79,6 +80,46 @@ test('classifyRequestError maps known codes and statuses', () => {
   assert.equal(classifyRequestError({ status: 502, error_code: 'ECONNRESET' }).error_class, 'timeout')
   assert.equal(classifyRequestError({ status: 200, error_code: 'stream_incomplete' }), null)
   assert.equal(classifyRequestError({ status: 200, error_message: 'stream first-byte timeout' }), null)
+})
+
+test('an incomplete stream remains an error after HTTP 200 has been committed', () => {
+  const failed = {
+    status: 200,
+    final_state: 'incomplete',
+    error_code: 'stream_incomplete',
+    error_message: 'Connection error.',
+    output_tokens: 0,
+  }
+  assert.equal(isErrorRow(failed), true)
+  assert.equal(classifyRequestError(failed)?.error_class, 'timeout')
+  assert.equal(collectErrors([failed]).total, 1)
+  assert.equal(classifyRequestError({ ...failed, final_state: 'verified' }), null)
+  assert.equal(classifyRequestError({ ...failed, error_code: 'client_cancelled' }), null)
+})
+
+test('upstream network failure keeps its error class when stream headers were already committed', () => {
+  const failure = {
+    error_code: 'upstream_network_error',
+    error_message: 'Connection error.',
+    final_state: 'incomplete',
+    output_tokens: 0,
+  }
+  assert.equal(classifyRequestError({ ...failure, status: 502 })?.error_class, 'upstream')
+  assert.equal(classifyRequestError({ ...failure, status: 200 })?.error_class, 'upstream')
+  assert.equal(collectErrors([{ ...failure, status: 200 }]).by_class[0]?.id, 'upstream')
+})
+
+test('failed terminal states are errors while cancelled, verified and legacy 2xx stay ignored', () => {
+  for (const final_state of ['incomplete', 'transport_error']) {
+    assert.equal(isErrorRow({ status: 200, final_state }), true)
+    assert.equal(isErrorRow({ status: 0, final_state }), true)
+    assert.equal(isErrorRow({ status: 200, final_state, error_code: 'client_cancelled' }), false)
+  }
+  for (const final_state of ['verified', 'cancelled', 'unknown', null]) {
+    assert.equal(isErrorRow({ status: 200, final_state }), false)
+  }
+  assert.equal(isErrorRow({ status: 499, final_state: 'cancelled', error_code: 'client_cancelled' }), false)
+  assert.equal(isErrorRow({ status: 502, final_state: 'incomplete', error_code: 'client_cancelled' }), true)
 })
 
 test('collectErrors groups by class and code', () => {
