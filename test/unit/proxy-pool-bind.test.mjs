@@ -129,6 +129,63 @@ async function listenSocks() {
   return { server, host: addr.address, port: addr.port }
 }
 
+test('unbound SOCKS probes stay healthy without creating guest egress', async (t) => {
+  const socks = await listenSocks()
+  const dir = tmpDir()
+  let checks = 0
+  let repairs = 0
+  const pool = new ProxyPool({
+    dataDir: dir,
+    egressCheck: () => {
+      checks += 1
+      return { ok: false, reason: 'not_running' }
+    },
+    repairEgress: () => {
+      repairs += 1
+      return { ok: false, error: 'all predefined address pools have been fully subnetted' }
+    },
+  })
+  t.after(() => {
+    pool.stopScheduler()
+    socks.server.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  pool.stopScheduler()
+  pool.importLines(`${socks.host}:${socks.port}`)
+  const id = pool.snapshot().proxies[0].id
+  const result = await pool.probeById(id)
+  assert.equal(result.ok, true)
+  assert.equal(result.probe.ok, true)
+  assert.equal(result.probe.scope, 'socks')
+  assert.equal(checks, 0)
+  assert.equal(repairs, 0)
+  assert.equal(pool.snapshot().proxies[0].last_error, null)
+})
+
+test('unbound proxies still fail when their SOCKS endpoint refuses connections', async (t) => {
+  const socks = await listenSocks()
+  await new Promise((resolve) => socks.server.close(resolve))
+  const dir = tmpDir()
+  let repairs = 0
+  const pool = new ProxyPool({
+    dataDir: dir,
+    egressCheck: () => ({ ok: true }),
+    repairEgress: () => {
+      repairs += 1
+    },
+  })
+  t.after(() => {
+    pool.stopScheduler()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  pool.stopScheduler()
+  pool.importLines(`${socks.host}:${socks.port}`)
+  const result = await pool.probeById(pool.snapshot().proxies[0].id)
+  assert.equal(result.probe.ok, false)
+  assert.equal(result.probe.scope, 'socks')
+  assert.equal(repairs, 0)
+})
+
 test('probeOne marks egress_down after SOCKS greeting if helper is dead', async () => {
   const socks = await listenSocks()
   const pool = new ProxyPool({
@@ -138,6 +195,7 @@ test('probeOne marks egress_down after SOCKS greeting if helper is dead', async 
   pool.stopScheduler()
   try {
     pool.importLines(`${socks.host}:${socks.port}`)
+    assert.equal(pool.bind(pool.state.proxies[0].id, 'vm-01').ok, true)
     const result = await pool.probeOne(pool.state.proxies[0])
     assert.equal(result.ok, false)
     assert.equal(result.error, 'not_running')
@@ -147,7 +205,7 @@ test('probeOne marks egress_down after SOCKS greeting if helper is dead', async 
   }
 })
 
-test('probeOne repairs egress then passes', async () => {
+test('probeOne repairs egress for a legacy single binding then passes', async () => {
   const socks = await listenSocks()
   let healthy = false
   const pool = new ProxyPool({
@@ -160,6 +218,9 @@ test('probeOne repairs egress then passes', async () => {
   pool.stopScheduler()
   try {
     pool.importLines(`${socks.host}:${socks.port}`)
+    assert.equal(pool.bind(pool.state.proxies[0].id, 'vm-01').ok, true)
+    delete pool.state.proxies[0].bound_vm_ids
+    assert.equal(pool.state.proxies[0].bound_vm_id, 'vm-01')
     const result = await pool.probeOne(pool.state.proxies[0])
     assert.equal(result.ok, true)
     assert.equal(healthy, true)
@@ -169,7 +230,7 @@ test('probeOne repairs egress then passes', async () => {
   }
 })
 
-test('startScheduler immediately repairs enabled egress', async () => {
+test('startScheduler immediately repairs enabled bound egress', async () => {
   const socks = await listenSocks()
   let healthy = false
   let repairs = 0
@@ -183,6 +244,7 @@ test('startScheduler immediately repairs enabled egress', async () => {
   })
   try {
     pool.importLines(`${socks.host}:${socks.port}`)
+    assert.equal(pool.bind(pool.state.proxies[0].id, 'vm-01').ok, true)
     pool.startScheduler()
     const deadline = Date.now() + 1000
     while (!healthy && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10))
@@ -204,6 +266,7 @@ test('egress_down does not mark a live SOCKS proxy dead', async () => {
   try {
     pool.importLines(`${socks.host}:${socks.port}`)
     const id = pool.snapshot().proxies[0].id
+    assert.equal(pool.bind(id, 'vm-01').ok, true)
     await pool.probeById(id)
     await pool.probeById(id)
     const p = pool.snapshot().proxies[0]
