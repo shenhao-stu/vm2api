@@ -198,6 +198,7 @@ export function isUnconfirmedAuthFailure(result = {}) {
 }
 
 const TIMEOUT_PATTERNS = /timeout|deadline|response header|timed out/i
+const GENERIC_CONNECTION_ERROR = /^(?:provider error:\s*)*connection error\.?$/i
 
 function isTimeoutFailure(workerCode, message) {
   return TIMEOUT_PATTERNS.test(`${workerCode} ${message}`)
@@ -403,6 +404,11 @@ function classifyUpstreamResultRaw(
   }
   // Kernel / cli-node named the cause; none of these is the account's fault.
   if (workerCode === ErrorCode.UPSTREAM_NETWORK) {
+    // This generic CLI message names no failed proxy or transport stage.
+    // Keep the existing retry budget instead of cooling a possibly healthy proxy.
+    if (status === 502 && GENERIC_CONNECTION_ERROR.test(message.trim())) {
+      return continueWithoutCooldown({ scope: 'worker', reason: 'upstream_network_error', retrySameAccount: true })
+    }
     if (isProxyFailure('', message)) {
       return {
         scope: 'proxy',

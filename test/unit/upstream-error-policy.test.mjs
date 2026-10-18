@@ -130,6 +130,61 @@ test('wrap Connection error retries the same account', () => {
   assert.equal(policy.retrySameAccount, true)
 })
 
+test('a coded generic connection error allows bounded recovery without blaming the proxy', () => {
+  for (const message of [
+    'Connection error.',
+    'provider error: provider error: Connection error.',
+    ' connection error ',
+  ]) {
+    const policy = classifyUpstreamResult({
+      status: 502,
+      committed: false,
+      terminalState: 'incomplete',
+      body: { error: { code: 'upstream_network_error', message } },
+    })
+    assert.equal(policy.scope, 'worker', message)
+    assert.equal(policy.action, 'continue')
+    assert.equal(policy.reason, 'upstream_network_error')
+    assert.equal(policy.retrySameAccount, true)
+    assert.equal(policy.cooldownUntil, null)
+  }
+})
+
+test('specific coded proxy failures keep their cooldown even beside generic connection wording', () => {
+  for (const message of [
+    'SOCKS proxy dial failed',
+    'DNS lookup failed',
+    'TLS handshake failed',
+    'connect ECONNREFUSED',
+    'provider error: Connection error. SOCKS proxy dial failed',
+    'provider error: Connection error. DNS lookup failed',
+    'provider error: Connection error. TLS handshake failed',
+  ]) {
+    const policy = classifyUpstreamResult(
+      { status: 502, body: { error: { code: 'upstream_network_error', message } } },
+      { now: 1000 },
+    )
+    assert.equal(policy.scope, 'proxy', message)
+    assert.equal(policy.reason, 'proxy_transport_failure')
+    assert.equal(policy.cooldownUntil, 61_000)
+    assert.notEqual(policy.retrySameAccount, true)
+  }
+})
+
+test('generic connection recovery does not override committed output or a quota status', () => {
+  for (const result of [
+    { status: 502, committed: true },
+    { status: 429, headers: { 'anthropic-ratelimit-unified-5h-status': 'rejected' } },
+  ]) {
+    const policy = classifyUpstreamResult({
+      ...result,
+      body: { error: { code: 'upstream_network_error', message: 'Connection error.' } },
+    })
+    assert.notEqual(policy.retrySameAccount, true)
+    if (result.committed) assert.equal(policy.action, 'stop')
+  }
+})
+
 test('committed incomplete stream never switches account', () => {
   const policy = classifyUpstreamResult({
     status: 200,

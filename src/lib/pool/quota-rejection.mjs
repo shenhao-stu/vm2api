@@ -4,9 +4,11 @@ const WINDOWS = Object.freeze({
   quota_5h_header: '5h',
   quota_5h_cli: '5h',
   quota_5h_safety: '5h',
+  quota_5h_seat_budget: '5h',
   quota_7d_header: '7d',
   quota_7d_cli: '7d',
   quota_7d_safety: '7d',
+  quota_7d_seat_budget: '7d',
 })
 
 /** Describe a known admission rejection without changing the admission decision. */

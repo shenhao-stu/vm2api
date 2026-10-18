@@ -1253,6 +1253,68 @@ test('a hop that failed with a kernel-named cause ends with that cause, not inco
   assert.deepEqual(scheduler.cooldowns, [], 'no account is penalised for it')
 })
 
+function genericConnectionFailure(message = 'Connection error.') {
+  return {
+    ok: false,
+    status: 502,
+    committed: false,
+    terminalState: 'incomplete',
+    body: { type: 'error', error: { type: 'api_error', code: 'upstream_network_error', message } },
+  }
+}
+
+for (const message of ['Connection error.', 'provider error: provider error: Connection error.']) {
+  test(`a single eligible slot recovers from a generic coded connection failure: ${message}`, async () => {
+    const scheduler = new Scheduler([candidate(1)])
+    const failures = []
+    const runner = new FailoverRunner({
+      scheduler,
+      config: { same_account_retry_delay_ms: 0 },
+      onProxyFailure: (...args) => failures.push(args),
+    })
+    let calls = 0
+    const result = await runner.run({
+      requestId: 'req-generic-connection',
+      canonicalBody: { model: 'claude-sonnet-5-5' },
+      model: 'claude-sonnet-5-5',
+      callAttempt: () => (++calls === 1 ? genericConnectionFailure(message) : success()),
+    })
+    assert.equal(calls, 2)
+    assert.equal(result.status, 200)
+    assert.equal(result.finalState, 'verified')
+    assert.equal(result.vmId, 'vm-01')
+    assert.deepEqual(scheduler.cooldowns, [])
+    assert.deepEqual(failures, [])
+  })
+}
+
+for (const [name, config, expectedCalls] of [
+  ['default same-account limit', {}, 2],
+  ['zero same-account retries', { max_same_account_retries: 0 }, 1],
+  ['spent total budget', { max_total_attempts: 1 }, 1],
+  ['spent hop duration', { same_account_retry_max_hop_ms: 0 }, 1],
+]) {
+  test(`repeated generic connection failures respect ${name}`, async () => {
+    const scheduler = new Scheduler([candidate(1)])
+    const runner = new FailoverRunner({ scheduler, config: { same_account_retry_delay_ms: 0, ...config } })
+    let calls = 0
+    const result = await runner.run({
+      requestId: 'req-generic-connection-budget',
+      canonicalBody: { model: 'claude-sonnet-5-5' },
+      model: 'claude-sonnet-5-5',
+      callAttempt: () => {
+        calls++
+        return genericConnectionFailure()
+      },
+    })
+    assert.equal(calls, expectedCalls)
+    assert.equal(result.status, 502)
+    assert.equal(result.body.error.code, 'upstream_network_error')
+    assert.equal(result.finalState, 'incomplete')
+    assert.deepEqual(scheduler.cooldowns, [])
+  })
+}
+
 test('the fifth candidate is reached after four VMs fail', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3), candidate(4), candidate(5)])
   const seen = []

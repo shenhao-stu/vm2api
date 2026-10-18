@@ -23,7 +23,7 @@ import {
   viewRuntimeWithoutLeftoverRevoke,
 } from './schedule-eligibility.mjs'
 import {
-  budgetHeadroom,
+  budgetHeadroomDetails,
   evaluateAccount,
   isAccountRestrictionReason,
   isLeftoverQuotaScheduleOff,
@@ -47,7 +47,7 @@ import {
   rustKernelReachable,
 } from '../transport/rust-kernel-client.mjs'
 import { resolveSessionSlots } from '../vm/slot-engine.mjs'
-import { SeatPlanner, rankSeatCandidates } from './seat-planner.mjs'
+import { SeatPlanner, budgetAllows, rankSeatCandidates } from './seat-planner.mjs'
 import { GATE_DRAINING } from './quota-gate.mjs'
 import { activeHoursOf, evaluateActiveHours } from './active-hours.mjs'
 import { quotaRejection } from './quota-rejection.mjs'
@@ -181,6 +181,17 @@ function scopedSeatKey(seatKey, scope = PLATFORM_SCOPE) {
   return `${owner}|${seatKey}`
 }
 
+function quotaPoolFailure(quota, now = Date.now()) {
+  const first = quota.reduce((best, item) =>
+    item.until > now && (!(best.until > now) || item.until < best.until) ? item : best,
+  )
+  return {
+    reason: first.reason,
+    quota_until: first.until,
+    retry_after_ms: first.until > now ? first.until - now : null,
+  }
+}
+
 /**
  * Nothing eligible. Fable keeps its Max gate; otherwise an upstream cooldown on
  * the dropped accounts names the cause: any 529 overload cooldown is capacity
@@ -190,16 +201,7 @@ function scopedSeatKey(seatKey, scope = PLATFORM_SCOPE) {
  */
 function emptyPoolFailure(model, candidates, now = Date.now()) {
   const quota = candidates?.quotaRejections || []
-  if (quota.length && !candidates.otherRejections) {
-    const first = quota.reduce((best, item) =>
-      item.until > now && (!(best.until > now) || item.until < best.until) ? item : best,
-    )
-    return {
-      reason: first.reason,
-      quota_until: first.until,
-      retry_after_ms: first.until > now ? first.until - now : null,
-    }
-  }
+  if (quota.length && !candidates.otherRejections) return quotaPoolFailure(quota, now)
   if (isFableModel(model)) return { reason: 'fable_requires_max', retry_after_ms: null }
   if ((candidates?.rejections?.quota_guard_request_too_large || 0) > 0) {
     return { reason: 'quota_guard_request_too_large', retry_after_ms: null }
@@ -658,6 +660,15 @@ export class PoolScheduler extends EventEmitter {
           }
           this.planner.pump(seat.vmId)
         } else {
+          // No held seat: if even an empty VM cannot budget one new seat,
+          // waiting for other seats to leave cannot help. Preserve mixed failures.
+          if (candidates.length && !candidates.otherRejections && candidates.every((c) => c.seatQuotaRejection)) {
+            const quota = quotaPoolFailure([
+              ...(candidates.quotaRejections || []),
+              ...candidates.map((c) => c.seatQuotaRejection),
+            ])
+            return { ...fail(quota.reason), ...quota }
+          }
           const stickyVms = [familyGated ? '' : familyVm, deviceVm, sticky.vmId || ''].filter(Boolean)
           if (!ticket) {
             const granted = this.openNewSeat(seatKey, candidates, { avoided, stickyVms })
@@ -950,6 +961,7 @@ export class PoolScheduler extends EventEmitter {
         maxConcurrency,
         seatCap,
         headroom: eligibility.headroom ?? null,
+        seatQuotaRejection: eligibility.seatQuotaRejection || null,
         draining: eligibility.gateZone === GATE_DRAINING,
         account: eligibility.account || null,
         loadRatio: (inflight + this.waiterCount(accountId)) / maxConcurrency,
@@ -997,6 +1009,7 @@ export class PoolScheduler extends EventEmitter {
     }
     let account = null
     let headroom = null
+    let seatQuotaRejection = null
     if (!pinned) {
       try {
         account = this.accountQuota?.repo?.get?.(accountId) || null
@@ -1063,7 +1076,11 @@ export class PoolScheduler extends EventEmitter {
             return { ok: false, reason: ev.reason || ev.key || 'account_gated', until: ev.until }
           }
         }
-        headroom = budgetHeadroom({ account: { ...account, last_used_at: lastUsedAt }, quota, policy, now })
+        const budget = budgetHeadroomDetails({ account: { ...account, last_used_at: lastUsedAt }, quota, policy, now })
+        headroom = budget.headroom
+        if (!budgetAllows(headroom, 0, this.config.seat_budget_reserve_pct)) {
+          seatQuotaRejection = quotaRejection(`quota_${budget.window}_seat_budget`, budget.reset, now)
+        }
       }
       // Operator-set working window: outside it the slot simply is not a
       // candidate. Checked after the model / account gates so only a slot that
@@ -1160,7 +1177,7 @@ export class PoolScheduler extends EventEmitter {
     } else if (workerStatus && rustKernelProcessUp(workerStatus) && !rustKernelReachable(workerStatus)) {
       return { ok: false, reason: 'worker_unhealthy' }
     }
-    return { ok: true, account, workerStatus, busy, availableAt, waitReason, headroom, gateZone }
+    return { ok: true, account, workerStatus, busy, availableAt, waitReason, headroom, gateZone, seatQuotaRejection }
   }
 
   executionContext(vm, accountId) {

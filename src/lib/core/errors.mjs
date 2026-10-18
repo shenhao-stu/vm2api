@@ -276,7 +276,9 @@ export function quotaWindowError(reason, { until = null, requestId = null } = {}
       type: ErrorType.RATE_LIMIT,
       code: quota.reason,
       status: 429,
-      message: `${quota.window} 额度保护已触发，当前没有可用账号。请等待额度窗口重置后重试。`,
+      message: quota.reason.endsWith('_seat_budget')
+        ? `${quota.window} 新会话额度余量不足，本地额度预留策略未允许建立新会话。请等待该窗口重置或额度读数更新后重试。`
+        : `${quota.window} 额度保护已触发，当前没有可用账号。请等待额度窗口重置后重试。`,
       details: {
         source: 'local_quota_policy',
         reason: quota.reason,

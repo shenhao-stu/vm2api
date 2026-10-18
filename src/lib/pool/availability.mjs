@@ -165,10 +165,17 @@ function usageWindows(quota = {}, account = {}, now = Date.now()) {
  * Seat budget headroom: min(limit_5h − u5, limit_7d − u7) with the same
  * windows and safety lines evaluateAccount admits against.
  */
-export function budgetHeadroom({ account = {}, quota = {}, policy = null, now = Date.now() } = {}) {
+export function budgetHeadroomDetails({ account = {}, quota = {}, policy = null, now = Date.now() } = {}) {
   const pol = policyOf({ policy })
-  const { u5, u7 } = usageWindows(quota || {}, account || {}, now)
-  return Math.min(pol.limit_5h - u5, pol.limit_7d - u7)
+  const { u5, u7, w5, w7 } = usageWindows(quota || {}, account || {}, now)
+  const five = { headroom: pol.limit_5h - u5, window: '5h', reset: w5.reset }
+  const seven = { headroom: pol.limit_7d - u7, window: '7d', reset: w7.reset }
+  const limiting = seven.headroom < five.headroom ? seven : five
+  return { ...limiting, headroom: Math.min(five.headroom, seven.headroom) }
+}
+
+export function budgetHeadroom(input = {}) {
+  return budgetHeadroomDetails(input).headroom
 }
 
 function policyOf(input = {}) {
