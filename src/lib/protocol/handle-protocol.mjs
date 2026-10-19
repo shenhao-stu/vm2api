@@ -459,6 +459,34 @@ export function createHandleProtocol(deps) {
     return acceptAssistantHop(workerResult)
   }
 
+  function bindRequestLog(req, res, logCtx, logBag) {
+    let settled = false
+    let recorded = false
+    const finish = () => {
+      if (!settled || recorded) return
+      recorded = true
+      try {
+        const groupId = req.apiKeyRecord?.group_id ?? 1
+        requestLog.finish(logCtx, {
+          status: res.statusCode || 0,
+          api_key_kind: req.apiKeyKind || null,
+          api_key_id: req.apiKeyRecord?.id || null,
+          user_id: req.apiKeyRecord?.user_id ?? null,
+          group_id: groupId,
+          rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
+          ...logBag,
+        })
+      } catch {}
+    }
+    res.on('finish', finish)
+    res.on('close', finish)
+    return () => {
+      // A socket can close before the worker returns its final usage and outcome.
+      settled = true
+      if (res.writableFinished || res.destroyed) finish()
+    }
+  }
+
   async function handleProtocol(req, res, protocol, pathName) {
     const logCtx = requestLog.start(req, { protocol, pathName })
     res._kinRequestId = logCtx.request_id
@@ -495,20 +523,15 @@ export function createHandleProtocol(deps) {
       reasoning_effort: null,
       outbound_session_id: null,
     }
-    res.on('finish', () => {
-      try {
-        const groupId = req.apiKeyRecord?.group_id ?? 1
-        requestLog.finish(logCtx, {
-          status: res.statusCode || 0,
-          api_key_kind: req.apiKeyKind || null,
-          api_key_id: req.apiKeyRecord?.id || null,
-          user_id: req.apiKeyRecord?.user_id ?? null,
-          group_id: groupId,
-          rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
-          ...logBag,
-        })
-      } catch {}
-    })
+    const settleLog = bindRequestLog(req, res, logCtx, logBag)
+    try {
+      return await runProtocol(req, res, protocol, pathName, logCtx, logBag)
+    } finally {
+      settleLog()
+    }
+  }
+
+  async function runProtocol(req, res, protocol, pathName, logCtx, logBag) {
     if (!requireAuth(req, res)) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
       logBag.error_message = req.authError?.message || 'Invalid credentials'
@@ -1678,20 +1701,15 @@ export function createHandleProtocol(deps) {
       attempt_count: null,
       final_state: null,
     }
-    res.on('finish', () => {
-      try {
-        const groupId = req.apiKeyRecord?.group_id ?? 1
-        requestLog.finish(logCtx, {
-          status: res.statusCode || 0,
-          api_key_kind: req.apiKeyKind || null,
-          api_key_id: req.apiKeyRecord?.id || null,
-          user_id: req.apiKeyRecord?.user_id ?? null,
-          group_id: groupId,
-          rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
-          ...logBag,
-        })
-      } catch {}
-    })
+    const settleLog = bindRequestLog(req, res, logCtx, logBag)
+    try {
+      return await runSearch(req, res, pathName, logBag)
+    } finally {
+      settleLog()
+    }
+  }
+
+  async function runSearch(req, res, pathName, logBag) {
     if (!requireAuth(req, res)) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
       logBag.error_message = req.authError?.message || 'Invalid credentials'
