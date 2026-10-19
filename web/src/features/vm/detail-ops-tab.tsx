@@ -1,8 +1,16 @@
+import { useState } from 'react'
 import type { Vm, VmProxySnap } from '@/types/panel-vm'
 import { type CredType, credTypeLabel } from '@/lib/cred-type'
 import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Separator } from '@/components/ui/separator'
 import { TabsContent } from '@/components/ui/tabs'
 import {
@@ -10,6 +18,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { ChoiceTiles } from '@/components/choice-tiles'
 import { Field } from '@/features/vm/detail-section-primitives'
 import { VmEnvironmentCard } from '@/features/vm/environment-card'
 import { NodeChip } from '@/features/vm/node-chip'
@@ -27,6 +36,8 @@ type VmOpsTabProps = {
   refreshBlocked: string
   savingTimezone: boolean
   onAction: (path: string, body?: unknown) => void
+  /** 该路径的操作正在进行。 */
+  busy: (path: string) => boolean
   /** 终端快捷指令执行后刷新详情。 */
   onRefresh: () => void
   onTimezoneSave: (timezone: string) => void
@@ -36,6 +47,8 @@ type VmOpsTabProps = {
 }
 
 export function VmOpsTab(props: VmOpsTabProps) {
+  const [kernelOpen, setKernelOpen] = useState(false)
+  const [kernelMode, setKernelMode] = useState<'keep' | 'traits'>('keep')
   const {
     vm,
     proxy,
@@ -45,6 +58,7 @@ export function VmOpsTab(props: VmOpsTabProps) {
     refreshBlocked,
     savingTimezone,
     onAction,
+    busy,
     onRefresh,
     onTimezoneSave,
     onTimezoneFollowProxy,
@@ -97,6 +111,7 @@ export function VmOpsTab(props: VmOpsTabProps) {
       </Card>
       <VmPhysicalFeaturesCard
         vm={vm}
+        collecting={busy('/collect-identity')}
         onCollect={() => onAction('/collect-identity')}
       />
       <VmEnvironmentCard
@@ -110,16 +125,23 @@ export function VmOpsTab(props: VmOpsTabProps) {
         <Button
           size='sm'
           variant='outline'
+          loading={busy('/activate')}
           onClick={() => onAction('/activate')}
         >
           设为活跃
         </Button>
-        <Button size='sm' variant='outline' onClick={() => onAction('/reload')}>
+        <Button
+          size='sm'
+          variant='outline'
+          loading={busy('/reload')}
+          onClick={() => onAction('/reload')}
+        >
           {gpt ? '重载 Codex kernel' : '重载 worker'}
         </Button>
         <Button
           size='sm'
           variant='outline'
+          loading={busy('/collect-identity')}
           onClick={() => onAction('/collect-identity')}
         >
           采集特征
@@ -133,6 +155,7 @@ export function VmOpsTab(props: VmOpsTabProps) {
                     size='sm'
                     variant='outline'
                     disabled={!officialCc || remote}
+                    loading={busy('/official-cc-bootstrap')}
                     onClick={() =>
                       onAction('/official-cc-bootstrap', {
                         force: true,
@@ -156,6 +179,7 @@ export function VmOpsTab(props: VmOpsTabProps) {
             <Button
               size='sm'
               variant='outline'
+              loading={busy('/reconcile-fingerprint')}
               onClick={() => onAction('/reconcile-fingerprint', {})}
             >
               对齐官方指纹
@@ -169,6 +193,7 @@ export function VmOpsTab(props: VmOpsTabProps) {
                 size='sm'
                 variant='outline'
                 disabled={!canRefresh}
+                loading={busy('/oauth/refresh')}
                 onClick={() => onAction('/oauth/refresh', {})}
               >
                 刷新凭证
@@ -188,6 +213,7 @@ export function VmOpsTab(props: VmOpsTabProps) {
               size='sm'
               variant='outline'
               disabled={remote}
+              loading={busy('/wrap-cli/promote')}
               onClick={() => onAction('/wrap-cli/promote')}
             >
               晋升母本
@@ -195,16 +221,11 @@ export function VmOpsTab(props: VmOpsTabProps) {
             <Button
               size='sm'
               variant='outline'
-              disabled={remote}
-              onClick={() => onAction('/wrap-cli/repair')}
+              loading={busy('/wrap-cli/repair')}
+              onClick={() => setKernelOpen(true)}
             >
               重装 kernel
             </Button>
-            {remote ? (
-              <span className='text-xs text-muted-foreground'>
-                {REMOTE_UNSUPPORTED_TEXT}
-              </span>
-            ) : null}
           </div>
         </>
       )}
@@ -218,6 +239,47 @@ export function VmOpsTab(props: VmOpsTabProps) {
           删除此槽位
         </Button>
       </div>
+      <Dialog open={kernelOpen} onOpenChange={setKernelOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>重装 kernel</DialogTitle>
+          </DialogHeader>
+          <ChoiceTiles
+            label='更新方式'
+            value={kernelMode}
+            onChange={setKernelMode}
+            choices={[
+              {
+                value: 'keep',
+                title: '保留原数据重建',
+                detail:
+                  '留下凭证、指纹和统计，只换 kernel、cli-node 与 Go 遥测。',
+              },
+              {
+                value: 'traits',
+                title: '重建新特征',
+                detail: remote
+                  ? '集群槽只换镜像，不在这里清远程家目录。'
+                  : '清家目录并重抽计算机身份。',
+              },
+            ]}
+          />
+          <DialogFooter>
+            <Button variant='outline' onClick={() => setKernelOpen(false)}>
+              取消
+            </Button>
+            <Button
+              variant={kernelMode === 'traits' ? 'destructive' : 'default'}
+              onClick={() => {
+                setKernelOpen(false)
+                onAction('/wrap-cli/repair', { mode: kernelMode })
+              }}
+            >
+              {kernelMode === 'keep' ? '保留原数据重建' : '重建新特征'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </TabsContent>
   )
 }

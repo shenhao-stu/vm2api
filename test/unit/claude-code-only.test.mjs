@@ -1,14 +1,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { isClaudeCodeFamilyRequest } from '../../src/lib/identity/claude-code-only.mjs'
+import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { handleUserCountTokens } from '../../src/lib/protocol/user-count-tokens.mjs'
+import { validatePersonaRoutingPatch } from '../../src/lib/admin/panel-api.mjs'
 import {
   applyCrsUnofficialPersona,
   isOfficialClaudeCodeTraffic,
   isProxiedOfficialClaudeCode,
 } from '../../src/lib/identity/crs-persona.mjs'
-import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
-import { handleUserCountTokens } from '../../src/lib/protocol/user-count-tokens.mjs'
-import { validatePersonaRoutingPatch } from '../../src/lib/admin/panel-api.mjs'
 
 const CLI_UA = 'claude-cli/2.1.293 (external, cli)'
 const SESSION = '11111111-2222-4333-8444-555555555555'
@@ -35,6 +35,16 @@ const OFFICIAL_BODY = {
   metadata: { user_id: USER_ID },
   messages: [{ role: 'user', content: 'hi' }],
 }
+const THIRD_PARTY_BODY = {
+  model: 'claude-sonnet-5',
+  max_tokens: 4096,
+  system: 'You are a helpful assistant.',
+  messages: [{ role: 'user', content: 'hi' }],
+}
+const ON = { compatibility: { claude_code_only: true } }
+
+const NO_RELAY = { routing: { compatibility: { detect_proxied_official_cc: false } } }
+
 const DESKTOP_HEADERS = {
   ...CLI_HEADERS,
   'user-agent': 'claude-cli/2.1.299 (external, local-agent, agent-sdk/0.3.299)',
@@ -45,19 +55,57 @@ const DESKTOP_HEADERS = {
 const DESKTOP_BODY = {
   ...OFFICIAL_BODY,
   system: [
-    { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.299.fa6; cc_entrypoint=local-agent; cch=ab;' },
+    { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.299.fa6; cc_entrypoint=local-agent;' },
     { type: 'text', text: "You are Claude Code, built on Anthropic's Claude Agent SDK." },
   ],
 }
-const THIRD_PARTY_BODY = {
-  model: 'claude-sonnet-5',
-  max_tokens: 4096,
-  system: 'You are a helpful assistant.',
-  messages: [{ role: 'user', content: 'hi' }],
-}
-const ON = { compatibility: { claude_code_only: true } }
 
-const NO_RELAY = { routing: { compatibility: { detect_proxied_official_cc: false } } }
+test('local-agent with desktop markers passes the existing Claude Code checks', () => {
+  assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, DESKTOP_BODY, NO_RELAY), true)
+  assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, DESKTOP_BODY), true)
+  assert.equal(isOfficialClaudeCodeTraffic(DESKTOP_HEADERS, DESKTOP_BODY), true)
+  assert.equal(applyCrsUnofficialPersona(DESKTOP_BODY, { headers: DESKTOP_HEADERS, mode: 'rewrite' }), DESKTOP_BODY)
+  assert.equal(isProxiedOfficialClaudeCode(DESKTOP_BODY, DESKTOP_HEADERS), false)
+})
+
+test('local-agent still rejects incomplete headers, inconsistent sessions/builds, and OMP', () => {
+  for (const key of Object.keys(DESKTOP_HEADERS)) {
+    const { [key]: dropped, ...headers } = DESKTOP_HEADERS
+    assert.equal(isClaudeCodeFamilyRequest(headers, DESKTOP_BODY), false, key)
+  }
+  for (const headers of [
+    { ...DESKTOP_HEADERS, 'anthropic-client-platform': 'web' },
+    { ...DESKTOP_HEADERS, 'anthropic-client-version': 'unknown' },
+    { ...DESKTOP_HEADERS, 'user-agent': 'claude-cli/2.1.299 (external, cli)' },
+    { ...DESKTOP_HEADERS, 'user-agent': 'claude-cli/2.1.299 (external, local-agent)' },
+    { ...DESKTOP_HEADERS, 'user-agent': 'Go-http-client/1.1' },
+    { ...DESKTOP_HEADERS, 'x-claude-code-session-id': '99999999-2222-4333-8444-555555555555' },
+    { ...DESKTOP_HEADERS, 'user-agent': 'claude-cli/2.1.280 (external, local-agent, agent-sdk/0.3.280)' },
+  ]) {
+    assert.equal(isClaudeCodeFamilyRequest(headers, DESKTOP_BODY), false)
+  }
+  assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, { ...DESKTOP_BODY, metadata: undefined }), false)
+  for (const text of [
+    'You are operating in the Oh My Pi coding harness.',
+    '<system-conventions>rules</system-conventions>\n<workstation>test</workstation>',
+    'ROLE\n====\nAssistant\nPROJECT\n====\nWorkspace',
+    'You are operating in the pi coding harness.',
+    'You are operating in the omp coding harness.',
+  ]) {
+    const body = { ...DESKTOP_BODY, system: [...DESKTOP_BODY.system, { type: 'text', text }] }
+    assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, body), false, text)
+    assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, body, { countTokens: true }), false, text)
+    assert.equal(isOfficialClaudeCodeTraffic(DESKTOP_HEADERS, body), false, text)
+  }
+  const tools = [{ type: 'function', function: { name: 'read_file' } }]
+  assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, { ...DESKTOP_BODY, tools }), false)
+})
+
+test('local-agent desktop count_tokens follows the existing header-only admission contract', () => {
+  const body = { model: DESKTOP_BODY.model, system: DESKTOP_BODY.system, messages: DESKTOP_BODY.messages }
+  assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, body, { countTokens: true }), true)
+  assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, body), false)
+})
 
 test('Claude Code family recognition needs the full client fingerprint, not the UA', () => {
   assert.equal(isClaudeCodeFamilyRequest(CLI_HEADERS, OFFICIAL_BODY, NO_RELAY), true)
@@ -74,65 +122,6 @@ test('Claude Code family recognition needs the full client fingerprint, not the 
   // Billing cc_version and UA version come from the same build.
   const otherVersion = { ...CLI_HEADERS, 'user-agent': 'claude-cli/2.1.280 (external, cli)' }
   assert.equal(isClaudeCodeFamilyRequest(otherVersion, OFFICIAL_BODY, NO_RELAY), false)
-})
-
-test('Claude Desktop local-agent with the complete fingerprint keeps its official identity', () => {
-  assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, DESKTOP_BODY, NO_RELAY), true)
-  assert.equal(isOfficialClaudeCodeTraffic(DESKTOP_HEADERS, DESKTOP_BODY), true)
-  assert.equal(applyCrsUnofficialPersona(DESKTOP_BODY, { headers: DESKTOP_HEADERS }), DESKTOP_BODY)
-  assert.equal(isProxiedOfficialClaudeCode(DESKTOP_BODY, DESKTOP_HEADERS), false)
-})
-
-test('Claude Desktop local-agent rejects incomplete fingerprints and inconsistent sessions or builds', () => {
-  for (const key of Object.keys(DESKTOP_HEADERS)) {
-    const { [key]: _drop, ...partial } = DESKTOP_HEADERS
-    assert.equal(isClaudeCodeFamilyRequest(partial, DESKTOP_BODY, NO_RELAY), false, key)
-  }
-  const invalidHeaders = [
-    { 'anthropic-client-platform': 'web_app' },
-    { 'anthropic-client-version': 'invalid' },
-    { 'user-agent': CLI_UA },
-    { 'user-agent': 'claude-cli/2.1.299 (external, local-agent)' },
-    { 'user-agent': 'claude-cli/2.1.299 (external, local-agent-extra, agent-sdk/0.3.299)' },
-    { 'user-agent': 'claude-cli/2.1.299 (external, local-agent, agent-sdk/0.3.299-extra)' },
-    { 'user-agent': 'claude-cli/2.1.298 (external, local-agent, agent-sdk/0.3.299)' },
-    { 'x-claude-code-session-id': '99999999-2222-4333-8444-555555555555' },
-  ]
-  for (const patch of invalidHeaders) {
-    assert.equal(isClaudeCodeFamilyRequest({ ...DESKTOP_HEADERS, ...patch }, DESKTOP_BODY, NO_RELAY), false)
-  }
-  assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, { ...DESKTOP_BODY, metadata: undefined }, NO_RELAY), false)
-  assert.equal(isClaudeCodeFamilyRequest({ 'user-agent': DESKTOP_HEADERS['user-agent'] }, DESKTOP_BODY), false)
-  // The default relay path must not turn a partial Desktop fingerprint into admission.
-  assert.equal(isClaudeCodeFamilyRequest({ 'user-agent': 'Go-http-client/1.1' }, DESKTOP_BODY), false)
-})
-
-test('Claude Desktop headers do not admit OMP prompts or OpenAI tool shapes', () => {
-  for (const marker of [
-    '<system-conventions>Oh My Pi</system-conventions>',
-    '<system-conventions><workstation>synthetic</workstation></system-conventions>',
-    'ROLE\n====\nsynthetic\nPROJECT\n=======\nsynthetic',
-    'pi coding harness',
-    'omp coding harness',
-  ]) {
-    const body = { ...DESKTOP_BODY, system: [...DESKTOP_BODY.system, { type: 'text', text: marker }] }
-    assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, body), false, marker)
-    assert.equal(isOfficialClaudeCodeTraffic(DESKTOP_HEADERS, body), false, marker)
-  }
-  for (const patch of [
-    { tools: [{ type: 'function', function: { name: 'synthetic' } }] },
-    { tool_choice: { type: 'function', function: { name: 'synthetic' } } },
-  ]) {
-    assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, { ...DESKTOP_BODY, ...patch }), false)
-  }
-})
-
-test('Claude Desktop count_tokens preserves the existing header-only contract', () => {
-  const body = { ...DESKTOP_BODY, metadata: undefined }
-  assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, body, { ...NO_RELAY, countTokens: true }), true)
-  assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, body, NO_RELAY), false)
-  const { 'x-app': _drop, ...partial } = DESKTOP_HEADERS
-  assert.equal(isClaudeCodeFamilyRequest(partial, body, { countTokens: true }), false)
 })
 
 test('Claude Code family recognition: relayed traffic follows detect_proxied_official_cc', () => {
@@ -267,16 +256,6 @@ test('switch on: third-party Claude requests are 403 before any account is picke
   assert.deepEqual(chat, BLOCKED)
 })
 
-test('switch on: Claude Desktop reaches the scheduler with relay detection disabled', async () => {
-  const routing = { compatibility: { claude_code_only: true, detect_proxied_official_cc: false } }
-  assert.equal((await runProtocol({ routing, body: DESKTOP_BODY, headers: DESKTOP_HEADERS })).reached, true)
-  const body = {
-    ...DESKTOP_BODY,
-    system: [...DESKTOP_BODY.system, { type: 'text', text: '<system-conventions>Oh My Pi</system-conventions>' }],
-  }
-  assert.deepEqual(await runProtocol({ routing, body, headers: DESKTOP_HEADERS }), BLOCKED)
-})
-
 test('switch on: health probes are refused, never answered from the probe cache', async () => {
   const seen = []
   const healthMonitor = {
@@ -307,6 +286,13 @@ test('switch on: official Claude Code and its own quota probe reach the schedule
   assert.deepEqual(await runProtocol({ routing: ON, body: QUOTA_PROBE, headers: { 'user-agent': CLI_UA } }), BLOCKED)
   const essay = { ...QUOTA_PROBE, messages: [{ role: 'user', content: 'write me an essay' }] }
   assert.deepEqual(await runProtocol({ routing: ON, body: essay, headers: CLI_HEADERS }), BLOCKED)
+})
+
+test('switch on: local-agent desktop reaches the scheduler without relay detection', async () => {
+  const routing = { compatibility: { claude_code_only: true, detect_proxied_official_cc: false } }
+  assert.equal((await runProtocol({ routing, body: DESKTOP_BODY, headers: DESKTOP_HEADERS })).reached, true)
+  const body = { ...DESKTOP_BODY, system: [...DESKTOP_BODY.system, { type: 'text', text: 'Oh My Pi coding harness' }] }
+  assert.deepEqual(await runProtocol({ routing, body, headers: DESKTOP_HEADERS }), BLOCKED)
 })
 
 test('switch on: master-key pinned panel diagnostics are not inbound clients', async () => {
@@ -382,4 +368,26 @@ test('routing patch rejects a non-boolean claude_code_only', () => {
   assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { claude_code_only: 'yes' } }), [
     'claude_code_only 必须是布尔',
   ])
+})
+
+// Fork boundary regressions complement the upstream Desktop compatibility cases.
+test('Desktop markers keep exact token boundaries and count_tokens header checks', () => {
+  for (const ua of [
+    'claude-cli/2.1.299 (external, local-agent-extra, agent-sdk/0.3.299)',
+    'claude-cli/2.1.299 (external, local-agent, agent-sdk/0.3.299-extra)',
+  ]) {
+    assert.equal(isClaudeCodeFamilyRequest({ ...DESKTOP_HEADERS, 'user-agent': ua }, DESKTOP_BODY, NO_RELAY), false)
+  }
+  assert.equal(
+    isClaudeCodeFamilyRequest(DESKTOP_HEADERS, {
+      ...DESKTOP_BODY,
+      tool_choice: { type: 'function', function: { name: 'synthetic' } },
+    }),
+    false,
+  )
+  const { 'x-app': _drop, ...partial } = DESKTOP_HEADERS
+  assert.equal(
+    isClaudeCodeFamilyRequest(partial, { ...DESKTOP_BODY, metadata: undefined }, { countTokens: true }),
+    false,
+  )
 })

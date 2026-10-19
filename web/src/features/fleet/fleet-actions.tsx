@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import {
   useMutation,
+  useQuery,
   useQueryClient,
   type QueryClient,
 } from '@tanstack/react-query'
@@ -15,12 +16,19 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { ChoiceTiles } from '@/components/choice-tiles'
+import { meQueryOptions } from '@/features/auth/queries'
 import {
   dashboardQueryOptions,
   usageQueryOptions,
 } from '@/features/overview/queries'
 import { proxiesQueryOptions } from '@/features/proxies/queries'
 import { vmsListQueryOptions } from '@/features/vm/queries'
+import type { WrapSyncReport } from '@/features/wrap/queries'
+import {
+  syncReportFromError,
+  syncReportSummary,
+} from '@/features/wrap/sync-report'
 
 type FleetAction = 'roll' | 'collect'
 
@@ -73,7 +81,12 @@ async function invalidateFleet(qc: QueryClient) {
 
 export function FleetActions() {
   const qc = useQueryClient()
+  const me = useQuery(meQueryOptions())
+  // 额度探测、全槽更新、重装内核都是管理员接口，其它角色点了只会 403。
+  const canManage = me.data?.role === 'admin'
   const [fleetOpen, setFleetOpen] = useState(false)
+  const [kernelOpen, setKernelOpen] = useState(false)
+  const [kernelMode, setKernelMode] = useState<'keep' | 'traits'>('keep')
   const refresh = useMutation({
     mutationFn: () => invalidateFleet(qc),
     onSuccess: () => toast.success('已刷新'),
@@ -128,30 +141,32 @@ export function FleetActions() {
     onError: (error: Error) => toast.error(error.message),
   })
   const wrapSync = useMutation({
-    mutationFn: () =>
-      api<{
-        ok_count?: number
-        total?: number
-        failed_count?: number
-        items?: { ok?: boolean; kernel?: { ok?: boolean } }[]
-      }>('/api/panel/wrap-cli/sync', {
+    mutationFn: (mode: 'keep' | 'traits') =>
+      api<WrapSyncReport>('/api/panel/wrap-cli/sync', {
         method: 'POST',
-        body: JSON.stringify({ restart: true }),
+        body: JSON.stringify({ restart: true, mode }),
       }),
-    onSuccess: async (report) => {
+    onSuccess: (report) => {
       const total = report.total ?? 0
       const ok = report.ok_count ?? 0
       const kernelFail = wrapSyncKernelFails(report.items)
       if ((report.failed_count || 0) > 0) {
-        toast.error(`kernel 重装 ${ok}/${total}`)
+        toast.error(`kernel 重装 ${syncReportSummary(report)}`)
       } else if (kernelFail > 0) {
         toast.error(`kernel 文件 ${ok}/${total}，进程未起来 ${kernelFail}`)
       } else {
         toast.success(`kernel 重装 ${ok}/${total}`)
       }
-      await invalidateFleet(qc)
+      setKernelOpen(false)
     },
-    onError: (error: Error) => toast.error(error.message),
+    onError: (error: Error) => {
+      // 部分槽失败时网关回 400，正文仍是逐槽报告。
+      const report = syncReportFromError(error)
+      toast.error(
+        report ? `kernel 重装 ${syncReportSummary(report)}` : error.message
+      )
+    },
+    onSettled: () => invalidateFleet(qc),
   })
 
   return (
@@ -165,33 +180,37 @@ export function FleetActions() {
       >
         刷新
       </Button>
-      <Button
-        variant='outline'
-        size='sm'
-        onClick={() => probe.mutate()}
-        disabled={probe.isPending}
-        loading={probe.isPending}
-      >
-        额度探测
-      </Button>
-      <Button
-        variant='outline'
-        size='sm'
-        onClick={() => setFleetOpen(true)}
-        disabled={fleet.isPending}
-        loading={fleet.isPending}
-      >
-        全槽更新
-      </Button>
-      <Button
-        variant='outline'
-        size='sm'
-        onClick={() => wrapSync.mutate()}
-        disabled={wrapSync.isPending}
-        loading={wrapSync.isPending}
-      >
-        重装当前内核
-      </Button>
+      {canManage ? (
+        <>
+          <Button
+            variant='outline'
+            size='sm'
+            onClick={() => probe.mutate()}
+            disabled={probe.isPending}
+            loading={probe.isPending}
+          >
+            额度探测
+          </Button>
+          <Button
+            variant='outline'
+            size='sm'
+            onClick={() => setFleetOpen(true)}
+            disabled={fleet.isPending}
+            loading={fleet.isPending}
+          >
+            全槽更新
+          </Button>
+          <Button
+            variant='outline'
+            size='sm'
+            onClick={() => setKernelOpen(true)}
+            disabled={wrapSync.isPending}
+            loading={wrapSync.isPending}
+          >
+            重装当前内核
+          </Button>
+        </>
+      ) : null}
 
       <Dialog open={fleetOpen} onOpenChange={setFleetOpen}>
         <DialogContent>
@@ -199,11 +218,12 @@ export function FleetActions() {
             <DialogTitle>全槽更新</DialogTitle>
           </DialogHeader>
           <p className='text-sm text-muted-foreground'>
-            滚动处理全部槽位的 kernel / slot runtime。不重启控制面，不 docker
-            rm，不启动 Go worker hop。
+            重装当前内核：本地槽换挂载的 kernel / cli-node
+            并重启进程；集群槽用同一份 kernel、cli-node 和 Go
+            遥测重建镜像，再换容器。凭证和指纹保留。
           </p>
           <p className='text-sm text-muted-foreground'>
-            重载会吃到新二进制再采集 guest 特征。KVM
+            全槽更新只重载已在跑的 runtime 并采集特征，不换二进制。KVM
             槽在适配器未接线时会失败并跳过。
           </p>
           <DialogFooter>
@@ -228,6 +248,51 @@ export function FleetActions() {
               onClick={() => fleet.mutate('roll')}
             >
               重载并采集
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={kernelOpen} onOpenChange={setKernelOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>重装当前内核</DialogTitle>
+          </DialogHeader>
+          <p className='text-sm text-muted-foreground'>
+            本地槽和集群槽都换成当前 kernel、cli-node 与 Go 遥测。Codex
+            槽不参与。
+          </p>
+          <ChoiceTiles
+            label='更新方式'
+            value={kernelMode}
+            onChange={setKernelMode}
+            choices={[
+              {
+                value: 'keep',
+                title: '保留原数据重建',
+                detail: '留下凭证、指纹和统计，只换服务并重启运行中的槽。',
+              },
+              {
+                value: 'traits',
+                title: '重建新特征',
+                detail: '本机槽清家目录并重抽计算机身份；集群槽仍只换镜像。',
+              },
+            ]}
+          />
+          <DialogFooter>
+            <Button
+              variant='outline'
+              onClick={() => setKernelOpen(false)}
+              disabled={wrapSync.isPending}
+            >
+              取消
+            </Button>
+            <Button
+              disabled={wrapSync.isPending}
+              loading={wrapSync.isPending}
+              variant={kernelMode === 'traits' ? 'destructive' : 'default'}
+              onClick={() => wrapSync.mutate(kernelMode)}
+            >
+              {kernelMode === 'keep' ? '保留原数据重建' : '重建新特征'}
             </Button>
           </DialogFooter>
         </DialogContent>

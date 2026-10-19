@@ -1095,7 +1095,7 @@ export class ProxyPool extends EventEmitter {
     let eg = this.egressCheck(proxy)
     if (!eg?.ok && typeof this.repairEgress === 'function') {
       try {
-        this.repairEgress(proxy)
+        await this.repairEgress(proxy)
       } catch {
         /* keep egress failure */
       }

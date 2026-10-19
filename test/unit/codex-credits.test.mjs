@@ -1,4 +1,4 @@
-import { test } from 'node:test'
+import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -21,6 +21,9 @@ import {
   pickCodexSlots,
 } from '../../src/lib/pool/codex-slot-pool.mjs'
 import { evaluateOpenAIQuotaGate } from '../../src/lib/pool/openai-quota-policy.mjs'
+import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+
+beforeEach(() => resetOpenAIAccountRuntime())
 
 const NOW = Date.parse('2026-10-17T12:00:00Z')
 const WEEK_RESET = new Date(NOW + 3 * 86_400_000).toISOString()
