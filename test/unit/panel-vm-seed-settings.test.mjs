@@ -216,3 +216,38 @@ test('seed edits and a telemetry restart cannot override deployment telemetry of
   assert.equal(commands.length, 1)
   assert.match(commands[0].at(-1), /pkill -TERM -x kin-worker/)
 })
+
+test('native privacy opt-outs survive subsequent seed edits without changing slot bindings', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seed-privacy-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  seed(root, 'vm-privacy')
+  const vmPath = path.join(root, 'vms', 'vm-privacy.json')
+  const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  vm.proxy = { id: 'px-private', host: '192.0.2.1', port: 1080 }
+  vm.policy = { maxConcurrency: 1 }
+  fs.writeFileSync(vmPath, JSON.stringify(vm))
+  const optOuts = {
+    DISABLE_ERROR_REPORTING: '1',
+    DISABLE_FEEDBACK_COMMAND: '1',
+    CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: '1',
+  }
+  const url = new URL('http://localhost/api/panel/vms/vm-privacy/seed-settings')
+  for (const body of [{ telemetry_disabled: true, extra_env: { CUSTOM: 'kept', ...optOuts } }, { theme: 'dark' }]) {
+    const { handlePanel, response } = handler(root, { readBody: async () => body })
+    await handlePanel({ method: 'PUT', url: url.pathname }, {}, url)
+    assert.equal(response.status, 200)
+    assert.equal(response.body.data.service, null)
+    const saved = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+    const settings = JSON.parse(fs.readFileSync(path.join(root, 'vms', vm.id, 'cli-home/.claude/settings.json')))
+    for (const [key, value] of Object.entries(optOuts)) {
+      assert.equal(saved.seed_policy.extra_env[key], value)
+      assert.equal(settings.env[key], value)
+    }
+    assert.equal(settings.env.CUSTOM, 'kept')
+    assert.equal(settings.env.DISABLE_TELEMETRY, '1')
+    assert.equal(settings.env.DO_NOT_TRACK, '1')
+    assert.deepEqual(saved.proxy, vm.proxy)
+    assert.deepEqual(saved.policy, vm.policy)
+    assert.equal(saved.status, 'stopped')
+  }
+})

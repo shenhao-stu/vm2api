@@ -22,7 +22,7 @@ import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import { createSlotShell } from '../../src/lib/vm/slot-shell.mjs'
 import { proxyExitGuardDirectory } from '../../src/lib/vm/proxy-exit-guard.mjs'
 
-test('official login refuses an unverified strict exit before inspecting or preparing the slot', (t) => {
+test('official login refuses an unverified strict exit before inspecting or preparing the slot', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-login-guard-'))
   const settings = new SettingsRepo(openDatabase({ dbPath: ':memory:' }))
   settings.set('proxy_exit_guard', { required: true, proxies: {} })
@@ -35,7 +35,7 @@ test('official login refuses an unverified strict exit before inspecting or prep
   fs.mkdirSync(path.join(home, '.kin'), { recursive: true })
   fs.writeFileSync(path.join(home, '.kin', 'cli-node'), '')
   let inspections = 0
-  assert.throws(
+  await assert.rejects(
     () =>
       assertAuthLoginReady(root, vm, {
         inspect() {
@@ -78,12 +78,12 @@ test('strict login checks the helper latch before fake authorization', async (t)
     { ...vm, platform: 'openai' },
     { ...vm, node_id: 'remote' },
   ]) {
-    assert.throws(() => assertAuthLoginReady(root, target), { code: 'exit_guard_blocked' })
+    await assert.rejects(assertAuthLoginReady(root, target), { code: 'exit_guard_blocked' })
   }
   assert.equal(fs.existsSync(path.join(root, 'vms')), false)
 })
 
-test('login ticket is rechecked after protection is enabled, without creating credentials', (t) => {
+test('login ticket is rechecked after protection is enabled, without creating credentials', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-login-ticket-'))
   const settings = new SettingsRepo(openDatabase({ dbPath: ':memory:' }))
   const savedPath = process.env.PATH
@@ -106,10 +106,10 @@ test('login ticket is rechecked after protection is enabled, without creating cr
     fs.rmSync(root, { recursive: true, force: true })
   })
   const shell = createSlotShell({ projectRoot: root })
-  const issued = shell.issueTicket(vm.id, { login: true })
+  const issued = await shell.issueTicket(vm.id, { login: true })
   assert.equal(issued.ok, true)
   settings.set('proxy_exit_guard', { required: true, proxies: {} })
-  const denied = shell.issueTicket(vm.id, { login: true })
+  const denied = await shell.issueTicket(vm.id, { login: true })
   assert.equal(denied.status, 409)
   assert.equal(denied.error.code, 'exit_guard_blocked')
   assert.equal(denied.error.reason, 'exit_ip_required')
@@ -123,6 +123,7 @@ test('login ticket is rechecked after protection is enabled, without creating cr
     ),
     true,
   )
+  await new Promise((resolve) => setImmediate(resolve))
   assert.match(responses[0], /^HTTP\/1\.1 409 /)
   assert.deepEqual(fs.readdirSync(home), ['.kin'])
   const commands = fs.readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse)
@@ -170,7 +171,7 @@ test('strict login accepts a verified live local helper', { skip: process.platfo
   const home = path.join(root, 'vms', vm.id, 'cli-home', '.kin')
   fs.mkdirSync(home, { recursive: true })
   fs.writeFileSync(path.join(home, 'cli-node'), '')
-  assert.equal(assertAuthLoginReady(root, vm, { inspect: () => ({ running: true }) }).container, 'kin-guard')
+  assert.equal((await assertAuthLoginReady(root, vm, { inspect: () => ({ running: true }) })).container, 'kin-guard')
 })
 
 test('extractAuthLoginUrl reads the official manual CAI link', () => {
@@ -234,33 +235,34 @@ test('auth login session stays reusable until force regenerate or login_ready', 
   assert.equal(isPersistentAuthLoginSession({ ...session, alive: false }), false)
 })
 
-test('assertAuthLoginReady refuses a missing container and a missing cli-node', () => {
+test('assertAuthLoginReady refuses a missing container and a missing cli-node', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-login-ready-'))
   const stopped = () => ({ running: false })
   const running = () => ({ running: true })
   try {
     fs.mkdirSync(path.join(root, 'vms', 'vm-01'), { recursive: true })
     fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01' }))
-    assert.throws(
-      () => assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: stopped }),
+    await assert.rejects(
+      assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: stopped }),
       (err) => err.code === 'container_not_ready',
     )
     const home = path.join(root, 'vms', 'vm-01', 'cli-home', '.kin')
     fs.mkdirSync(home, { recursive: true })
     fs.writeFileSync(path.join(home, 'cli-node'), '')
-    assert.throws(
-      () => assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: stopped }),
+    await assert.rejects(
+      assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: stopped }),
       (err) => err.code === 'container_not_ready',
     )
-    assert.throws(
-      () => assertAuthLoginReady(root, { id: 'vm-missing' }, { inspect: running }),
+    await assert.rejects(
+      assertAuthLoginReady(root, { id: 'vm-missing' }, { inspect: running }),
       (err) => err.code === 'cli_node_missing',
     )
-    assert.throws(
-      () => assertAuthLoginReady(root, { id: 'vm-01', node_id: 'node-a' }, { inspect: running }),
-      (err) => err.code === 'remote_unsupported',
+    const remote = { id: 'vm-01', node_id: 'node-a' }
+    await assert.rejects(
+      assertAuthLoginReady(root, remote, { inspect: running }),
+      (err) => err.code === 'container_unreadable',
     )
-    assert.equal(assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: running }).container, 'kin-01')
+    assert.equal((await assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: running })).container, 'kin-01')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -343,25 +345,23 @@ test('stopClaudeAuthLoginSession pkills auth login, not setup-token', async () =
     fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify({ id: 'vm-02', runtime: { type: 'docker' } }))
     const seen = []
     await stopClaudeAuthLoginSession(root, 'vm-02', {
-      spawn: (bin, argv) => {
-        seen.push({ bin, argv })
-        return { status: 0 }
+      execDetach: async (_connect, id, cmd) => {
+        seen.push({ id, cmd })
       },
     })
-    assert.equal(seen[0].bin, 'docker')
-    assert.deepEqual(seen[0].argv.slice(0, 4), ['exec', 'kin-02', 'sh', '-lc'])
-    assert.match(seen[0].argv.at(-1), /auth login/)
-    assert.doesNotMatch(seen[0].argv.at(-1), /setup-token/)
+    assert.equal(seen[0].id, 'kin-02')
+    assert.deepEqual(seen[0].cmd.slice(0, 2), ['sh', '-lc'])
+    assert.match(seen[0].cmd.at(-1), /auth login/)
+    assert.doesNotMatch(seen[0].cmd.at(-1), /setup-token/)
 
     fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01', runtime: { type: 'kvm' } }))
     const kvm = []
     await stopClaudeAuthLoginSession(root, 'vm-01', {
-      spawn: (_bin, argv) => {
-        kvm.push(argv)
-        return { status: 0 }
+      execDetach: async (_connect, _id, cmd) => {
+        kvm.push(cmd)
       },
     })
-    assert.equal(kvm[0][2], KVM_GUEST_EXEC)
+    assert.equal(kvm[0][0], KVM_GUEST_EXEC)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

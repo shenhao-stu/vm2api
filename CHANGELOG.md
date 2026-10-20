@@ -2,7 +2,19 @@
 
 ## 未发布
 
+- 自动/手动备份流水线改到 worker 线程执行（VACUUM INTO + tar），避免主线程长时间阻塞网关导致 Cloudflare 524。（#638，#639）
+
+## 1.3.202 — 2026-10-20
+
+- 官方凭证只保留一份 refresh token：`.credentials.json` 里较新的授权先并入宿主 `credentials.json`，再把官方文件名链回去。进行中的槽内 `claude auth login` 不再拿旧 refresh token 去换票，避免新授权被判 revoked。
+- cli-node 2.1.296 在 `CLAUDE_CODE_HOST_REFRESH=1` 时读写宿主 `credentials.json`，logout 不删除该文件。仍有效的 access 不再因为残留 `oauth_revoked` 被钉成无效凭证。
+- 集群槽官方登录：票据与 WebSocket 升级走 Engine API 异步检查容器与 cli-node；登录终端开前把控制面空凭证与 `.credentials.json` 链接推到节点 `claude/` 挂载，粘贴完成后从节点拉回 OAuth 再 `adoptShellLogin` 入账，避免只读本地空文件。（#630）
+- 面板租户（role=user）权限收紧：导入凭证、导入代理时绑定槽位、API Key 的 `allowed_vms` 只认本人的槽（他人的与不存在的同样回 404）；租户改 Key 时忽略 `user_id`、`group_id`，`vm_pool_id` 仅管理员可设（非管理员带值回 403 `key_pool_forbidden`，前端隐藏账号池）；改角色或停用用户时撤销其全部面板会话；`GET /api/panel/test-models` 对租户与 super 只读放行，带他人 `vm_id` 回 404，`refresh=1` 仅管理员生效。
 - Docker 槽在线扩容：面板成功须 HostConfig 内存与 swap 一致；可读 cgroup 时核对 v2 `memory.max` 或 v1 `memory.limit_in_bytes`（`max`/无上限哨兵在 HostConfig 已匹配时跳过）。扩容后校验失败会 docker update 回滚至扩容前限额且不写 vm 配置。（#623，REQ-0441）
+- 集群槽 prepareRemoteDir：程序目录 slot-bin 改为 0755（私有 run/claude/cli-home 仍 0700），使 CapDrop ALL 的 egress 能 traverse /opt/kin-live，避免迁 live 后容器停在 Created / permission denied。（#632）
+
+已部署机升级：更新 Node 控制面后重启一次。cli-node 字节已变，需要 `wrap-cli/sync`（逐槽重启 dataplane，不要 `docker rm`）。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 
 ## 1.3.201 — 2026-10-20
 
