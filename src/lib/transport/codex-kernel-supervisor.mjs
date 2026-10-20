@@ -9,12 +9,17 @@ import path from 'node:path'
 import { boundProxyUrl, isLocalEgressProxy, localEgressProxyUrl } from '../vm/egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { assertProxyAllowed } from '../vm/proxy-policy.mjs'
+import { exitGuardError, getProxyExitGuardPolicy } from '../vm/proxy-exit-guard.mjs'
 import { maxRequestBytes } from '../core/config.mjs'
 import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 import { codexKernelHealth, codexKernelPaths } from './codex-kernel-client.mjs'
 import { computedUpstreamTransport, normalizeCodexRouting } from '../protocol/codex-route.mjs'
 
 const starts = new Map()
+
+function assertCodexExitSupported() {
+  if (getProxyExitGuardPolicy(null).required) throw exitGuardError('exit_guard_unsupported_platform')
+}
 
 // The kernel exits only through config.proxy_url; inherited proxy variables would give it a second, unseen exit.
 function kernelEnv(env = process.env) {
@@ -55,6 +60,7 @@ export function codexKernelRequestOptions(routing = {}) {
 }
 
 export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxyRequired, routing } = {}) {
+  assertCodexExitSupported()
   if (!projectRoot || !vm?.id) return null
   assertProxyAllowed(vm.proxy)
   if (proxyUrl) assertProxyAllowed({ url: proxyUrl })
@@ -180,6 +186,7 @@ export async function finishCodexRecycle(child, socketPath, { termMs = 2000, kil
 }
 
 export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
+  assertCodexExitSupported()
   const bin = codexKernelBinPath()
   if (!bin) return { ok: false, reason: 'bin_missing' }
   const paths = codexKernelPaths(exec)

@@ -23,6 +23,7 @@ import {
 } from './vm-runtime.mjs'
 import { inspectWrapCliDir, materializeWrapCli, wrapCliHomeDir } from './wrap-cli-runtime.mjs'
 import { isLocalEgressProxy } from './egress.mjs'
+import { exitGuardVmRejection } from './proxy-exit-guard.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm, slotHost } from './slot-host.mjs'
 
@@ -33,6 +34,8 @@ function unsupportedOnHost(action) {
 }
 
 export function startSlot(vm, projectRoot, opts = {}) {
+  const guard = exitGuardVmRejection(vm)
+  if (guard) return guard
   return slotHost(vm).start(vm, projectRoot, opts)
 }
 
@@ -46,6 +49,8 @@ function persistNodeRuntime(vm, projectRoot, boot) {
 }
 
 export async function startSlotReady(vm, projectRoot, opts = {}) {
+  const guard = exitGuardVmRejection(vm)
+  if (guard) return guard
   if (isCodexVm(vm)) {
     if (!slotHost(vm).supports('codex')) return unsupportedOnHost('codex')
     const boot = await (opts.ops?.startSlot || startSlot)(vm, projectRoot, opts)
@@ -73,6 +78,8 @@ export async function destroySlot(vm) {
 
 /** Reload guest worker so a new bind-mounted / virtiofs binary is picked up. Recreate only when the bound egress network moved; otherwise never docker rm. */
 export async function reloadSlot(vm, projectRoot, opts = {}) {
+  const guard = exitGuardVmRejection(vm)
+  if (guard) return guard
   return slotHost(vm).reload(vm, projectRoot, opts)
 }
 
@@ -105,6 +112,8 @@ function wrapUsesSlotKernel(wrap) {
 }
 
 export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
+  const guard = exitGuardVmRejection(vm)
+  if (guard) return guard
   const routing = opts.routing || {}
   const eager = routing?.inference?.eager_start !== false
   if (isCodexVm(vm)) {

@@ -104,6 +104,7 @@ export function NotifyPane({
   const config = notifyConfig(value)
   const telegram = config.telegram
   const wecom = config.wecom
+  const feishu = config.feishu || { enabled: false, webhook: '' }
   const status = useQuery(notifyQueryOptions())
 
   const testTelegram = useMutation({
@@ -142,6 +143,22 @@ export function NotifyPane({
     },
     onSuccess: async () => {
       toast.success('测试企业微信已发送')
+      await status.refetch()
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+
+  const testFeishu = useMutation({
+    mutationFn: () =>
+      api('/api/panel/notify/test', {
+        method: 'POST',
+        body: JSON.stringify({
+          channel: 'feishu',
+          feishu: { ...feishu, enabled: true },
+        }),
+      }),
+    onSuccess: async () => {
+      toast.success('飞书测试消息已发送')
       await status.refetch()
     },
     onError: (error: Error) => toast.error(error.message),
@@ -197,6 +214,14 @@ export function NotifyPane({
                       cls: 'none',
                       text: '企业微信未就绪',
                     }
+              }
+              variant='pill'
+            />
+            <StatusMark
+              tone={
+                status.data?.channels?.feishu
+                  ? { key: 'feishu-ready', cls: 'ok', text: '飞书已就绪' }
+                  : { key: 'feishu-missing', cls: 'none', text: '飞书未就绪' }
               }
               variant='pill'
             />
@@ -411,6 +436,58 @@ export function NotifyPane({
               checked={wecom.mention_all}
               aria-label='企业微信 @所有人'
               onCheckedChange={(mention_all) => patchWecom({ mention_all })}
+            />
+          </SettingRow>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader className='flex flex-row items-center justify-between gap-3'>
+          <CardTitle>飞书群机器人</CardTitle>
+          <Button
+            variant='outline'
+            size='sm'
+            loading={testFeishu.isPending}
+            onClick={() => testFeishu.mutate()}
+          >
+            发送测试
+          </Button>
+        </CardHeader>
+        <CardContent className='divide-y'>
+          <SettingRow
+            label='启用飞书'
+            desc='接收出口 IP 校验告警及已启用的账号池通知'
+          >
+            <Switch
+              checked={feishu.enabled}
+              aria-label='启用飞书'
+              onCheckedChange={(enabled) =>
+                patch({ feishu: { ...feishu, enabled } })
+              }
+            />
+          </SettingRow>
+          <SettingRow
+            label='Webhook'
+            desc={
+              feishu.webhook_set
+                ? '已保存；留空不改，地址不会回显'
+                : '填写飞书自定义机器人的 Webhook 地址'
+            }
+          >
+            <Input
+              aria-label='飞书 Webhook'
+              className='w-full min-w-56 sm:w-80'
+              type='password'
+              autoComplete='new-password'
+              maxLength={500}
+              value={feishu.webhook}
+              placeholder={
+                feishu.webhook_set
+                  ? '已保存，留空不改'
+                  : 'https://open.feishu.cn/open-apis/bot/v2/hook/…'
+              }
+              onChange={(event) =>
+                patch({ feishu: { ...feishu, webhook: event.target.value } })
+              }
             />
           </SettingRow>
         </CardContent>

@@ -62,12 +62,17 @@ import {
   setVmSchedulable,
   isCodexVm,
   syncCodexQuotaSchedule,
+  patchVmRecord,
 } from './lib/vm/vm-registry.mjs'
 import { makeError, ErrorType, ErrorCode } from './lib/core/errors.mjs'
 import * as panel from './lib/admin/panel-api.mjs'
 import { ProxyPool } from './lib/vm/proxy-pool.mjs'
 import { ProxySubscriptions } from './lib/vm/proxy-subscriptions.mjs'
 import { ensureProxyEgress, proxyEgressReady } from './lib/vm/egress.mjs'
+import { slotHost } from './lib/vm/slot-host.mjs'
+import { stopSlot } from './lib/vm/slot-runtime.mjs'
+import { getProxyExitGuardPolicy, getProxyExitGuardState } from './lib/vm/proxy-exit-guard.mjs'
+import { createProxyExitGuardManager } from './lib/admin/proxy-exit-guard-manager.mjs'
 import { syncIpv6ProxyEgress } from './lib/vm/proxy-policy-runtime.mjs'
 import { GATEWAY_CAPABILITIES } from './lib/vm/execution-context.mjs'
 import { isTelemetryPath, telemetryInterceptResponse } from './lib/identity/telemetry-rewrite.mjs'
@@ -364,6 +369,8 @@ proxyPool = new ProxyPool({
     setVmSchedulable(cfg.paths.project, vmId, false, `${reason}|proxy=${proxyId}`)
   },
   onEnableVm: (vmId, _reason, proxyId) => {
+    // Exit-policy incidents require explicit operator recovery, never a health-probe recovery.
+    if (getProxyExitGuardPolicy(proxyId).required) return
     const vm = getVm(cfg.paths.project, vmId)
     const why = String(vm?.schedule_disabled_reason || '')
     if (!why.includes(`proxy=${proxyId}`) && !/egress_down|proxy_probe_failed/.test(why)) return
@@ -372,6 +379,33 @@ proxyPool = new ProxyPool({
   egressCheck: (proxy) => proxyEgressReady(proxy, cfg.paths.project),
   repairEgress: (proxy) => ensureProxyEgress(cfg.paths.project, proxy),
 })
+async function quiesceExitProxy(proxy, reason = 'exit_guard_policy_change') {
+  let ok = true
+  for (const summary of listVms(cfg.paths.project).filter((vm) => vm.proxy?.id === proxy.id)) {
+    const vm = getVm(cfg.paths.project, summary.id)
+    if (!vm) continue
+    // Mark stopped before halting so background monitors cannot revive it in the gap.
+    patchVmRecord(cfg.paths.project, vm.id, {
+      status: 'stopped',
+      schedulable: false,
+      schedule_disabled_reason: reason,
+    })
+    const result = await stopSlot(vm)
+    ok = !!result?.ok && ok
+  }
+  const result = await slotHost({ proxy }).setProxyEgressEnabled({ proxy }, cfg.paths.project, false)
+  return { ok: !!result?.ok && ok }
+}
+const proxyExitGuard = createProxyExitGuardManager({
+  settings: new SettingsRepo(),
+  listProxies: () => proxyPool.snapshot().proxies,
+  readState: (id) => getProxyExitGuardState(cfg.paths.project, id),
+  quiesce: quiesceExitProxy,
+  onBlock: (proxy, reason) => quiesceExitProxy(proxy, `exit_guard:${reason}`),
+  startHelper: (proxy) => ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(proxy.id)),
+  notify: (message) => (routingConfig.notify.enabled ? dispatchNotify(routingConfig.notify, message) : undefined),
+})
+proxyExitGuard.start()
 // An upgrade replaces bin/ files; slots mounting data/run/slot-guest-bin must see the new ones.
 try {
   refreshSlotGuestBinDir(cfg.paths.project)
@@ -993,6 +1027,7 @@ const handlePanel = createPanelHandler({
     return proxyPool
   },
   proxySubscriptions,
+  proxyExitGuard,
   apiKeyStore,
   apiEndpointStore,
   apiScheduler,
@@ -1254,6 +1289,7 @@ async function shutdown(signal) {
     backupService.stopScheduler()
   } catch {}
   try {
+    proxyExitGuard.stop()
     proxyPool.stopScheduler()
     await proxySubscriptions.close()
   } catch {}

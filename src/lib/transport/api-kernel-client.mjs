@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import crypto from 'node:crypto'
+import { getProxyExitGuardPolicy } from '../vm/proxy-exit-guard.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
 
@@ -120,6 +121,12 @@ export function forwardApi({
   timeoutMs = 300_000,
 } = {}) {
   return new Promise((resolve, reject) => {
+    if (getProxyExitGuardPolicy(null).required) {
+      throw Object.assign(new Error('Exit IP protection requires a guarded VM slot; API endpoints are disabled.'), {
+        code: 'exit_guard_api_endpoint_unsupported',
+        status: 409,
+      })
+    }
     const { socketPath, tokenPath } = apiKernelPaths(cfg)
     const token = readToken(tokenPath)
     const envelope = JSON.stringify({

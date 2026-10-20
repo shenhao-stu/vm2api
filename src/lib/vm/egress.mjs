@@ -11,6 +11,7 @@ import path from 'node:path'
 import { getDb, isDbOpen } from '../db/database.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { socksProxyUrl } from './socks-address.mjs'
+import { exitGuardConfigForProxy, getProxyExitGuardPolicy, getProxyExitGuardState } from './proxy-exit-guard.mjs'
 import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
 
 export const EGRESS_BIN = process.env.KIN_EGRESS_BIN || '/opt/kin-gateway/bin/kin-egress'
@@ -76,6 +77,10 @@ export function proxyEgressReady(proxy, projectRoot, timeoutMs = 400) {
   // Direct exit. kin-egress not running is success, not egress_down.
   const blocked = proxyBlockedReason(proxy)
   if (blocked) return { ok: false, reason: blocked }
+  if (getProxyExitGuardPolicy(proxy?.id).required) {
+    const guard = getProxyExitGuardState(projectRoot, proxy?.id)
+    if (!guard.ready) return { ok: false, reason: guard.reason }
+  }
   if (isLocalEgressProxy(proxy)) return { ok: true, mode: 'direct' }
   return egressListening(projectRoot, proxy?.id, timeoutMs)
 }
@@ -410,8 +415,12 @@ export async function startEgressProcess({
   dnsUpstream = '',
   dnsEmptyTypes = [],
   domainForward = false,
+  exitGuard = null,
 }) {
-  const blocked = proxyBlockedReason({ url: proxyUrl })
+  if (getProxyExitGuardPolicy(proxyId).required) {
+    exitGuard = exitGuardConfigForProxy(projectRoot, { id: proxyId, url: proxyUrl })
+  }
+  const blocked = proxyBlockedReason({ id: proxyId, url: proxyUrl })
   if (blocked) return { ok: false, error: blocked }
   if (!listenHost) return { ok: false, error: 'egress listen host required' }
   const dir = egressRunDir(projectRoot, proxyId)
@@ -430,7 +439,8 @@ export async function startEgressProcess({
         old.proxy_url === proxyUrl &&
         (old.dns_upstream || '') === dnsUpstream &&
         JSON.stringify(old.dns_empty_types || []) === JSON.stringify(dnsEmptyTypes) &&
-        !!old.domain_forward === !!domainForward
+        !!old.domain_forward === !!domainForward &&
+        JSON.stringify(old.exit_guard || null) === JSON.stringify(exitGuard)
       ) {
         return { ok: true, pid: existing, reused: true, configPath: cfgPath }
       }
@@ -461,6 +471,7 @@ export async function startEgressProcess({
   if (dnsUpstream) cfg.dns_upstream = dnsUpstream
   if (dnsEmptyTypes.length) cfg.dns_empty_types = dnsEmptyTypes
   if (domainForward) cfg.domain_forward = true
+  if (exitGuard) cfg.exit_guard = exitGuard
   fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 })
   const spawned = await spawnDetachedEgress(bin, cfgPath)
   if (!spawned.ok) return spawned
@@ -665,6 +676,13 @@ const egressStarts = new Map()
  * overlapping starts would both spawn and record the helper that lost the bind.
  */
 export async function ensureProxyEgress(projectRoot, proxy, opts = {}) {
+  let exitGuard
+  try {
+    exitGuard = exitGuardConfigForProxy(projectRoot, proxy)
+  } catch (error) {
+    return { ok: false, error: error.reason || error.code || 'exit_guard_blocked' }
+  }
+  opts = { ...opts, exitGuard }
   if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, { runDocker: opts.runDocker })
   const key = egressRunDir(projectRoot || '', proxy?.id || '')
   const run = (egressStarts.get(key) || Promise.resolve()).then(() => startProxyEgress(projectRoot, proxy, opts))
@@ -685,6 +703,7 @@ async function startProxyEgress(
     runIptables = iptables,
     dnsUpstream = configuredDnsUpstream(),
     dnsEmptyTypes = configuredDnsEmptyTypes(),
+    exitGuard = null,
     bin,
   } = {},
 ) {
@@ -716,6 +735,7 @@ async function startProxyEgress(
     dnsUpstream,
     dnsEmptyTypes,
     domainForward: proxy?.domain_forward === true,
+    exitGuard,
     ...(bin ? { bin } : {}),
   })
   if (!started.ok) return started

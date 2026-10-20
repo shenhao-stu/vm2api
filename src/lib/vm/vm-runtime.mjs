@@ -23,6 +23,7 @@ import { coerceRfc4122Uuid } from '../identity/rfc4122-uuid.mjs'
 import { boundProxyUrl, ensureProxyEgress, isLocalEgressProxy, slotNetworkForVm } from './egress.mjs'
 import { socksProxyEndpoint } from './socks-address.mjs'
 import { assertProxyAllowed } from './proxy-policy.mjs'
+import { exitGuardVmRejection } from './proxy-exit-guard.mjs'
 import { toHostPath } from './host-path.mjs'
 import { fileURLToPath } from 'node:url'
 import {
@@ -893,6 +894,8 @@ export function dockerSlotResourceArgs(vm, routing) {
 }
 
 export async function startVmRuntime(vm, projectRoot, { recreate = false, routing, accel: accelOpt } = {}) {
+  const guard = exitGuardVmRejection(vm)
+  if (guard) return guard
   if (!isKvmRuntime(vm)) slotDockerCpus(vm) // reject corrupt persisted quotas before any lifecycle changes
   if (isKvmRuntime(vm) && accelOpt !== 'kvm' && accelOpt !== 'tcg') {
     const recorded = vm.runtime?.accel

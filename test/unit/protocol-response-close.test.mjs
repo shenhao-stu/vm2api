@@ -6,6 +6,8 @@ import path from 'node:path'
 import http from 'node:http'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { parseRequestUrl, readBody } from '../../src/lib/http/respond.mjs'
+import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
+import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 
 const body = {
   model: 'claude-sonnet-5-5',
@@ -19,7 +21,14 @@ const usage = { input_tokens: 10, output_tokens: 4 }
 
 async function exercise(
   t,
-  { closeAtTerminal = false, cancelled = false, beforeTerminal = false, unauthorized = false, search = false } = {},
+  {
+    closeAtTerminal = false,
+    cancelled = false,
+    beforeTerminal = false,
+    unauthorized = false,
+    search = false,
+    input = body,
+  } = {},
 ) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-close-summary-'))
   const routing = { compatibility: {}, failover: { stream_keepalive_ms: 0, queue_keepalive_delay_ms: 60000 } }
@@ -54,7 +63,7 @@ async function exercise(
         return false
       }
       req.apiKeyKind = 'managed'
-      req.apiKeyRecord = { id: 'synthetic-key', vm_scope: 'all' }
+      req.apiKeyRecord = { id: 'synthetic-key', vm_scope: 'all', group_type: 'all' }
       return true
     },
     cfg: {
@@ -172,7 +181,7 @@ async function exercise(
       },
     )
     req.on('error', reject)
-    req.end(JSON.stringify(body))
+    req.end(JSON.stringify(input))
   })
   await handled
   await new Promise((resolve) => setImmediate(resolve))
@@ -231,5 +240,37 @@ for (const search of [false, true]) {
     assert.equal(result.releases, 0)
     assert.equal(result.billed.length, 0)
     assert.equal(result.ingested.length, 0)
+  })
+}
+
+test('required exit guard rejects remote images at the HTTP boundary before inference or accounting', async (t) => {
+  new SettingsRepo(openDatabase({ dbPath: ':memory:' })).set('proxy_exit_guard', { required: true, proxies: {} })
+  t.after(closeDatabase)
+  const result = await exercise(t, {
+    input: {
+      ...body,
+      messages: [
+        { role: 'user', content: [{ type: 'image', source: { type: 'url', url: 'https://image.invalid/a' } }] },
+      ],
+    },
+  })
+  assert.equal(result.records.length, 1)
+  assert.equal(result.records[0].status, 400)
+  assert.equal(result.records[0].error_code, 'exit_guard_remote_image_unsupported')
+  assert.equal(result.workerCalls, 0)
+  assert.equal(result.releases, 0)
+  assert.equal(result.billed.length, 0)
+})
+
+for (const search of [false, true]) {
+  test(`required exit guard rejects unsupported Codex ${search ? 'search' : 'inference'} before dispatch`, async (t) => {
+    new SettingsRepo(openDatabase({ dbPath: ':memory:' })).set('proxy_exit_guard', { required: true, proxies: {} })
+    t.after(closeDatabase)
+    const result = await exercise(t, { search, input: { ...body, model: 'gpt-5' } })
+    assert.equal(result.records.length, 1)
+    assert.equal(result.records[0].status, 409)
+    assert.equal(result.records[0].error_code, 'exit_guard_blocked')
+    assert.equal(result.workerCalls, 0)
+    assert.equal(result.billed.length, 0)
   })
 }

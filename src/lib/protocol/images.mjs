@@ -1,6 +1,7 @@
 /**
  * OpenAI image_url content parts → Claude image content blocks
  */
+import { getProxyExitGuardPolicy } from '../vm/proxy-exit-guard.mjs'
 
 export function openaiImagePartToClaude(part) {
   // OpenAI: { type: 'image_url', image_url: { url: 'data:image/png;base64,...' | 'https://...' } }
@@ -93,6 +94,25 @@ export function normalizeImageContentBlocks(content) {
 const IMAGE_FETCH_MS = 20_000
 const IMAGE_FETCH_MAX = 8 * 1024 * 1024
 
+function containsRemoteImage(value) {
+  if (Array.isArray(value)) return value.some(containsRemoteImage)
+  if (!value || typeof value !== 'object') return false
+  if (value.type === 'image' && value.source?.type === 'url') return true
+  if (value.type === 'image_url' || value.type === 'input_image') {
+    const url = typeof value.image_url === 'string' ? value.image_url : value.image_url?.url
+    if (url && !/^data:/i.test(url)) return true
+  }
+  return ['messages', 'input', 'content'].some((key) => containsRemoteImage(value[key]))
+}
+
+export function assertInlineImages(body) {
+  if (!containsRemoteImage(body)) return
+  throw Object.assign(new Error('Exit IP protection requires inline base64 images; remote image URLs are disabled.'), {
+    code: 'exit_guard_remote_image_unsupported',
+    status: 400,
+  })
+}
+
 function mediaTypeFrom(contentType, url) {
   const raw = String(contentType || '')
     .split(';')[0]
@@ -154,7 +174,8 @@ async function materializeBlock(block, fetchImpl) {
 }
 
 /** Wrap CLI / SDK often reject `image.source.type=url`. Fetch to base64; leave URL if fetch fails. */
-export async function materializeRemoteImageSources(body, { fetchImpl = fetch } = {}) {
+export async function materializeRemoteImageSources(body, { fetchImpl = fetch, allowRemote = true } = {}) {
+  if (!allowRemote || getProxyExitGuardPolicy(null).required) assertInlineImages(body)
   if (!body || typeof body !== 'object' || !Array.isArray(body.messages)) return body
   let changed = false
   const messages = []

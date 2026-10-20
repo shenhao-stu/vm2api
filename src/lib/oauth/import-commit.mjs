@@ -47,9 +47,21 @@ export function createImportCommit(ctx) {
       vm: existing,
       proxyPool: ctx.proxyPool,
       overrideUrl: body.proxy_url || null,
+      projectRoot: ctx.cfg?.paths?.project,
     })
-    const allowProxyBypass = process.env.KIN_CRS_MOCK === '1' && body.require_proxy === false
+    const allowProxyBypass =
+      resolved.code !== 'exit_guard_blocked' && process.env.KIN_CRS_MOCK === '1' && body.require_proxy === false
     if (!resolved.ok && !allowProxyBypass) {
+      if (resolved.code === 'exit_guard_blocked') {
+        return {
+          ok: false,
+          status: 409,
+          code: resolved.code,
+          reason: resolved.reason,
+          message: `出口 IP 校验未放行: ${resolved.reason}`,
+          resolved,
+        }
+      }
       const message =
         resolved.reason === 'ipv6_disabled'
           ? 'IPv6 已关闭，请在设置 → SOCKS5 开启 IPv6 代理出口'
@@ -144,6 +156,10 @@ export function createImportCommit(ctx) {
   }
 
   async function commitImportedOauth({ vmId, vmPath, existing, oauth, source, name, skipOfficialCc = false }) {
+    const exit = requireSlotProxy(existing)
+    if (!exit.ok && exit.code === 'exit_guard_blocked') {
+      return { ok: false, status: exit.status, error: { code: exit.code, reason: exit.reason, message: exit.message } }
+    }
     const importedCredential = importedCredentialFromOauth(oauth, existing)
     const workerExec = {
       vmId,

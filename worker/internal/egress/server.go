@@ -22,12 +22,13 @@ import (
 )
 
 type Config struct {
-	ProxyID       string   `json:"proxy_id"`
-	ProxyURL      string   `json:"proxy_url"`
-	ListenTCP     string   `json:"listen_tcp"`
-	ListenDNS     string   `json:"listen_dns"`
-	DNSUpstream   string   `json:"dns_upstream"`
-	DNSEmptyTypes []uint16 `json:"dns_empty_types,omitempty"`
+	ExitGuard     *ExitGuardConfig `json:"exit_guard,omitempty"`
+	ProxyID       string           `json:"proxy_id"`
+	ProxyURL      string           `json:"proxy_url"`
+	ListenTCP     string           `json:"listen_tcp"`
+	ListenDNS     string           `json:"listen_dns"`
+	DNSUpstream   string           `json:"dns_upstream"`
+	DNSEmptyTypes []uint16         `json:"dns_empty_types,omitempty"`
 	// DomainForward sends a unique helper DNS answer as a SOCKS hostname.
 	// Off by default: the original IP literal is unchanged.
 	DomainForward bool `json:"domain_forward,omitempty"`
@@ -82,6 +83,7 @@ var DefaultDNSUpstreams = []string{
 const dnsAttemptTimeout = 4 * time.Second
 
 type Server struct {
+	guard     *exitGuard
 	cfg       Config
 	dialer    *kinproxy.Dialer
 	http      *http.Client
@@ -114,7 +116,7 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{
+	server := &Server{
 		cfg:       cfg,
 		dialer:    dialer,
 		upstreams: upstreams,
@@ -133,10 +135,29 @@ func New(cfg Config) (*Server, error) {
 				DialContext: dialer.DialContext,
 			},
 		},
-	}, nil
+	}
+	if cfg.ExitGuard != nil {
+		server.guard, err = newExitGuard(*cfg.ExitGuard, dialer.DialContext)
+		if err != nil {
+			return nil, err
+		}
+		server.http.Transport.(*http.Transport).DialContext = server.guardedDial
+	}
+	return server, nil
 }
 
 func (s *Server) Serve(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if s.guard != nil {
+		listener, err := s.startGuardSOCKS(ctx)
+		if err != nil {
+			return err
+		}
+		defer listener.Close()
+		_ = s.VerifyExit(ctx)
+		go s.guard.monitor(ctx)
+	}
 	tcpLn, err := net.Listen("tcp", s.cfg.ListenTCP)
 	if err != nil {
 		return fmt.Errorf("listen tcp: %w", err)
@@ -203,17 +224,37 @@ func (s *Server) handleTCP(ctx context.Context, conn net.Conn) {
 }
 
 func (s *Server) ForwardTCP(ctx context.Context, client net.Conn, dest string) error {
+	return s.forwardTCP(ctx, client, dest, nil)
+}
+
+func (s *Server) forwardTCP(ctx context.Context, client net.Conn, dest string, connected func() error) error {
+	if err := s.VerifyExit(ctx); err != nil {
+		return err
+	}
+	if s.guard != nil {
+		tracked, err := s.guard.register(client)
+		if err != nil {
+			return err
+		}
+		client = tracked
+		defer client.Close()
+	}
 	dialDest, err := s.dialDest(dest)
 	if err != nil {
 		return err
 	}
-	up, err := s.dialer.DialContext(ctx, "tcp", dialDest)
+	up, err := s.guardedDial(ctx, "tcp", dialDest)
 	if err != nil {
 		return &spliceError{class: classSocksDial, dest: dialDest, err: err}
 	}
 	defer up.Close()
 	kinproxy.ApplyTCPKeepAlive(client)
 	kinproxy.ApplyTCPKeepAlive(up)
+	if connected != nil {
+		if err := connected(); err != nil {
+			return err
+		}
+	}
 	return spliceIdle(client, up, dialDest, IdleClose)
 }
 
@@ -255,7 +296,7 @@ func spliceIdle(a, b net.Conn, dest string, idle time.Duration) error {
 				break
 			}
 		}
-		if tcp, ok := dst.(*net.TCPConn); ok {
+		if tcp, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = tcp.CloseWrite()
 		} else {
 			_ = dst.Close()
@@ -440,6 +481,9 @@ func dnsServFail(query []byte) ([]byte, bool) {
 // ResolveDNS tries each upstream in order, starting from the last one that
 // succeeded, and returns the first valid reply.
 func (s *Server) ResolveDNS(ctx context.Context, query []byte) ([]byte, error) {
+	if err := s.VerifyExit(ctx); err != nil {
+		return nil, err
+	}
 	if len(s.cfg.DNSEmptyTypes) > 0 {
 		var msg dnsmessage.Message
 		if err := msg.Unpack(query); err != nil {
@@ -529,7 +573,7 @@ func (s *Server) resolveDoH(ctx context.Context, upstream string, query []byte) 
 }
 
 func (s *Server) resolveDNSTCP(ctx context.Context, upstream string, query []byte) ([]byte, error) {
-	up, err := s.dialer.DialContext(ctx, "tcp", upstream)
+	up, err := s.guardedDial(ctx, "tcp", upstream)
 	if err != nil {
 		return nil, err
 	}

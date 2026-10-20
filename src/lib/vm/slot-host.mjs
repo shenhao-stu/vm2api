@@ -30,6 +30,7 @@
  */
 
 import { localDocker } from '../cluster/docker-remote.mjs'
+import { exitGuardError, getProxyExitGuardPolicy } from './proxy-exit-guard.mjs'
 import { clusterManager, SLOT_CAPS_NODE, vmNodeId } from '../cluster/placement.mjs'
 import {
   pullSlotCredentials,
@@ -160,6 +161,7 @@ export function slotHost(vm) {
  * has no proxy env, so its requests stay direct; a node slot's must not leave from here.
  */
 export function hostProxyUrlForVm(vm) {
+  if (getProxyExitGuardPolicy(vm?.proxy?.id).required) throw exitGuardError('exit_guard_unsupported_host_route')
   if (!isLocalEgressProxy(vm?.proxy)) return boundProxyUrl(vm?.proxy)
   return slotHost(vm).localExitProxyUrl(vm)
 }

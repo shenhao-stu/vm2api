@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { materializeRemoteImageSources } from '../../src/lib/protocol/images.mjs'
+import { assertInlineImages, materializeRemoteImageSources } from '../../src/lib/protocol/images.mjs'
 
 const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
@@ -51,4 +51,61 @@ test('materializeRemoteImageSources keeps url when fetch fails', async () => {
     },
   )
   assert.equal(out.messages[0].content[0].source.type, 'url')
+})
+
+test('remote images are rejected before any download when inline images are required', async () => {
+  let calls = 0
+  const body = {
+    messages: [{ role: 'user', content: [{ type: 'image_url', image_url: 'https://example.com/image.png' }] }],
+  }
+  const original = structuredClone(body)
+  await assert.rejects(
+    materializeRemoteImageSources(body, {
+      allowRemote: false,
+      fetchImpl: async () => {
+        calls++
+        return { ok: false }
+      },
+    }),
+    { code: 'exit_guard_remote_image_unsupported' },
+  )
+  assert.equal(calls, 0)
+  assert.deepEqual(body, original)
+})
+
+test('inline-only validation covers nested tool results and Responses image inputs without changing content', () => {
+  for (const body of [
+    {
+      messages: [
+        {
+          content: [
+            {
+              type: 'tool_result',
+              content: [{ type: 'image', source: { type: 'url', url: 'https://image.invalid/a' } }],
+            },
+          ],
+        },
+      ],
+    },
+    { input: [{ role: 'user', content: [{ type: 'input_image', image_url: 'https://image.invalid/a' }] }] },
+  ]) {
+    const original = structuredClone(body)
+    assert.throws(() => assertInlineImages(body), { code: 'exit_guard_remote_image_unsupported' })
+    assert.deepEqual(body, original)
+  }
+  const inline = {
+    messages: [
+      {
+        content: [
+          { type: 'thinking', thinking: 'synthetic', signature: 'synthetic-signature' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG.toString('base64') } },
+          { type: 'image_url', image_url: { url: `data:image/png;base64,${PNG.toString('base64')}` } },
+          { type: 'text', text: 'https://example.com is ordinary text' },
+        ],
+      },
+    ],
+  }
+  const original = structuredClone(inline)
+  assert.doesNotThrow(() => assertInlineImages(inline))
+  assert.deepEqual(inline, original)
 })

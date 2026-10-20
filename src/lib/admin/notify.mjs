@@ -1,5 +1,5 @@
 /**
- * Account-pool notify: SMTP email + Telegram bot + WeCom group robot.
+ * Account-pool notify: SMTP email + Telegram bot + WeCom / Feishu group robots.
  * Watches the same availability口径 as the overview KPI
  * (has token and cred_status is not 不可用/吊销).
  * Secrets stay on disk; GET/public views never return pass / bot_token / webhook.
@@ -43,6 +43,7 @@ export const DEFAULT_NOTIFY = Object.freeze({
     bot_token: '',
     chat_id: '',
   }),
+  feishu: Object.freeze({ enabled: false, webhook: '' }),
   wecom: Object.freeze({
     enabled: false,
     webhook: '',
@@ -102,6 +103,7 @@ export function normalizeNotifyConfig(raw = {}) {
   const src = raw && typeof raw === 'object' ? raw : {}
   const emailSrc = src.email && typeof src.email === 'object' ? src.email : {}
   const tgSrc = src.telegram && typeof src.telegram === 'object' ? src.telegram : {}
+  const feishuSrc = src.feishu && typeof src.feishu === 'object' ? src.feishu : {}
   const wecomSrc = src.wecom && typeof src.wecom === 'object' ? src.wecom : {}
   const evSrc = src.events && typeof src.events === 'object' ? src.events : {}
   const port = clampInt(emailSrc.port, 1, 65535, DEFAULT_NOTIFY.email.port)
@@ -149,6 +151,12 @@ export function normalizeNotifyConfig(raw = {}) {
         .trim()
         .slice(0, 80),
     },
+    feishu: {
+      enabled: asBool(feishuSrc.enabled, false),
+      webhook: String(feishuSrc.webhook || '')
+        .trim()
+        .slice(0, 500),
+    },
     wecom: {
       enabled: asBool(wecomSrc.enabled, false),
       webhook: String(wecomSrc.webhook || '')
@@ -164,6 +172,7 @@ export function mergeNotifyConfig(previous = {}, patch = {}) {
   const nextSrc = patch && typeof patch === 'object' ? patch : {}
   const emailPatch = nextSrc.email && typeof nextSrc.email === 'object' ? nextSrc.email : {}
   const tgPatch = nextSrc.telegram && typeof nextSrc.telegram === 'object' ? nextSrc.telegram : {}
+  const feishuPatch = nextSrc.feishu && typeof nextSrc.feishu === 'object' ? nextSrc.feishu : {}
   const wecomPatch = nextSrc.wecom && typeof nextSrc.wecom === 'object' ? nextSrc.wecom : {}
   const merged = normalizeNotifyConfig({
     ...prev,
@@ -172,9 +181,11 @@ export function mergeNotifyConfig(previous = {}, patch = {}) {
     email: { ...prev.email, ...emailPatch },
     telegram: { ...prev.telegram, ...tgPatch },
     wecom: { ...prev.wecom, ...wecomPatch },
+    feishu: { ...prev.feishu, ...feishuPatch },
   })
   if (isSecretKeep(emailPatch.pass)) merged.email.pass = prev.email.pass
   if (isSecretKeep(tgPatch.bot_token)) merged.telegram.bot_token = prev.telegram.bot_token
+  if (isSecretKeep(feishuPatch.webhook)) merged.feishu.webhook = prev.feishu.webhook
   if (isSecretKeep(wecomPatch.webhook)) merged.wecom.webhook = prev.wecom.webhook
   return merged
 }
@@ -193,6 +204,7 @@ export function publicNotifyConfig(raw = {}) {
       bot_token: '',
       bot_token_set: !!cfg.telegram.bot_token,
     },
+    feishu: { ...cfg.feishu, webhook: '', webhook_set: !!cfg.feishu.webhook },
     wecom: {
       ...cfg.wecom,
       webhook: '',
@@ -523,7 +535,8 @@ export function notifyChannelsReady(cfg) {
   const email = emailChannelReady(cfg)
   const telegram = telegramChannelReady(cfg)
   const wecom = wecomChannelReady(cfg)
-  return { email, telegram, wecom, any: email || telegram || wecom }
+  const feishu = !!(cfg?.feishu?.enabled && feishuWebhookUrl(cfg.feishu.webhook))
+  return { email, telegram, wecom, feishu, any: email || telegram || wecom || feishu }
 }
 
 function smtpExpectOk(reply, allowed) {
@@ -786,6 +799,43 @@ export async function sendWecomNotify(cfg, message, opts = {}) {
   return { ok: true, channel: 'wecom' }
 }
 
+/** Fixed HTTPS origin, no redirects; the webhook is a credential and never appears in errors. */
+export function feishuWebhookUrl(value) {
+  const raw = String(value || '').trim()
+  return /^https:\/\/open\.feishu\.cn\/open-apis\/bot\/v2\/hook\/[a-f0-9-]{36}$/i.test(raw) ? raw : null
+}
+
+export async function sendFeishuNotify(cfg, message, opts = {}) {
+  const url = feishuWebhookUrl(cfg?.feishu?.webhook)
+  if (!url) throw new Error('feishu_not_configured')
+  const fetchFn = opts.fetch || globalThis.fetch
+  let response
+  try {
+    response = await fetchFn(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        msg_type: 'text',
+        content: { text: truncateUtf8(String(message.text || message.title || 'vm2api'), 12000) },
+      }),
+      redirect: 'error',
+      signal: opts.signal ? AbortSignal.any([opts.signal, AbortSignal.timeout(8000)]) : AbortSignal.timeout(8000),
+    })
+  } catch {
+    throw new Error('feishu_transport_failed')
+  }
+  if (!response.ok) throw new Error(`feishu_http_${Number(response.status) || 0}`)
+  let data
+  try {
+    data = await response.json()
+  } catch {
+    throw new Error('feishu_bad_response')
+  }
+  const code = data?.code ?? data?.StatusCode
+  if (code !== 0) throw new Error(`feishu_api_${Number.isInteger(code) ? code : 'invalid'}`)
+  return { ok: true, channel: 'feishu' }
+}
+
 export async function dispatchNotify(cfg, message, opts = {}) {
   const ready = notifyChannelsReady(cfg)
   if (!ready.any) return { ok: false, error: 'no_channel', results: [] }
@@ -809,6 +859,13 @@ export async function dispatchNotify(cfg, message, opts = {}) {
       results.push(await sendWecomNotify(cfg, message, opts))
     } catch (err) {
       results.push({ ok: false, channel: 'wecom', error: String(err?.message || err).slice(0, 180) })
+    }
+  }
+  if (ready.feishu) {
+    try {
+      results.push(await sendFeishuNotify(cfg, message, opts))
+    } catch (err) {
+      results.push({ ok: false, channel: 'feishu', error: err.message })
     }
   }
   return {
@@ -837,6 +894,7 @@ export async function sendNotifyTest(cfg, channel, extra = {}) {
   if (want === 'email') return sendEmailNotify(cfg, message, extra)
   if (want === 'telegram') return sendTelegramNotify(cfg, message, extra)
   if (want === 'wecom') return sendWecomNotify(cfg, message, extra)
+  if (want === 'feishu') return sendFeishuNotify(cfg, message, extra)
   return dispatchNotify(cfg, message, extra)
 }
 

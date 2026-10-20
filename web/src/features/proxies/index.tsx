@@ -20,6 +20,7 @@ import { PageHeader } from '@/components/page-header'
 import { SectionSkeleton } from '@/components/page-skeletons'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
+import { ExitGuardStatus } from './exit-guard-status'
 import { ProxyBulkActions } from './proxy-bulk-actions'
 import { ProxyEditDialog } from './proxy-edit-dialog'
 import { createProxyHover } from './proxy-hover'
@@ -389,6 +390,7 @@ export function ProxiesPage() {
         </div>
       }
     >
+      {canManage ? <ExitGuardStatus /> : null}
       <QueryGate
         loading={px.isLoading}
         error={px.error || (px.data?.error ? new Error(px.data.error) : null)}

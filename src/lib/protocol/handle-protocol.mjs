@@ -157,7 +157,8 @@ import {
   restoreToolNamesInSSELine,
   wantsFastMode,
 } from './anthropic-policy.mjs'
-import { materializeRemoteImageSources } from './images.mjs'
+import { assertInlineImages, materializeRemoteImageSources } from './images.mjs'
+import { exitGuardError, getProxyExitGuardPolicy } from '../vm/proxy-exit-guard.mjs'
 import { applyMinMaxTokens } from './min-max-tokens.mjs'
 import { detectWarmupIntercept, formatWarmupSse, warmupMockMessage } from './warmup-intercept.mjs'
 
@@ -182,6 +183,31 @@ export function createHandleProtocol(deps) {
     typeof deps.getFailoverRunner === 'function' ? deps.getFailoverRunner() : deps.failoverRunner
   function responseClosed(res) {
     return !!(res?.destroyed || res?.writableEnded || res?.closed)
+  }
+
+  function rejectUnsupportedExitPath(body, res, logBag, { search = false } = {}) {
+    try {
+      if (!getProxyExitGuardPolicy(null).required) return false
+      if (search || detectInboundPlatform(body?.model).platform === 'openai') {
+        throw exitGuardError('exit_guard_unsupported_platform')
+      }
+      assertInlineImages(body)
+      return false
+    } catch (error) {
+      stats.errors++
+      logBag.error_code = error.code
+      logBag.error_message = error.message
+      logBag.final_state = 'rejected'
+      logBag.attempt_count = 0
+      const result = makeError({
+        type: ErrorType.INVALID_REQUEST,
+        code: error.code,
+        message: error.message,
+        status: error.status || 409,
+      })
+      json(res, result.status, result.body)
+      return true
+    }
   }
 
   function usageForLog(usage, { cacheTtl = null, requestedSpeed = null } = {}) {
@@ -566,6 +592,8 @@ export function createHandleProtocol(deps) {
     logBag.has_tools = Array.isArray(inbound?.tools) && inbound.tools.length > 0
     logBag.session_id = sessionIdForLog(extractCallerSession({ inbound, headers: req.headers }))
     logBag.reasoning_effort = reasoningEffortOf(inbound)
+
+    if (rejectUnsupportedExitPath(inbound, res, logBag)) return
 
     const fp = fingerprintRequest(req, inbound)
     // Before the health probe: its synthesized or fail-closed replies would otherwise answer
@@ -1737,6 +1765,7 @@ export function createHandleProtocol(deps) {
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeBody(body)
+    if (rejectUnsupportedExitPath(body, res, logBag, { search: true })) return
     return handleCodexSearch({
       req,
       res,

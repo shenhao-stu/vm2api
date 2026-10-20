@@ -238,6 +238,7 @@ export type NotifyConfig = {
   events: NotifyEvents
   telegram: NotifyTelegramConfig
   wecom: NotifyWecomConfig
+  feishu?: { enabled: boolean; webhook: string; webhook_set?: boolean }
   email?: Record<string, unknown>
 }
 
@@ -251,6 +252,7 @@ export type NotifyStatus = {
     email?: boolean
     telegram?: boolean
     wecom?: boolean
+    feishu?: boolean
     any?: boolean
   }
 }

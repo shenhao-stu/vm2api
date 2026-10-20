@@ -1,3 +1,5 @@
+import { handleProxyExitGuard } from './proxy-exit-guard-manager.mjs'
+import { getProxyExitGuardPolicy, getProxyExitGuardState } from '../vm/proxy-exit-guard.mjs'
 import { handleProxySubscriptions } from './proxy-subscription-routes.mjs'
 /**
  * /admin and /api/panel routes. Login / logout / me and { ok, data }
@@ -4239,6 +4241,16 @@ export function createPanelHandler(ctx) {
           const existing = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
           existing.id = existing.id || vmId
           if (isCodexVm(existing)) {
+            if (getProxyExitGuardPolicy(existing.proxy?.id).required) {
+              return json(res, 409, {
+                ok: false,
+                error: {
+                  code: 'exit_guard_blocked',
+                  reason: 'exit_guard_codex_unsupported',
+                  message: '出口强校验模式暂不支持 Codex 槽位',
+                },
+              })
+            }
             const parsed = parseCodexImportPayload(body)
             if (!parsed.ok) {
               return json(res, 400, {
@@ -4252,7 +4264,11 @@ export function createPanelHandler(ctx) {
               if (!slotProxy.ok) {
                 return json(res, slotProxy.status, {
                   ok: false,
-                  error: { code: 'proxy_required', message: slotProxy.message },
+                  error: {
+                    code: slotProxy.code || 'proxy_required',
+                    message: slotProxy.message,
+                    reason: slotProxy.resolved?.reason,
+                  },
                 })
               }
               const tok = await refreshCodexAccessToken({
@@ -4289,8 +4305,11 @@ export function createPanelHandler(ctx) {
             looksLikeConsoleApiKey(apiKeyRaw || sessionKey || accessToken) ||
             String(requestedType).toLowerCase() === 'apikey' ||
             String(requestedType).toLowerCase() === 'console'
-          if ((sessionKey || wantsApiKey) && !slotProxy.ok) {
-            return json(res, slotProxy.status, { ok: false, error: { message: slotProxy.message } })
+          if (!slotProxy.ok && (sessionKey || wantsApiKey || slotProxy.code === 'exit_guard_blocked')) {
+            return json(res, slotProxy.status, {
+              ok: false,
+              error: { code: slotProxy.code, message: slotProxy.message, reason: slotProxy.resolved?.reason },
+            })
           }
           const proxyUrl = slotProxy.proxyUrl
           let oauth = null
@@ -4399,7 +4418,11 @@ export function createPanelHandler(ctx) {
         if (!slotProxy.ok) {
           return json(res, slotProxy.status, {
             ok: false,
-            error: { code: 'proxy_required', message: slotProxy.message },
+            error: {
+              code: slotProxy.code || 'proxy_required',
+              message: slotProxy.message,
+              reason: slotProxy.resolved?.reason,
+            },
           })
         }
         try {
@@ -4479,7 +4502,11 @@ export function createPanelHandler(ctx) {
         if (!slotProxy.ok) {
           return json(res, slotProxy.status, {
             ok: false,
-            error: { code: 'proxy_required', message: slotProxy.message },
+            error: {
+              code: slotProxy.code || 'proxy_required',
+              message: slotProxy.message,
+              reason: slotProxy.resolved?.reason,
+            },
           })
         }
         try {
@@ -5262,13 +5289,13 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && p === '/api/panel/notify/test') {
         const body = await readBody(req, 64 * 1024)
         const channel = String(body.channel || '').toLowerCase()
-        if (channel !== 'email' && channel !== 'telegram' && channel !== 'wecom') {
+        if (!['email', 'telegram', 'wecom', 'feishu'].includes(channel)) {
           return json(res, 400, {
             ok: false,
             error: {
               type: 'invalid_request_error',
               code: 'missing_field',
-              message: 'channel must be email, telegram or wecom',
+              message: 'channel must be email, telegram, wecom or feishu',
               param: 'channel',
             },
           })
@@ -5277,6 +5304,7 @@ export function createPanelHandler(ctx) {
           email: body.email,
           telegram: body.telegram,
           wecom: body.wecom,
+          feishu: body.feishu,
         })
         try {
           const result = await sendNotifyTest(trial, channel, {
@@ -5303,6 +5331,17 @@ export function createPanelHandler(ctx) {
             },
           })
         }
+      }
+      if (p === '/api/panel/proxy-exit-guard' || p.startsWith('/api/panel/proxy-exit-guard/')) {
+        return handleProxyExitGuard({
+          req,
+          res,
+          url,
+          manager: ctx.proxyExitGuard,
+          readBody,
+          json,
+          role: panelIdentity(req).role,
+        })
       }
       if (p === '/api/panel/proxy-subscriptions' || p.startsWith('/api/panel/proxy-subscriptions/')) {
         return handleProxySubscriptions({
@@ -5583,6 +5622,11 @@ export function createPanelHandler(ctx) {
           (result.proxy?.bound_vm_id ? [result.proxy.bound_vm_id] : [])) {
           const bound = getVm(cfg.paths.project, vmId)
           const reason = String(bound?.schedule_disabled_reason || '')
+          if (
+            getProxyExitGuardPolicy(id).required &&
+            (reason.startsWith('exit_guard') || !getProxyExitGuardState(cfg.paths.project, id)?.ready)
+          )
+            continue
           if (vmHasSchedulableCredential(bound, cfg.paths.project) && reason !== 'disabled' && reason !== 'stopped') {
             setVmSchedulable(cfg.paths.project, vmId, true, null)
           }
