@@ -597,3 +597,7 @@ curl -sS -X POST http://127.0.0.1:8787/api/panel/wrap-cli/sync \
 ---
 
 交流见仓库 [README](../README.md)。
+
+### 固定出口部署的发布验收
+
+固定出口、自定义Compose和定向槽位升级使用 [升级状态门禁及原生恢复流程](operations/guarded-upgrade.md)。保留升级前快照，核对逻辑running、调度意图、代理、并发和守卫；helper更新后再查一次。守卫锁存不自动解除，旧停用槽不得复活。

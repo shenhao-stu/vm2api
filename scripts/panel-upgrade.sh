@@ -1,26 +1,6 @@
 #!/bin/sh
 set -eu
 
-ROOT=$1
-PROJECT=$2
-CONTAINER=$3
-PREVIOUS_ID=$4
-TAG=$5
-ARCH=$6
-shift 6
-cd "$ROOT"
-
-COMPOSE_FILE_LIST=''
-for file do
-  if [ -n "$COMPOSE_FILE_LIST" ]; then COMPOSE_FILE_LIST="$COMPOSE_FILE_LIST:"; fi
-  COMPOSE_FILE_LIST="$COMPOSE_FILE_LIST$file"
-done
-
-compose() {
-  COMPOSE_FILE="$COMPOSE_FILE_LIST" docker compose \
-    --project-directory "$ROOT" --project-name "$PROJECT" "$@"
-}
-
 # Use the HTTP server's kernel client, so this also catches auth/protocol regressions.
 # Busy kernels may have no idle slots; process health still has to survive the update.
 probe() {
@@ -43,27 +23,64 @@ probe() {
       const health = kernel?.codex_health || kernel?.rust_health || kernel?.go_health
       return health?.status === 200 && health.process_up !== false && health.healthy !== false
     }
+    function verifySlot(saved, detail, guards) {
+      const vm = detail.vm
+      if (!saved?.id || typeof saved.schedulable !== "boolean") throw new Error("Invalid slot baseline")
+      if (!kernelHealthy(detail)) throw new Error(`Previously healthy slot ${saved.id} failed kernel verification`)
+      if (vm?.status !== "running") throw new Error(`Slot ${saved.id} is not running; use native /start only after reviewing its exit guard`)
+      if (vm.schedulable !== saved.schedulable) throw new Error(`Slot ${saved.id} is not schedulable as recorded`)
+      if ((vm.proxy_id || vm.proxy?.id || null) !== saved.proxy_id ||
+          (vm.max_concurrency ?? null) !== saved.max_concurrency) throw new Error(`Slot ${saved.id} proxy or concurrency changed`)
+      if (saved.guard_required !== (guards.required === true)) throw new Error("Exit guard requirement changed")
+      if (saved.guard_required && saved.schedulable) {
+        const proxy = guards.proxies?.find(p => p.id === saved.proxy_id)
+        const state = proxy?.state
+        const age = Date.now() - Date.parse(state?.checked_at)
+        if (!saved.expected_ip || proxy?.expected_ip !== saved.expected_ip ||
+            state?.expected_ip !== saved.expected_ip || state?.observed_ip !== saved.expected_ip ||
+            state?.revision !== proxy?.revision || state?.ready !== true || state?.latched !== false ||
+            !Number.isFinite(age) || age < 0 || age > 120000) {
+          throw new Error(`Slot ${saved.id} exit guard is blocked or changed; operator review required, never auto-rearm`)
+        }
+      }
+    }
     try {
       if (mode === "snapshot") {
         const list = await json("/api/panel/vms")
         const vms = Array.isArray(list) ? list : list.items
         if (!Array.isArray(vms)) throw new Error("Invalid slot list")
         const healthy = []
+        const guards = await json("/api/panel/proxy-exit-guard")
+        if (typeof guards.required !== "boolean" || !Array.isArray(guards.proxies)) throw new Error("Invalid exit guard response")
         for (const vm of vms.filter(vm => vm.status === "running")) {
-          if (kernelHealthy(await json(`/api/panel/vms/${encodeURIComponent(vm.id)}`))) {
-            healthy.push(vm.id)
+          const detail = await json(`/api/panel/vms/${encodeURIComponent(vm.id)}`)
+          if (kernelHealthy(detail)) {
+            const current = detail.vm
+            const proxyId = current?.proxy_id || current?.proxy?.id || null
+            const guard = guards.proxies?.find(p => p.id === proxyId)
+            const saved = {
+              id: vm.id, schedulable: vm.schedulable !== false,
+              proxy_id: proxyId, max_concurrency: current?.max_concurrency ?? null,
+              guard_required: guards.required === true, expected_ip: guard?.expected_ip || null,
+            }
+            verifySlot(saved, detail, guards)
+            healthy.push(saved)
           }
         }
         console.log(JSON.stringify(healthy))
       } else {
         const health = await fetch(`${base}/health`, { signal: AbortSignal.timeout(4000) })
         if (!health.ok) throw new Error(`Backend health: HTTP ${health.status}`)
-        const version = await json("/api/panel/version")
-        if (version.current_tag !== target) throw new Error(`Backend still at ${version.current_tag}`)
-        for (const id of JSON.parse(baseline)) {
-          if (!kernelHealthy(await json(`/api/panel/vms/${encodeURIComponent(id)}`))) {
-            throw new Error(`Previously healthy slot ${id} failed kernel verification`)
-          }
+        if (mode === "verify") {
+          const version = await json("/api/panel/version")
+          if (version.current_tag !== target) throw new Error(`Backend still at ${version.current_tag}`)
+        }
+        const guards = await json("/api/panel/proxy-exit-guard")
+        if (typeof guards.required !== "boolean" || !Array.isArray(guards.proxies)) throw new Error("Invalid exit guard response")
+        const saved = JSON.parse(baseline)
+        if (!Array.isArray(saved)) throw new Error("Invalid slot baseline")
+        for (const slot of saved) {
+          verifySlot(slot, await json(`/api/panel/vms/${encodeURIComponent(slot.id)}`), guards)
         }
       }
     } catch (error) {
@@ -71,6 +88,41 @@ probe() {
       process.exit(1)
     }
   ' "$@"
+}
+
+# These modes only read native APIs; they never start slots or clear a guard latch.
+case "${1:-}" in
+  --snapshot-slots)
+    CONTAINER=$2
+    probe snapshot ""
+    exit 0
+    ;;
+  --verify-slots)
+    CONTAINER=$2
+    probe slots "" "$(cat "$3")"
+    echo "Slot state, proxy, concurrency and exit guard verified"
+    exit 0
+    ;;
+esac
+
+ROOT=$1
+PROJECT=$2
+CONTAINER=$3
+PREVIOUS_ID=$4
+TAG=$5
+ARCH=$6
+shift 6
+cd "$ROOT"
+
+COMPOSE_FILE_LIST=''
+for file do
+  if [ -n "$COMPOSE_FILE_LIST" ]; then COMPOSE_FILE_LIST="$COMPOSE_FILE_LIST:"; fi
+  COMPOSE_FILE_LIST="$COMPOSE_FILE_LIST$file"
+done
+
+compose() {
+  COMPOSE_FILE="$COMPOSE_FILE_LIST" docker compose \
+    --project-directory "$ROOT" --project-name "$PROJECT" "$@"
 }
 
 # Let the update request return before replacing its own HTTP server.
@@ -137,7 +189,6 @@ fi
 attempt=0
 while [ "$attempt" -lt 45 ]; do
   if probe verify "$TAG" "$BASELINE"; then
-    [ -d .git ] || printf '%s\n' "${TAG#v}" > VERSION
     # Replace the Go worker/egress payloads in-place; no VM/container rebuild.
     # Older control-plane images may not carry the helper yet; retry on the
     # next image update instead of invalidating an otherwise verified upgrade.
@@ -147,6 +198,9 @@ while [ "$attempt" -lt 45 ]; do
       echo "Go service-only update failed; inspect the per-slot report" >&2
       exit 1
     fi
+    # A helper refresh can stop a slot after the first successful probe.
+    probe verify "$TAG" "$BASELINE" || exit 1
+    [ -d .git ] || printf '%s\n' "${TAG#v}" > VERSION
     echo "Control plane restarted and verified at $TAG"
     echo "Previously healthy slot kernels verified: $BASELINE"
     exit 0
