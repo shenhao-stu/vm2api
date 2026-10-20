@@ -51,9 +51,14 @@ const patchVm = (handlePanel, id = 'vm-01') =>
   handlePanel({ method: 'PATCH' }, {}, new URL(`http://localhost/api/panel/vms/${id}`))
 
 function mockExec() {
+  let memoryBytes = 512 * 1024 ** 2
   return (argv) => {
-    if (argv.includes('update')) return { ok: true, stdout: '', stderr: '' }
-    if (argv.includes('inspect')) return { ok: true, stdout: String(1024 ** 3), stderr: '' }
+    if (argv.includes('update')) {
+      memoryBytes = 1024 ** 3
+      return { ok: true, stdout: '', stderr: '' }
+    }
+    if (argv.includes('inspect')) return { ok: true, stdout: `${memoryBytes} ${memoryBytes} true`, stderr: '' }
+    if (argv.includes('exec')) return { ok: true, stdout: String(1024 ** 3), stderr: '' }
     return { ok: false, stderr: 'unexpected' }
   }
 }

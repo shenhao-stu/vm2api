@@ -4,6 +4,7 @@ import vmContext from 'node:vm'
 import test from 'node:test'
 import { createKernelWatchdog } from '../../src/lib/transport/kernel-watchdog.mjs'
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
+import { exitGuardVmRejection } from '../../src/lib/vm/proxy-exit-guard.mjs'
 
 // Execute the exact production lifecycle body with synthetic I/O boundaries.
 // No SSH, Docker daemon, credentials or production filesystem is accessed.
@@ -36,6 +37,7 @@ function fixture({
         State: { Running: running, Restarting: restarting },
       }
   const io = {
+    exitGuardVmRejection,
     prepare: async () => ({
       nodeId: target.node_id,
       session: { docker: {}, client: {} },

@@ -30,6 +30,8 @@ import {
 import { OS_CATALOG } from '../vm/os-catalog.mjs'
 import { REMOTE_KERNEL_ENTRY, resolveKernelDataplane } from '../vm/slot-engine.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
+import { exitGuardVmRejection } from '../vm/proxy-exit-guard.mjs'
+import { isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
 import { slotMemory, slotDockerCpus, memoryMiB, normalizeVmConfig, VM_CONFIG_DEFAULTS } from '../vm/machine-spec.mjs'
@@ -52,8 +54,11 @@ import {
   imagePresent,
   inspectContainerOrNull,
   inspectNetworkOrNull,
+  connectContainerToNetwork,
+  disconnectContainerFromNetwork,
   removeContainer,
   removeNetwork,
+  renameContainer,
 } from './docker-remote.mjs'
 import {
   awaitSlotImageBuild,
@@ -66,14 +71,258 @@ import {
   vmNodeId,
 } from './placement.mjs'
 import { openSftp, readRemoteFileNoFollow, runRemote, shellQuote, writeRemoteFile } from './remote-fs.mjs'
-import { pushSlotFiles, reconcileSlotCredentials, remoteSlotPath, removeRemoteSlotDir } from './remote-slot-files.mjs'
+import {
+  pushSlotBinaries,
+  pushSlotFiles,
+  reconcileSlotCredentials,
+  remoteSlotPath,
+  removeRemoteSlotDir,
+} from './remote-slot-files.mjs'
 import { REMOTE_WORKER_BIN, slotImageSpec } from './slot-image.mjs'
 
 /** Bump when the slot's mount layout changes; a running container with an older label is recreated. */
-const SLOT_LAYOUT = '2'
+const SLOT_LAYOUT = '3'
+const LIVE_BIN = '/opt/kin-live'
+const LIVE_BIN_GUEST = '/opt/kin-guest/opt/kin-live'
+const LIVE_SERVICE_MOUNT_DESTINATIONS = Object.freeze([LIVE_BIN, LIVE_BIN_GUEST])
 
 function failure(err, fallbackCode = 'remote_slot_failed') {
   return { ok: false, code: err?.code || fallbackCode, error: String(err?.message || err) }
+}
+
+const MIGRATION_CONFIG_KEYS = Object.freeze([
+  'Hostname',
+  'Domainname',
+  'User',
+  'AttachStdin',
+  'AttachStdout',
+  'AttachStderr',
+  'Tty',
+  'OpenStdin',
+  'StdinOnce',
+  'Env',
+  'Cmd',
+  'Image',
+  'Volumes',
+  'WorkingDir',
+  'Entrypoint',
+  'Labels',
+  'StopSignal',
+  'StopTimeout',
+  'Shell',
+  'ExposedPorts',
+])
+const MIGRATION_HOST_CONFIG_KEYS = Object.freeze([
+  'Binds',
+  'LogConfig',
+  'NetworkMode',
+  'PortBindings',
+  'PublishAllPorts',
+  'Privileged',
+  'ReadonlyRootfs',
+  'Dns',
+  'DnsOptions',
+  'DnsSearch',
+  'ExtraHosts',
+  'GroupAdd',
+  'IpcMode',
+  'Links',
+  'Memory',
+  'MemorySwap',
+  'MemoryReservation',
+  'MemorySwappiness',
+  'NanoCpus',
+  'CpuShares',
+  'CpuQuota',
+  'CpuPeriod',
+  'CpusetCpus',
+  'CpusetMems',
+  'PidsLimit',
+  'RestartPolicy',
+  'CapAdd',
+  'CapDrop',
+  'SecurityOpt',
+  'ShmSize',
+  'UTSMode',
+  'UsernsMode',
+  'PidMode',
+  'Devices',
+  'DeviceCgroupRules',
+  'Init',
+  'OomKillDisable',
+  'OomScoreAdj',
+  'Runtime',
+  'Sysctls',
+  'Tmpfs',
+  'VolumesFrom',
+  'CgroupnsMode',
+])
+
+function bindDestination(bind) {
+  const parts = String(bind || '').split(':')
+  return parts.length >= 2 ? parts[1] : ''
+}
+
+function replaceBindMount(binds, source, destination, removeDestinations = []) {
+  const remove = new Set([destination, ...removeDestinations])
+  const next = (binds || []).filter((bind) => !remove.has(bindDestination(bind)))
+  next.push(`${source}:${destination}:ro`)
+  return next
+}
+
+/** Build a replacement body from inspect data without changing VM-owned state. */
+export function legacyServiceContainerBody(
+  info,
+  { name, sourceDir, destination = LIVE_BIN, removeDestinations = [], command, layout } = {},
+) {
+  const body = {}
+  for (const key of MIGRATION_CONFIG_KEYS) {
+    if (info?.Config && info.Config[key] !== undefined) body[key] = structuredClone(info.Config[key])
+  }
+  body.Image = info?.Config?.Image
+  body.Labels = { ...(info?.Config?.Labels || {}) }
+  if (layout) body.Labels['kin.vm.layout'] = SLOT_LAYOUT
+  if (command) body.Cmd = command
+  const host = info?.HostConfig || {}
+  body.HostConfig = {}
+  for (const key of MIGRATION_HOST_CONFIG_KEYS) {
+    if (host[key] !== undefined) body.HostConfig[key] = structuredClone(host[key])
+  }
+  body.HostConfig.Binds = replaceBindMount(host.Binds, sourceDir, destination, removeDestinations)
+  const networkMode = String(host.NetworkMode || '')
+  if (isUserDefinedNetwork(networkMode)) {
+    body.NetworkingConfig = { EndpointsConfig: networkEndpointSnapshot(info) }
+  }
+  return body
+}
+
+function migrationBackupName(name, stamp = Date.now()) {
+  const suffix = `-legacy-${stamp}`
+  return `${String(name).slice(0, Math.max(1, 63 - suffix.length))}${suffix}`
+}
+
+function hasBindDestination(info, destination, source = '') {
+  return (info?.Mounts || []).some(
+    (mount) => mount.Destination === destination && mount.RW === false && (!source || mount.Source === source),
+  )
+}
+
+function hasLiveServiceMount(info, { sourceDir = '' } = {}) {
+  return (info?.Mounts || []).some(
+    (mount) =>
+      LIVE_SERVICE_MOUNT_DESTINATIONS.includes(mount.Destination) &&
+      mount.RW === false &&
+      (!sourceDir || mount.Source === sourceDir),
+  )
+}
+
+function isUserDefinedNetwork(name) {
+  const value = String(name || '')
+  return value && !['host', 'none', 'bridge', 'default'].includes(value) && !value.startsWith('container:')
+}
+
+function userDefinedNetworkNames(info) {
+  const names = new Set()
+  const mode = String(info?.HostConfig?.NetworkMode || '')
+  if (isUserDefinedNetwork(mode)) names.add(mode)
+  for (const net of Object.keys(info?.NetworkSettings?.Networks || {})) {
+    if (isUserDefinedNetwork(net)) names.add(net)
+  }
+  return [...names]
+}
+
+function networkEndpointSnapshot(info) {
+  const endpoints = {}
+  for (const net of userDefinedNetworkNames(info)) {
+    const ep = info?.NetworkSettings?.Networks?.[net]
+    if (!ep) continue
+    const endpoint = {}
+    if (ep.IPAddress) endpoint.IPAMConfig = { IPv4Address: ep.IPAddress }
+    if (ep.Aliases?.length) endpoint.Aliases = ep.Aliases
+    endpoints[net] = endpoint
+  }
+  return endpoints
+}
+
+export function needsLegacyServiceMigration(info, { sourceDir = '' } = {}) {
+  return !!info && !hasLiveServiceMount(info, { sourceDir })
+}
+
+export async function migrateRemoteContainer(docker, name, body, { wasRunning, ops = {} } = {}) {
+  const inspect = ops.inspect || inspectContainerOrNull
+  const action = ops.action || containerAction
+  const rename = ops.rename || renameContainer
+  const create = ops.create || createContainerRaw
+  const disconnect = ops.disconnect || disconnectContainerFromNetwork
+  const connect = ops.connect || connectContainerToNetwork
+  const existing = await inspect(docker, name)
+  if (!existing) return { ok: true, action: 'absent', name }
+  const backup = migrationBackupName(name)
+  if (await inspect(docker, backup)) throw new Error(`legacy migration backup already exists: ${backup}`)
+  const oldId = existing.Id
+  const networks = userDefinedNetworkNames(existing)
+  const endpoints = networkEndpointSnapshot(existing)
+  let createdId = null
+  try {
+    if (wasRunning) await action(docker, oldId, 'stop', { t: 30 })
+    await rename(docker, name, backup)
+    for (const net of networks) await disconnect(docker, net, oldId)
+    createdId = await create(docker, name, body)
+    if (wasRunning) await action(docker, createdId, 'start')
+    const next = await inspect(docker, name)
+    if (!next || (wasRunning && !next.State?.Running) || (!wasRunning && next.State?.Running)) {
+      throw new Error(`migrated container did not preserve state: ${name}`)
+    }
+    return { ok: true, action: 'migrated', name, old_id: oldId, new_id: next.Id, backup, was_running: wasRunning }
+  } catch (error) {
+    const failures = []
+    const restore = async (fn) => {
+      try {
+        return await fn()
+      } catch (failure) {
+        failures.push(failure)
+        return null
+      }
+    }
+    if (createdId) {
+      const replacement = await restore(() => inspect(docker, createdId))
+      if (replacement) {
+        if (replacement.State?.Running) await restore(() => action(docker, createdId, 'stop', { t: 30 }))
+        for (const net of userDefinedNetworkNames(replacement)) await restore(() => disconnect(docker, net, createdId))
+        await restore(() => rename(docker, createdId, migrationBackupName(`${name}-failed`)))
+      }
+    }
+    const original = await restore(() => inspect(docker, oldId))
+    for (const [net, endpoint] of Object.entries(endpoints)) {
+      if (!original?.NetworkSettings?.Networks?.[net]) await restore(() => connect(docker, net, oldId, endpoint))
+    }
+    const named = await restore(() => inspect(docker, name))
+    if (named?.Id !== oldId) await restore(() => rename(docker, oldId, name))
+    if (!failures.length && wasRunning && !original?.State?.Running) await restore(() => action(docker, oldId, 'start'))
+    const restored = await restore(() => inspect(docker, name))
+    const networksRestored = Object.entries(endpoints).every(([net, endpoint]) => {
+      const actual = restored?.NetworkSettings?.Networks?.[net]
+      return (
+        actual &&
+        (!endpoint.IPAMConfig?.IPv4Address || actual.IPAddress === endpoint.IPAMConfig.IPv4Address) &&
+        (endpoint.Aliases || []).every((alias) => actual.Aliases?.includes(alias))
+      )
+    })
+    if (restored?.Id !== oldId || !!restored?.State?.Running !== !!wasRunning || !networksRestored)
+      failures.push(new Error(`migration rollback state mismatch: ${name}`))
+    if (failures.length) {
+      throw Object.assign(
+        new AggregateError([error, ...failures], `legacy migration failed and rollback is incomplete: ${name}`, {
+          cause: error,
+        }),
+        {
+          code: 'legacy_migration_rollback_failed',
+          rollback_succeeded: false,
+        },
+      )
+    }
+    throw Object.assign(error, { rollback_succeeded: true })
+  }
 }
 
 /**
@@ -164,15 +413,22 @@ export function slotEgressNames(vmId) {
  * (kincli) could not open the root-owned file and crash-looped on EACCES. The
  * user is part of the digest so a helper created under the old spec is rebuilt.
  */
-export function remoteEgressContainer({ vmId, proxyId, dir, imageRef, body, host }) {
+export function remoteEgressContainer({ vmId, proxyId, dir, imageRef, body, host, binaryDigest = '' }) {
   const user = `${host.uid}:${host.gid}`
-  const digest = crypto.createHash('sha256').update(body).update(imageRef).update(user).digest('hex').slice(0, 16)
+  const digest = crypto
+    .createHash('sha256')
+    .update(body)
+    .update(imageRef)
+    .update(user)
+    .update(binaryDigest)
+    .digest('hex')
+    .slice(0, 16)
   return {
     digest,
     spec: {
       Image: imageRef,
       User: user,
-      Cmd: ['/usr/local/bin/kin-egress', '-config', '/etc/kin-egress/egress.json'],
+      Cmd: [`${LIVE_BIN}/kin-egress`, '-config', '/etc/kin-egress/egress.json'],
       Labels: {
         'kin.egress': '1',
         'kin.egress.vm': vmId,
@@ -182,7 +438,7 @@ export function remoteEgressContainer({ vmId, proxyId, dir, imageRef, body, host
       },
       HostConfig: {
         NetworkMode: 'host',
-        Binds: [`${dir}:/etc/kin-egress:ro`],
+        Binds: [`${dir}:/etc/kin-egress:ro`, `${path.posix.join(dir, '..', 'slot-bin')}:${LIVE_BIN}:ro`],
         RestartPolicy: { Name: 'unless-stopped' },
         ReadonlyRootfs: true,
         CapDrop: ['ALL'],
@@ -207,7 +463,9 @@ export function canReuseRemoteEgress(existing, digest) {
  * kin-egress (host-network container from the slot image) + iptables REDIRECT,
  * exactly like egress.mjs does on the control plane.
  */
-export async function ensureRemoteEgress(session, vm, { imageRef }) {
+export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest = '' }) {
+  const rejected = exitGuardVmRejection(vm)
+  if (rejected) return rejected
   const proxy = vm.proxy
   const blocked = proxyBlockedReason(proxy)
   if (blocked) return { ok: false, code: blocked, error: blocked }
@@ -229,6 +487,12 @@ export async function ensureRemoteEgress(session, vm, { imageRef }) {
     return { ok: false, code: 'egress_sudo_required', error: '节点需要 root 或免密 sudo 才能为 SOCKS5 出口写 iptables' }
   }
   const names = slotEgressNames(vm.id)
+  // Keep the helper's executable on the persistent mount even when egress is
+  // enabled independently of a slot start/update.
+  await runRemote(
+    session.client,
+    `umask 077 && mkdir -p ${shellQuote(`${remoteSlotDir(session.host, vm.id)}/slot-bin`)}`,
+  )
   const net = await ensureRemoteNetwork(session.docker, {
     name: names.network,
     bridge: names.bridge,
@@ -248,7 +512,15 @@ export async function ensureRemoteEgress(session, vm, { imageRef }) {
   const body = `${JSON.stringify(cfg, null, 2)}\n`
   // Beside the slot tree, outside every guest bind: the guest never sees the proxy password.
   const dir = `${remoteSlotDir(session.host, vm.id)}/egress`
-  const { digest, spec } = remoteEgressContainer({ vmId: vm.id, proxyId, dir, imageRef, body, host: session.host })
+  const { digest, spec } = remoteEgressContainer({
+    vmId: vm.id,
+    proxyId,
+    dir,
+    imageRef,
+    body,
+    host: session.host,
+    binaryDigest,
+  })
   const existing = await inspectContainerOrNull(session.docker, names.egress)
   if (!canReuseRemoteEgress(existing, digest)) {
     await runRemote(session.client, `umask 077 && mkdir -p ${shellQuote(dir)} && chmod 700 ${shellQuote(dir)}`)
@@ -275,6 +547,8 @@ export async function ensureRemoteEgress(session, vm, { imageRef }) {
 }
 /** Policy changes stop only the exit helper, preserving slot containers and bindings. */
 export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {
+  const rejected = enabled && exitGuardVmRejection(vm)
+  if (rejected) return rejected
   try {
     const session = await nodeSession(vmNodeId(vm))
     const current = vm.runtime?.egress_container || slotEgressNames(vm.id).egress
@@ -289,7 +563,8 @@ export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {
         return { ok: true }
       }
       const image = slotImageSpec(projectRoot, vm.kernel || 'ubuntu-24.04')
-      return ensureRemoteEgress(session, vm, { imageRef: image.ref })
+      const binaries = await pushSlotBinaries(vm, projectRoot, session)
+      return ensureRemoteEgress(session, vm, { imageRef: image.ref, binaryDigest: binaries.digest })
     }
     for (const name of new Set([current, legacy])) {
       const existing = await inspectContainerOrNull(session.docker, name)
@@ -448,6 +723,7 @@ function kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, s
         `${remoteDir}/claude:/slot/claude`,
         `${remoteDir}/run:/slot/run`,
         `${remoteDir}/kvm:/slot/kvm`,
+        `${remoteDir}/slot-bin:/opt/kin-guest/opt/kin-live:ro`,
       ],
       NetworkMode: network,
       RestartPolicy: { Name: 'unless-stopped' },
@@ -508,6 +784,7 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
         `${remoteDir}/run:/run/kin`,
         `${remoteDir}/machine-id:/etc/machine-id:ro`,
         `${remoteDir}/machine-id:/var/lib/dbus/machine-id:ro`,
+        `${remoteDir}/slot-bin:${LIVE_BIN}:ro`,
       ],
       NetworkMode: network,
       RestartPolicy: { Name: 'unless-stopped' },
@@ -741,7 +1018,8 @@ export function codexRoleMatches(info, vm) {
 
 async function startRemoteTelemetry(docker, vm, name) {
   const target = { ...vm, runtime: { ...(vm.runtime || {}), container: name, type: runtimeKind(vm) } }
-  const { Cmd, User } = slotExecCmd(target, [REMOTE_WORKER_BIN, 'telemetry', '--config', '/run/kin/worker.json'], {
+  const worker = isKvmRuntime(vm) ? '/opt/kin-payload/opt/kin-live/kin-worker' : REMOTE_WORKER_BIN
+  const { Cmd, User } = slotExecCmd(target, [worker, 'telemetry', '--config', '/run/kin/worker.json'], {
     detach: true,
   })
   await execDetached(docker, name, Cmd, { user: User }).catch(() => {})
@@ -754,6 +1032,8 @@ async function chownRemoteKvmBinds(session, name, vm) {
 
 /** Remote twin of startVmRuntime. Running + same image/network is left alone (Node restart must not bounce slots). */
 export async function startRemoteSlot(vm, projectRoot, { recreate = false, routing } = {}) {
+  const rejected = exitGuardVmRejection(vm)
+  if (rejected) return rejected
   try {
     if (!isKvmRuntime(vm)) slotDockerCpus(vm)
     const p = await prepare(vm, projectRoot, routing)
@@ -766,7 +1046,9 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       if (!probe.ok) return { ok: false, code: 'kvm_unavailable', error: probe.error }
       accel = probe.accel
     }
-    const eg = await ensureRemoteEgress(session, vm, { imageRef: egressImage || image })
+    const binaries =
+      typeof pushSlotBinaries === 'function' ? await pushSlotBinaries(vm, projectRoot, session) : { digest: '' }
+    const eg = await ensureRemoteEgress(session, vm, { imageRef: egressImage || image, binaryDigest: binaries.digest })
     if (!eg.ok) return eg
     const name = containerName(vm.id)
     const relays = await clusterManager().ensureSlotRelays(nodeId, vm.id)
@@ -839,12 +1121,19 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
 
 /** Remote twin of reloadSlotWorker: rewrite + push config, bounce the container, never remove it unless the exit moved. */
 export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
+  const rejected = exitGuardVmRejection(vm)
+  if (rejected) return rejected
   try {
     if (!isKvmRuntime(vm)) slotDockerCpus(vm)
     const p = await prepare(vm, projectRoot, routing)
     if (p.fail) return p.fail
     const { nodeId, session, image, user, remoteDir, slotDir } = p
-    const eg = await ensureRemoteEgress(session, vm, { imageRef: p.egressImage || image })
+    const binaries =
+      typeof pushSlotBinaries === 'function' ? await pushSlotBinaries(vm, projectRoot, session) : { digest: '' }
+    const eg = await ensureRemoteEgress(session, vm, {
+      imageRef: p.egressImage || image,
+      binaryDigest: binaries.digest,
+    })
     if (!eg.ok) return eg
     const name = containerName(vm.id)
     const existing = await inspectContainerOrNull(session.docker, name)
@@ -893,6 +1182,94 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
     return { ok: true, action: running ? 'reloaded' : 'started', runtime: vm.runtime }
   } catch (err) {
     return failure(err)
+  }
+}
+
+/** Update a node slot's Go services without recreating its VM/container. */
+export async function migrateRemoteServiceContainers(vm, projectRoot) {
+  const rejected = exitGuardVmRejection(vm)
+  if (rejected) return rejected
+  try {
+    const session = await nodeSession(vmNodeId(vm))
+    const remoteDir = remoteSlotDir(session.host, vm.id)
+    const slotBin = `${remoteDir}/slot-bin`
+    const binaries = await pushSlotBinaries(vm, projectRoot, session)
+    const migrated = []
+    const slotName = vm.runtime?.container || containerName(vm.id)
+    const slot = await inspectContainerOrNull(session.docker, slotName)
+    if (needsLegacyServiceMigration(slot, { sourceDir: slotBin })) {
+      const body = legacyServiceContainerBody(slot, {
+        name: slotName,
+        sourceDir: slotBin,
+        removeDestinations: ['/usr/local/bin/kin-worker'],
+        layout: true,
+      })
+      migrated.push(
+        await migrateRemoteContainer(session.docker, slotName, body, {
+          wasRunning: !!slot.State?.Running,
+        }),
+      )
+    }
+    const egressName = slotEgressNames(vm.id).egress
+    const egress = await inspectContainerOrNull(session.docker, egressName)
+    if (needsLegacyServiceMigration(egress, { sourceDir: slotBin })) {
+      const body = legacyServiceContainerBody(egress, {
+        name: egressName,
+        sourceDir: slotBin,
+        removeDestinations: ['/usr/local/bin/kin-egress'],
+        command: [`${LIVE_BIN}/kin-egress`, '-config', '/etc/kin-egress/egress.json'],
+      })
+      migrated.push(
+        await migrateRemoteContainer(session.docker, egressName, body, {
+          wasRunning: !!egress.State?.Running,
+        }),
+      )
+    }
+    return {
+      ok: true,
+      action: migrated.length ? 'migrated' : 'unchanged',
+      migrated,
+      binary_digest: binaries.digest || null,
+    }
+  } catch (err) {
+    return failure(err, 'legacy_service_migration_failed')
+  }
+}
+
+export async function restartRemoteServices(vm, projectRoot, { telemetryEnabled } = {}) {
+  telemetryEnabled = isTelemetryEnabled({ telemetry_disabled: telemetryEnabled !== true })
+  const rejected = exitGuardVmRejection(vm)
+  if (rejected) return rejected
+  try {
+    const session = await nodeSession(vmNodeId(vm))
+    const remoteDir = remoteSlotDir(session.host, vm.id)
+    const slotDir = path.join(projectRoot, 'vms', vm.id)
+    const name = vm.runtime?.container || containerName(vm.id)
+    const migration = await migrateRemoteServiceContainers(vm, projectRoot)
+    if (!migration.ok) return migration
+    await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
+    const target = { ...vm, runtime: { ...(vm.runtime || {}), container: name, type: runtimeKind(vm) } }
+    const stop = 'pkill -TERM -x kin-worker 2>/dev/null || true'
+    await execDetached(session.docker, name, slotExecCmd(target, ['sh', '-c', stop]).Cmd, {
+      user: slotExecCmd(target, ['sh', '-c', stop]).User,
+    })
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    if (telemetryEnabled === true) await startRemoteTelemetry(session.docker, vm, name)
+    const image = slotImageSpec(projectRoot, vm.kernel || 'ubuntu-24.04')
+    const egress = await ensureRemoteEgress(session, vm, {
+      imageRef: image.ref,
+      binaryDigest: migration.binary_digest,
+    })
+    if (!egress.ok) return { ok: false, error: egress.error, code: egress.code || 'egress_update_failed' }
+    return {
+      ok: true,
+      action: telemetryEnabled === true ? 'restarted' : 'stopped',
+      remote_dir: remoteDir,
+      binary_digest: migration.binary_digest,
+      migration: migration.migrated,
+    }
+  } catch (err) {
+    return failure(err, 'service_update_failed')
   }
 }
 
