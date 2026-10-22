@@ -205,6 +205,32 @@ test('probeOne marks egress_down after SOCKS greeting if helper is dead', async 
   }
 })
 
+test('pending exit verification neither repairs the helper nor disables the bound slot', async (t) => {
+  const socks = await listenSocks()
+  const dir = tmpDir()
+  let repairs = 0
+  const disabled = []
+  const pool = new ProxyPool({
+    dataDir: dir,
+    egressCheck: () => ({ ok: false, pending: true, reason: 'exit_guard_checking' }),
+    repairEgress: () => { repairs++ },
+    onDisableVm: (...args) => disabled.push(args),
+  })
+  pool.stopScheduler()
+  t.after(() => { pool.stopScheduler(); socks.server.close(); fs.rmSync(dir, { recursive: true, force: true }) })
+  pool.importLines(`${socks.host}:${socks.port}`)
+  const row = pool.state.proxies[0]
+  assert.equal(pool.bind(row.id, 'vm-01').ok, true)
+  const before = structuredClone(row)
+  const result = await pool.probeOne(row)
+  pool._applyProbeResult(row, result)
+  assert.equal(result.ok, false)
+  assert.equal(result.scope, 'pending')
+  assert.equal(repairs, 0)
+  assert.deepEqual(disabled, [])
+  assert.deepEqual(row, before)
+})
+
 test('probeOne repairs egress for a legacy single binding then passes', async () => {
   const socks = await listenSocks()
   let healthy = false

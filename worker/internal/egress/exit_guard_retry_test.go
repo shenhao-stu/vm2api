@@ -180,3 +180,17 @@ func TestExitGuardOnlyRetriesTransientFailures(t *testing.T) {
 		}
 	}
 }
+
+func TestExitGuardMonitorCancellationDuringProbeClosesAdmission(t *testing.T) {
+	f := newGuardFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.server.guard.client.Transport = guardRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		cancel()
+		return guardIPResponse("203.0.113.9"), nil
+	})
+	f.server.guard.monitor(ctx)
+	if state := f.server.ExitGuardState(); state.Ready || !state.Latched || state.Reason != "exit_guard_stopped" {
+		t.Fatalf("stopped monitor left shared guard open: %+v", state)
+	}
+}

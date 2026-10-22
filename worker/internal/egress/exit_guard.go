@@ -349,12 +349,14 @@ func probeErrorKind(err error) string {
 func (g *exitGuard) monitor(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(g.cfg.IntervalSeconds) * time.Second)
 	defer ticker.Stop()
+	defer func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.blockLocked("exit_guard_stopped", g.state.ObservedIP)
+	}()
 	for {
 		select {
 		case <-ctx.Done():
-			g.mu.Lock()
-			g.blockLocked("exit_guard_stopped", g.state.ObservedIP)
-			g.mu.Unlock()
 			return
 		case <-ticker.C:
 			if g.verify(ctx) != nil {
