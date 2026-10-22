@@ -690,6 +690,8 @@ export function createHandleProtocol(deps) {
     const bodyCheck = validateRequestBody(protocol, ctx.body)
     if (!bodyCheck.ok) {
       stats.errors++
+      logBag.attempt_count = 0
+      logBag.final_state = 'rejected'
       const errorResult = bodyCheck.errorResult
       logBag.error_code = errorResult.body?.error?.code || 'invalid_request'
       logBag.error_message = errorResult.body?.error?.message || null
@@ -718,6 +720,8 @@ export function createHandleProtocol(deps) {
     const platform = detectInboundPlatform(ctx.body?.model)
     if (!platform.ok) {
       stats.errors++
+      logBag.attempt_count = 0
+      logBag.final_state = 'rejected'
       const errorResult = makeError({
         type: ErrorType.INVALID_REQUEST,
         code: platform.code || 'model_not_supported',
@@ -871,6 +875,8 @@ export function createHandleProtocol(deps) {
       const modelCheck = validateOfficialModel(ctx.body?.model)
       if (!modelCheck.ok) {
         stats.errors++
+        logBag.attempt_count = 0
+        logBag.final_state = 'rejected'
         const errorResult = mapModelError(modelCheck)
         logBag.error_code = errorResult.body?.error?.code || 'model_not_supported'
         logBag.error_message = errorResult.body?.error?.message || null
