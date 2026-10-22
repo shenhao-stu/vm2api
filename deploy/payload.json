@@ -1,6 +1,6 @@
 {
-  "repo": "dofastted/vm2api",
-  "release": "payload-2026.10.19-kernel-cli",
+  "repo": "shenhao-stu/vm2api",
+  "release": "payload-2026.10.22-preserved",
   "files": [
     {
       "path": "bin/kin-kernel",
