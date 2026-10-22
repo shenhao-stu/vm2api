@@ -2,18 +2,21 @@ package egress
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,17 +28,30 @@ type ExitGuardConfig struct {
 	IntervalSeconds int    `json:"interval_seconds,omitempty"`
 }
 
+// Leave time for proxy/TLS handshakes while keeping the default 15s monitor
+// interval plus this deadline below the gateway's 30s freshness limit.
+const exitProbeTimeout = 10 * time.Second
+
 type ExitGuardState struct {
-	Version    int    `json:"version"`
-	Ready      bool   `json:"ready"`
-	Latched    bool   `json:"latched"`
-	Reason     string `json:"reason"`
-	ExpectedIP string `json:"expected_ip"`
-	ObservedIP string `json:"observed_ip"`
-	Revision   string `json:"revision"`
-	CheckedAt  string `json:"checked_at"`
-	SocksAddr  string `json:"socks_addr"`
-	PID        int    `json:"pid"`
+	Version    int             `json:"version"`
+	Ready      bool            `json:"ready"`
+	Latched    bool            `json:"latched"`
+	Reason     string          `json:"reason"`
+	ExpectedIP string          `json:"expected_ip"`
+	ObservedIP string          `json:"observed_ip"`
+	Revision   string          `json:"revision"`
+	CheckedAt  string          `json:"checked_at"`
+	SocksAddr  string          `json:"socks_addr"`
+	PID        int             `json:"pid"`
+	Probe      *ExitGuardProbe `json:"probe,omitempty"`
+}
+
+// Probe diagnostics contain no request URL, response body or raw error text.
+type ExitGuardProbe struct {
+	Stage      string `json:"stage"`
+	ErrorKind  string `json:"error_kind,omitempty"`
+	DurationMS int64  `json:"duration_ms"`
+	HTTPStatus int    `json:"http_status,omitempty"`
 }
 
 type exitGuard struct {
@@ -68,7 +84,7 @@ func newExitGuard(cfg ExitGuardConfig, dial func(context.Context, string, string
 	}
 	g := &exitGuard{cfg: cfg, conns: map[*guardConn]struct{}{}, state: ExitGuardState{Version: 1, ExpectedIP: cfg.ExpectedIP, Revision: cfg.Revision, PID: os.Getpid(), Reason: "exit_guard_checking", CheckedAt: time.Now().UTC().Format(time.RFC3339Nano)}}
 	g.canceled, g.cancel = context.WithCancel(context.Background())
-	g.client = &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DialContext: dial, DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("exit guard redirects forbidden") }}
+	g.client = &http.Client{Timeout: exitProbeTimeout, Transport: &http.Transport{DialContext: dial, DisableKeepAlives: true}, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("exit guard redirects forbidden") }}
 	previous, readErr := os.ReadFile(cfg.StatePath)
 	var prior ExitGuardState
 	reason := ""
@@ -77,6 +93,12 @@ func newExitGuard(cfg ExitGuardConfig, dial func(context.Context, string, string
 			reason = "exit_guard_state_invalid"
 		} else if prior.Revision == cfg.Revision {
 			reason = "exit_guard_restart_requires_rearm"
+			if prior.Latched && prior.ExpectedIP == cfg.ExpectedIP {
+				reason = prior.Reason
+				g.state.ObservedIP = prior.ObservedIP
+				g.state.CheckedAt = prior.CheckedAt
+				g.state.Probe = prior.Probe
+			}
 		}
 	} else if !os.IsNotExist(readErr) {
 		reason = "exit_guard_state_unreadable"
@@ -143,6 +165,9 @@ func (g *exitGuard) persistLocked() error {
 func (g *exitGuard) snapshot() ExitGuardState { g.mu.Lock(); defer g.mu.Unlock(); return g.state }
 
 func (g *exitGuard) blockLocked(reason, observed string) {
+	if g.state.Latched {
+		return
+	}
 	g.state.Ready = false
 	g.state.Latched = true
 	g.state.Reason = reason
@@ -168,39 +193,15 @@ func (g *exitGuard) verify(ctx context.Context) error {
 		return errors.New(reason)
 	}
 	g.mu.Unlock()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.cfg.ProbeURL, nil)
-	var observed string
-	if err == nil {
-		var resp *http.Response
-		resp, err = g.client.Do(req)
-		if err == nil {
-			if resp.StatusCode != http.StatusOK {
-				err = errors.New("probe status")
-			} else {
-				var raw []byte
-				raw, err = io.ReadAll(io.LimitReader(resp.Body, 129))
-				if err == nil {
-					if len(raw) > 128 {
-						err = errors.New("oversized probe")
-					} else {
-						var ip netip.Addr
-						ip, err = netip.ParseAddr(strings.TrimSpace(string(raw)))
-						if err == nil {
-							observed = ip.Unmap().String()
-						}
-					}
-				}
-			}
-			_ = resp.Body.Close()
-		}
-	}
+	observed, probe := g.probe(ctx)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.state.Latched {
 		return errors.New(g.state.Reason)
 	}
 	g.state.CheckedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	if err != nil {
+	g.state.Probe = &probe
+	if probe.ErrorKind != "" {
 		g.blockLocked("exit_ip_probe_failed", "")
 		return errors.New(g.state.Reason)
 	}
@@ -212,11 +213,82 @@ func (g *exitGuard) verify(ctx context.Context) error {
 	g.state.Ready = true
 	g.state.Reason = "verified"
 	g.state.ObservedIP = observed
-	if err = g.persistLocked(); err != nil {
+	if err := g.persistLocked(); err != nil {
 		g.blockLocked("exit_guard_state_write_failed", observed)
 		return errors.New(g.state.Reason)
 	}
 	return nil
+}
+
+func (g *exitGuard) probe(ctx context.Context) (observed string, result ExitGuardProbe) {
+	started := time.Now()
+	var stage atomic.Uint32 // proxy connect, TLS handshake, response headers, body
+	trace := &httptrace.ClientTrace{
+		TLSHandshakeStart: func() { stage.Store(1) },
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			if err == nil {
+				stage.Store(2)
+			}
+		},
+	}
+	defer func() {
+		result.Stage = [...]string{"proxy_connect", "tls_handshake", "response_headers", "body"}[stage.Load()]
+		result.DurationMS = time.Since(started).Milliseconds()
+	}()
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodGet, g.cfg.ProbeURL, nil)
+	if err != nil {
+		result.ErrorKind = "request_invalid"
+		return
+	}
+	resp, err := g.client.Do(req)
+	if resp != nil {
+		result.HTTPStatus = resp.StatusCode
+		defer resp.Body.Close()
+	}
+	if err != nil {
+		result.ErrorKind = probeErrorKind(err)
+		if resp != nil && resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			result.ErrorKind = "redirect"
+		}
+		return
+	}
+	if resp.StatusCode != http.StatusOK {
+		result.ErrorKind = "http_status"
+		return
+	}
+	stage.Store(3)
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 129))
+	if err != nil {
+		result.ErrorKind = probeErrorKind(err)
+		return
+	}
+	if len(raw) > 128 {
+		result.ErrorKind = "oversized_response"
+		return
+	}
+	ip, err := netip.ParseAddr(strings.TrimSpace(string(raw)))
+	if err != nil {
+		result.ErrorKind = "invalid_ip"
+		return
+	}
+	return ip.Unmap().String(), result
+}
+
+func probeErrorKind(err error) string {
+	var netErr net.Error
+	var certErr *tls.CertificateVerificationError
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
+		return "timeout"
+	case errors.As(err, &certErr):
+		return "tls_certificate"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected_eof"
+	default:
+		return "network"
+	}
 }
 
 func (g *exitGuard) monitor(ctx context.Context) {
