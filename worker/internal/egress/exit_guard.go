@@ -51,6 +51,7 @@ type ExitGuardProbe struct {
 	Stage      string `json:"stage"`
 	ErrorKind  string `json:"error_kind,omitempty"`
 	DurationMS int64  `json:"duration_ms"`
+	Attempts   int    `json:"attempts,omitempty"`
 	HTTPStatus int    `json:"http_status,omitempty"`
 }
 
@@ -186,6 +187,9 @@ func (g *exitGuard) blockLocked(reason, observed string) {
 func (g *exitGuard) verify(ctx context.Context) error {
 	g.probeMu.Lock()
 	defer g.probeMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	g.mu.Lock()
 	if g.state.Latched {
 		reason := g.state.Reason
@@ -193,31 +197,82 @@ func (g *exitGuard) verify(ctx context.Context) error {
 		return errors.New(reason)
 	}
 	g.mu.Unlock()
-	observed, probe := g.probe(ctx)
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.state.Latched {
-		return errors.New(g.state.Reason)
+
+	// A canceled business request is not evidence that the shared exit failed.
+	// Independent verification has one total deadline, including all retries.
+	probeCtx, cancel := context.WithTimeout(g.canceled, exitProbeTimeout)
+	defer cancel()
+	for attempt := 1; ; attempt++ {
+		observed, probe := g.probe(probeCtx)
+		probe.Attempts = attempt
+		g.mu.Lock()
+		if g.state.Latched {
+			reason := g.state.Reason
+			g.mu.Unlock()
+			return errors.New(reason)
+		}
+		g.state.CheckedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		g.state.Probe = &probe
+		if attempt < 3 && probeCtx.Err() == nil && retryableExitProbe(probe) {
+			// The native checking state blocks admission but does not stop the VM
+			// or close established flows during this bounded confirmation window.
+			g.state.Ready = false
+			g.state.Reason = "exit_guard_checking"
+			g.state.ObservedIP = ""
+			if g.persistLocked() != nil {
+				g.blockLocked("exit_guard_state_write_failed", "")
+				reason := g.state.Reason
+				g.mu.Unlock()
+				return errors.New(reason)
+			}
+			g.mu.Unlock()
+			timer := time.NewTimer(250 * time.Millisecond)
+			select {
+			case <-timer.C:
+			case <-probeCtx.Done():
+			}
+			timer.Stop()
+			continue
+		}
+		var err error
+		expected, _ := netip.ParseAddr(g.cfg.ExpectedIP)
+		switch {
+		case probe.ErrorKind != "":
+			g.blockLocked("exit_ip_probe_failed", "")
+			err = errors.New(g.state.Reason)
+		case observed != expected.Unmap().String():
+			g.blockLocked("exit_ip_mismatch", observed)
+			err = errors.New(g.state.Reason)
+		default:
+			g.state.Ready = true
+			g.state.Reason = "verified"
+			g.state.ObservedIP = observed
+			if g.persistLocked() != nil {
+				g.blockLocked("exit_guard_state_write_failed", observed)
+				err = errors.New(g.state.Reason)
+			}
+		}
+		g.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		return ctx.Err()
 	}
-	g.state.CheckedAt = time.Now().UTC().Format(time.RFC3339Nano)
-	g.state.Probe = &probe
-	if probe.ErrorKind != "" {
-		g.blockLocked("exit_ip_probe_failed", "")
-		return errors.New(g.state.Reason)
+}
+
+func retryableExitProbe(probe ExitGuardProbe) bool {
+	switch probe.ErrorKind {
+	case "timeout", "unexpected_eof", "network":
+		return true
+	case "http_status":
+		switch probe.HTTPStatus {
+		case 429, 500, 502, 503, 504:
+			return true
+		}
+		return false
+	default:
+		return false
 	}
-	expected, _ := netip.ParseAddr(g.cfg.ExpectedIP)
-	if observed != expected.Unmap().String() {
-		g.blockLocked("exit_ip_mismatch", observed)
-		return errors.New(g.state.Reason)
-	}
-	g.state.Ready = true
-	g.state.Reason = "verified"
-	g.state.ObservedIP = observed
-	if err := g.persistLocked(); err != nil {
-		g.blockLocked("exit_guard_state_write_failed", observed)
-		return errors.New(g.state.Reason)
-	}
-	return nil
 }
 
 func (g *exitGuard) probe(ctx context.Context) (observed string, result ExitGuardProbe) {
@@ -294,12 +349,14 @@ func probeErrorKind(err error) string {
 func (g *exitGuard) monitor(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(g.cfg.IntervalSeconds) * time.Second)
 	defer ticker.Stop()
+	defer func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.blockLocked("exit_guard_stopped", g.state.ObservedIP)
+	}()
 	for {
 		select {
 		case <-ctx.Done():
-			g.mu.Lock()
-			g.blockLocked("exit_guard_stopped", g.state.ObservedIP)
-			g.mu.Unlock()
 			return
 		case <-ticker.C:
 			if g.verify(ctx) != nil {

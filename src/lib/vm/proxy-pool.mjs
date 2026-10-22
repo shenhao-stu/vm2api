@@ -1093,7 +1093,7 @@ export class ProxyPool extends EventEmitter {
     // Guest bridges are needed only after binding; probing an inventory must not consume Docker address pools.
     if (!boundVmIdsOf(proxy).length || typeof this.egressCheck !== 'function') return { ...socks, scope: 'socks' }
     let eg = this.egressCheck(proxy)
-    if (!eg?.ok && typeof this.repairEgress === 'function') {
+    if (!eg?.ok && !eg?.pending && typeof this.repairEgress === 'function') {
       try {
         await this.repairEgress(proxy)
       } catch {
@@ -1102,6 +1102,7 @@ export class ProxyPool extends EventEmitter {
       eg = this.egressCheck(proxy)
     }
     if (eg?.ok) return { ...socks, scope: 'socks' }
+    if (eg?.pending) return { ok: false, scope: 'pending', error: eg.reason, latency_ms: socks.latency_ms }
     return {
       ok: false,
       scope: 'egress',
