@@ -112,8 +112,19 @@ func TestExitGuardRetryNeverAcceptsMismatchOrReopensLatch(t *testing.T) {
 func TestExitGuardRetriesAreBounded(t *testing.T) {
 	f := newGuardFixture(t)
 	var attempts int
-	f.server.guard.client.Transport = guardRoundTripFunc(func(*http.Request) (*http.Response, error) {
+	var firstDeadline time.Time
+	f.server.guard.client.Transport = guardRoundTripFunc(func(r *http.Request) (*http.Response, error) {
 		attempts++
+		deadline, ok := r.Context().Deadline()
+		if !ok {
+			t.Fatal("retry has no deadline")
+		}
+		if attempts == 1 {
+			firstDeadline = deadline
+		}
+		if !deadline.Equal(firstDeadline) {
+			t.Fatal("retry extended the total verification budget")
+		}
 		return nil, io.ErrUnexpectedEOF
 	})
 	if err := f.server.VerifyExit(context.Background()); err == nil {

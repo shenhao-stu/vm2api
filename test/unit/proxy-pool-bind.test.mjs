@@ -213,11 +213,17 @@ test('pending exit verification neither repairs the helper nor disables the boun
   const pool = new ProxyPool({
     dataDir: dir,
     egressCheck: () => ({ ok: false, pending: true, reason: 'exit_guard_checking' }),
-    repairEgress: () => { repairs++ },
+    repairEgress: () => {
+      repairs++
+    },
     onDisableVm: (...args) => disabled.push(args),
   })
   pool.stopScheduler()
-  t.after(() => { pool.stopScheduler(); socks.server.close(); fs.rmSync(dir, { recursive: true, force: true }) })
+  t.after(() => {
+    pool.stopScheduler()
+    socks.server.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
   pool.importLines(`${socks.host}:${socks.port}`)
   const row = pool.state.proxies[0]
   assert.equal(pool.bind(row.id, 'vm-01').ok, true)
