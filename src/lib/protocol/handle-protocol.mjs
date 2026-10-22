@@ -1328,9 +1328,7 @@ export function createHandleProtocol(deps) {
             boundAccountId: keptAccount,
             boundVmId: keptVm,
             vmId: selected.vmId,
-            epoch: extra.freshSlot
-              ? `slot:${selected.slotIndex ?? 'x'}:${attemptStartedAt}`
-              : `${attemptStartedAt}:${selected.vmId || extra.attemptNo || ''}`,
+            epoch: extra.freshSlot ? `slot:${selected.slotIndex ?? 'x'}:${attemptStartedAt}` : 'pending',
           })
           if (identity && attemptSessionId) identity.callerSessionId = attemptSessionId
           const credMode = credentialModeFromOauth(selected.vm?.claude || {})

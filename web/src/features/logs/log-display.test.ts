@@ -1,10 +1,11 @@
-import type { ProviderChainItem } from '@/types/panel-usage-logs'
+import type { ProviderChainItem, UsageLogRow } from '@/types/panel-usage-logs'
 import { describe, expect, it } from 'vitest'
 import {
   cacheCostSplit,
   cacheWriteSplit,
   chainItemStatus,
   finalChainItem,
+  finalProviderName,
   formatShortDistance,
   latencySegments,
   resolveModelAuditDisplay,
@@ -105,6 +106,25 @@ describe('latency segments', () => {
 })
 
 describe('provider chain', () => {
+  it('distinguishes requests with zero upstream attempts from missing attribution', () => {
+    const row = {
+      providerChain: [],
+      attemptCount: 0,
+      vmName: null,
+      vmId: null,
+      providerName: null,
+    } as unknown as UsageLogRow
+    expect(finalProviderName(row)).toBe('未发送上游')
+    expect(finalProviderName({ ...row, attemptCount: 1 })).toBe('未知')
+    expect(finalProviderName({ ...row, attemptCount: null })).toBe('未知')
+    expect(finalProviderName({ ...row, vmName: 'known slot' })).toBe(
+      'known slot'
+    )
+    expect(finalProviderName({ ...row, providerChain: [attempt({})] })).toBe(
+      'slot-a'
+    )
+  })
+
   it('classifies attempts by commit / upstream status / terminal state', () => {
     expect(chainItemStatus(attempt({ downstreamCommitted: true }))).toBe(
       'success'

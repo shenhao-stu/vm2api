@@ -304,11 +304,16 @@ export function finalChainItem(
   return chain.length ? chain[chain.length - 1] : null
 }
 
-/** 行级供应商名：最终尝试 → 行上的槽位 / 账号 → 未知。 */
+/** Zero attempts is a local decision, not an unidentified upstream. */
 export function finalProviderName(row: UsageLogRow): string {
   const last = finalChainItem(row.providerChain)
   if (last) return chainItemName(last)
-  return row.vmName || row.vmId || row.providerName || '未知'
+  return (
+    row.vmName ||
+    row.vmId ||
+    row.providerName ||
+    (row.attemptCount === 0 ? '未发送上游' : '未知')
+  )
 }
 
 /** 队列等待取首次尝试：后续尝试的 wait 只是重试间隔，不是排队。 */

@@ -448,7 +448,7 @@ for (const previousVm of [null, 'vm-01']) {
   })
 }
 
-async function runManagedKeyHop(root, result) {
+async function runManagedKeyHop(root, result, { attemptStartedAt, freshSlot = false } = {}) {
   const routingFile = path.join(root, 'routing.json')
   fs.writeFileSync(routingFile, JSON.stringify({ compatibility: {} }))
   const vm = { id: 'vm-01', claude: { mode: 'oauth' } }
@@ -460,6 +460,7 @@ async function runManagedKeyHop(root, result) {
   }
   const charges = []
   const logged = []
+  let prepared
   const response = { ...fakeResponse(), on: (event, fn) => event === 'finish' && (response.finish = fn) }
   const handler = createHandleProtocol({
     json: (_res, status, body) => {
@@ -491,7 +492,7 @@ async function runManagedKeyHop(root, result) {
     routingConfig: { compatibility: {}, failover: {} },
     failoverRunner: {
       async run(opts) {
-        await opts.applyAttempt(opts.canonicalBody, selected)
+        prepared = await opts.applyAttempt(opts.canonicalBody, selected, { attemptStartedAt, freshSlot })
         return result
       },
     },
@@ -508,8 +509,29 @@ async function runManagedKeyHop(root, result) {
   }
   await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
   response.finish?.()
-  return { charges, logged }
+  return { charges, logged, prepared }
 }
+
+test('unbound consecutive turns keep their outbound session until a fresh slot is requested', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-unbound-session-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const result = {
+    ok: true,
+    status: 200,
+    accountId: 'account-1',
+    terminalState: 'verified',
+    body: { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' },
+  }
+  const sessions = []
+  for (const attemptStartedAt of [1000, 2000, 3000]) {
+    const { prepared } = await runManagedKeyHop(root, result, { attemptStartedAt })
+    sessions.push(sessionIdFromOutboundBody(prepared.body) || prepared.meta.sessionId)
+  }
+  assert.ok(sessions[0])
+  assert.deepEqual(sessions, [sessions[0], sessions[0], sessions[0]])
+  const { prepared } = await runManagedKeyHop(root, result, { attemptStartedAt: 4000, freshSlot: true })
+  assert.notEqual(sessionIdFromOutboundBody(prepared.body) || prepared.meta.sessionId, sessions[0])
+})
 
 test('a managed key is charged exactly once for a hop billed inline', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-key-inline-'))
