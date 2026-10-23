@@ -130,7 +130,7 @@ func TestExitGuardRetriesAreBounded(t *testing.T) {
 	if err := f.server.VerifyExit(context.Background()); err == nil {
 		t.Fatal("unverified exit admitted")
 	}
-	if !f.server.ExitGuardState().Latched || attempts != 3 {
+	if f.server.ExitGuardState().Latched || f.server.ExitGuardState().Ready || attempts != 3 {
 		t.Fatalf("latch=%+v attempts=%d", f.server.ExitGuardState(), attempts)
 	}
 }

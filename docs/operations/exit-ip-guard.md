@@ -41,3 +41,18 @@
 用模拟 TLS IP 服务、模拟 SOCKS 和本地目标验收：正确 IP、两个并发流、不一致、检测异常、活动连接关闭、重启锁存、人工 rearm、未配置与不支持路径、通知失败和秘密脱敏。不要为了出口验收调用封禁账号。
 
 更新 helper 二进制或重启生产服务后，先检查锁存状态；需人工重新验证时不能由部署脚本自动确认新 IP。保留 `data/run/egress/<proxy-id>/exit-guard-state.json` 与 SQLite 策略，不能通过删状态目录“修复”。备份恢复不得重新引入已退休账号的凭据或虚拟机。
+# 2026-10-23: recoverable network pauses
+
+An exhausted probe window caused by a timeout, EOF, network failure or selected
+transient HTTP status enters `exit_guard_retrying`. Admission stays closed and
+established flows remain open. The existing monitor continues its bounded
+checks; only a successful observation of the approved IP reopens admission.
+This state requires the same policy revision, a live native helper and fresh
+evidence (30 seconds). It cannot hide a stopped or stale monitor.
+
+IP mismatches, certificate failures, invalid responses, failed state writes and
+helper shutdown/restart still latch. An existing latch is never automatically
+cleared, and neither account suspension nor manual scheduling stops are
+changed. Recovery does not accept an observed new IP as the approved baseline.
+No cron job or new scheduler is required.
+

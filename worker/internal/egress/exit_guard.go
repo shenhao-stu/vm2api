@@ -94,11 +94,11 @@ func newExitGuard(cfg ExitGuardConfig, dial func(context.Context, string, string
 			reason = "exit_guard_state_invalid"
 		} else if prior.Revision == cfg.Revision {
 			reason = "exit_guard_restart_requires_rearm"
+			g.state.ObservedIP = prior.ObservedIP
+			g.state.CheckedAt = prior.CheckedAt
+			g.state.Probe = prior.Probe
 			if prior.Latched && prior.ExpectedIP == cfg.ExpectedIP {
 				reason = prior.Reason
-				g.state.ObservedIP = prior.ObservedIP
-				g.state.CheckedAt = prior.CheckedAt
-				g.state.Probe = prior.Probe
 			}
 		}
 	} else if !os.IsNotExist(readErr) {
@@ -237,6 +237,18 @@ func (g *exitGuard) verify(ctx context.Context) error {
 		var err error
 		expected, _ := netip.ParseAddr(g.cfg.ExpectedIP)
 		switch {
+		case retryableExitProbe(probe):
+			// Exhausting a network confirmation window is not evidence of a
+			// changed exit or compromised identity. Block new connections while
+			// the existing monitor rechecks; preserve established customer flows.
+			// Only a fresh successful probe of the approved IP may reopen admission.
+			g.state.Ready = false
+			g.state.Reason = "exit_guard_retrying"
+			g.state.ObservedIP = ""
+			if g.persistLocked() != nil {
+				g.blockLocked("exit_guard_state_write_failed", "")
+			}
+			err = errors.New(g.state.Reason)
 		case probe.ErrorKind != "":
 			g.blockLocked("exit_ip_probe_failed", "")
 			err = errors.New(g.state.Reason)
@@ -359,7 +371,7 @@ func (g *exitGuard) monitor(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if g.verify(ctx) != nil {
+			if g.verify(ctx) != nil && g.snapshot().Latched {
 				return
 			}
 		}

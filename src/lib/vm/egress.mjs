@@ -80,7 +80,11 @@ export function proxyEgressReady(proxy, projectRoot, timeoutMs = 400) {
   if (getProxyExitGuardPolicy(proxy?.id).required) {
     const guard = getProxyExitGuardState(projectRoot, proxy?.id)
     if (!guard.ready)
-      return { ok: false, reason: guard.reason, pending: !guard.latched && guard.reason === 'exit_guard_checking' }
+      return {
+        ok: false,
+        reason: guard.reason,
+        pending: !guard.latched && ['exit_guard_checking', 'exit_guard_retrying'].includes(guard.reason),
+      }
   }
   if (isLocalEgressProxy(proxy)) return { ok: true, mode: 'direct' }
   return egressListening(projectRoot, proxy?.id, timeoutMs)

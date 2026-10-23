@@ -119,7 +119,8 @@ export function createProxyExitGuardManager({
             alerted.delete(row.id)
             continue
           }
-          if (!row.state?.latched && row.state?.reason === 'exit_guard_checking') continue
+          if (!row.state?.latched && ['exit_guard_checking', 'exit_guard_retrying'].includes(row.state?.reason))
+            continue
           const boundIds = source.bound_vm_ids || (source.bound_vm_id ? [source.bound_vm_id] : [])
           if (!row.expected_ip && !boundIds.length) continue
           const reason = row.state?.reason || 'exit_guard_unverified'

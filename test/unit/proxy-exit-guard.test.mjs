@@ -95,6 +95,29 @@ test('operator policy persists separately from geo and malformed settings fail c
   }
 })
 
+test('network pause preserves admission closure and requires a fresh live monitor', () => {
+  const state = { ...ready, ready: false, observed_ip: '', reason: 'exit_guard_retrying' }
+  const current = evaluateProxyExitGuardState(state, policy, { now: now + 25_000, processActive: true })
+  assert.equal(current.reason, 'exit_guard_retrying')
+  assert.equal(current.ready, false)
+  assert.equal(current.latched, false)
+  for (const options of [
+    { now: now + 30_001, processActive: true },
+    { now, processActive: false },
+    { now: now - 1, processActive: true },
+  ]) {
+    assert.notEqual(evaluateProxyExitGuardState(state, policy, options).reason, 'exit_guard_retrying')
+  }
+  assert.notEqual(
+    evaluateProxyExitGuardState({ ...state, latched: true }, policy, { now, processActive: true }).reason,
+    'exit_guard_retrying',
+  )
+  assert.notEqual(
+    evaluateProxyExitGuardState(state, { ...policy, revision: 'changed' }, { now, processActive: true }).reason,
+    'exit_guard_retrying',
+  )
+})
+
 test('raw helper startup cannot omit the required guard config', async () => {
   const { startEgressProcess } = await import('../../src/lib/vm/egress.mjs')
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'exit-guard-start-'))

@@ -160,6 +160,9 @@ test('bound incident stops its slot, but a bounded startup probe is not killed',
   state.reason = 'exit_guard_checking'
   await manager.poll()
   assert.deepEqual(stopped, [])
+  state.reason = 'exit_guard_retrying'
+  await manager.poll()
+  assert.deepEqual(stopped, [])
   state.latched = true
   state.reason = 'exit_ip_mismatch'
   await manager.poll()

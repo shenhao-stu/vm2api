@@ -110,11 +110,23 @@ export function evaluateProxyExitGuardState(state, policy, { now = Date.now(), p
   if (!state.latched && state.reason === 'exit_guard_checking' && processActive && age >= 0 && age <= 10_000) {
     return { ...result, reason: 'exit_guard_checking' }
   }
+  // This is a live monitor's temporary network pause, never permission to
+  // bypass verification. A dead/stale helper must still trigger enforcement.
+  if (
+    !state.latched &&
+    state.reason === 'exit_guard_retrying' &&
+    processActive &&
+    age >= 0 &&
+    age <= EXIT_GUARD_MAX_AGE_MS
+  ) {
+    return { ...result, reason: 'exit_guard_retrying' }
+  }
   if (state.latched || state.ready !== true) {
     return {
       ...result,
       reason:
-        state.reason !== 'exit_guard_checking' && /^exit_(?:ip|guard)_[a-z_]+$/.test(state.reason || '')
+        !['exit_guard_checking', 'exit_guard_retrying'].includes(state.reason) &&
+        /^exit_(?:ip|guard)_[a-z_]+$/.test(state.reason || '')
           ? state.reason
           : 'exit_guard_unverified',
     }
