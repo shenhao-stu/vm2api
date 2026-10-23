@@ -360,7 +360,7 @@ func TestExitGuardProbeTimeoutClosesAdmission(t *testing.T) {
 		t.Fatal("timeout admitted")
 	}
 	state := f.server.ExitGuardState()
-	if !state.Latched || state.Reason != "exit_ip_probe_failed" {
+	if state.Ready || state.Latched || state.Reason != "exit_guard_retrying" {
 		t.Fatalf("state=%+v", state)
 	}
 }

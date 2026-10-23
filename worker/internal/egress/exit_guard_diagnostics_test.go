@@ -44,7 +44,7 @@ func TestExitGuardProbeFailureDiagnosticsSurviveRestart(t *testing.T) {
 		t.Fatal("restart reopened admission")
 	}
 	state := restarted.ExitGuardState()
-	if state.Reason != first.Reason || state.CheckedAt != first.CheckedAt || !state.Latched || state.Ready {
+	if state.Reason != "exit_guard_restart_requires_rearm" || state.CheckedAt != first.CheckedAt || !state.Latched || state.Ready {
 		t.Fatalf("restart overwrote the first failure: %+v", state)
 	}
 	if got := persistedProbe(t, f); got["error_kind"] != "timeout" || got["duration_ms"] != probe["duration_ms"] {
