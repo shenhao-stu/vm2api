@@ -5,6 +5,7 @@ import { getDb, isDbOpen } from '../db/database.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { socksProxyUrl } from './socks-address.mjs'
 import { isCodexVm } from './vm-kind.mjs'
+import { proxyRequiresExitIp } from './exit-guard-policy.mjs'
 
 export const EXIT_GUARD_MAX_AGE_MS = 30_000
 
@@ -28,7 +29,7 @@ export function getProxyExitGuardConfig() {
 export function getProxyExitGuardPolicy(proxyId, config = getProxyExitGuardConfig()) {
   const policy = config.proxies?.[proxyId]
   return {
-    required: config.required === true,
+    required: proxyRequiresExitIp(config, proxyId),
     expected_ip: typeof policy?.expected_ip === 'string' ? policy.expected_ip : '',
     revision: typeof policy?.revision === 'string' ? policy.revision : '',
   }

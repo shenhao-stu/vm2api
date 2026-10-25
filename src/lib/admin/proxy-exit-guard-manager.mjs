@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import net from 'node:net'
+import { proxyRequiresExitIp } from '../vm/exit-guard-policy.mjs'
 
 const KEY = 'proxy_exit_guard'
 const failure = (code, status = 400) => Object.assign(new Error(code), { code, status })
@@ -44,7 +45,11 @@ export function createProxyExitGuardManager({
   const policy = (id) => {
     const cfg = config()
     const row = cfg.proxies?.[id]
-    return { required: cfg.required === true, expected_ip: row?.expected_ip || null, revision: row?.revision || null }
+    return {
+      required: proxyRequiresExitIp(cfg, id),
+      expected_ip: row?.expected_ip || null,
+      revision: row?.revision || null,
+    }
   }
   const view = () => ({
     required: config().required === true,
@@ -70,7 +75,7 @@ export function createProxyExitGuardManager({
     settings.set(KEY, next)
     const helpers = []
     for (const row of rows) {
-      if (!next.required || !next.proxies?.[row.id]?.expected_ip) continue
+      if (!proxyRequiresExitIp(next, row.id) || !next.proxies?.[row.id]?.expected_ip) continue
       const result = await startHelper(row)
       helpers.push({ id: row.id, ok: !!result?.ok, error: result?.ok ? null : 'exit_guard_helper_unavailable' })
     }
@@ -93,6 +98,14 @@ export function createProxyExitGuardManager({
   function setExpected(id, body, { rearm = false } = {}) {
     return mutate(async () => {
       const row = proxy(id)
+      if (!rearm && body?.required === false && Object.keys(body).length === 1) {
+        const prev = config()
+        if (prev.proxies?.[id]?.required === false) return view()
+        return apply([row], {
+          ...prev,
+          proxies: { ...prev.proxies, [id]: { required: false, revision: revision() } },
+        })
+      }
       if (!body || Object.keys(body).some((k) => k !== 'expected_ip')) throw failure('exit_guard_invalid_config')
       const expectedIp = canonicalExitIp(body.expected_ip)
       const prev = config()
