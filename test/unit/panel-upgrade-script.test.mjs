@@ -71,7 +71,9 @@ async function runUpgrade({ source = true, arch = 'amd64', override, env = {}, r
             proxies: [
               {
                 id: 'px-one',
-                expected_ip: '203.0.113.10',
+                ...(env.DYNAMIC_PROXY === '1' ? { required: upgraded && env.DYNAMIC_REMOVED === '1' } : {}),
+                ...(upgraded && env.PROXY_GUARD_DISABLED === '1' ? { required: false } : {}),
+                expected_ip: env.DYNAMIC_PROXY === '1' ? null : '203.0.113.10',
                 revision: 'approved-policy',
                 state: {
                   expected_ip: '203.0.113.10',
@@ -354,5 +356,20 @@ test('standalone verification fails closed for a changed IP, stale evidence or d
     assert.match(result.stderr, /guard/)
     assert.ok(result.apiCalls.every((call) => call.method === 'GET'))
     assert.ok(result.calls.every((call) => call[0] === 'exec'))
+  }
+})
+
+test('a dynamic proxy retains its own guard policy while the global guard stays enabled', async () => {
+  const result = await runUpgrade({ env: { DYNAMIC_PROXY: '1' } })
+  assert.equal(result.code, 0, result.stderr)
+  assert.ok(result.apiCalls.every((call) => call.method === 'GET'))
+})
+
+test('changing a per-proxy guard policy fails upgrade verification without recovery', async () => {
+  for (const env of [{ DYNAMIC_PROXY: '1', DYNAMIC_REMOVED: '1' }, { PROXY_GUARD_DISABLED: '1' }]) {
+    const result = await runUpgrade({ env })
+    assert.equal(result.code, 1, result.stdout)
+    assert.match(result.stderr, /guard/)
+    assert.ok(result.apiCalls.every((call) => call.method === 'GET'))
   }
 })

@@ -23,6 +23,11 @@ probe() {
       const health = kernel?.codex_health || kernel?.rust_health || kernel?.go_health
       return health?.status === 200 && health.process_up !== false && health.healthy !== false
     }
+    function guardRequired(guards, proxy) {
+      const required = proxy && Object.hasOwn(proxy, "required") ? proxy.required : guards.required
+      if (typeof required !== "boolean") throw new Error("Invalid proxy guard requirement")
+      return required
+    }
     function verifySlot(saved, detail, guards) {
       const vm = detail.vm
       if (!saved?.id || typeof saved.schedulable !== "boolean") throw new Error("Invalid slot baseline")
@@ -31,9 +36,12 @@ probe() {
       if (vm.schedulable !== saved.schedulable) throw new Error(`Slot ${saved.id} is not schedulable as recorded`)
       if ((vm.proxy_id || vm.proxy?.id || null) !== saved.proxy_id ||
           (vm.max_concurrency ?? null) !== saved.max_concurrency) throw new Error(`Slot ${saved.id} proxy or concurrency changed`)
-      if (saved.guard_required !== (guards.required === true)) throw new Error("Exit guard requirement changed")
+      const proxy = guards.proxies?.find(p => p.id === saved.proxy_id)
+      if (saved.guard_required !== guardRequired(guards, proxy) ||
+          (typeof saved.guard_default_required === "boolean" && saved.guard_default_required !== guards.required)) {
+        throw new Error("Exit guard requirement changed")
+      }
       if (saved.guard_required && saved.schedulable) {
-        const proxy = guards.proxies?.find(p => p.id === saved.proxy_id)
         const state = proxy?.state
         const age = Date.now() - Date.parse(state?.checked_at)
         if (!saved.expected_ip || proxy?.expected_ip !== saved.expected_ip ||
@@ -61,7 +69,8 @@ probe() {
             const saved = {
               id: vm.id, schedulable: vm.schedulable !== false,
               proxy_id: proxyId, max_concurrency: current?.max_concurrency ?? null,
-              guard_required: guards.required === true, expected_ip: guard?.expected_ip || null,
+              guard_required: guardRequired(guards, guard), guard_default_required: guards.required,
+              expected_ip: guard?.expected_ip || null,
             }
             verifySlot(saved, detail, guards)
             healthy.push(saved)
