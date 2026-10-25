@@ -25,3 +25,17 @@ Do not route production traffic to a newly created slot until its owner has
 completed OAuth and the account, stream, session isolation and billing checks
 have passed. OAuth browser traffic uses the browser's network; it does not
 inherit the server's proxy merely by opening the authorization page.
+
+On a Docker host, also verify forwarding order. A rule appended to `FORWARD`
+can sit after `DOCKER-FORWARD`, which may already accept the packet. The absence
+of masquerading alone does not enforce isolation. Use the host firewall's native
+forward hook to drop forwarded traffic from each private egress bridge before
+Docker's accept rules. Keep the scope to those bridges and persist the rules;
+do not flush Docker's tables. Transparent TCP and DNS reach the local helper
+through `INPUT`, so they remain available with forwarding blocked.
+
+Check both positive and negative paths: HTTPS through the intended proxy, TCP
+and UDP DNS redirection, and a non-DNS UDP packet hitting the forward drop
+counter. A successful IP lookup alone does not prove the forwarding boundary.
+See [Docker's firewall guidance](https://docs.docker.com/engine/network/firewall-nftables/)
+for base-chain ordering and the distinction between accept and drop verdicts.
