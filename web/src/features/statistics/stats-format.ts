@@ -1,4 +1,21 @@
-import type { StatsRange, StatsResolution } from '@/types/panel-statistics'
+import type {
+  StatsDimension,
+  StatsRange,
+  StatsResolution,
+} from '@/types/panel-statistics'
+
+export const UNATTRIBUTED_SLOT_HELP =
+  '未归属槽位表示日志未记录槽位，可能是本地拦截、预热应答或归属缺失，并非新增供应商。是否发送上游请查看日志中的尝试记录。'
+
+/** Missing VM attribution alone does not prove that no upstream call occurred. */
+export function statisticsEntityName(
+  entry: { id: string; name: string },
+  dimension: StatsDimension
+): string {
+  if (entry.id === '__others__') return '其他'
+  if (dimension === 'vm' && entry.id === '__none__') return '未归属槽位'
+  return entry.name || entry.id
+}
 
 /** 与 hub bento 图表同一套 10 色，序号 = 序列在 `series` 中的位置（与筛选无关，颜色稳定）。 */
 export const SERIES_PALETTE = [

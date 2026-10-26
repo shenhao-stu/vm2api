@@ -26,6 +26,8 @@ import {
   formatBucketTick,
   formatBucketTitle,
   seriesColor,
+  statisticsEntityName,
+  UNATTRIBUTED_SLOT_HELP,
 } from './stats-format'
 
 const METRIC_TABS: { id: StatsMetric; label: string }[] = [
@@ -50,11 +52,6 @@ function formatMetric(metric: StatsMetric, value: number): string {
   return value.toLocaleString()
 }
 
-function seriesLabel(series: StatsSeries): string {
-  if (series.id === '__others__') return '其他'
-  return series.name || series.id
-}
-
 function SeriesName({
   series,
   dimension,
@@ -64,12 +61,19 @@ function SeriesName({
   dimension: StatsDimension
   className?: string
 }) {
-  const label = seriesLabel(series)
+  const label = statisticsEntityName(series, dimension)
   const showIcon = dimension === 'model' && !series.id.startsWith('__')
   return (
     <>
       {showIcon ? <ModelVendorIcon modelId={series.name} /> : null}
-      <span className={className} title={label}>
+      <span
+        className={className}
+        title={
+          dimension === 'vm' && series.id === '__none__'
+            ? UNATTRIBUTED_SLOT_HELP
+            : label
+        }
+      >
         {label}
       </span>
     </>
@@ -418,7 +422,7 @@ export function StatisticsChartCard({
                   <Area
                     key={s.dataKey}
                     dataKey={s.dataKey}
-                    name={seriesLabel(s)}
+                    name={statisticsEntityName(s, activeDimension)}
                     type='monotone'
                     fill={`url(#fill-stats-${s.dataKey})`}
                     stroke={seriesColor(index)}

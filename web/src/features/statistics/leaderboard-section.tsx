@@ -34,6 +34,7 @@ import {
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { EntryName } from './leaderboard-card'
 import { leaderboardQueryOptions } from './queries'
+import { UNATTRIBUTED_SLOT_HELP } from './stats-format'
 
 const PERIODS: { id: StatsRange; label: string; empty: string }[] = [
   { id: 'today', label: '今日', empty: '今日暂无数据' },
@@ -45,7 +46,7 @@ const PERIODS: { id: StatsRange; label: string; empty: string }[] = [
 const SCOPE_LABELS: Record<LeaderboardScope, string> = {
   user: '用户',
   key: '密钥',
-  vm: '供应商',
+  vm: '槽位',
   model: '模型',
 }
 
@@ -260,6 +261,12 @@ export function LeaderboardSection({
           </Button>
         ))}
       </div>
+
+      {scope === 'vm' && entries?.some((entry) => entry.id === '__none__') ? (
+        <p className='mb-3 text-sm text-muted-foreground'>
+          {UNATTRIBUTED_SLOT_HELP}
+        </p>
+      ) : null}
 
       {board.isLoading ? (
         <Card>

@@ -9,6 +9,7 @@ import { cn } from '@/lib/utils'
 import { ModelVendorIcon } from '@/components/model-vendor-icon'
 import { BentoCard } from './bento'
 import { leaderboardQueryOptions } from './queries'
+import { statisticsEntityName, UNATTRIBUTED_SLOT_HELP } from './stats-format'
 
 type Accent = 'primary' | 'purple' | 'blue'
 
@@ -70,11 +71,18 @@ export function EntryName({
   scope: LeaderboardScope
   className?: string
 }) {
-  const label = entry.name || entry.id
+  const label = statisticsEntityName(entry, scope)
   return (
     <span className={cn('flex min-w-0 items-center gap-1.5', className)}>
       {scope === 'model' ? <ModelVendorIcon modelId={label} /> : null}
-      <span className='truncate' title={label}>
+      <span
+        className='truncate'
+        title={
+          scope === 'vm' && entry.id === '__none__'
+            ? UNATTRIBUTED_SLOT_HELP
+            : label
+        }
+      >
         {label}
       </span>
     </span>

@@ -6,7 +6,37 @@ import {
   percentChange,
   seriesColor,
   sessionDisplay,
+  statisticsEntityName,
 } from './stats-format'
+
+describe('statistics entity names', () => {
+  it('labels missing slot attribution without inventing an upstream provider', () => {
+    expect(statisticsEntityName({ id: '__none__', name: '未知' }, 'vm')).toBe(
+      '未归属槽位'
+    )
+    expect(statisticsEntityName({ id: '__none__', name: '未知' }, 'user')).toBe(
+      '未知'
+    )
+    expect(
+      statisticsEntityName({ id: '__none__', name: '未知' }, 'model')
+    ).toBe('未知')
+    expect(statisticsEntityName({ id: '__none__', name: '未知' }, 'key')).toBe(
+      '未知'
+    )
+  })
+
+  it('preserves named and deleted slots, and the aggregated others bucket', () => {
+    expect(statisticsEntityName({ id: 'slot-a', name: '未知' }, 'vm')).toBe(
+      '未知'
+    )
+    expect(statisticsEntityName({ id: 'deleted-slot', name: '' }, 'vm')).toBe(
+      'deleted-slot'
+    )
+    expect(statisticsEntityName({ id: '__others__', name: '' }, 'vm')).toBe(
+      '其他'
+    )
+  })
+})
 
 describe('seriesColor', () => {
   it('wraps around the 10-colour palette', () => {

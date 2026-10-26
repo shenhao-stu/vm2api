@@ -44,6 +44,6 @@ export const VIEW_TITLES: Record<ViewId, string> = {
 // 监控组四页的职责边界，避免同一块数据在多页重复出现。
 export const VIEW_DESCRIPTIONS: Partial<Record<ViewId, string>> = {
   overview: '集群健康、账号可用性与近 1 小时服务质量',
-  statistics: '请求、消费与耗时趋势，以及用户 / 供应商 / 模型排行',
+  statistics: '请求、消费与耗时趋势，以及用户 / 槽位 / 模型排行',
   logs: '逐条请求记录，支持筛选、导出与查看详情',
 }

@@ -23,7 +23,7 @@ const USER_DIMENSIONS: StatsDimension[] = ['key', 'model']
 
 const ADMIN_CARDS: { scope: LeaderboardScope; title: string }[] = [
   { scope: 'user', title: '用户排行' },
-  { scope: 'vm', title: '供应商排行' },
+  { scope: 'vm', title: '槽位排行' },
   { scope: 'model', title: '模型排行' },
 ]
 const USER_CARDS: { scope: LeaderboardScope; title: string }[] = [
