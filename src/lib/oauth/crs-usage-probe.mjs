@@ -4,6 +4,8 @@
  */
 import { isCrsMock } from '../transport/crs-mock.mjs'
 import { callGoWorker, callWorkerGet } from '../transport/go-worker-client.mjs'
+import { isModelEnabled } from '../protocol/model-policy.mjs'
+import { modelMatchesAllowlist } from '../pool/slot-model-gate.mjs'
 import {
   compareUsageInterpretations,
   fableScopeText,
@@ -299,6 +301,7 @@ export async function probeFableEntitlement({
 } = {}) {
   const attempts = []
   for (const model of models) {
+    if (!isModelEnabled(model) || !modelMatchesAllowlist(model, exec?.vm?.policy?.allowed_models)) continue
     const fableRes = await callGoWorker({
       exec,
       timeoutMs,
