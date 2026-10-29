@@ -67,9 +67,14 @@ separately validated native-client design resolves that concern. Rebinding alone
 does not resolve it. The authorization-state fix prevents further dispatch after
 a known revocation; it does not prevent or reverse provider revocation.
 
-This organization rejects
-ordinary SDK clients: use real Claude Code with its documented custom base URL
-and gateway authentication. Do not forge a client identity to remove that limit.
+The observed organization rejects ordinary SDK clients. The earlier tests used
+real Claude Code with documented gateway authentication, but that did not make
+the relay equivalent to a native client or prevent subsequent revocation.
+ReClaude's [client FAQ](https://docs.reclaude.ai/help/faq) lists native Claude Code
+and its official extensions, and excludes API-key-based tools. Do not infer
+support for a shared Messages relay from a successful short request.
+See [the native-client evaluation plan](NATIVE-CLIENT-PLAN.md) before changing
+this architecture; installing a CLI alone does not change the relay data path.
 Tools, thinking, long conversations and ten simultaneous paid calls were not
 validated online. Concurrency 10 and session separation were tested offline;
 short successful calls do not establish long-term provider authorization.
@@ -81,6 +86,33 @@ old slot. Exact deployment IDs, secret paths, receipts and rollback steps belong
 in the private project handoff, not this public repository.
 
 ## Behavior and boundaries
+
+### Controlled gateway-client checks
+
+`gateway-client.py` reuses the local project's corrected gateway-auth workflow:
+an explicit stable private profile, a private key file and a clean child
+environment. It runs the actual installed Claude Code executable, never copies
+device identity or OAuth, and never puts a relay key into the OAuth variable.
+Use the same `--state-dir` for one actual test client across distinct sessions;
+do not create a new profile merely to select another model.
+
+```sh
+python3 integrations/reclaude/gateway-client.py \
+  --base-url https://your-gateway.example \
+  --state-dir /private/path/isolated-client \
+  --key-file /private/path/gateway.key \
+  -- --model claude-sonnet-5-5 --tools '' --max-turns 1 --max-budget-usd 0.15 -p 'Your new bounded test prompt'
+```
+
+Only run a new online check after the intended binding is valid and the specific
+test has been authorized. This helper does not retry, reauthorize, alter a server,
+invent telemetry or convert gateway mode into a native client. Review persistent
+profile/project settings separately; a clean child environment alone is not proof
+of complete reporting. The local historical single gateway success followed by
+over three hours without revocation weakens an immediate-revocation hypothesis;
+it does not establish multi-client shared-pool compatibility.
+
+### Server behavior
 
 - `KIN_API_PASSTHROUGH=1` applies only to API-category keys on a **separate
   instance**. It accepts Anthropic Messages, preserves caller metadata and
