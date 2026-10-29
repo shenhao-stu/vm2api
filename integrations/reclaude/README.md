@@ -190,6 +190,16 @@ on decoded bytes; truncated, unsupported or oversized compression fails explicit
 A prior audit-only gzip parsing bug was caught before shared activation and fixed
 with four regression cases. Do not replay its already successful paid requests.
 
+The native API-backend SSE path also lacked returned usage and recognized a
+terminal by substring. It now merges actual message-start/delta usage without
+buffering response text, requires a real terminal event, and preserves stream
+errors. The isolated passthrough profile keeps upstream cache-TTL buckets for
+billing instead of applying a panel TTL that was never sent. Four regression
+cases reproduced these defects before the fix. A saved successful response was
+then verified in a network-disabled candidate with byte-identical output and
+matching usage/cost; historical counters were not backfilled and no paid call
+was replayed. Existing OAuth gateway runtime/code remained unchanged.
+
 The edge may separately compress non-streaming JSON (zstd in the deployment).
 Acceptance tools must decode HTTP content encoding before JSON assertions.
 Stored response bytes can be verified offline; a parser failure is not permission

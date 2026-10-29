@@ -16,7 +16,12 @@ const events = [
       role: 'assistant',
       content: [],
       model: 'claude-sonnet-4-6',
-      usage: { input_tokens: 2, output_tokens: 0 },
+      usage: {
+        input_tokens: 2,
+        output_tokens: 0,
+        cache_creation_input_tokens: 8,
+        cache_creation: { ephemeral_5m_input_tokens: 5, ephemeral_1h_input_tokens: 3 },
+      },
     },
   },
   { type: 'content_block_start', index: 0, content_block: { type: 'text', text: 'ok' } },
@@ -37,6 +42,7 @@ async function fixture(t, enabled) {
   const routingFile = path.join(root, 'routing.json')
   fs.writeFileSync(routingFile, JSON.stringify(routing))
   const received = []
+  const charges = []
   const kernel = http.createServer(async (req, res) => {
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
@@ -68,7 +74,7 @@ async function fixture(t, enabled) {
       requestLog: { start: () => ({ request_id: 'fixture' }), finish() {} },
       stickyRouter: {},
       accountQuota: {},
-      apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+      apiKeyStore: { acquire: () => ({ ok: true }), release() {}, recordUsage: (_key, usage) => charges.push(usage) },
       apiEndpointStore: {},
       apiScheduler: {
         pick: () => ({
@@ -105,7 +111,7 @@ async function fixture(t, enabled) {
     )
     return response
   }
-  return { invoke, received }
+  return { invoke, received, charges }
 }
 
 const body = {
@@ -201,4 +207,11 @@ test('independent telemetry ingress rejects unsupported delivery while default r
     assert.equal(rejected.body.metrics_logging_enabled, undefined)
   }
   assert.throws(() => telemetryIngressResponse('/event_logging/batch', 'typo'))
+})
+
+test('isolated API billing keeps actual cache TTL buckets rather than the panel default', async (t) => {
+  const { invoke, charges } = await fixture(t, true)
+  assert.equal((await invoke(body)).status, 200)
+  assert.equal(charges.length, 1)
+  assert.deepEqual(charges[0].cache_creation, { ephemeral_5m_input_tokens: 5, ephemeral_1h_input_tokens: 3 })
 })

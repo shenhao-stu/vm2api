@@ -1160,7 +1160,9 @@ export function createHandleProtocol(deps) {
       logBag.account_id = result?.accountId || null
       logBag.final_account_id = result?.accountId || null
       logBag.upstream_status = result?.status ?? null
-      logBag.usage = usageForLog(result?.body?.usage || result?.usage || null, { cacheTtl })
+      logBag.usage = usageForLog(result?.body?.usage || result?.usage || null, {
+        cacheTtl: apiPassthrough ? null : cacheTtl,
+      })
       logBag.upstream_model = result?.model || null
       // API transport still stamps the first data: line; subtract t0 for queue wait only.
       logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)

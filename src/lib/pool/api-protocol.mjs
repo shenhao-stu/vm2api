@@ -351,12 +351,20 @@ export async function runApiInference({
 
   let committed = false
   let sawStop = false
+  let streamedUsage = null
+  let streamError = null
+  const streamState = { dataBuf: '' }
   const started = Date.now()
   let ttftMs = null
   await readUpstreamLines(async (line) => {
+    const event = consumeClaudeSSEData(line, streamState)
+    const usage =
+      event?.type === 'message_start' ? event.message?.usage : event?.type === 'message_delta' ? event.usage : null
+    if (usage && typeof usage === 'object' && !Array.isArray(usage)) streamedUsage = { ...streamedUsage, ...usage }
+    if (event?.type === 'message_stop') sawStop = true
+    if (event?.type === 'error') streamError = event
     if (personaHideTokens) line = converters.hidePersonaUsageInSseLine(line, personaHideTokens, cacheTtl) || line
     if (String(line).startsWith('data:') && ttftMs == null) ttftMs = Date.now() - started
-    if (String(line).includes('message_stop')) sawStop = true
     if (!committed && String(line).startsWith('data:')) {
       committed = true
       if (protocol === 'anthropic.messages' && !res.headersSent) converters.writeSSEHeaders(res)
@@ -378,11 +386,25 @@ export async function runApiInference({
   })
 
   const failure = classifierFailure()
-  if (failure) return { ...failure, committed, ttftMs }
+  if (failure) return { ...failure, usage: streamedUsage, committed, ttftMs }
+  if (streamError) {
+    const declared = Number(streamError.error?.status)
+    return {
+      ...resultBase,
+      ok: false,
+      status: declared >= 400 && declared < 600 ? declared : mapUpstreamError(200, streamError).status,
+      body: streamError,
+      usage: streamedUsage,
+      terminalState: 'rejected',
+      committed,
+      ttftMs,
+    }
+  }
 
   return {
     ...resultBase,
-    ok: resultBase.ok && (deliveryMode !== 'verified' || sawStop),
+    ok: resultBase.ok && sawStop,
+    usage: streamedUsage,
     terminalState: sawStop ? 'verified' : committed ? 'incomplete' : 'rejected',
     committed,
     ttftMs,
