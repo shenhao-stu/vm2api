@@ -14,6 +14,15 @@ settings file cannot reinitialize reporting in an existing process.
 These properties can be reused. The Mac launcher, OAuth, device identity, profile,
 machine description and older vendor binary must not be copied to a server.
 
+The 2026-10-29 Linux evaluation verified an official Claude Code 2.1.304 manifest
+signature and executable hash, installed it only in the new runtime, and ran two
+native controls with genuine first-party configuration. Both succeeded. A separate
+external gateway control and four Sub2API model controls also succeeded, followed
+by another provider revocation. This rejects the hypothesis that installing a CLI
+and enabling daemon reporting alone repairs the existing relay. It does not prove
+the provider's private trigger or establish whether a native-only workload would
+remain authorized long term. No repeated rebind or synthetic telemetry was used.
+
 ## Evaluate in a separate native runtime
 
 1. Preserve the existing account, device identity, fixed-egress policy and

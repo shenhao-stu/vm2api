@@ -31,6 +31,16 @@ The Fable request encountered a native `device_revoked` event. It did not pass
 acceptance; scheduling was paused and the persistent authentication latch kept.
 Catalog visibility is not proof of successful inference or continuing authorization.
 
+A later controlled recovery installed an integrity-verified, unmodified official
+Claude Code build on the bound Linux machine. Two native CLI controls succeeded,
+followed by a direct gateway SSE control and four separate Sub2API SSE controls
+(Sonnet/Haiku/Opus 5.5 and Fable 5.1). Each used a fresh session and one dispatch;
+the four Sub2API usage records matched the actual responses. Nevertheless, the
+native daemon reported another `device_revoked` about 11 seconds after the last
+successful response. Fixed egress remained correct. This reproduced the stability
+failure; installing the native CLI and rejecting ordinary SDK formats did not
+resolve it. Timing alone does not identify Fable or telemetry as the trigger.
+
 The operator confirmed that the second revocation was not manual. Keep this
 deployment paused: a short successful request is not a sufficient admission test
 for a shared pool. The native v1.7.1 state records product-specific revocations in
@@ -40,6 +50,9 @@ an unrelated Codex error or a transient network timeout must not latch Claude.
 When that revocation is already known at startup, the adapter keeps a persistent
 latch and serves 503 without dispatching, rather than exiting into a container
 restart loop. Other local configuration failures still prevent startup.
+The local health endpoint also persists a confirmed native revocation immediately,
+without waiting for another model request. A transient missing state file reports
+unhealthy but does not create an authentication latch.
 
 ### Native-client compatibility remains unresolved
 
@@ -114,6 +127,12 @@ it does not establish multi-client shared-pool compatibility.
 
 ### Server behavior
 
+- Optional `--claude-code-only` rejects known unsupported client formats locally
+  with `400 unsupported_client` and zero upstream attempts. It checks one actual
+  `User-Agent: claude-cli/<version>` and one `x-app: cli`; it never adds missing
+  client signals. These headers are not cryptographic client attestation and do
+  not establish native reporting or provider approval. Keep it enabled for this
+  deployment and use Sub2API's existing Claude-Code-only groups as the first gate.
 - `KIN_API_PASSTHROUGH=1` applies only to API-category keys on a **separate
   instance**. It accepts Anthropic Messages, preserves caller metadata and
   approved actual protocol headers, and skips persona/tool/classifier
@@ -187,7 +206,7 @@ python3 adapter.py \
   --key-file /private/relay.key \
   --trace-file /audit/requests.jsonl \
   --latch-file /audit/auth-latch.json \
-  --model claude-sonnet-4-6 --concurrency 10
+  --model claude-sonnet-4-6 --concurrency 10 --claude-code-only
 ```
 
 `--model` is repeatable. To change an existing allowlist, first pause only this
@@ -234,6 +253,32 @@ master key for inference. Do not copy the main gateway's routing or database.
       stopping its containers. Do not restore the whole production database.
 
 ## Persist and recover the isolated deployment
+
+### Reauthorization does not reload a foreground daemon
+
+The official login flow can replace native credentials and reset daemon state
+while the old supervised foreground daemon still runs. A successful browser
+authorization or a reachable socket therefore does not prove the running process
+has loaded the intended binding. For an explicitly approved, single recovery:
+
+1. Keep only this relay unscheduled, drain its key, and save the old state and
+   authentication latch privately. Verify the existing fixed-IP guard; do not
+   alter its expected IP, revision or latch.
+2. Let the native login flow authorize the same machine and intended organization.
+   Verify exactly one intended credentialed binding and the official CLI discovery
+   path. Never copy another machine's OAuth, identity or profile.
+3. If the foreground daemon still has stale state, stop only this relay's adapter
+   and gateway, restart its native runtime once, and wait for a fresh daemon
+   start timestamp, correct binding and healthy product-specific authorization.
+   Start the two dependents and verify all three share the runtime's live network
+   namespace. Do not restart the existing OAuth slots or global gateways.
+4. Retain the old authentication latch until valid native controls and the unchanged
+   exit guard have been reviewed. An operator may archive that obsolete auth latch;
+   this is not an exit-guard reset and must not be automated.
+5. A new revocation fails recovery even if every short model request succeeded.
+   Pause scheduling, retain the new latch and receipts, remove temporary canary
+   credentials, and stop further login/model attempts. Do not promote a failed
+   stability test into the shared pool.
 
 Persist a **separate** Compose definition for the native daemon, adapter and
 API gateway. The adapter and gateway use `network_mode: service:runtime`.

@@ -106,6 +106,65 @@ def post(server, body=BODY, path='/v1/messages', headers=None):
     return result
 
 class AdapterTests(unittest.TestCase):
+    def test_health_persists_native_revocation_without_model_dispatch(self):
+        relay = Relay()
+        with tempfile.TemporaryDirectory() as directory:
+            latch = Path(directory) / 'auth-latch.json'
+            with serve(relay, latch_file=latch) as server:
+                for failed in [['native_state_unavailable'], ['native_device_revoked'], []]:
+                    with patch.object(relay, 'failed_health_checks', return_value=failed):
+                        connection = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=3)
+                        connection.request('GET', '/healthz')
+                        response = connection.getresponse()
+                        health = json.loads(response.read())
+                        connection.close()
+                    self.assertEqual(response.status, 503)
+                    if failed == ['native_state_unavailable']:
+                        self.assertFalse(latch.exists())
+                    else:
+                        self.assertTrue(latch.exists())
+                        self.assertIn('authentication_latched', health['failed'])
+                self.assertEqual(relay.calls, [])
+            with serve(relay, latch_file=latch) as restarted:
+                self.assertEqual(post(restarted)[0], 503)
+                self.assertEqual(relay.calls, [])
+
+    def test_client_policy_rejects_sdk_before_dispatch_without_latching(self):
+        limits = a.Limits(claude_code_only=True)
+        with serve(limits=limits) as s:
+            for headers in [{}, {'User-Agent': 'anthropic-python/0.72', 'x-app': 'cli'},
+                            {'User-Agent': 'claude-cli/2.1.304 (external, sdk-cli)'},
+                            {'User-Agent': 'claude-cli/2.1.304', 'x-app': 'web'}]:
+                with self.subTest(headers=headers):
+                    status, _, body = post(s, headers=headers)
+                    self.assertEqual(status, 400)
+                    self.assertEqual(json.loads(body)['error']['code'], 'unsupported_client')
+            self.assertEqual(s.relay.calls, [])
+            self.assertFalse(s.latched)
+            self.assertTrue(s.completed.wait(1))
+            self.assertTrue(all(r['attempts'] == 0 for r in s.records))
+
+    def test_client_policy_preserves_actual_cli_headers_without_fabricating_signals(self):
+        limits = a.Limits(claude_code_only=True)
+        headers = {'User-Agent': 'claude-cli/2.1.304 (external, sdk-cli)', 'x-app': 'cli'}
+        with serve(limits=limits) as s:
+            self.assertEqual(post(s, headers=headers)[0], 200)
+            self.assertEqual(len(s.relay.calls), 1)
+            forwarded = {k.lower(): v for k, v in s.relay.calls[0][2].items()}
+            self.assertEqual(forwarded['user-agent'], headers['User-Agent'])
+            self.assertEqual(forwarded['x-app'], headers['x-app'])
+            self.assertNotIn('x-client-request-id', forwarded)
+            self.assertNotIn('x-cc-atis', forwarded)
+
+    def test_client_policy_rejects_ambiguous_headers(self):
+        headers = http.client.HTTPMessage()
+        headers['User-Agent'] = 'claude-cli/2.1.304'
+        headers['x-app'] = 'cli'
+        headers['X-App'] = 'cli'
+        with self.assertRaises(a.Rejection) as raised:
+            a.validate_client(headers)
+        self.assertEqual(raised.exception.code, 'unsupported_client')
+
     def test_gzip_split_stream_is_decoded_before_validation_and_forwarding(self):
         compressed = gzip.compress(COMPLETE)
         chunks = [compressed[i:i+7] for i in range(0, len(compressed), 7)]

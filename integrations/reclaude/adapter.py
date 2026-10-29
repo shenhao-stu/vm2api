@@ -54,6 +54,7 @@ class Limits:
     receive_seconds: float = 20
     models: tuple[str, ...] = ("claude-sonnet-4-6",)
     concurrency: int = 1
+    claude_code_only: bool = False
 
     def __post_init__(self):
         if min(self.body_bytes, self.response_bytes, self.request_seconds, self.receive_seconds) <= 0:
@@ -62,6 +63,8 @@ class Limits:
             raise ValueError("an explicit model allowlist is required")
         if type(self.concurrency) is not int or not 1 <= self.concurrency <= 32:
             raise ValueError("concurrency must be an integer from 1 to 32")
+        if type(self.claude_code_only) is not bool:
+            raise ValueError("client policy must be boolean")
 
 
 class Rejection(Exception):
@@ -254,6 +257,15 @@ def request_trace(data: dict, body_size: int) -> dict:
             "identity_sha256": hashlib.sha256(identity.encode()).hexdigest() if isinstance(identity, str) else None}
 
 
+def validate_client(headers: Mapping[str, str]):
+    """Reject known unsupported formats; these headers are not client attestation."""
+    agents = [v for k, v in headers.items() if k.lower() == "user-agent"]
+    apps = [v for k, v in headers.items() if k.lower() == "x-app"]
+    version = r"claude-cli/[0-9]+(?:\.[0-9]+){1,3}(?:[-+.\w]+)?(?: [^\r\n]{1,160})?"
+    if len(agents) != 1 or apps != ["cli"] or not re.fullmatch(version, agents[0]):
+        raise Rejection(400, "unsupported_client")
+
+
 def usage_counters(value: object) -> dict:
     return {k: v for k, v in value.items() if k in USAGE_KEYS and type(v) is int and v >= 0} if isinstance(value, dict) else {}
 
@@ -419,6 +431,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         if self.path != "/healthz":
             return self.send_error_json(404, "not_found")
         failed = self.server.relay.failed_health_checks()
+        if "native_device_revoked" in failed:
+            self.server.latch()
         if self.server.latched:
             failed.append("authentication_latched")
         self.send_json(503 if failed else 200, {"ok": not failed, "failed": failed})
@@ -489,6 +503,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         try:
             body, data = self.read_message()
             record.update(request_trace(data, len(body)))
+            if self.server.limits.claude_code_only:
+                validate_client(self.headers)
             if self.server.relay.authorization_revoked():
                 self.server.latch()
                 raise Rejection(503, "upstream_authentication_latched")
@@ -603,6 +619,8 @@ def main():
     parser.add_argument("--latch-file", type=Path, required=True)
     parser.add_argument("--model", action="append", required=True)
     parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--claude-code-only", action="store_true",
+                        help="Reject unsupported client formats before using this binding")
     args = parser.parse_args()
     credentials, identity = discover_binding(args.rec_home)
     config = Config(credentials, args.ca_file, args.key_file, args.proxy_url, identity,
@@ -613,7 +631,8 @@ def main():
     if any(check != "native_device_revoked" for check in failed):
         raise SystemExit("ReClaude local readiness failed")
     server = RelayServer(("127.0.0.1", args.port), relay, load_relay_key(args.key_file), args.trace_file,
-                         limits=Limits(models=tuple(args.model), concurrency=args.concurrency), latch_file=args.latch_file)
+                         limits=Limits(models=tuple(args.model), concurrency=args.concurrency,
+                                       claude_code_only=args.claude_code_only), latch_file=args.latch_file)
     try:
         if "native_device_revoked" in failed:
             server.latch()
