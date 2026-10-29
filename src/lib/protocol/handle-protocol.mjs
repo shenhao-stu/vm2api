@@ -679,10 +679,18 @@ export function createHandleProtocol(deps) {
     }
 
     const autoCompactWindow = callerAutoCompactWindow(inbound)
+    const inferenceBackend = resolveInferenceBackend(req)
+    const apiPassthrough = inferenceBackend === 'api' && cfg.api_passthrough === true
+    if (apiPassthrough && protocol !== 'anthropic.messages') {
+      return json(res, 400, {
+        type: 'error',
+        error: { type: 'invalid_request_error', code: 'messages_required', message: 'Use the Anthropic Messages API.' },
+      })
+    }
     let ctx = {
       path: pathName,
       protocol,
-      body: sanitizeInboundBody(inbound, defaultSeedPolicy()),
+      body: sanitizeInboundBody(inbound, defaultSeedPolicy({ reject_client_metadata_identity: !apiPassthrough })),
       headers: { ...req.headers },
       autoCompactWindow,
     }
@@ -697,7 +705,6 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, errorResult.status, errorResult.body)
     }
-    const inferenceBackend = resolveInferenceBackend(req)
     let want1m = hasClaudeCode1mSuffix(inbound?.model) || hasClaudeCode1mSuffix(ctx.body?.model)
     const modelRewrite = applyCodexInboundModelRewrite(ctx.body, getRouting() || {})
     if (!modelRewrite.ok) {
@@ -903,7 +910,7 @@ export function createHandleProtocol(deps) {
     const officialTraffic =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound, req.headers))
-    const requestContext = classifyClaudeRequestPurpose(inbound, { officialTraffic })
+    const requestContext = apiPassthrough ? null : classifyClaudeRequestPurpose(inbound, { officialTraffic })
     if (requestContext) {
       logBag.classifier = classifierRequestSummary(inbound, ctx.body, requestContext)
       try {
@@ -916,7 +923,7 @@ export function createHandleProtocol(deps) {
         logBag.error_message = error.body.error.message
         return json(res, error.status, error.body)
       }
-    } else ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+    } else if (!apiPassthrough) ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
     if (!requestContext && officialTraffic && officialCcPassthroughFromRouting(getRouting())) {
       try {
         validateCacheBreakpoints(ctx.body)
@@ -929,7 +936,10 @@ export function createHandleProtocol(deps) {
       }
     }
 
-    if (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res })) {
+    if (
+      !apiPassthrough &&
+      (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res }))
+    ) {
       return
     }
     const officialClient = isOfficialClaudeClient(fp.client_class)
@@ -1022,7 +1032,7 @@ export function createHandleProtocol(deps) {
     const openaiCompat = String(protocol || '').startsWith('openai.')
     syncClaudeKernelConfigsFromFile(cfg.paths?.project, routingConfigPath)
     const personaMode = personaModeFromRoutingFile(routingConfigPath)
-    if (!requestContext && !officialClient && !officialTraffic) {
+    if (!apiPassthrough && !requestContext && !officialClient && !officialTraffic) {
       ctx.body = ensureClaudeWebSearch(ctx.body, {
         enabled: shouldInjectClaudeWebSearch({
           officialClient: officialTraffic,
@@ -1034,9 +1044,9 @@ export function createHandleProtocol(deps) {
     }
     // After OpenAI→Anthropic conversion so function tools already have input_schema;
     // leftover OpenAI-shaped tools are still marked (rewrite / mixed inbound).
-    ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
+    if (!apiPassthrough) ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
     const personaIn = ctx.body
-    if (!requestContext)
+    if (!apiPassthrough && !requestContext)
       ctx.body = applyCrsUnofficialPersona(ctx.body, {
         officialClient: officialTraffic,
         routingFile: routingConfigPath,
@@ -1056,6 +1066,7 @@ export function createHandleProtocol(deps) {
 
     if (
       inferenceBackend === 'api' &&
+      !apiPassthrough &&
       !requestContext &&
       officialTraffic &&
       !officialCcPassthroughFromRouting(getRouting() || {})
@@ -1115,6 +1126,7 @@ export function createHandleProtocol(deps) {
           protocol,
           inbound,
           convertedBody: ctx.body,
+          clientHeaders: apiPassthrough ? req.headers : null,
           clientStream,
           deliveryMode,
           signal: clientAbort.signal,

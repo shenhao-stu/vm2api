@@ -37,6 +37,27 @@ function joinHeaderMap(headers = {}) {
   return out
 }
 
+/** Forward only actual client protocol headers; endpoint credentials always replace downstream auth. */
+export function anthropicClientHeaders(headers) {
+  const names = new Set([
+    'anthropic-version',
+    'anthropic-beta',
+    'user-agent',
+    'x-app',
+    'x-client-request-id',
+    'x-claude-code-session-id',
+    'x-claude-code-prompt-id',
+    'x-claude-code-wiggly-dove',
+    'x-cc-atis',
+  ])
+  return Object.fromEntries(
+    Object.entries(headers || {}).filter(
+      ([name, value]) =>
+        (names.has(name.toLowerCase()) || name.toLowerCase().startsWith('x-stainless-')) && typeof value === 'string',
+    ),
+  )
+}
+
 async function readLines(stream, onLine) {
   let buf = ''
   for await (const chunk of stream) {
@@ -60,6 +81,7 @@ export async function runApiInference({
   protocol,
   inbound,
   convertedBody,
+  clientHeaders = null,
   clientStream,
   deliveryMode,
   signal,
@@ -106,6 +128,7 @@ export async function runApiInference({
     : { ...canonical, model: picked.upstream_model, stream: true }
   if (requestContext) Object.assign(body, prepareClassifierBody(body))
   const headers = {
+    ...(!isOpenAI ? anthropicClientHeaders(clientHeaders) : {}),
     'content-type': 'application/json',
     accept: 'text/event-stream',
     ...upstreamAuthHeaders(protocolKind, picked.key.api_key, {

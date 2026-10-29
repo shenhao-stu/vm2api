@@ -214,6 +214,8 @@ export function loadConfig() {
   const host = process.env.HOST || '0.0.0.0'
   const publicHost = resolvePublicHost(process.env)
   const base_url = resolvePublicBaseUrl(process.env, port)
+  const telemetryIngressPolicy = process.env.KIN_TELEMETRY_INGRESS || 'intercept'
+  if (!['intercept', 'reject'].includes(telemetryIngressPolicy)) throw new Error('Invalid KIN_TELEMETRY_INGRESS')
 
   const cfg = {
     port,
@@ -222,6 +224,8 @@ export function loadConfig() {
     base_url,
     api_key: apiKey,
     api_key_hash: hashKey(apiKey),
+    telemetry_ingress_policy: telemetryIngressPolicy,
+    api_passthrough: process.env.KIN_API_PASSTHROUGH === '1',
     // rewrite pipeline — DEFAULT OFF (passthrough preferred)
     rewrite: {
       enabled: process.env.KIN_REWRITE === '1' || process.env.KIN_REWRITE === 'true',
