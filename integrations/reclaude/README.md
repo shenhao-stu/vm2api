@@ -17,12 +17,21 @@ Sub2API shared account (configured concurrency)
 
 A separate Linux deployment passed native authorization, fixed-egress checks,
 real Claude Code SSE, and Messages JSON/SSE through a one-account Sub2API canary.
-It now participates in shared groups with concurrency 10 and no user affinity.
+It was admitted to shared groups with concurrency 10 and no user affinity.
 The original seven OAuth slots, their proxies, concurrency 1, routing, keys and
 container lifecycles were preserved. The new instance is not an ordinary OAuth
 slot and must not be added to that allocator.
 
-The accepted model is **claude-sonnet-4-6 only**. This organization rejects
+The initial acceptance used **claude-sonnet-4-6 only**. This was a deployment
+allowlist, not a relay limitation. A subsequent native model-catalog query listed
+`claude-opus-5-5`, `claude-haiku-5-5`, `claude-sonnet-5-5`, and `claude-fable-5-1`.
+All three 5.5 models then passed separate real Claude Code SSE requests through
+Sub2API and this gateway, with matching model, session IDs, usage and costs.
+The Fable request encountered a native `device_revoked` event. It did not pass
+acceptance; scheduling was paused and the persistent authentication latch kept.
+Catalog visibility is not proof of successful inference or continuing authorization.
+
+This organization rejects
 ordinary SDK clients: use real Claude Code with its documented custom base URL
 and gateway authentication. Do not forge a client identity to remove that limit.
 Tools, thinking, long conversations and ten simultaneous paid calls were not
@@ -112,6 +121,19 @@ python3 adapter.py \
   --latch-file /audit/auth-latch.json \
   --model claude-sonnet-4-6 --concurrency 10
 ```
+
+`--model` is repeatable. To change an existing allowlist, first pause only this
+relay's Sub2API account and drain its gateway key. Recreate only the adapter with
+the desired arguments, update the independent gateway endpoint's `models` using
+the native panel API, and set the same exact Sub2API `model_mapping`. Persist
+the adapter command in its own Compose definition. Do not change existing OAuth
+slot policies or the daemon's binding. Test the requested models before resuming;
+an authentication revocation requires operator review, not an automatic rebind.
+
+This separate API gateway has its own database and panel. Its API endpoint and
+request statistics do not appear in the original OAuth gateway's VM list. Trace
+the actual Sub2API base URL, gateway request ID, endpoint account, adapter audit
+and native upstream request ID to verify the path.
 
 Use a new vm2api instance with `KIN_API_PASSTHROUGH=1`,
 `KIN_TELEMETRY_INGRESS=reject`, `KIN_REQUEST_LOG_MODE=normal`, a dedicated
@@ -211,7 +233,8 @@ capture production prompts or credentials in routine diagnostics.
 ```sh
 python3 -m unittest discover -s integrations/reclaude/tests -v
 node --test test/unit/relay-egress-bootstrap.test.mjs \
-  test/unit/api-passthrough.test.mjs test/unit/api-backend.test.mjs \
+  test/unit/api-passthrough.test.mjs test/unit/api-stream-accounting.test.mjs \
+  test/unit/api-backend.test.mjs \
   test/unit/api-endpoints.test.mjs test/unit/crs-persona.test.mjs \
   test/unit/seed-policy.test.mjs
 ```
