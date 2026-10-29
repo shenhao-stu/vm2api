@@ -5,11 +5,13 @@ import importlib.util
 import json
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location('adapter', Path(__file__).parents[1] / 'adapter.py')
@@ -407,6 +409,87 @@ class AdapterTests(unittest.TestCase):
             self.assertFalse(a.native_authorization_revoked(state))
             state.unlink()
             with self.assertRaises(FileNotFoundError): a.native_authorization_revoked(state)
+
+    def test_native_identity_revocation_blocks_dispatch_before_a_local_latch_exists(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / 'state.json'
+            state.write_text(json.dumps({'last_error': None, 'identities': {'claude': {
+                'gateway': {'healthy': True}, 'last_error': {'kind': 'account_sync_failed',
+                'detail': 'unexpected status 401: {"error":{"code":"device_revoked"}}'}}}}))
+            class NativeStateRelay(Relay):
+                def authorization_revoked(self):
+                    return a.native_authorization_revoked(state)
+            with serve(NativeStateRelay(), latch_file=Path(d)/'latch') as s:
+                self.assertEqual(post(s)[0], 503)
+                self.assertTrue(s.completed.wait(1))
+                self.assertTrue(s.latched)
+                self.assertEqual(s.relay.calls, [])
+                self.assertEqual(s.records[0]['attempts'], 0)
+
+    def test_native_identity_revocation_is_unhealthy_even_when_gateway_is_reachable(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / 'state.json'
+            state.write_text(json.dumps({'daemon': {'running': True, 'port': 30001},
+                'last_error': None, 'identities': {'claude': {'gateway': {'healthy': True},
+                'last_error': {'kind': 'account_sync_failed', 'detail': 'device_revoked'}}}}))
+            relay = a.ReClaudeRelay(a.Config(state, state, state, None, state_file=state))
+            with patch.object(a, 'load_access_token', return_value='test-token'), \
+                 patch.object(a.ssl, 'create_default_context'), patch.object(a.socket, 'create_connection'):
+                self.assertEqual(relay.failed_health_checks(), ['native_device_revoked'])
+
+    def test_revoked_daemon_starts_a_latched_service_instead_of_exiting(self):
+        with tempfile.TemporaryDirectory() as d, socket.socket() as proxy:
+            root = Path(d)
+            config = root / 'claude/accounts/fixture/config'
+            config.mkdir(parents=True)
+            (config/'.credentials.json').write_text(json.dumps({'accessToken': 'fixture-token'}))
+            (config/'.claude.json').write_text(json.dumps({'oauthAccount': {'accountUuid': 'fixture-account'}}))
+            key = root/'relay.key'; key.write_text(KEY); key.chmod(0o600)
+            ca = root/'ca.pem'
+            certificate = a.ssl.create_default_context().get_ca_certs(binary_form=True)[0]
+            ca.write_text(a.ssl.DER_cert_to_PEM_cert(certificate))
+            proxy.bind(('127.0.0.1', 0)); proxy.listen(4)
+            (root/'state.json').write_text(json.dumps({'daemon': {'running': True, 'port': proxy.getsockname()[1]},
+                'last_error': None, 'identities': {'claude': {'last_error': {'detail': 'device_revoked'}}}}))
+            with socket.socket() as reserve:
+                reserve.bind(('127.0.0.1', 0)); port = reserve.getsockname()[1]
+            process = subprocess.Popen([sys.executable, str(Path(a.__file__)), '--rec-home', str(root),
+                '--ca-file', str(ca), '--key-file', str(key), '--port', str(port),
+                '--trace-file', str(root/'trace'), '--latch-file', str(root/'latch'),
+                '--model', BODY['model']], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                for _ in range(100):
+                    self.assertIsNone(process.poll(), 'revoked state must remain observable, not exit at startup')
+                    connection = http.client.HTTPConnection('127.0.0.1', port, timeout=.2)
+                    try:
+                        connection.request('GET', '/healthz')
+                        response = connection.getresponse(); health = json.loads(response.read())
+                        self.assertEqual(response.status, 503)
+                        break
+                    except OSError:
+                        time.sleep(.02)
+                    finally:
+                        connection.close()
+                else:
+                    self.fail('adapter did not start')
+                self.assertEqual(set(health['failed']), {'native_device_revoked', 'authentication_latched'})
+                self.assertTrue((root/'latch').exists())
+                self.assertEqual(post(SimpleNamespace(server_port=port))[0], 503)
+                self.assertEqual((root/'trace').read_bytes(), b'')
+                self.assertIsNone(process.poll())
+            finally:
+                process.terminate()
+                process.communicate(timeout=3)
+
+    def test_native_revocation_is_scoped_to_claude_and_not_transient_network_failures(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / 'state.json'
+            for error, expected in [('network timeout', False), ('invalid_sk', True), (None, False)]:
+                with self.subTest(error=error):
+                    state.write_text(json.dumps({'last_error': None, 'identities': {
+                        'claude': {'last_error': {'detail': error} if error else None},
+                        'codex': {'last_error': {'detail': 'device_revoked'}}}}))
+                    self.assertEqual(a.native_authorization_revoked(state), expected)
 
     def test_json_response_is_forwarded_and_validated_without_context_storage(self):
         payload = {'type': 'message', 'stop_reason': 'end_turn', 'content': [{'type': 'text', 'text': 'result'}], 'usage': {'input_tokens': 1, 'output_tokens': 2}}

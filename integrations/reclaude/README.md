@@ -31,6 +31,42 @@ The Fable request encountered a native `device_revoked` event. It did not pass
 acceptance; scheduling was paused and the persistent authentication latch kept.
 Catalog visibility is not proof of successful inference or continuing authorization.
 
+The operator confirmed that the second revocation was not manual. Keep this
+deployment paused: a short successful request is not a sufficient admission test
+for a shared pool. The native v1.7.1 state records product-specific revocations in
+`identities.claude.last_error` even when the top-level error is null and the
+gateway is reachable. Both health checks and dispatch must inspect that scope;
+an unrelated Codex error or a transient network timeout must not latch Claude.
+When that revocation is already known at startup, the adapter keeps a persistent
+latch and serves 503 without dispatching, rather than exiting into a container
+restart loop. Other local configuration failures still prevent startup.
+
+### Native-client compatibility remains unresolved
+
+The source handoff had already documented this limitation. A client using
+`ANTHROPIC_BASE_URL` and gateway credentials does not send the same first-party
+request identifiers or device-routed telemetry as Claude Code launched by
+ReClaude. In the four captured requests, `x-client-request-id` and `x-cc-atis`
+were absent before Sub2API or vm2api received them. Preserving incoming headers
+cannot recover signals the caller never produced.
+
+The native daemon had reporting enabled and no telemetry opt-out variables.
+`KIN_TELEMETRY_INGRESS=reject` describes this gateway's unsupported telemetry
+endpoint; it does not disable the daemon's reporting. Changing its 501 to a
+success response would not deliver real telemetry. Do not populate the OAuth
+environment variable with a relay key, fabricate events or signatures, or use
+internal first-party overrides.
+
+ReClaude's [device documentation](https://docs.reclaude.ai/account/devices)
+identifies modified environments and reporting opt-outs as common revocation
+causes. Claude Code's [gateway documentation](https://code.claude.com/docs/en/llm-gateway-connect#turn-off-traffic-outside-the-gateway-path)
+explains that background traffic is outside the model gateway path. These
+establish a compatibility concern, not the server-side cause of this incident.
+Restore service only after the provider supports the intended relay flow or a
+separately validated native-client design resolves that concern. Rebinding alone
+does not resolve it. The authorization-state fix prevents further dispatch after
+a known revocation; it does not prevent or reverse provider revocation.
+
 This organization rejects
 ordinary SDK clients: use real Claude Code with its documented custom base URL
 and gateway authentication. Do not forge a client identity to remove that limit.

@@ -107,7 +107,8 @@ def native_authorization_revoked(state_file: Path | None) -> bool:
     if state_file is None:
         return False
     state = json.loads(state_file.read_text(encoding="utf-8"))
-    error = json.dumps(state.get("last_error"), separators=(",", ":"))
+    claude = state.get("identities", {}).get("claude", {})
+    error = json.dumps([state.get("last_error"), claude.get("last_error")], separators=(",", ":"))
     return re.search(r"\b(?:device_revoked|invalid_sk)\b", error) is not None
 
 
@@ -608,11 +609,14 @@ def main():
                     state_file=args.rec_home / "state.json")
     current_proxy_address(config)
     relay = ReClaudeRelay(config)
-    if relay.failed_health_checks():
+    failed = relay.failed_health_checks()
+    if any(check != "native_device_revoked" for check in failed):
         raise SystemExit("ReClaude local readiness failed")
     server = RelayServer(("127.0.0.1", args.port), relay, load_relay_key(args.key_file), args.trace_file,
                          limits=Limits(models=tuple(args.model), concurrency=args.concurrency), latch_file=args.latch_file)
     try:
+        if "native_device_revoked" in failed:
+            server.latch()
         server.serve_forever()
     except KeyboardInterrupt:
         pass
