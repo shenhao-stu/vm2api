@@ -3,7 +3,15 @@
  * go-worker-client; the socket is run/kernel.sock instead of worker.sock.
  */
 import path from 'node:path'
+import { vmNodeId } from '../cluster/placement.mjs'
 import { callGoWorker, streamGoWorker, workerHealth, workerPaths } from './go-worker-client.mjs'
+
+export const NODE_SLOT_HEALTH_TIMEOUT_MS = 3000
+
+/** Remote health traverses SSH; keep local probes short without declaring node latency a dead kernel. */
+export function rustKernelHealthTimeoutMs(vm, localTimeoutMs = 800) {
+  return vmNodeId(vm) ? NODE_SLOT_HEALTH_TIMEOUT_MS : localTimeoutMs
+}
 
 export function rustKernelPaths(exec = {}) {
   const base = workerPaths(exec)

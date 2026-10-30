@@ -11,6 +11,7 @@ import {
   streamRustKernel,
   callRustKernel,
   rustKernelHealth,
+  rustKernelHealthTimeoutMs,
   rustKernelReachable,
   rustKernelBusy,
   isNeedsRefreshResult,
@@ -69,11 +70,16 @@ export async function waitForReadySlot(exec, timeoutMs = DEFAULT_SLOT_WAIT_MS, p
   const waitMs = Number.isFinite(parsed) ? Math.max(0, parsed) : DEFAULT_SLOT_WAIT_MS
   const deadline = Date.now() + waitMs
   const gap = Math.max(40, Number(pollMs) || DEFAULT_SLOT_POLL_MS)
-  let last = await rustKernelHealth(exec, { timeoutMs: 400 })
+  const probe = () =>
+    rustKernelHealth(exec, {
+      timeoutMs: Math.min(rustKernelHealthTimeoutMs(exec?.vm, 400), Math.max(1, deadline - Date.now())),
+    })
+  let last = await probe()
   if (rustKernelReachable(last)) return { ok: true, reason: 'already_up', health: last }
   while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, gap))
-    last = await rustKernelHealth(exec, { timeoutMs: 400 })
+    await new Promise((resolve) => setTimeout(resolve, Math.min(gap, deadline - Date.now())))
+    if (Date.now() >= deadline) break
+    last = await probe()
     if (rustKernelReachable(last)) return { ok: true, reason: 'slot_ready', health: last }
   }
   return { ok: false, reason: 'slot_busy', health: last, error: 'rust kernel has no free slot' }
@@ -194,7 +200,7 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs } = {}) {
   if (cached && rustKernelReachable(cached.health)) {
     return { ok: true, reason: 'health_cache', health: cached.health }
   }
-  const health = await rustKernelHealth(exec, { timeoutMs: 800 })
+  const health = await rustKernelHealth(exec, { timeoutMs: rustKernelHealthTimeoutMs(exec?.vm) })
   if (rustKernelReachable(health)) {
     const ready = { ok: true, reason: 'already_up', health }
     rememberRustHealth(exec, ready)

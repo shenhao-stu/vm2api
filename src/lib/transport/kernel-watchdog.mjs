@@ -11,6 +11,7 @@ import fs from 'node:fs'
 import {
   kernelFaults,
   rustKernelHealth,
+  rustKernelHealthTimeoutMs,
   rustKernelNeedsRestart,
   rustKernelProcessUp,
   rustKernelPaths,
@@ -110,8 +111,7 @@ function isTelemetryHealTarget(vm) {
   return !HARD_DOWN.has(String(vm.status || '').toLowerCase())
 }
 
-/** A node slot answers through an SSH relay across the ocean (~110ms RTT); 800ms misfires there. */
-export const NODE_SLOT_HEALTH_TIMEOUT_MS = 3000
+export { NODE_SLOT_HEALTH_TIMEOUT_MS } from './rust-kernel-client.mjs'
 
 function clusterRelayPaths(nodeId, vmId) {
   return clusterManager().slotRelayPaths(nodeId, vmId)
@@ -248,7 +248,7 @@ export function createKernelWatchdog({
       vm: probed,
       homeDir: typeof homeDirFor === 'function' ? homeDirFor(vm) : null,
     }
-    const current = await health(exec, { timeoutMs: vmNodeId(vm) ? NODE_SLOT_HEALTH_TIMEOUT_MS : 800 })
+    const current = await health(exec, { timeoutMs: rustKernelHealthTimeoutMs(vm) })
     if (held.has(vm.id)) return
     // cc-node is the crag worker. Restarting a live kernel SIGKILLs it.
     if (dataplaneUsesCcNode(exec) && rustKernelProcessUp(current)) return
