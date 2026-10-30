@@ -260,7 +260,7 @@ import { restartRustKernel, writeKernelConfig } from '../transport/rust-kernel-s
 
 import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
-import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
+import { rustKernelHealth, rustKernelHealthTimeoutMs, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import { setManualScheduleWins } from '../pool/schedule-policy.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
@@ -1004,7 +1004,7 @@ export function createPanelHandler(ctx) {
         },
       }
     }
-    const rust = await rustKernelHealth(exec, { timeoutMs: 600 })
+    const rust = await rustKernelHealth(exec, { timeoutMs: rustKernelHealthTimeoutMs(vm, 600) })
     return {
       rust: toPublicKernelHealth(rust, 'rust'),
     }
