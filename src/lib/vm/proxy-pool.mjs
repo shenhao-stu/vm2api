@@ -29,6 +29,7 @@ import {
 } from './egress.mjs'
 import { normalizeSocksHost, socksEndpoint, socksProxyUrl, socksProxyFamily } from './socks-address.mjs'
 import { proxyBlockedReason } from './proxy-policy.mjs'
+import { clusterGuardedEgressEnabled, getProxyExitGuardPolicy } from './proxy-exit-guard.mjs'
 import { canRevealClusterNodes, annotatePublicLocalProxy } from './local-proxy-nodes.mjs'
 
 export const MAX_VMS_PER_PROXY = 5
@@ -723,7 +724,10 @@ export class ProxyPool extends EventEmitter {
     const managed = this.state.proxies.find((p) => proxyHasVm(p, vmId) && this.managedProxyIds?.has(p.id))
     if (
       managed &&
-      (this._vmNodeOrUndefined(vmId) || !managed.enabled || managed.status === 'dead' || managed.status === 'fail')
+      (this.managedProxyLocalOnly(managed.id, vmId) ||
+        !managed.enabled ||
+        managed.status === 'dead' ||
+        managed.status === 'fail')
     )
       return null
     if (!vmId) return null
@@ -745,7 +749,10 @@ export class ProxyPool extends EventEmitter {
     const managed = this.state.proxies.find((p) => proxyHasVm(p, vmId) && this.managedProxyIds?.has(p.id))
     if (
       managed &&
-      (this._vmNodeOrUndefined(vmId) || !managed.enabled || managed.status === 'dead' || managed.status === 'fail')
+      (this.managedProxyLocalOnly(managed.id, vmId) ||
+        !managed.enabled ||
+        managed.status === 'dead' ||
+        managed.status === 'fail')
     )
       return null
     if (!vmId) return null
@@ -763,7 +770,7 @@ export class ProxyPool extends EventEmitter {
       this.ensureLocalForNode(localEgressNodeId(localTarget))
     }
     const candidates = this.state.proxies.filter((p) => {
-      if (this.managedProxyIds?.has(p.id) && this._vmNodeOrUndefined(vmId)) return false
+      if (this.managedProxyLocalOnly(p.id, vmId)) return false
       if (isLocalEgressProxy(p) && p.id !== localTarget) return false
       if (!p.enabled || p.status === 'dead' || p.status === 'fail') return false
       if (proxyBlockedReason(p, this.state.config.ipv6_enabled)) return false
@@ -781,10 +788,17 @@ export class ProxyPool extends EventEmitter {
     return bound.ok ? bound.proxy : null
   }
 
+  managedProxyLocalOnly(proxyId, vmId) {
+    return (
+      this.managedProxyIds?.has(proxyId) &&
+      this._vmNodeOrUndefined(vmId) &&
+      !(clusterGuardedEgressEnabled() && getProxyExitGuardPolicy(proxyId).required)
+    )
+  }
+
   bind(proxyId, vmId, { force = false } = {}) {
     const vm = String(vmId || '').trim()
-    if (this.managedProxyIds?.has(proxyId) && this._vmNodeOrUndefined(vm))
-      return { ok: false, error: 'subscription_local_only' }
+    if (this.managedProxyLocalOnly(proxyId, vm)) return { ok: false, error: 'subscription_local_only' }
     if (isLocalEgressId(proxyId) && vm) {
       // Local egress is the slot's own VPS route: a generic px-local request lands
       // on the slot's node row; another machine's local row is refused.
@@ -1424,11 +1438,7 @@ export class ProxyPool extends EventEmitter {
 
   /** For upstream: get socks URL for a VM */
   getProxyForVm(vmId) {
-    if (
-      this._vmNodeOrUndefined(vmId) &&
-      this.state.proxies.some((p) => proxyHasVm(p, vmId) && this.managedProxyIds?.has(p.id))
-    )
-      return null
+    if (this.state.proxies.some((p) => proxyHasVm(p, vmId) && this.managedProxyLocalOnly(p.id, vmId))) return null
     const p = this.state.proxies.find(
       (x) =>
         proxyHasVm(x, vmId) &&

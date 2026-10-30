@@ -14,7 +14,8 @@ import {
 import { renderSubscriptionConfig } from '../../src/lib/vm/subscription-runtime.mjs'
 import { ProxySubscriptions } from '../../src/lib/vm/proxy-subscriptions.mjs'
 import { ProxyPool } from '../../src/lib/vm/proxy-pool.mjs'
-import { createDatabase } from '../../src/lib/db/database.mjs'
+import { createDatabase, openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
+import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import { handleProxySubscriptions } from '../../src/lib/admin/proxy-subscription-routes.mjs'
 
 const UUID = '00000000-0000-4000-8000-000000000001'
@@ -318,4 +319,30 @@ test('managed loopback nodes cannot bind or auto-allocate to a remote cluster sl
   pool.vmNodeOf = () => 'remote-node'
   assert.equal(pool.getProxyForVm('vm-local'), null)
   assert.equal(pool.ensureBoundToVm('vm-local'), null)
+})
+
+test('opt-in remote subscription bindings require pinned guards and survive restoration without reallocation', async (t) => {
+  const settings = new SettingsRepo(openDatabase({ dbPath: ':memory:' }))
+  t.after(closeDatabase)
+  settings.set('cluster_guarded_egress', true)
+  const { manager, pool } = environment(t)
+  pool.vmNodeOf = () => 'node-test'
+  await manager.start()
+  await manager.import({ content: fixture() })
+  const id = manager.state.nodes[0].proxyId
+  assert.equal(pool.bind(id, 'vm-test').error, 'subscription_local_only')
+  settings.set('proxy_exit_guard', { required: true, proxies: {} })
+  assert.equal(pool.bind(id, 'vm-test').ok, false)
+  settings.set('proxy_exit_guard', {
+    required: true,
+    proxies: { [id]: { expected_ip: '203.0.113.5', revision: 'test' } },
+  })
+  assert.equal(pool.bind(id, 'vm-test').ok, true)
+  assert.equal(pool.getProxyForVm('vm-test').id, id)
+  assert.equal(pool.ensureBoundToVm('vm-test').id, id)
+  assert.equal(pool.allocateForVm('vm-test').id, id)
+  settings.set('cluster_guarded_egress', false)
+  assert.equal(pool.getProxyForVm('vm-test'), null)
+  assert.equal(pool.ensureBoundToVm('vm-test'), null)
+  assert.equal(pool.allocateForVm('vm-test'), null)
 })

@@ -30,7 +30,8 @@ import {
 import { OS_CATALOG } from '../vm/os-catalog.mjs'
 import { REMOTE_KERNEL_ENTRY, resolveKernelDataplane } from '../vm/slot-engine.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
-import { exitGuardVmRejection } from '../vm/proxy-exit-guard.mjs'
+import { exitGuardVmRejection, getProxyExitGuardPolicy } from '../vm/proxy-exit-guard.mjs'
+import { ensureGuardedNodeProxy, releaseGuardedNodeProxy } from './guarded-node-relay.mjs'
 import { isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
@@ -463,7 +464,7 @@ export function canReuseRemoteEgress(existing, digest) {
  * kin-egress (host-network container from the slot image) + iptables REDIRECT,
  * exactly like egress.mjs does on the control plane.
  */
-export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest = '' }) {
+export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest = '', projectRoot }) {
   const rejected = exitGuardVmRejection(vm)
   if (rejected) return rejected
   const proxy = vm.proxy
@@ -479,7 +480,9 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
     return { ok: true, mode: 'local', network: net.name, egress: null }
   }
   const proxyId = proxy?.id
-  const proxyUrl = boundProxyUrl(proxy)
+  const proxyUrl = getProxyExitGuardPolicy(proxyId).required
+    ? await ensureGuardedNodeProxy(session.client, vm, projectRoot)
+    : boundProxyUrl(proxy)
   if (!proxyId || !proxyUrl) {
     return { ok: false, code: 'proxy_required', error: 'bound SOCKS5 id and url required; refusing fallback' }
   }
@@ -556,18 +559,19 @@ export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {
       if (blocked) return { ok: false, code: blocked, error: blocked }
       const name = vm.runtime?.network === networkName(vm.proxy?.id) ? legacy : current
       const existing = await inspectContainerOrNull(session.docker, name)
-      if (existing) {
+      if (existing && !getProxyExitGuardPolicy(vm.proxy?.id).required) {
         if (!existing.State?.Running) await containerAction(session.docker, name, 'start')
         return { ok: true }
       }
       const image = slotImageSpec(projectRoot, vm.kernel || 'ubuntu-24.04')
       const binaries = await pushSlotBinaries(vm, projectRoot, session)
-      return ensureRemoteEgress(session, vm, { imageRef: image.ref, binaryDigest: binaries.digest })
+      return ensureRemoteEgress(session, vm, { imageRef: image.ref, binaryDigest: binaries.digest, projectRoot })
     }
     for (const name of new Set([current, legacy])) {
       const existing = await inspectContainerOrNull(session.docker, name)
       if (existing?.State?.Running) await containerAction(session.docker, name, 'stop')
     }
+    await releaseGuardedNodeProxy(session.client, vm.id)
     return { ok: true }
   } catch (err) {
     return failure(err)
@@ -1046,7 +1050,11 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
     }
     const binaries =
       typeof pushSlotBinaries === 'function' ? await pushSlotBinaries(vm, projectRoot, session) : { digest: '' }
-    const eg = await ensureRemoteEgress(session, vm, { imageRef: egressImage || image, binaryDigest: binaries.digest })
+    const eg = await ensureRemoteEgress(session, vm, {
+      imageRef: egressImage || image,
+      binaryDigest: binaries.digest,
+      projectRoot,
+    })
     if (!eg.ok) return eg
     const name = containerName(vm.id)
     const relays = await clusterManager().ensureSlotRelays(nodeId, vm.id)
@@ -1131,6 +1139,7 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
     const eg = await ensureRemoteEgress(session, vm, {
       imageRef: p.egressImage || image,
       binaryDigest: binaries.digest,
+      projectRoot,
     })
     if (!eg.ok) return eg
     const name = containerName(vm.id)
@@ -1257,6 +1266,7 @@ export async function restartRemoteServices(vm, projectRoot, { telemetryEnabled 
     const egress = await ensureRemoteEgress(session, vm, {
       imageRef: image.ref,
       binaryDigest: migration.binary_digest,
+      projectRoot,
     })
     if (!egress.ok) return { ok: false, error: egress.error, code: egress.code || 'egress_update_failed' }
     return {
@@ -1274,6 +1284,7 @@ export async function restartRemoteServices(vm, projectRoot, { telemetryEnabled 
 export async function stopRemoteSlot(vm) {
   try {
     const session = await nodeSession(vmNodeId(vm))
+    await releaseGuardedNodeProxy(session.client, vm.id)
     const name = containerName(vm.id)
     const info = await inspectContainerOrNull(session.docker, name)
     if (!info) {
@@ -1293,6 +1304,7 @@ export async function stopRemoteSlot(vm) {
 export async function destroyRemoteSlot(vm) {
   try {
     const session = await nodeSession(vmNodeId(vm))
+    await releaseGuardedNodeProxy(session.client, vm.id)
     const name = containerName(vm.id)
     const info = await inspectContainerOrNull(session.docker, name)
     if (info) {

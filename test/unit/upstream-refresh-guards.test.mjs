@@ -14,6 +14,47 @@ import {
   ensureRemoteEgress,
   setRemoteProxyEgressEnabled,
 } from '../../src/lib/cluster/remote-slot.mjs'
+import { clusterGuardedEgressEnabled } from '../../src/lib/vm/proxy-exit-guard.mjs'
+
+test('persisted cluster opt-in never bypasses guard validation or opens a raw route', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cluster-guard-opt-in-'))
+  const saved = process.env.KIN_CLUSTER_GUARDED_EGRESS
+  delete process.env.KIN_CLUSTER_GUARDED_EGRESS
+  t.after(() => {
+    closeDatabase()
+    fs.rmSync(root, { recursive: true, force: true })
+    if (saved === undefined) delete process.env.KIN_CLUSTER_GUARDED_EGRESS
+    else process.env.KIN_CLUSTER_GUARDED_EGRESS = saved
+  })
+  const settings = new SettingsRepo(openDatabase({ dataDir: root }))
+  assert.equal(clusterGuardedEgressEnabled(), false)
+  settings.set('cluster_guarded_egress', 'true')
+  assert.equal(clusterGuardedEgressEnabled(), false)
+  settings.set('cluster_guarded_egress', true)
+  assert.equal(clusterGuardedEgressEnabled(), true)
+  process.env.KIN_CLUSTER_GUARDED_EGRESS = '0'
+  assert.equal(clusterGuardedEgressEnabled(), false)
+  delete process.env.KIN_CLUSTER_GUARDED_EGRESS
+  settings.set('proxy_exit_guard', {
+    required: true,
+    proxies: { 'px-test': { expected_ip: '203.0.113.5', revision: 'test' } },
+  })
+  let forwards = 0
+  const client = new (await import('node:events')).EventEmitter()
+  client.forwardIn = () => {
+    forwards++
+  }
+  await assert.rejects(
+    ensureRemoteEgress(
+      { client },
+      { id: 'remote', node_id: 'node-test', proxy: { id: 'px-test', host: '127.0.0.1', port: 1080 } },
+      { projectRoot: root },
+    ),
+    { reason: 'exit_guard_unverified' },
+  )
+  assert.equal(forwards, 0)
+  client.emit('close')
+})
 
 test('strict guard rejects every remote activation entry before a node session is acquired', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'upstream-strict-'))

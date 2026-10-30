@@ -71,7 +71,12 @@ import { ProxySubscriptions } from './lib/vm/proxy-subscriptions.mjs'
 import { ensureProxyEgress, proxyEgressReady } from './lib/vm/egress.mjs'
 import { slotHost } from './lib/vm/slot-host.mjs'
 import { stopSlot } from './lib/vm/slot-runtime.mjs'
-import { getProxyExitGuardPolicy, getProxyExitGuardState } from './lib/vm/proxy-exit-guard.mjs'
+import {
+  clusterGuardedEgressEnabled,
+  getProxyExitGuardPolicy,
+  getProxyExitGuardState,
+} from './lib/vm/proxy-exit-guard.mjs'
+import { ensureGuardedNodeProxy } from './lib/cluster/guarded-node-relay.mjs'
 import { createProxyExitGuardManager } from './lib/admin/proxy-exit-guard-manager.mjs'
 import { syncIpv6ProxyEgress } from './lib/vm/proxy-policy-runtime.mjs'
 import { GATEWAY_CAPABILITIES } from './lib/vm/execution-context.mjs'
@@ -953,6 +958,15 @@ const clusterManager = new ClusterManager({
   onLinkState: (nodeId, state) => {
     if (state === 'ready' || state === 'error' || state === 'backoff') {
       proxyPool.probeLocalNode(nodeId).catch(() => {})
+    }
+    if (state === 'ready' && clusterGuardedEgressEnabled()) {
+      for (const vm of listVms(cfg.paths.project)) {
+        if (vm.node_id !== nodeId || vm.status !== 'running' || !getProxyExitGuardPolicy(vm.proxy?.id).required)
+          continue
+        ensureGuardedNodeProxy(clusterManager.client(nodeId), vm, cfg.paths.project).catch((error) => {
+          console.warn('[cluster-guarded-egress]', vm.id, error.reason || error.code || error.message)
+        })
+      }
     }
   },
 })

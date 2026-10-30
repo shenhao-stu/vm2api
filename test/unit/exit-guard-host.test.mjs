@@ -59,6 +59,29 @@ test('required exit guard rejects remote nodes and local direct exits', (t) => {
   assert.equal(direct.proxyUrl, null)
 })
 
+test('opt-in remote Cookie import still requires a verified central guard and forbids override', (t) => {
+  requireExitGuard(t)
+  const previous = process.env.KIN_CLUSTER_GUARDED_EGRESS
+  process.env.KIN_CLUSTER_GUARDED_EGRESS = '1'
+  t.after(() => {
+    if (previous === undefined) delete process.env.KIN_CLUSTER_GUARDED_EGRESS
+    else process.env.KIN_CLUSTER_GUARDED_EGRESS = previous
+  })
+  const remote = { ...vm, node_id: 'node-fixture' }
+  const resolved = resolveImportProxy({ vm: remote, proxyPool, projectRoot: '/missing-fixture' })
+  assert.equal(resolved.ok, false)
+  assert.equal(resolved.proxyUrl, null)
+  assert.equal(resolved.reason, 'exit_ip_required')
+  assert.equal(
+    resolveImportProxy({ vm: remote, proxyPool, overrideUrl: proxy.url }).reason,
+    'exit_guard_override_forbidden',
+  )
+  assert.equal(
+    resolveImportProxy({ vm: { ...remote, platform: 'openai' }, proxyPool }).reason,
+    'exit_guard_unsupported_platform',
+  )
+})
+
 test('a retained expected IP with protection disabled preserves existing proxy behavior', (t) => {
   const settings = requireExitGuard(t)
   settings.set('proxy_exit_guard', {

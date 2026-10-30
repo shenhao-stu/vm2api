@@ -12,7 +12,12 @@
 import { boundProxyUrl, isLocalEgressProxy } from './egress.mjs'
 import { slotHost } from './slot-host.mjs'
 import { configuredIpv6Enabled, proxyBlockedReason } from './proxy-policy.mjs'
-import { exitGuardError, getProxyExitGuardPolicy, guardedProxyUrl } from './proxy-exit-guard.mjs'
+import {
+  clusterGuardedEgressEnabled,
+  exitGuardError,
+  getProxyExitGuardPolicy,
+  guardedProxyUrl,
+} from './proxy-exit-guard.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 
 function poolHitForVm(proxyPool, vm) {
@@ -52,7 +57,7 @@ export function resolveImportProxy({ vm, proxyPool, overrideUrl = null, projectR
     if (getProxyExitGuardPolicy(allocated?.id || hit?.id || vm?.proxy?.id).required) {
       if (overrideUrl) throw exitGuardError('exit_guard_override_forbidden')
       if (isCodexVm(vm)) throw exitGuardError('exit_guard_unsupported_platform')
-      if (vm?.node_id) throw exitGuardError('exit_guard_unsupported_exit')
+      if (vm?.node_id && !clusterGuardedEgressEnabled()) throw exitGuardError('exit_guard_unsupported_exit')
       if (poolProxyUnavailable(hit)) throw exitGuardError('exit_guard_proxy_unavailable')
       const proxyUrl = guardedProxyUrl(projectRoot, allocated || hit || vm?.proxy)
       return { ok: true, proxyUrl, blocked: false, reason: null }

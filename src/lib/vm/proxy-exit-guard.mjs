@@ -9,6 +9,11 @@ import { proxyRequiresExitIp } from './exit-guard-policy.mjs'
 
 export const EXIT_GUARD_MAX_AGE_MS = 30_000
 
+export function clusterGuardedEgressEnabled() {
+  if (process.env.KIN_CLUSTER_GUARDED_EGRESS !== undefined) return process.env.KIN_CLUSTER_GUARDED_EGRESS === '1'
+  return isDbOpen() && new SettingsRepo(getDb()).get('cluster_guarded_egress') === true
+}
+
 export function getProxyExitGuardConfig() {
   if (!isDbOpen()) return { required: false, proxies: {} }
   const settings = new SettingsRepo(getDb())
@@ -162,6 +167,10 @@ export function guardedProxyUrl(projectRoot, proxy) {
 
 export function exitGuardVmRejection(vm) {
   if (!getProxyExitGuardPolicy(vm?.proxy?.id).required) return null
-  const code = isCodexVm(vm) ? 'exit_guard_unsupported_platform' : vm?.node_id ? 'exit_guard_unsupported_exit' : null
+  const code = isCodexVm(vm)
+    ? 'exit_guard_unsupported_platform'
+    : vm?.node_id && !clusterGuardedEgressEnabled()
+      ? 'exit_guard_unsupported_exit'
+      : null
   return code ? { ok: false, status: 409, code, error: code } : null
 }
