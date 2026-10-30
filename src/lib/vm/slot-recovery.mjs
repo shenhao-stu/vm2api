@@ -12,7 +12,12 @@ import { isDeepStrictEqual } from 'node:util'
 import { clusterManager, vmNodeId } from '../cluster/placement.mjs'
 import { containerLogs, inspectContainerOrNull } from '../cluster/docker-remote.mjs'
 import { slotEgressNames } from '../cluster/remote-slot.mjs'
-import { kernelFaults, rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
+import {
+  kernelFaults,
+  rustKernelHealth,
+  rustKernelHealthTimeoutMs,
+  toPublicKernelHealth,
+} from '../transport/rust-kernel-client.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import { codexKernelTracked } from '../transport/codex-kernel-supervisor.mjs'
 import {
@@ -116,7 +121,7 @@ export async function inspectSlotContainer(vm) {
 
 const DEFAULT_PROBES = Object.freeze({
   container: inspectSlotContainer,
-  rustHealth: (exec) => rustKernelHealth(exec, { timeoutMs: HEALTH_TIMEOUT_MS }),
+  rustHealth: (exec) => rustKernelHealth(exec, { timeoutMs: rustKernelHealthTimeoutMs(exec?.vm, HEALTH_TIMEOUT_MS) }),
   codexHealth: (exec) => codexKernelHealth(exec, { timeoutMs: HEALTH_TIMEOUT_MS }),
   localEgress: (proxy) => localEgressStatus(proxy),
   socksEgress: (projectRoot, proxyId) => egressListening(projectRoot, proxyId),

@@ -5,6 +5,7 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { dispatchCallInference, waitForReadySlot } from '../../src/lib/transport/kernel-router.mjs'
+import { diagnoseSlotServices } from '../../src/lib/vm/slot-recovery.mjs'
 
 async function fixture(t, { remote = true, delay = 1100, healthy = true, respond = true } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kh-'))
@@ -45,7 +46,7 @@ async function fixture(t, { remote = true, delay = 1100, healthy = true, respond
       routing: { inference: { health_ttl_ms: 0 } },
       timeoutMs: 5000,
     })
-  return { exec, calls, send }
+  return { root, exec, calls, send }
 }
 
 test('remote health over 800ms reaches inference once without a false unavailable', async (t) => {
@@ -92,4 +93,15 @@ test('remote slot polling does not extend an exhausted wait budget', async (t) =
   assert.equal(result.ok, false)
   assert.equal(fx.calls.inference, 0)
   assert.ok(performance.now() - start < 350)
+})
+
+test('remote panel diagnosis uses the same node health budget', async (t) => {
+  const fx = await fixture(t, { delay: 1800 })
+  const vm = { ...fx.exec.vm, status: 'running', claude: { has_access: true, has_refresh: true } }
+  const result = await diagnoseSlotServices(vm, {
+    projectRoot: fx.root,
+    probes: { container: async () => ({ exists: true, running: true }), cluster: () => null },
+  })
+  assert.equal(result.checks.find((c) => c.id === 'kernel').status, 'ok')
+  assert.equal(fx.calls.inference, 0)
 })
