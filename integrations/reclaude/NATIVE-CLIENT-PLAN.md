@@ -23,6 +23,21 @@ and enabling daemon reporting alone repairs the existing relay. It does not prov
 the provider's private trigger or establish whether a native-only workload would
 remain authorized long term. No repeated rebind or synthetic telemetry was used.
 
+The 2026-10-30 recovery repeated the failure on v1.7.1 with a different authorized
+binding. An official v1.7.4 candidate was then checksum-verified and installed
+only in the isolated runtime. Four native CLI controls passed while the API relay
+was stopped. Preserve that distinction when comparing results: changing both
+the native version and the request path cannot attribute a result to either one.
+An authorized follow-up must change one factor at a time and retain all failures.
+
+That follow-up also failed stability: after the native controls and observation,
+the gateway and isolated Sub2API path completed model, tool/history and session
+checks, then v1.7.4 revoked the binding. No native restart, OOM, quota exhaustion
+or egress change accompanied the failure. Updating the native binary is therefore
+insufficient. The exact provider-side reason remains unknown; the current shared
+Messages relay must stay paused. Do not turn repeated reauthorization into a
+recovery loop or substitute invented reporting for the missing native workflow.
+
 ## Evaluate in a separate native runtime
 
 1. Preserve the existing account, device identity, fixed-egress policy and
@@ -60,7 +75,7 @@ The current vm2api OAuth-slot path is not a drop-in native ReClaude launcher:
 it uses its own CLI/kernel contract, seed settings and telemetry policy. Even
 its telemetry-on seed writes a nonessential-traffic override. Reusing that path
 unchanged would reintroduce a configuration difference that the local reference
-removed. Keep the seven existing slots unchanged and evaluate independently.
+removed. Keep existing slots unchanged and evaluate independently.
 
 Ten relay permits are not a memory reservation for ten native CLI processes.
 Measure native peak memory and queue behavior before enabling that workload.

@@ -13,7 +13,44 @@ Sub2API shared account (configured concurrency)
   → ReClaude service
 ```
 
-## Verified release scope (2026-10-29)
+## Verified release scope
+
+Shared-pool admission remains suspended. The recovery on 2026-10-30 reproduced
+revocation on native ReClaude v1.7.1 after ten successful upstream requests.
+The next Fable attempt was rejected locally with zero upstream attempts and no
+usage; it cannot explain a revocation already recorded before that attempt.
+The temporary Sub2API key, group and grant were removed, while the three complete
+Sub2API usage records were retained and reconciled.
+
+An official update check then found v1.7.4. Its Linux binary passed the vendor's
+SHA256 check and network-disabled version/help checks before replacing only the
+isolated native runtime. The same private HOME, machine identity, pinned egress
+and resource limits were retained. Official reauthorization and four new native
+CLI controls (Sonnet/Haiku/Opus 5.5 and Fable 5.1) passed complete SSE and terminal
+usage checks. After a native-only observation window, a separate gateway control
+and an isolated Sub2API canary exercised the actual gateway-auth client. All four
+models completed SSE. A two-turn Read tool exchange kept execution on the client,
+returned the tool result in history, and produced the exact file contents. A new
+session could not retrieve that fixture from the earlier conversation.
+
+Nevertheless, v1.7.4 also reported `device_revoked`, about 24 minutes after the
+first relay request. The provider recorded thirteen successful requests: four
+native controls, three direct-relay requests and six Sub2API requests. The next
+JSON contract check was rejected for revoked authorization; JSON acceptance on
+this binding remains incomplete. Neither the version update nor the successful
+functional checks resolved authorization stability. The account stays
+unscheduled, the new authentication latch stays in place, and the temporary
+canary key, group and grant were removed. Six successful Sub2API records were
+reconciled against response usage, vm2api and provider records.
+
+The eight existing Pro slots, their fixed egress, concurrency one, account scope,
+Fable exclusions and container lifecycles were unchanged. The native daemon
+reported no OOM or restart, and the provider quota was far below its limit.
+These observations do not reveal the provider's private revocation reason or
+prove that any particular model caused it. Do not keep rebinding an unchanged
+request path; a new recovery needs a falsifiable compatibility change.
+
+### Earlier acceptance and failure
 
 A separate Linux deployment passed native authorization, fixed-egress checks,
 real Claude Code SSE, and Messages JSON/SSE through a one-account Sub2API canary.
@@ -88,9 +125,11 @@ and its official extensions, and excludes API-key-based tools. Do not infer
 support for a shared Messages relay from a successful short request.
 See [the native-client evaluation plan](NATIVE-CLIENT-PLAN.md) before changing
 this architecture; installing a CLI alone does not change the relay data path.
-Tools, thinking, long conversations and ten simultaneous paid calls were not
-validated online. Concurrency 10 and session separation were tested offline;
-short successful calls do not establish long-term provider authorization.
+The latest canary exercised client-side tools, their two-turn history and fresh
+session separation. Long conversations, nonzero reasoning output and ten
+simultaneous paid calls were not validated online. Concurrency 10 and rejection
+of an eleventh request were tested offline; successful functional tests do not
+establish long-term provider authorization.
 
 The first server organization was manually unbound by its owner before model
 use. That retired binding stays stopped. Native reauthorization selected the
@@ -264,6 +303,10 @@ has loaded the intended binding. For an explicitly approved, single recovery:
 1. Keep only this relay unscheduled, drain its key, and save the old state and
    authentication latch privately. Verify the existing fixed-IP guard; do not
    alter its expected IP, revision or latch.
+   Run the official `reclaude update --check` before selecting a candidate.
+   Verify the chosen binary against its official checksum and test `version`
+   and `help` without network or production mounts. Do not replace a mounted
+   executable or whole shared gateway opportunistically during authorization.
 2. Let the native login flow authorize the same machine and intended organization.
    Verify exactly one intended credentialed binding and the official CLI discovery
    path. Never copy another machine's OAuth, identity or profile.
@@ -279,6 +322,14 @@ has loaded the intended binding. For an explicitly approved, single recovery:
    Pause scheduling, retain the new latch and receipts, remove temporary canary
    credentials, and stop further login/model attempts. Do not promote a failed
    stability test into the shared pool.
+
+Use a unique intent and response file for **each upstream dispatch**, including
+each turn of a tool test. A downstream recorder failure does not imply the
+upstream call failed: reconcile the existing terminal usage before considering
+another test. Never replay a consumed request. Check the actual health result
+between controls and stop dependent tests after a failed gate; a command that
+only prints a failure is insufficient. Passive observation must be read-only,
+not periodic charged model requests.
 
 Persist a **separate** Compose definition for the native daemon, adapter and
 API gateway. The adapter and gateway use `network_mode: service:runtime`.
@@ -340,6 +391,20 @@ Acceptance tools must decode HTTP content encoding before JSON assertions.
 Stored response bytes can be verified offline; a parser failure is not permission
 to send a second model request. Keep raw synthetic receipts restricted and never
 capture production prompts or credentials in routine diagnostics.
+
+A later direct acceptance tunnel disconnected before vm2api received upstream
+headers. The provider completed and priced that request, while vm2api recorded
+`ABORT_ERR` with no terminal usage. This known discrepancy was retained; it was
+neither replayed nor guessed into a customer bill. Subsequent canary checks used
+the production HTTPS path. Sub2API's existing streaming drain and its disconnect,
+timeout and read-error regression tests were retained. Complete canary responses
+and their ledgers reconciled, but they do not prove lossless accounting for every
+transport failure before headers.
+
+Use the downstream application's native scheduling endpoint and read back its
+state before sending a canary. An HTTP success from a general account update can
+ignore a field it does not support. A canary must belong only to its temporary
+group until admission succeeds. Removing its key/group must preserve usage rows.
 
 ## Tests
 
