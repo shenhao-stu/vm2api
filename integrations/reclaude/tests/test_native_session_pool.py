@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 
 from native_bridge_session import ContractError
@@ -102,6 +103,76 @@ class PoolTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "native_pool_stopped"):
             with self.pool.lease("other", self.body):
                 pass
+
+    def test_expiring_cli_does_not_block_another_live_session(self):
+        with self.pool.lease("first", self.body) as first:
+            pass
+        self.time = 5
+        with self.pool.lease("second", self.body):
+            pass
+        close_started, finish_close, acquired = (threading.Event() for _ in range(3))
+        def slow_close(**kwargs):
+            close_started.set()
+            finish_close.wait(2)
+            first.closed = True
+        first.close = slow_close
+        self.time = 11
+        reaper = threading.Thread(target=self.pool.expire)
+        reaper.start()
+        self.assertTrue(close_started.wait(1))
+        def lease_other():
+            with self.pool.lease("second", self.body):
+                acquired.set()
+        other = threading.Thread(target=lease_other)
+        other.start()
+        try:
+            self.assertTrue(acquired.wait(0.2), "slow CLI exit blocked unrelated session")
+        finally:
+            finish_close.set()
+            reaper.join(3)
+            other.join(3)
+
+    def test_prepared_sessions_have_short_expiry_and_still_use_pool_capacity(self):
+        self.pool.idle_seconds = 1800
+        self.pool.prepared_idle_seconds = 120
+        with self.pool.lease("first", self.body) as first:
+            first.prepared = True
+        with self.pool.lease("second", self.body):
+            pass
+        with self.assertRaisesRegex(ContractError, "native_session_capacity"):
+            with self.pool.lease("third", self.body):
+                pass
+        self.time = 121
+        self.assertEqual(self.pool.expire(), 1)
+        self.assertTrue(first.closed)
+        self.assertEqual(len(self.pool.entries), 1)
+
+    def test_eviction_reserves_capacity_until_the_old_process_exits(self):
+        self.pool.recover = FixtureSession
+        with self.pool.lease("first", self.body) as first:
+            pass
+        entered, finish, acquired = (threading.Event() for _ in range(3))
+        def slow_close(**kwargs):
+            entered.set()
+            finish.wait(2)
+            first.closed = True
+        first.close = slow_close
+        def replace():
+            with self.pool.lease("third", self.body):
+                acquired.set()
+        with self.pool.lease("second", self.body):
+            worker = threading.Thread(target=replace)
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            try:
+                self.assertFalse(acquired.is_set())
+                with self.assertRaisesRegex(ContractError, "native_session_capacity"):
+                    with self.pool.lease("fourth", self.body):
+                        pass
+            finally:
+                finish.set()
+                worker.join(3)
+        self.assertTrue(acquired.is_set())
 
     def test_waiting_for_real_caller_tool_result_is_not_idle_expired(self):
         with self.pool.lease("first", self.body) as a:

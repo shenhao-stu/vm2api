@@ -82,6 +82,23 @@ class ContinuationTests(unittest.TestCase):
             self.assertEqual(self.session.pending_ids, {"tool_fixture"})
             self.assertEqual((self.path / "continuation.json").read_bytes(), saved)
 
+    def test_only_unconsumed_prewarm_can_restart_empty(self):
+        path = Path(self.temp.name) / "prepared"
+        original = Session(path, ["unused"], self.env, self.body)
+        original.checkpoint("prepared")
+        recovered = Session(path, ["unused"], self.env, self.body, restore=True)
+        self.assertEqual(recovered.history, [])
+        self.assertTrue(recovered.prepared)
+        self.assertNotEqual(original.native_id, recovered.native_id)
+        self.assertIsNone(recovered.resume_uuid)
+        changed = {**self.body, "system": "not the same owner context"}
+        with self.assertRaisesRegex(ContractError, "incomplete_no_replay"):
+            Session(path, ["unused"], self.env, changed, restore=True)
+        (path / "dispatch").mkdir()
+        (path / "dispatch" / "old.consumed.json").write_text("{}")
+        with self.assertRaisesRegex(ContractError, "incomplete_no_replay"):
+            Session(path, ["unused"], self.env, self.body, restore=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -184,3 +184,48 @@ trips using the existing guarded helper, without changing the model backend or
 sharing CLI context between conversations. Its deployment requires no relay or
 OAuth-slot restart. DNS readiness timings alone do not establish end-to-end
 first-token improvement.
+
+### Explicit session preparation
+
+The private native backend can opt in to `--allow-prewarm`. It then accepts an
+authenticated `POST /v1/messages/prepare` with the same validated Messages body
+and caller session ID as the intended first request. It launches that session's
+native CLI, waits for the real policy and native `initialize` acknowledgement,
+and returns JSON such as:
+
+```json
+{"ready":true,"reused":false,"model_dispatches":0,"idle_ttl_seconds":120}
+```
+
+The preparation request does not submit its user messages, create a model grant,
+append conversation history, or consume the operator's model-request budget.
+Send the actual prompt separately to `/v1/messages`. Model, system context,
+tools, output limit and other launch configuration must remain identical; user
+text can change before the first real turn. Each process belongs to exactly one
+authenticated key and caller session. Existing conversations still require
+their verified history. No prepared process is reassigned to a different
+conversation, and no native authorization or telemetry is synthesized.
+
+Preparation uses the same concurrency gate and bounded session pool as inference.
+An unused prepared CLI expires after 120 seconds (or the shorter normal idle
+limit), checked by the existing 30-second reaper. Actual conversations retain the
+configured normal idle limit. Closing CLIs remain counted until exit, while
+unrelated sessions can continue without waiting under the pool lock. Only a
+checkpoint explicitly recorded as never dispatched may restart empty after
+expiration; consumed, failed or uncertain turns retain no-replay protections.
+
+The native control handshake follows the official SDK's
+[streaming-input initialization](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py).
+Normal multi-turn reuse follows the native
+[persistent streaming-input session](https://code.claude.com/docs/en/agent-sdk/streaming-vs-single-mode).
+The preparation endpoint is a backend extension, not part of Anthropic Messages:
+the ordinary vm2api/Sub2API route does not automatically call or forward it.
+Keep it private behind the same authentication and network restrictions. A
+trusted caller integration must prepare the actual session while the user is
+still composing input; adding preparation immediately before an awaited request
+only moves the same cold-start delay. A new Sub2API account test intentionally
+creates a new UUID and therefore remains a cold-session measurement.
+
+Audit records distinguish `operation=prepare` from `messages`, report native
+CLI reuse and pool lease time, and timestamp the first non-empty text delta.
+Handshake bytes and readiness responses are never reported as model first tokens.

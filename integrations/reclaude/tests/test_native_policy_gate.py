@@ -17,7 +17,11 @@ if __import__('os').environ.get('FIXTURE_POLICY_READY'):
  time.sleep(.25)
  log.write_text('Policy limits: Cache still valid (304 Not Modified)\\n')
 for line in sys.stdin:
- pathlib.Path('received.json').write_text(line)
+ message=json.loads(line)
+ if message['type']=='control_request':
+  print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':message['request_id'],'response':{}}}),flush=True)
+ else:
+  pathlib.Path('received.json').write_text(line)
 """
 
 
@@ -79,6 +83,33 @@ class PolicyGate(unittest.TestCase):
         self.assertEqual(s.process.pid, pid)
         data = json.loads((s.directory / "received.json").read_text())
         self.assertEqual(data["message"]["content"][0]["text"], "genuine test input")
+
+    def test_prewarm_has_no_prompt_grant_and_reuses_initialized_process(self):
+        s = self.session(True)
+        body = {"model": "fixture", "messages": [{"role": "user", "content": "draft"}],
+                "max_tokens": 1024, "tools": []}
+        self.assertFalse(s.prepare_request(body)["reused"])
+        pid = s.process.pid
+        self.assertTrue(s.prepare_request(body)["reused"])
+        self.assertEqual(s.process.pid, pid)
+        self.assertFalse((s.directory / "received.json").exists())
+        self.assertEqual(s.history, [])
+        self.assertEqual(s.seen, set())
+        self.assertIsNone(s.last_grant_id)
+
+    def test_prewarm_rejects_changed_configuration_without_poisoning(self):
+        s = self.session(True)
+        body = {"model": "other", "messages": [{"role": "user", "content": "draft"}],
+                "max_tokens": 1024, "tools": []}
+        with self.assertRaisesRegex(ContractError, "session_configuration_changed"):
+            s.prepare_request(body)
+        self.assertFalse(s.failed)
+        self.assertIsNone(s.process)
+        body["model"] = "fixture"
+        body["messages"].append({"role": "system", "content": "different startup context"})
+        with self.assertRaisesRegex(ContractError, "session_configuration_changed"):
+            s.prepare_request(body)
+        self.assertFalse(s.failed)
 
 
 if __name__ == "__main__":

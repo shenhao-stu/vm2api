@@ -37,9 +37,17 @@ class FixtureSession:
         self.reject = False
         self.refusal = False
         self.fail_before_event = False
+        self.prepares = 0
+        self.prepared = False
 
     def close(self, **kwargs):
         self.closed = True
+
+    def prepare_request(self, body):
+        reused = self.prepares > 0
+        self.prepares += 1
+        self.prepared = True
+        return {"ready": True, "reused": reused, "model_dispatches": 0}
 
     def request(self, body):
         if self.reject:
@@ -145,11 +153,11 @@ class NativeHTTPTests(unittest.TestCase):
             **changes,
         }
 
-    def request(self, body=None, key=None):
+    def request(self, body=None, key=None, path="/v1/messages"):
         c = http.client.HTTPConnection(*self.server.server_address, timeout=5)
         c.request(
             "POST",
-            "/v1/messages",
+            path,
             json.dumps(body or self.body()),
             {
                 "Content-Type": "application/json",
@@ -160,6 +168,37 @@ class NativeHTTPTests(unittest.TestCase):
         result = (r.status, r.read())
         c.close()
         return result
+
+    def test_optional_prewarm_is_authenticated_and_never_dispatches(self):
+        path = "/v1/messages/prepare"
+        self.assertEqual(self.request(path=path)[0], 404)
+        self.server.allow_prewarm = True
+        self.assertEqual(self.request(path=path, key="incorrect")[0], 401)
+        self.assertFalse(self.created)
+        status, raw = self.request(path=path)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["model_dispatches"], 0)
+        self.assertEqual(self.server.accepted, 0)
+        first = self.created[0]
+        status, raw = self.request(path=path)
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(raw)["reused"])
+        self.assertEqual(len(self.created), 1)
+        self.assertEqual(list(first.directory.glob("dispatch/*.consumed.json")), [])
+        self.assertEqual(self.request()[0], 200)
+        self.assertEqual(self.created, [first])
+        self.assertEqual(self.server.accepted, 1)
+
+    def test_unhealthy_or_paused_prewarm_never_starts_a_cli(self):
+        self.server.allow_prewarm = True
+        path = "/v1/messages/prepare"
+        self.server.management_pause.touch()
+        self.assertEqual(self.request(path=path)[0], 503)
+        self.server.management_pause.unlink()
+        self.health.revoked = True
+        self.assertEqual(self.request(path=path)[0], 503)
+        self.assertTrue(self.server.latched)
+        self.assertFalse(self.created)
 
     def audit(self, expected=1):
         deadline = time.monotonic() + 1

@@ -223,6 +223,16 @@ def history_shape(messages):
     return [message_shape(message) for message in messages]
 
 
+def initial_system(body):
+    systems = text_blocks(body.get("system", ""))
+    for message in body["messages"]:
+        if message.get("role") == "system":
+            systems.extend(text_blocks(message.get("content")))
+    if any(block.get("type") != "text" for block in systems):
+        raise ContractError("prototype_only_accepts_text_system")
+    return "\n".join(block["text"] for block in systems)
+
+
 def tool_schema(tools):
     if not isinstance(tools, list):
         raise ContractError("invalid_tools")
@@ -362,6 +372,10 @@ class Session:
         self.suspended = False
         self.assistants = {}
         self.assistant_ready = threading.Condition()
+        self.prepared = False
+        self.initialize_id = None
+        self.initialize_response = None
+        self.control_ready = threading.Condition()
         if existed:
             self.restore(body)
         (self.directory / "tools.json").write_text(json.dumps(self.tools))
@@ -373,6 +387,17 @@ class Session:
             state = json.loads((self.directory / "continuation.json").read_text())
         except (OSError, ValueError):
             raise ContractError("native_session_recovery_unavailable") from None
+        if state["status"] == "prepared":
+            if (
+                state.get("configuration") != self.body_signature
+                or state.get("system_sha256") != signature(initial_system(body))
+                or list((self.directory / "dispatch").glob("*.consumed.json"))
+            ):
+                raise ContractError("native_session_incomplete_no_replay")
+            # No user input or grant existed. Start a new empty native process;
+            # never resume an old paid conversation through this branch.
+            self.prepared = True
+            return
         if state["status"] != "idle":
             raise ContractError("native_session_incomplete_no_replay")
         history = body["messages"][: state["history_length"]]
@@ -389,7 +414,12 @@ class Session:
     def checkpoint(self, status, request_sha256=None, message_id=None):
         path = self.directory / "continuation.json"
         state = {"version": 1, "status": status, "native_id": self.native_id}
-        if status == "idle":
+        if status == "prepared":
+            state.update({
+                "configuration": self.body_signature,
+                "system_sha256": signature((self.directory / "system.txt").read_text()),
+            })
+        elif status == "idle":
             with self.assistant_ready:
                 self.assistant_ready.wait_for(
                     lambda: message_id in self.assistants, timeout=5
@@ -422,15 +452,65 @@ class Session:
             os.close(descriptor)
 
     def write_system(self, body):
-        systems = text_blocks(body.get("system", ""))
-        for message in body["messages"]:
-            if message.get("role") == "system":
-                systems.extend(text_blocks(message.get("content")))
-        if any(b.get("type") != "text" for b in systems):
-            raise ContractError("prototype_only_accepts_text_system")
         temp = self.directory / "system.tmp"
-        temp.write_text("\n".join(b["text"] for b in systems))
+        temp.write_text(initial_system(body))
         os.replace(temp, self.directory / "system.txt")
+
+    def validate_configuration(self, body):
+        native_options(body)
+        if signature(configuration(body)) != self.body_signature or (
+            not self.history
+            and initial_system(body) != (self.directory / "system.txt").read_text()
+        ):
+            raise RequestRejected("session_configuration_changed")
+
+    def prepare_request(self, body):
+        """Prepare one caller's CLI without a prompt or model dispatch grant."""
+        if not self.lock.acquire(blocking=False):
+            raise RequestRejected("session_busy")
+        try:
+            self.validate_configuration(body)
+            if not self.history:
+                try:
+                    fresh_prompt(body["messages"])
+                except ContractError as exc:
+                    raise RequestRejected(str(exc)) from None
+            if self.failed:
+                raise ContractError("session_failed_no_replay")
+            if not self.history:
+                self.prepared = True
+                self.checkpoint("prepared")
+            reused = self.process is not None
+            self.prepare()
+            if not self.history:
+                self.initialize_native()
+            return {"ready": True, "reused": reused, "model_dispatches": 0}
+        except RequestRejected:
+            raise
+        except Exception:
+            self.failed = True
+            self.close()
+            raise
+        finally:
+            self.lock.release()
+
+    def initialize_native(self):
+        if self.initialize_response is None:
+            self.initialize_id = str(uuid.uuid4())
+            self.process.stdin.write(json.dumps({
+                "type": "control_request",
+                "request_id": self.initialize_id,
+                "request": {"subtype": "initialize", "hooks": None},
+            }) + "\n")
+            self.process.stdin.flush()
+            with self.control_ready:
+                self.control_ready.wait_for(
+                    lambda: self.initialize_response is not None
+                    or self.process.poll() is not None,
+                    timeout=min(self.timeout, 90),
+                )
+        if not self.initialize_response or self.initialize_response.get("subtype") != "success":
+            raise ContractError("native_initialize_not_ready_no_dispatch")
 
     def prepare(self):
         if self.process is not None:
@@ -625,7 +705,13 @@ class Session:
                     log.write(line)
                     log.flush()
                     event = json.loads(line)
-                    if event.get("type") == "stream_event":
+                    if event.get("type") == "control_response":
+                        response = event.get("response", {})
+                        if response.get("request_id") == self.initialize_id:
+                            with self.control_ready:
+                                self.initialize_response = response
+                                self.control_ready.notify_all()
+                    elif event.get("type") == "stream_event":
                         self.events.put(event["event"])
                     elif event.get("type") == "assistant" and (
                         event.get("error") or event.get("is_api_error_message")
@@ -646,6 +732,8 @@ class Session:
             self.events.put(ContractError(type(exc).__name__))
         finally:
             self.events.put(None)
+            with self.control_ready:
+                self.control_ready.notify_all()
 
     def request(self, body):
         if not self.lock.acquire(blocking=False):
@@ -654,15 +742,14 @@ class Session:
         try:
             if self.failed:
                 raise ContractError("session_failed_no_replay")
-            native_options(body)
-            if signature(configuration(body)) != self.body_signature:
-                raise ContractError("session_configuration_changed")
+            self.validate_configuration(body)
             request_signature = signature(history_shape(body["messages"]))
             if request_signature in self.seen:
                 raise ContractError("request_already_consumed")
             if not self.history:
                 blocks = fresh_prompt(body["messages"])
                 mutation_started = True
+                self.prepared = False
                 self.seen.add(request_signature)
                 self.history = copy.deepcopy(body["messages"])
                 self.checkpoint("in_flight")

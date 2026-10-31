@@ -37,7 +37,8 @@ class NativeServer(RelayServer):
         idle_seconds=1800,
         private_host=None,
         max_requests=None,
-        recover=None
+        recover=None,
+        allow_prewarm=False,
     ):
         root = Path(root)
         root.mkdir(mode=0o700, exist_ok=True)
@@ -64,6 +65,7 @@ class NativeServer(RelayServer):
         )
         self.tenant = hashlib.sha256(key.encode()).hexdigest()
         self.proof = proof
+        self.allow_prewarm = allow_prewarm
         self.stop_reaper = threading.Event()
         self.max_requests = max_requests
         self.accepted = 0
@@ -115,7 +117,8 @@ class NativeHandler(RelayHandler):
 
     def do_POST(self):
         parsed = urlsplit(self.path)
-        if parsed.path != "/v1/messages":
+        prewarm = parsed.path == "/v1/messages/prepare" and self.server.allow_prewarm
+        if parsed.path != "/v1/messages" and not prewarm:
             return self.send_error_json(404, "not_found")
         if not self.authorized():
             return self.send_error_json(401, "invalid_relay_key")
@@ -140,6 +143,7 @@ class NativeHandler(RelayHandler):
             "attempts": 0,
             "complete": False,
             "response_bytes": 0,
+            "operation": "prepare" if prewarm else "messages",
         }
         started = time.monotonic()
         committed = False
@@ -180,9 +184,22 @@ class NativeHandler(RelayHandler):
             if failed or not self.server.proof():
                 raise Rejection(503, "native_not_ready")
             context = self.server.pool.lease(self.server.tenant, body)
+            lease_started = time.monotonic()
             session = context.__enter__()
+            record["pool_lease_ms"] = round((time.monotonic() - lease_started) * 1000)
+            process = getattr(session, "process", None)
+            record["native_cli_reused"] = process is not None and process.poll() is None
             lease = context
             before = set((session.directory / "dispatch").glob("*.consumed.json"))
+            if prewarm:
+                result = session.prepare_request(body)
+                result["idle_ttl_seconds"] = (
+                    self.server.pool.prepared_idle_seconds
+                    if session.prepared else self.server.pool.idle_seconds
+                )
+                self.send_json(200, result)
+                record.update(status=200, complete=True, reused=result["reused"])
+                return
             with self.server.counter_lock:
                 if (
                     self.server.max_requests is not None
@@ -208,6 +225,13 @@ class NativeHandler(RelayHandler):
                 yield from iterator
 
             for event in events():
+                if (
+                    "first_content_ms" not in record
+                    and event.get("type") == "content_block_delta"
+                    and event.get("delta", {}).get("type") == "text_delta"
+                    and event["delta"].get("text")
+                ):
+                    record["first_content_ms"] = round((time.monotonic() - started) * 1000)
                 collect(observation, event)
                 encoded = (
                     "event: "
@@ -372,6 +396,7 @@ def main():
     p.add_argument("--max-requests", type=int)
     p.add_argument("--session-budget-usd", type=float)
     p.add_argument("--idle-seconds", type=float, default=1800)
+    p.add_argument("--allow-prewarm", action="store_true")
     args = p.parse_args()
     limits = Limits(models=tuple(args.model), concurrency=args.concurrency)
     health = NativeHealth(args.home, args.binding)
@@ -425,6 +450,7 @@ def main():
         max_requests=args.max_requests,
         idle_seconds=args.idle_seconds,
         recover=factory,
+        allow_prewarm=args.allow_prewarm,
     )
 
     def stop(*_):
