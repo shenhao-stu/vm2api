@@ -1,0 +1,12 @@
+# Replace the private bridge and existing guarded DNS upstream for your deployment.
+port=42455
+listen-address=127.0.0.1,172.30.31.1
+bind-interfaces
+no-resolv
+no-hosts
+server=172.30.31.1#42454
+cache-size=256
+max-cache-ttl=60
+max-ttl=60
+no-negcache
+log-facility=-

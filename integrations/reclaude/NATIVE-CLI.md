@@ -175,3 +175,12 @@ four-way accounting and a meaningful authorization observation window. A provide
 revocation: preserve it and its usage without automatic fallback. Record transport
 completion separately from a normal-output acceptance assertion. Keep the
 production account paused until the applicable gates pass.
+
+## Cold-start latency
+
+Keep native authorization and policy readiness checks in the request path. An
+optional [private DNS cache](dns-cache/README.md) can reduce repeated DNS round
+trips using the existing guarded helper, without changing the model backend or
+sharing CLI context between conversations. Its deployment requires no relay or
+OAuth-slot restart. DNS readiness timings alone do not establish end-to-end
+first-token improvement.

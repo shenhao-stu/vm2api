@@ -1,0 +1,24 @@
+[Unit]
+Description=Private DNS cache for the isolated ReClaude relay
+After=network.target
+
+[Service]
+Type=simple
+User=dnsmasq
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --pid-file= --conf-file=/etc/vm2api/reclaude-dns-cache.conf
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+MemoryMax=64M
+TasksMax=64
+CPUQuota=25%
+LimitNOFILE=256
