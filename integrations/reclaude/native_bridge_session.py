@@ -127,7 +127,7 @@ def configuration(body):
     """The validated subset's effective native configuration, not JSON spelling."""
     return {
         "model": body.get("model"),
-        "system": "\n".join(b["text"] for b in text_blocks(body.get("system", ""))),
+        "system": caller_system(body.get("system", "")),
         "tools": tool_schema(body.get("tools", [])),
         "max_tokens": body.get("max_tokens"),
         "output_config": {"effort": body.get("output_config", {}).get("effort", "medium")},
@@ -283,8 +283,20 @@ def history_shape(messages):
     return [message_shape(message) for message in messages]
 
 
+def caller_system(content):
+    """The native CLI must generate its own runtime header, not inherit a caller's."""
+    blocks = text_blocks(content)
+    if any(block['type'] != 'text' for block in blocks):
+        raise ContractError('unsupported_system_content')
+    text = '\n'.join(block['text'] for block in blocks)
+    first, separator, rest = text.partition('\n')
+    if re.fullmatch(r'x-anthropic-billing-header: cc_version=[^;\r\n]+;[^\r\n]*', first):
+        return rest if separator else ''
+    return text
+
+
 def initial_system(body):
-    systems = text_blocks(body.get("system", ""))
+    systems = [{'type': 'text', 'text': caller_system(body.get('system', ''))}]
     for message in body["messages"]:
         if message.get("role") == "system":
             systems.extend(text_blocks(message.get("content")))

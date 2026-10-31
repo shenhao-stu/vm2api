@@ -58,6 +58,14 @@ controls are never dropped merely to make a configuration comparison pass.
 Equivalent defaults, system text representations and cache annotations reuse
 the resident process. Structured `output_config.format` remains unsupported.
 
+When the caller is itself Claude Code, its leading
+`x-anthropic-billing-header: cc_version=...` system line is runtime metadata,
+not a server instruction. The adapter removes only that recognized prefix;
+following instructions remain intact. The unmodified native CLI generates its
+own runtime header. Configuration comparisons use the same normalization, so
+a caller runtime-header change does not replace its conversation or discard
+other system changes.
+
 Tools execute on the caller. The backend exports only the requested tool schemas
 through MCP and has no server Read/Bash tool enabled. A tool result must match
 the exact pending tool-call set. The tool wait is bounded; an abandoned request
@@ -142,7 +150,10 @@ to repeat.
 
 If a grant was consumed before an HTTP response could start, an incomplete turn
 returns `400 native_request_consumed_no_replay`, retaining its original cause in
-the audit. Other inadmissible session continuations also return 400. Returning a
+the audit. If native health confirms authorization was revoked, the response is
+instead `400 device_revoked`, with the original error and `no_replay` recorded
+and the authentication latch set. A consumed turn remains non-replayable in
+either case. Other inadmissible session continuations also return 400. Returning a
 5xx would allow an upstream account pool to send the same paid turn elsewhere;
 409 is also retried by some SDKs and remapped by some gateways. A missing final
 usage record stays unknown and must be reconciled, never guessed or replayed.

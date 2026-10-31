@@ -31,9 +31,41 @@ Sub2API shared account (configured concurrency)
   → ReClaude service
 ```
 
-## Verified release scope
+## Latest acceptance: 2026-11-01
 
-Shared-pool admission remains suspended. The recovery on 2026-10-30 reproduced
+A real, unmodified Claude Code client completed six streamed calls through
+GeToken, Sub2API, the dedicated vm2api gateway and the native ReClaude backend.
+Two caller-side calculator operations produced 714. After the client exited,
+resuming the same conversation retrieved that total and calculated 1428.
+An independent client profile used a different native conversation and private
+directory. Each stream had one terminal event, one upstream dispatch and matching
+input, output and cache usage in the gateway, billing and provider records.
+
+The first attempt in this investigation encountered an actual device revocation.
+Inspection found that the adapter copied the caller CLI's runtime billing header
+into the native CLI's system instructions. The boundary now excludes that one
+recognized metadata prefix while preserving user instructions and allowing the
+unmodified native CLI to generate its own header. Consumed failures now expose
+confirmed `device_revoked` instead of masking it as a generic no-replay error.
+The authentication latch and dispatch guard remain enforced.
+
+After those changes and one explicit official recovery, the six full-chain calls
+and native telemetry delivery succeeded. The scoped shared account was restored
+with concurrency ten. The eleven existing Pro slots, their fixed egress,
+concurrency one and Fable exclusions were unchanged. Local and Linux regression
+suites each passed 145 tests; network-disabled real-CLI fixtures also covered
+runtime metadata, structured tools, history recovery and separate sessions.
+
+This is bounded functional acceptance, not proof that revocation has been
+permanently resolved. The binding and adapter boundary changed together, so the
+provider's precise revocation trigger remains unconfirmed. One separate direct
+test received a genuine upstream refusal with terminal usage; its consumed state
+was retained and not replayed. Do not clear refusal or authorization protections
+to turn an unsuccessful test into a passing result.
+
+## Earlier release investigation: 2026-10-30
+
+Shared-pool admission was suspended at this point. The recovery on 2026-10-30 reproduced
 revocation on native ReClaude v1.7.1 after ten successful upstream requests.
 The next Fable attempt was rejected locally with zero upstream attempts and no
 usage; it cannot explain a revocation already recorded before that attempt.

@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import uuid
 
 from adapter import Limits
@@ -431,6 +432,30 @@ class NativeHTTPTests(unittest.TestCase):
         self.assertEqual(self.request()[0], 429)
         rows = self.audit(2)
         self.assertEqual([row["attempts"] for row in rows], [1, 0])
+
+    def test_revocation_after_dispatch_keeps_the_cause_and_no_replay(self):
+        self.fail_before_event = True
+        original = FixtureSession.request
+
+        def revoked(session, body):
+            try:
+                yield from original(session, body)
+            except ContractError:
+                self.health.revoked = True
+                raise
+
+        with patch.object(FixtureSession, 'request', revoked):
+            status, data = self.request()
+        self.assertEqual(status, 400)
+        self.assertIn(b'device_revoked', data)
+        row = self.audit()[0]
+        self.assertEqual(row['attempts'], 1)
+        self.assertEqual(row['native_error'], 'native_stream_incomplete')
+        self.assertTrue(row['no_replay'])
+        self.assertTrue(self.server.latched)
+        self.health.revoked = False
+        self.assertEqual(self.request()[0], 503)
+        self.assertEqual(len(self.created), 1)
 
     def test_revocation_persists_and_does_not_auto_recover(self):
         self.health.revoked = True

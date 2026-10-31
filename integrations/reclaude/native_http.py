@@ -372,6 +372,10 @@ class NativeHandler(RelayHandler):
                 # An inadmissible turn must not be retried by a pool or SDK.
                 record["native_error"] = code
                 status, code = 400, "native_request_consumed_no_replay"
+                record['no_replay'] = True
+                if self.server.relay.authorization_revoked():
+                    self.server.latch()
+                    code = 'device_revoked'
             record.update({"error": code, "status": 499 if disconnected else status})
             if not committed:
                 try:

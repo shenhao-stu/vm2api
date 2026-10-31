@@ -80,6 +80,12 @@ try:
  z=start('imported-pending',pending);wire=run(z,pending)
  checks['pending_import_only_dispatches_new_result']=len(calls)==6 and 'HISTORICAL_RESULT' not in json.dumps(wire['messages']) and 'RESULT_MARKER' in json.dumps(wire['messages'])
  time.sleep(.3);checks['exactly_six_new_requests']=len(calls)==6
+ # A downstream CLI's billing/runtime header must never become the server CLI's identity.
+ runtime_body={**base,'system':[{'type':'text','text':'x-anthropic-billing-header: cc_version=2.1.111.caller; cc_entrypoint=cli;'}, {'type':'text','text':'CALLER_INSTRUCTIONS_PRESERVED'}]}
+ runtime_session=start('runtime-header',runtime_body);wire=run(runtime_session,runtime_body)
+ systems=[block['text'] for block in wire['system'] if block['type']=='text']
+ checks['native_generates_own_runtime_header']=len([s for s in systems if s.startswith('x-anthropic-billing-header:')])==1 and '2.1.111.caller' not in '\n'.join(systems)
+ checks['runtime_boundary_keeps_caller_instructions']=any(s=='CALLER_INSTRUCTIONS_PRESERVED' for s in systems)
  receipt={'checks':checks,'fixture_calls':len(calls),'real_provider_calls':0,'ok':all(checks.values())}
  (root/'calls.synthetic.json').write_text(json.dumps(calls,indent=2));(root/'receipt.safe.json').write_text(json.dumps(receipt,indent=2));print(json.dumps(receipt));assert receipt['ok']
 finally:
