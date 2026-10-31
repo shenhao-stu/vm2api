@@ -150,6 +150,44 @@ runtime and tools before raising it. An isolated ten-CLI fixture measured about
 1.12 GiB and 154 processes; that is not a live-workload memory guarantee. Use
 container memory/PID/CPU limits and retain host headroom for other accounts.
 
+### Bounded residency
+
+For longer reuse on an always-on host, configure the existing session pool:
+
+```sh
+--concurrency 10 --idle-seconds 7200 --prepared-idle-seconds 1800 \
+  --memory-high-bytes 3221225472
+```
+
+These settings retain a used conversation for two idle hours and an unused
+prepared CLI for 30 minutes. Both count against the same ten-process limit.
+They do not launch ten speculative sessions or send model requests to keep
+processes alive. Keep the host awake and connected; sleeping or restarting it
+discards the warm processes.
+
+On Linux, the memory guard reads cgroup v2 `memory.current` and discounts valid
+`inactive_file` cache, matching vm2api's node working-set measurement. Its default
+path is `/sys/fs/cgroup/memory.current`; `--memory-current-file` may point at the
+actual containing cgroup. The default threshold is zero (disabled). An enabled
+guard refuses admission if the measurement is unavailable. This soft threshold
+is separate from the container's required hard limit: deploy the above profile
+with a 4 GiB memory limit and no additional swap allowance. On macOS, run this
+backend in the existing bounded Linux VM/container; it is not a macOS RSS limit.
+Verify actual `memory.max` and `memory.swap.max` as well as Docker configuration:
+an observed runtime retained `memory.swap.max=max` until its existing Docker
+limits were reapplied with `docker update`, without restarting the container.
+
+Before admission and during the existing 30-second maintenance pass, pressure
+reclaims the oldest idle CLI until usage falls below the threshold. Capacity
+pressure uses the same policy. Active requests and conversations waiting for
+caller tool results are protected. If no eligible process can be reclaimed,
+new work receives `429 native_memory_pressure`; unavailable measurements return
+`503 native_memory_not_ready` before any model grant. A running inference may
+still grow after admission, so the hard cap and host headroom remain necessary.
+Reclaimed conversations retain native history for verified resume; a worker
+is never reassigned to another conversation. `/healthz` exposes aggregate pool
+limits and occupancy, without session identities or context.
+
 For a finite canary, additionally use `--max-requests`,
 `--session-budget-usd` and `--proof-file`. The optional proof is a fresh operator
 observation with `observed_at_ms`, successful official `quota`/`devices` responses,
@@ -207,9 +245,10 @@ their verified history. No prepared process is reassigned to a different
 conversation, and no native authorization or telemetry is synthesized.
 
 Preparation uses the same concurrency gate and bounded session pool as inference.
-An unused prepared CLI expires after 120 seconds (or the shorter normal idle
-limit), checked by the existing 30-second reaper. Actual conversations retain the
-configured normal idle limit. Closing CLIs remain counted until exit, while
+An unused prepared CLI expires after `--prepared-idle-seconds` (default 120,
+bounded by the normal idle limit), checked by the existing 30-second reaper.
+Both idle limits must be positive and at most 24 hours. Actual conversations
+retain the configured normal idle limit. Closing CLIs remain counted until exit, while
 unrelated sessions can continue without waiting under the pool lock. Only a
 checkpoint explicitly recorded as never dispatched may restart empty after
 expiration; consumed, failed or uncertain turns retain no-replay protections.

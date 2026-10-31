@@ -200,6 +200,57 @@ class NativeHTTPTests(unittest.TestCase):
         self.assertTrue(self.server.latched)
         self.assertFalse(self.created)
 
+    def test_memory_pressure_and_missing_reading_never_dispatch(self):
+        self.server.pool.under_pressure = lambda: True
+        self.assertEqual(self.request()[0], 429)
+        def unavailable():
+            raise ContractError("native_memory_not_ready")
+        self.server.pool.under_pressure = unavailable
+        self.assertEqual(self.request()[0], 503)
+        self.assertFalse(self.created)
+        self.assertEqual(self.server.accepted, 0)
+        self.assertTrue(all(r['attempts'] == 0 for r in self.audit(2)))
+
+    def test_reaper_reports_memory_read_failure_and_can_recover(self):
+        def unavailable():
+            raise ContractError("native_memory_not_ready")
+        self.server.pool.under_pressure = unavailable
+        self.server.maintain_pool()
+        self.server.maintain_pool()
+        self.assertEqual(self.server.maintenance_error, "native_memory_not_ready")
+        self.assertEqual(len(self.audit()), 1)
+        self.server.pool.under_pressure = lambda: False
+        self.server.maintain_pool()
+        self.assertIsNone(self.server.maintenance_error)
+        self.assertEqual(len(self.audit(2)), 2)
+        self.assertFalse(self.created)
+
+    def test_json_completion_waits_for_usage_audit_and_lease_release(self):
+        entered, release, completed = (threading.Event() for _ in range(3))
+        original = self.server.audit
+        def slow_audit(record):
+            entered.set()
+            release.wait(2)
+            original(record)
+        self.server.audit = slow_audit
+        result = []
+        def request():
+            result.append(self.request())
+            completed.set()
+        worker = threading.Thread(target=request)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            self.assertFalse(completed.wait(.1), "JSON completed before accounting and lease release")
+        finally:
+            release.set()
+            worker.join(3)
+            self.server.audit = original
+        self.assertEqual(result[0][0], 200)
+        self.assertEqual(self.server.active_requests, 0)
+        self.created[0].reject = True
+        self.assertEqual(self.request()[0], 400)
+
     def audit(self, expected=1):
         deadline = time.monotonic() + 1
         while True:

@@ -17,7 +17,7 @@ from urllib.parse import urlsplit
 
 from adapter import Limits, Rejection, RelayHandler, RelayServer, load_relay_key
 from native_bridge_session import ContractError, RequestRejected, Session, Turn
-from native_session_pool import SessionPool
+from native_session_pool import SessionPool, memory_pressure
 from native_health import NativeHealth, validate_official
 
 
@@ -39,7 +39,12 @@ class NativeServer(RelayServer):
         max_requests=None,
         recover=None,
         allow_prewarm=False,
+        prepared_idle_seconds=120,
+        memory_high_bytes=0,
+        memory_current_file=Path("/sys/fs/cgroup/memory.current"),
     ):
+        if type(memory_high_bytes) is not int or memory_high_bytes < 0:
+            raise ValueError("invalid_memory_high_bytes")
         root = Path(root)
         root.mkdir(mode=0o700, exist_ok=True)
         if private_host:
@@ -62,7 +67,11 @@ class NativeServer(RelayServer):
             limits.concurrency,
             idle_seconds,
             recover=recover,
+            prepared_idle_seconds=prepared_idle_seconds,
+            under_pressure=lambda: memory_pressure(memory_current_file, memory_high_bytes),
         )
+        self.memory_high_bytes = memory_high_bytes
+        self.maintenance_error = None
         self.tenant = hashlib.sha256(key.encode()).hexdigest()
         self.proof = proof
         self.allow_prewarm = allow_prewarm
@@ -77,7 +86,19 @@ class NativeServer(RelayServer):
 
     def reap(self):
         while not self.stop_reaper.wait(30):
-            self.pool.expire()
+            self.maintain_pool()
+
+    def maintain_pool(self):
+        reclaimed, error = 0, None
+        try:
+            reclaimed = self.pool.expire()
+        except ContractError as exc:
+            error = str(exc)
+        if reclaimed or error != self.maintenance_error:
+            self.audit({"at": time.time(), "operation": "pool_maintenance",
+                        "attempts": 0, "retired": reclaimed, "error": error,
+                        "status": 503 if error else 200})
+        self.maintenance_error = error
 
     def server_close(self):
         self.stop_reaper.set()
@@ -99,6 +120,18 @@ def collect(observation, event):
 
 
 class NativeHandler(RelayHandler):
+    def send_json(self, status, body):
+        if not getattr(self, "request_body_read", False):
+            return super().send_json(status, body)
+        # Close-delimited JSON makes EOF follow accounting and lease release.
+        self.close_connection = True
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+        self.wfile.flush()
+
     def do_GET(self):
         if self.path != "/healthz":
             return self.send_error_json(404, "not_found")
@@ -107,15 +140,20 @@ class NativeHandler(RelayHandler):
             self.server.latch()
         if self.server.latched:
             failed.append("authentication_latched")
+        if self.server.maintenance_error:
+            failed.append(self.server.maintenance_error)
         with self.server.counter_lock:
             paused = self.server.management_pause.exists()
             active = self.server.active_requests
         self.send_json(503 if failed or paused else 200, {
             "ok": not failed and not paused, "failed": failed,
             "management_paused": paused, "active_requests": active,
+            "pool": self.server.pool.snapshot(),
+            "memory_high_bytes": self.server.memory_high_bytes,
         })
 
     def do_POST(self):
+        self.request_body_read = False
         parsed = urlsplit(self.path)
         prewarm = parsed.path == "/v1/messages/prepare" and self.server.allow_prewarm
         if parsed.path != "/v1/messages" and not prewarm:
@@ -171,6 +209,7 @@ class NativeHandler(RelayHandler):
         timer.start()
         try:
             raw, body = self.read_message()
+            self.request_body_read = True
             record.update(
                 {
                     "model": body["model"],
@@ -263,7 +302,6 @@ class NativeHandler(RelayHandler):
                     encoded = json.dumps(observation.message).encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(encoded)))
                     self.send_header("Connection", "close")
                     committed = True
                     self.end_headers()
@@ -295,7 +333,7 @@ class NativeHandler(RelayHandler):
                 if isinstance(exc, Rejection)
                 else (
                     429
-                    if code in {"session_busy", "native_session_capacity"}
+                    if code in {"session_busy", "native_session_capacity", "native_memory_pressure"}
                     else (
                         400
                         if code
@@ -397,6 +435,9 @@ def main():
     p.add_argument("--session-budget-usd", type=float)
     p.add_argument("--idle-seconds", type=float, default=1800)
     p.add_argument("--allow-prewarm", action="store_true")
+    p.add_argument("--prepared-idle-seconds", type=float, default=120)
+    p.add_argument("--memory-high-bytes", type=int, default=0)
+    p.add_argument("--memory-current-file", type=Path, default=Path("/sys/fs/cgroup/memory.current"))
     args = p.parse_args()
     limits = Limits(models=tuple(args.model), concurrency=args.concurrency)
     health = NativeHealth(args.home, args.binding)
@@ -451,6 +492,9 @@ def main():
         idle_seconds=args.idle_seconds,
         recover=factory,
         allow_prewarm=args.allow_prewarm,
+        prepared_idle_seconds=args.prepared_idle_seconds,
+        memory_high_bytes=args.memory_high_bytes,
+        memory_current_file=args.memory_current_file,
     )
 
     def stop(*_):
@@ -465,6 +509,9 @@ def main():
                 "listen": server.server_address,
                 "concurrency": args.concurrency,
                 "models": args.model,
+                "idle_seconds": args.idle_seconds,
+                "prepared_idle_seconds": server.pool.prepared_idle_seconds,
+                "memory_high_bytes": args.memory_high_bytes,
             }
         )
     )
