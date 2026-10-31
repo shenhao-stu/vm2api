@@ -64,10 +64,17 @@ def execute(config, action):
     before = status(config)
     pause = Path(config["state_dir"]) / "management-paused"
     if action == "stop":
+        was_paused = pause.exists()
         pause.touch(mode=0o600)
         until = time.monotonic() + 55
         while before["http_active"]:
             h = health(config)
+            pending = h.get("pool", {}).get("pending_tools_sessions")
+            if type(pending) is not int or pending != 0:
+                if not was_paused:
+                    pause.unlink(missing_ok=True)
+                raise ValueError("pending_tool_sessions_unknown" if type(pending) is not int
+                                 else "pending_tool_sessions")
             if h.get("active_requests") == 0:
                 break
             if time.monotonic() > until:

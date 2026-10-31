@@ -51,18 +51,46 @@ format. A new session starts with user text. Subsequent requests must contain th
 exact prior history and unchanged model/system/tool configuration. Cache-control
 annotations and the equivalent text-block representation are normalized for
 comparison. Arbitrary imported conversations, compaction, media inputs and
-changing a session's model or configuration are currently unsupported.
+changing a session's model, system or tools are currently unsupported. An
+explicit `max_tokens` or output `effort` change is applied by resuming the
+original native conversation at its latest verified assistant checkpoint. These
+controls are never dropped merely to make a configuration comparison pass.
+Equivalent defaults, system text representations and cache annotations reuse
+the resident process. Structured `output_config.format` remains unsupported.
 
 Tools execute on the caller. The backend exports only the requested tool schemas
 through MCP and has no server Read/Bash tool enabled. A tool result must match
 the exact pending tool-call set. The tool wait is bounded; an abandoned request
 does not authorize another model call.
 
+A user message may contain the complete pending text tool-result set together
+with ordinary text. The backend stops the waiting native process and resumes at
+that tool-use assistant's genuine UUID, then submits the complete user message.
+The text stays in the user role; it is not moved to a system-context hook. This
+also permits output-limit or effort changes on a tool continuation. Pure tool
+results with unchanged controls keep the resident MCP path. Wrong, missing or
+duplicate tool IDs are rejected before changing the live conversation.
+
 Idle CLI processes can be reclaimed and restored through native `--resume` and
 `--resume-session-at`, using the original native conversation and a verified
 history hash. Failed or unfinished turns are never replayed. Invalid new input
 does not destroy an otherwise healthy conversation. Configuration and histories
 are not interchangeable across sessions.
+
+Version-two continuation checkpoints distinguish idle, prepared and
+awaiting-tools states. Restart recovery accepts only idle or unconsumed prepared
+checkpoints. Resuming a pending tool turn requires the current process owner's
+verified history and exact result set; process loss does not silently convert an
+unfinished paid turn into an empty session. Version-one checkpoints migrate only
+when their original configuration hash matches exactly. Version-two hashes
+separate immutable configuration from the two supported per-turn controls.
+An older adapter cannot restore these new hashes: rolling code back preserves
+the no-replay refusal, but does not promise continuation of version-two sessions.
+
+Pool health reports `pending_tools_sessions` separately from active HTTP leases.
+A completed tool-use response can leave no active HTTP request while its native
+conversation still awaits tool results. Deployment must drain both counts before
+stopping the adapter; a zero HTTP count alone is insufficient.
 
 The key scopes a caller session namespace; a shared key is not a downstream user
 identity. Trusted ingress must authenticate people and keep their session IDs

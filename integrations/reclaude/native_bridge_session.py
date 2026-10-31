@@ -103,7 +103,8 @@ def native_options(body):
     ]
 
 
-def configuration(body):
+def legacy_configuration(body):
+    """Version-one checkpoints can migrate only after their exact hash matches."""
     result = copy.deepcopy(
         {k: v for k, v in body.items()
          if k not in {"messages", "metadata", "stream", "temperature"}}
@@ -114,6 +115,22 @@ def configuration(body):
         for block in result["system"]:
             block.pop("cache_control", None)
     return result
+
+
+def configuration(body):
+    """The validated subset's effective native configuration, not JSON spelling."""
+    return {
+        "model": body.get("model"),
+        "system": "\n".join(b["text"] for b in text_blocks(body.get("system", ""))),
+        "tools": tool_schema(body.get("tools", [])),
+        "max_tokens": body.get("max_tokens"),
+        "output_config": {"effort": body.get("output_config", {}).get("effort", "medium")},
+    }
+
+
+def fixed_configuration(body):
+    return {k: v for k, v in configuration(body).items()
+            if k not in {"max_tokens", "output_config"}}
 
 
 def canonical(value):
@@ -319,6 +336,7 @@ class Session:
         restore=False,
     ):
         native_env, self.options = native_options(body)
+        self.budget_options = []
         self.directory = Path(directory)
         existed = self.directory.exists()
         self.directory.mkdir(mode=0o700, exist_ok=restore)
@@ -328,7 +346,8 @@ class Session:
                 or session_budget_usd <= 0
             ):
                 raise ContractError("invalid_session_budget")
-            self.options += ["--max-budget-usd", str(session_budget_usd)]
+            self.budget_options = ["--max-budget-usd", str(session_budget_usd)]
+            self.options += self.budget_options
         self.command, self.environment = list(command), dict(environment)
         self.environment.pop("CLAUDE_CODE_RETRY_WATCHDOG", None)
         self.environment.update(native_env)
@@ -357,18 +376,24 @@ class Session:
         self.tools = tool_schema(body.get("tools", []))
         self.history = []
         self.body_signature = signature(configuration(body))
+        self.fixed_signature = signature(fixed_configuration(body))
+        self.checkpoint_configuration = None
         self.seen = set()
         self.pending_ids = set()
         self.events = queue.Queue()
         self.lock = threading.Lock()
         self.close_lock = threading.RLock()
         self.process = None
+        self.process_has_turn = False
         self.reader = None
         self.native_id = str(uuid.uuid4())
         self.failed = False
         self.result = None
+        self.result_message_id = None
+        self.last_native_message_id = None
         self.native_cli_argv = None
         self.resume_uuid = None
+        self.resume_message_id = None
         self.suspended = False
         self.assistants = {}
         self.assistant_ready = threading.Condition()
@@ -387,9 +412,15 @@ class Session:
             state = json.loads((self.directory / "continuation.json").read_text())
         except (OSError, ValueError):
             raise ContractError("native_session_recovery_unavailable") from None
+        version = state.get("version")
+        matching = (
+            state.get("configuration") == signature(legacy_configuration(body))
+            if version == 1 else version == 2
+            and state.get("fixed_configuration") == self.fixed_signature
+        )
         if state["status"] == "prepared":
             if (
-                state.get("configuration") != self.body_signature
+                not matching
                 or state.get("system_sha256") != signature(initial_system(body))
                 or list((self.directory / "dispatch").glob("*.consumed.json"))
             ):
@@ -402,24 +433,27 @@ class Session:
             raise ContractError("native_session_incomplete_no_replay")
         history = body["messages"][: state["history_length"]]
         if (
-            state["configuration"] != self.body_signature
+            not matching
             or signature(history_shape(history)) != state["history_sha256"]
         ):
             raise ContractError("history_prefix_mismatch")
         self.native_id = str(uuid.UUID(state["native_id"]))
         self.resume_uuid = str(uuid.UUID(state["assistant_uuid"]))
+        self.resume_message_id = state.get("message_id")
+        self.checkpoint_configuration = state["configuration"]
         self.history = copy.deepcopy(history)
         self.seen = {state["request_sha256"]}
 
     def checkpoint(self, status, request_sha256=None, message_id=None):
         path = self.directory / "continuation.json"
-        state = {"version": 1, "status": status, "native_id": self.native_id}
+        state = {"version": 2, "status": status, "native_id": self.native_id}
         if status == "prepared":
             state.update({
                 "configuration": self.body_signature,
+                "fixed_configuration": self.fixed_signature,
                 "system_sha256": signature((self.directory / "system.txt").read_text()),
             })
-        elif status == "idle":
+        elif status in {"idle", "awaiting_tools"}:
             with self.assistant_ready:
                 self.assistant_ready.wait_for(
                     lambda: message_id in self.assistants, timeout=5
@@ -428,10 +462,14 @@ class Session:
             if not assistant_uuid:
                 status = state["status"] = "native_resume_point_missing"
             else:
+                self.resume_uuid = str(uuid.UUID(assistant_uuid))
+                self.resume_message_id = message_id
                 state.update(
                     {
                         "assistant_uuid": assistant_uuid,
+                        "message_id": message_id,
                         "configuration": self.body_signature,
+                        "fixed_configuration": self.fixed_signature,
                         "history_length": len(self.history),
                         "history_sha256": signature(history_shape(self.history)),
                         "request_sha256": request_sha256,
@@ -445,6 +483,7 @@ class Session:
             out.flush()
             os.fsync(out.fileno())
         os.replace(temp, path)
+        self.checkpoint_configuration = state.get("configuration")
         descriptor = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(descriptor)
@@ -458,18 +497,59 @@ class Session:
 
     def validate_configuration(self, body):
         native_options(body)
-        if signature(configuration(body)) != self.body_signature or (
+        if signature(fixed_configuration(body)) != self.fixed_signature or (
             not self.history
             and initial_system(body) != (self.directory / "system.txt").read_text()
         ):
             raise RequestRejected("session_configuration_changed")
+        return signature(configuration(body)) != self.body_signature
+
+    def restart_for_request(self, body):
+        """Resume at a verified assistant boundary; never replay a model turn."""
+        if self.history:
+            try:
+                state = json.loads((self.directory / "continuation.json").read_text())
+            except (OSError, ValueError):
+                raise ContractError("native_resume_point_missing") from None
+            if (
+                state.get("status") != ("awaiting_tools" if self.pending_ids else "idle")
+                or state.get("native_id") != self.native_id
+                or state.get("assistant_uuid") != self.resume_uuid
+                or state.get("history_sha256") != signature(history_shape(self.history))
+                or state.get("configuration") != self.checkpoint_configuration
+            ):
+                raise ContractError("native_resume_point_missing")
+            if (not self.pending_ids and self.process_has_turn
+                    and self.process and self.process.poll() is None):
+                with self.control_ready:
+                    ready = self.control_ready.wait_for(
+                        lambda: self.result_message_id == self.resume_message_id,
+                        timeout=min(self.timeout, 5),
+                    )
+                if not ready or not self.result or self.result.get("is_error"):
+                    raise ContractError("native_turn_not_idle")
+        self.close()
+        if self.reader and self.reader.is_alive():
+            raise ContractError("native_reader_not_stopped")
+        # No old reader may write an EOF or terminal event into the next turn.
+        self.process = self.reader = self.dispatch_process = None
+        self.process_has_turn = False
+        self.dispatch_address = None
+        self.events = queue.Queue()
+        self.initialize_id = self.initialize_response = None
+        self.result = self.result_message_id = self.last_native_message_id = None
+        self.suspended = False
+        native_env, options = native_options(body)
+        self.environment.update(native_env)
+        self.options = options + self.budget_options
+        self.body_signature = signature(configuration(body))
 
     def prepare_request(self, body):
         """Prepare one caller's CLI without a prompt or model dispatch grant."""
         if not self.lock.acquire(blocking=False):
             raise RequestRejected("session_busy")
         try:
-            self.validate_configuration(body)
+            changed = self.validate_configuration(body)
             if not self.history:
                 try:
                     fresh_prompt(body["messages"])
@@ -477,6 +557,10 @@ class Session:
                     raise RequestRejected(str(exc)) from None
             if self.failed:
                 raise ContractError("session_failed_no_replay")
+            if changed:
+                if self.history:
+                    raise RequestRejected("prepare_configuration_change_requires_turn")
+                self.restart_for_request(body)
             if not self.history:
                 self.prepared = True
                 self.checkpoint("prepared")
@@ -604,6 +688,7 @@ class Session:
 
     def start(self, blocks):
         self.prepare()
+        self.process_has_turn = True
         self.authorize_dispatch()
         self.process.stdin.write(
             json.dumps({"type": "user", "message": {"role": "user", "content": blocks}})
@@ -719,12 +804,16 @@ class Session:
                         self.events.put(ContractError("native_api_error"))
                     elif event.get("type") == "assistant" and event.get("uuid"):
                         with self.assistant_ready:
+                            self.last_native_message_id = event["message"]["id"]
                             self.assistants[event["message"]["id"]] = event["uuid"]
                             if len(self.assistants) > 16:
                                 self.assistants.pop(next(iter(self.assistants)))
                             self.assistant_ready.notify_all()
                     elif event.get("type") == "result":
-                        self.result = event
+                        with self.control_ready:
+                            self.result = event
+                            self.result_message_id = self.last_native_message_id
+                            self.control_ready.notify_all()
                         if event.get("is_error"):
                             self.events.put(ContractError("native_cli_error"))
                         # Keep native stream input open for the next genuine user turn.
@@ -742,13 +831,15 @@ class Session:
         try:
             if self.failed:
                 raise ContractError("session_failed_no_replay")
-            self.validate_configuration(body)
+            changed = self.validate_configuration(body)
             request_signature = signature(history_shape(body["messages"]))
             if request_signature in self.seen:
                 raise ContractError("request_already_consumed")
             if not self.history:
                 blocks = fresh_prompt(body["messages"])
                 mutation_started = True
+                if changed:
+                    self.restart_for_request(body)
                 self.prepared = False
                 self.seen.add(request_signature)
                 self.history = copy.deepcopy(body["messages"])
@@ -783,12 +874,14 @@ class Session:
                 results = {}
                 if self.pending_ids:
                     if (
-                        len(ids) != len(blocks)
+                        any(b.get("type") not in {"text", "tool_result"} for b in blocks)
                         or len(set(ids)) != len(ids)
                         or set(ids) != self.pending_ids
                     ):
                         raise ContractError("tool_result_set_mismatch")
                     for block in blocks:
+                        if block.get("type") == "text":
+                            continue
                         content = text_blocks(block.get("content", ""))
                         if any(x.get("type") != "text" for x in content):
                             raise ContractError(
@@ -810,6 +903,14 @@ class Session:
                     raise ContractError("prototype_only_accepts_text_system")
                 contexts = [b["text"] for b in context_blocks]
                 mutation_started = True
+                # Native stdin treats text arriving during an MCP call as a
+                # mid-turn system attachment. Resume at the actual tool-use
+                # assistant instead, preserving the caller's whole user message.
+                resume_tools = bool(results) and (
+                    changed or any(b.get("type") == "text" for b in blocks)
+                )
+                if changed or resume_tools or self.suspended:
+                    self.restart_for_request(body)
                 self.seen.add(request_signature)
                 self.history = copy.deepcopy(messages)
                 self.checkpoint("in_flight")
@@ -821,7 +922,8 @@ class Session:
                     json.dumps(contexts)
                 )
                 self.authorize_dispatch()
-                if results:
+                self.process_has_turn = True
+                if results and not resume_tools:
                     for tool_id, result in results.items():
                         pending = self.directory / (tool_id + ".result.tmp")
                         pending.write_text(json.dumps(result))
@@ -874,8 +976,10 @@ class Session:
                         # consumed network grant blocks it; do not reuse this turn.
                         self.suspended = True
                         self.close(graceful=True)
-                    if not self.pending_ids:
-                        self.checkpoint("idle", request_signature, turn.message["id"])
+                    self.checkpoint(
+                        "awaiting_tools" if self.pending_ids else "idle",
+                        request_signature, turn.message["id"],
+                    )
                 yield converted
                 if event.get("type") == "message_stop":
                     return

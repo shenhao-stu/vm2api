@@ -178,6 +178,8 @@ class PoolTests(unittest.TestCase):
     def test_waiting_for_real_caller_tool_result_is_not_idle_expired(self):
         with self.pool.lease("first", self.body) as a:
             a.pending_ids = {"tool_caller"}
+        self.assertEqual(self.pool.snapshot()["busy"], 0)
+        self.assertEqual(self.pool.snapshot()["pending_tools_sessions"], 1)
         self.time = 30
         self.assertEqual(self.pool.expire(), 0)
         self.assertFalse(a.closed)

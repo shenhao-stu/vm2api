@@ -342,6 +342,7 @@ class NativeHandler(RelayHandler):
                             "native_session_failed_no_replay",
                             "native_session_incomplete_no_replay",
                             "native_session_recovery_unavailable",
+                            "native_session_history_not_imported",
                             "history_prefix_mismatch",
                             "session_configuration_changed",
                             "request_already_consumed",

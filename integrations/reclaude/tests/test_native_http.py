@@ -189,6 +189,17 @@ class NativeHTTPTests(unittest.TestCase):
         self.assertEqual(self.created, [first])
         self.assertEqual(self.server.accepted, 1)
 
+    def test_unowned_imported_history_is_client_error_without_dispatch(self):
+        status, raw = self.request(self.body(messages=[
+            {"role": "user", "content": "external request"},
+            {"role": "assistant", "content": "external answer"},
+            {"role": "user", "content": "new turn"},
+        ]))
+        self.assertEqual(status, 400)
+        self.assertIn(b"native_session_history_not_imported", raw)
+        self.assertFalse(self.created)
+        self.assertEqual(self.server.accepted, 0)
+
     def test_unhealthy_or_paused_prewarm_never_starts_a_cli(self):
         self.server.allow_prewarm = True
         path = "/v1/messages/prepare"

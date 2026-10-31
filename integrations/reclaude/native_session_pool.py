@@ -141,6 +141,9 @@ class SessionPool:
         with self.lock:
             return {"capacity": self.capacity, "resident": len(self.entries),
                     "busy": sum(e.busy for e in self.entries.values()),
+                    "pending_tools_sessions": sum(
+                        bool(getattr(e.session, "pending_ids", set()))
+                        and not e.session.failed for e in self.entries.values()),
                     "prepared": sum(bool(getattr(e.session, "prepared", False))
                                     for e in self.entries.values()),
                     "idle_seconds": self.idle_seconds,
