@@ -203,7 +203,11 @@ def text_blocks(content):
                 or not isinstance(inner, (str, list))
             ):
                 raise ContractError("invalid_text_tool_result")
-            for child in text_blocks(inner):
+            children = text_blocks(inner)
+            kinds = {child['type'] for child in children}
+            if 'search_result' in kinds and kinds != {'search_result'}:
+                raise ContractError('search_results_must_not_mix_content_types')
+            for child in children:
                 validate_tool_content(child)
         else:
             non_result_seen = True

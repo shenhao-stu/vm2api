@@ -46,9 +46,9 @@ try:
  inner=[{'type':'text','text':'RESULT_MARKER'},
   {'type':'tool_reference','tool_name':'Read'},
   {'type':'document','source':{'type':'text','media_type':'text/plain','data':'DOCUMENT_MARKER'}},
-  {'type':'search_result','source':'https://example.com/','title':'Synthetic','content':[{'type':'text','text':'SEARCH_MARKER'}]},
   {'type':'image','source':{'type':'base64','media_type':'image/png','data':'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5WQAAAAASUVORK5CYII='}}]
- follow_body=follow(t);follow_body['messages'][-1]['content']=[{'type':'tool_result','tool_use_id':i,'content':inner} for i in sorted(t.pending_ids)]
+ search=[{'type':'search_result','source':'https://example.com/','title':'Synthetic','content':[{'type':'text','text':'SEARCH_MARKER'}]}]
+ follow_body=follow(t);follow_body['messages'][-1]['content']=[{'type':'tool_result','tool_use_id':i,'content':content} for i,content in zip(sorted(t.pending_ids),[inner,search])]
  reply[0]='text';wire=run(t,follow_body)
  actual=[b for m in wire['messages'] if m['role']=='user' for b in (m['content'] if isinstance(m['content'],list) else []) if b['type']=='tool_result']
  checks['structured_results_preserved']=all(any(c['type']==k for b in actual for c in (b['content'] if isinstance(b.get('content'),list) else [])) for k in ['text','image','document','search_result'])

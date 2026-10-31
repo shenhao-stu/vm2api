@@ -78,6 +78,8 @@ Protocol tool names are translated to the registered MCP namespace; tool inputs
 and text are unchanged. The CLI resolves tool references using its own catalogue.
 Invalid results, undeclared references and results after ordinary user text are
 rejected before a model grant. Server-side toolsets remain outside this subset.
+If a tool result contains `search_result`, every block in that result must be a
+`search_result`; mixed blocks are rejected locally, as required by the provider.
 
 ### Optional caller history import
 

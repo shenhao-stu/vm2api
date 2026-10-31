@@ -42,3 +42,15 @@ class ToolContentTests(unittest.TestCase):
         self.assertEqual(mapped[0]["input"], {"tool_name": "Read"})
         self.assertEqual(mapped[1]["content"][0]["text"], "Read")
         self.assertEqual(blocks, before)
+
+    def test_search_results_cannot_share_a_result_with_other_block_types(self):
+        search = {"type": "search_result", "title": "synthetic", "source": "https://example.com/",
+                  "content": [{"type": "text", "text": "search context"}]}
+        bridge.native_options(self.body([search, copy.deepcopy(search)]))
+        for other in [{"type": "text", "text": "ordinary text"},
+                      {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "doc"}},
+                      {"type": "tool_reference", "tool_name": "Read"}]:
+            with self.subTest(kind=other["type"]), self.assertRaisesRegex(
+                bridge.ContractError, "search_results_must_not_mix_content_types"
+            ):
+                bridge.native_options(self.body([search, other]))
