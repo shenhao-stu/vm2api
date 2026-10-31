@@ -19,6 +19,25 @@ export function isTelemetryPath(pathname = '') {
   )
 }
 
+/** A dedicated relay may have no verified telemetry upstream. Default behavior is unchanged. */
+export function telemetryIngressResponse(pathname, policy = 'intercept') {
+  if (policy === 'reject') {
+    return {
+      status: 501,
+      body: {
+        type: 'error',
+        error: {
+          type: 'not_supported_error',
+          code: 'telemetry_passthrough_unsupported',
+          message: 'Real telemetry passthrough is not supported; no telemetry was reported',
+        },
+      },
+    }
+  }
+  if (policy !== 'intercept') throw new Error('Invalid telemetry ingress policy')
+  return { status: 200, body: telemetryInterceptResponse(pathname) }
+}
+
 export function fakeMetricsEnabledResponse() {
   return { metrics_logging_enabled: true }
 }

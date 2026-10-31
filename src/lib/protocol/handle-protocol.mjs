@@ -243,7 +243,7 @@ export function createHandleProtocol(deps) {
     // final_state for audit, but leave error fields empty so the cancelled turn
     // can continue on the same sticky session with an edited request.
     logBag.error_code = null
-    logBag.final_state = 'cancelled'
+    logBag.final_state = result?.usageComplete === false ? 'cancelled_incomplete' : 'cancelled'
     logBag.error_message = null
     if (responseClosed(res)) return
     if (res.headersSent) res.end()
@@ -258,6 +258,7 @@ export function createHandleProtocol(deps) {
     }
     req.once('aborted', onGone)
     res.once('close', onGone)
+    if (req.aborted || responseClosed(res)) onGone()
     return {
       signal: abortController.signal,
       settle() {
@@ -679,10 +680,18 @@ export function createHandleProtocol(deps) {
     }
 
     const autoCompactWindow = callerAutoCompactWindow(inbound)
+    const inferenceBackend = resolveInferenceBackend(req)
+    const apiPassthrough = inferenceBackend === 'api' && cfg.api_passthrough === true
+    if (apiPassthrough && protocol !== 'anthropic.messages') {
+      return json(res, 400, {
+        type: 'error',
+        error: { type: 'invalid_request_error', code: 'messages_required', message: 'Use the Anthropic Messages API.' },
+      })
+    }
     let ctx = {
       path: pathName,
       protocol,
-      body: sanitizeInboundBody(inbound, defaultSeedPolicy()),
+      body: sanitizeInboundBody(inbound, defaultSeedPolicy({ reject_client_metadata_identity: !apiPassthrough })),
       headers: { ...req.headers },
       autoCompactWindow,
     }
@@ -697,7 +706,6 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, errorResult.status, errorResult.body)
     }
-    const inferenceBackend = resolveInferenceBackend(req)
     let want1m = hasClaudeCode1mSuffix(inbound?.model) || hasClaudeCode1mSuffix(ctx.body?.model)
     const modelRewrite = applyCodexInboundModelRewrite(ctx.body, getRouting() || {})
     if (!modelRewrite.ok) {
@@ -903,7 +911,7 @@ export function createHandleProtocol(deps) {
     const officialTraffic =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound, req.headers))
-    const requestContext = classifyClaudeRequestPurpose(inbound, { officialTraffic })
+    const requestContext = apiPassthrough ? null : classifyClaudeRequestPurpose(inbound, { officialTraffic })
     if (requestContext) {
       logBag.classifier = classifierRequestSummary(inbound, ctx.body, requestContext)
       try {
@@ -916,7 +924,7 @@ export function createHandleProtocol(deps) {
         logBag.error_message = error.body.error.message
         return json(res, error.status, error.body)
       }
-    } else ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+    } else if (!apiPassthrough) ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
     if (!requestContext && officialTraffic && officialCcPassthroughFromRouting(getRouting())) {
       try {
         validateCacheBreakpoints(ctx.body)
@@ -929,7 +937,10 @@ export function createHandleProtocol(deps) {
       }
     }
 
-    if (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res })) {
+    if (
+      !apiPassthrough &&
+      (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res }))
+    ) {
       return
     }
     const officialClient = isOfficialClaudeClient(fp.client_class)
@@ -1022,7 +1033,7 @@ export function createHandleProtocol(deps) {
     const openaiCompat = String(protocol || '').startsWith('openai.')
     syncClaudeKernelConfigsFromFile(cfg.paths?.project, routingConfigPath)
     const personaMode = personaModeFromRoutingFile(routingConfigPath)
-    if (!requestContext && !officialClient && !officialTraffic) {
+    if (!apiPassthrough && !requestContext && !officialClient && !officialTraffic) {
       ctx.body = ensureClaudeWebSearch(ctx.body, {
         enabled: shouldInjectClaudeWebSearch({
           officialClient: officialTraffic,
@@ -1034,9 +1045,9 @@ export function createHandleProtocol(deps) {
     }
     // After OpenAI→Anthropic conversion so function tools already have input_schema;
     // leftover OpenAI-shaped tools are still marked (rewrite / mixed inbound).
-    ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
+    if (!apiPassthrough) ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
     const personaIn = ctx.body
-    if (!requestContext)
+    if (!apiPassthrough && !requestContext)
       ctx.body = applyCrsUnofficialPersona(ctx.body, {
         officialClient: officialTraffic,
         routingFile: routingConfigPath,
@@ -1056,6 +1067,7 @@ export function createHandleProtocol(deps) {
 
     if (
       inferenceBackend === 'api' &&
+      !apiPassthrough &&
       !requestContext &&
       officialTraffic &&
       !officialCcPassthroughFromRouting(getRouting() || {})
@@ -1115,9 +1127,11 @@ export function createHandleProtocol(deps) {
           protocol,
           inbound,
           convertedBody: ctx.body,
+          clientHeaders: apiPassthrough ? req.headers : null,
           clientStream,
           deliveryMode,
           signal: clientAbort.signal,
+          drainOnCancel: apiPassthrough,
           timeoutMs: cfg.limits.upstream_timeout_ms,
           personaHideTokens,
           cacheTtl,
@@ -1148,17 +1162,21 @@ export function createHandleProtocol(deps) {
       logBag.account_id = result?.accountId || null
       logBag.final_account_id = result?.accountId || null
       logBag.upstream_status = result?.status ?? null
-      logBag.usage = usageForLog(result?.body?.usage || result?.usage || null, { cacheTtl })
+      logBag.usage = usageForLog(result?.body?.usage || result?.usage || null, {
+        cacheTtl: apiPassthrough ? null : cacheTtl,
+      })
       logBag.upstream_model = result?.model || null
       // API transport still stamps the first data: line; subtract t0 for queue wait only.
       logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
         ? Math.max(0, result.firstTokenAt - logCtx.t0)
         : (result?.ttftMs ?? null)
       logBag.final_state = result?.terminalState || null
+      logBag.attempt_count = result?.attemptCount ?? null
+      if (isClientCancelledResult(result)) logBag.status = 499
       attachPricing(logBag, {
         managedKey,
         rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
-        bill: !!(result?.ok && managedKey),
+        bill: !!(managedKey && result?.accountId && (result?.ok || (result?.clientCancelled && result?.usageComplete))),
       })
       if (clientStream) {
         if (isClientCancelledResult(result)) return finishClientCancel(res, result, logBag)

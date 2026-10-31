@@ -37,6 +37,27 @@ function joinHeaderMap(headers = {}) {
   return out
 }
 
+/** Forward only actual client protocol headers; endpoint credentials always replace downstream auth. */
+export function anthropicClientHeaders(headers) {
+  const names = new Set([
+    'anthropic-version',
+    'anthropic-beta',
+    'user-agent',
+    'x-app',
+    'x-client-request-id',
+    'x-claude-code-session-id',
+    'x-claude-code-prompt-id',
+    'x-claude-code-wiggly-dove',
+    'x-cc-atis',
+  ])
+  return Object.fromEntries(
+    Object.entries(headers || {}).filter(
+      ([name, value]) =>
+        (names.has(name.toLowerCase()) || name.toLowerCase().startsWith('x-stainless-')) && typeof value === 'string',
+    ),
+  )
+}
+
 async function readLines(stream, onLine) {
   let buf = ''
   for await (const chunk of stream) {
@@ -60,9 +81,11 @@ export async function runApiInference({
   protocol,
   inbound,
   convertedBody,
+  clientHeaders = null,
   clientStream,
   deliveryMode,
   signal,
+  drainOnCancel = false,
   timeoutMs,
   personaHideTokens,
   cacheTtl,
@@ -86,6 +109,19 @@ export async function runApiInference({
   const protocolKind = normalizeProtocol(picked.endpoint.protocol || preset.protocol, preset.kind)
   const extraHeaders = joinHeaderMap(picked.endpoint.headers)
   const isOpenAI = protocolKind === 'openai'
+  drainOnCancel = drainOnCancel && !isOpenAI && protocol === 'anthropic.messages'
+  const settle = (result) =>
+    drainOnCancel && signal?.aborted
+      ? {
+          ...result,
+          ok: false,
+          status: 499,
+          clientCancelled: true,
+          usageComplete: result.attemptCount === 0 || (result.ok === true && result.terminalState === 'verified'),
+          terminalState: 'cancelled',
+        }
+      : result
+  if (signal?.aborted) return settle({ ok: false, status: 499, terminalState: 'cancelled', attemptCount: 0 })
   if (requestContext && (isOpenAI || picked.upstream_model !== canonical.model)) {
     return {
       ok: false,
@@ -106,6 +142,7 @@ export async function runApiInference({
     : { ...canonical, model: picked.upstream_model, stream: true }
   if (requestContext) Object.assign(body, prepareClassifierBody(body))
   const headers = {
+    ...(!isOpenAI ? anthropicClientHeaders(clientHeaders) : {}),
     'content-type': 'application/json',
     accept: 'text/event-stream',
     ...upstreamAuthHeaders(protocolKind, picked.key.api_key, {
@@ -122,11 +159,13 @@ export async function runApiInference({
       headers,
       body,
       proxyUrl: picked.key.proxy_url,
-      signal,
+      // A native backend finishes its accepted turn after caller disconnect.
+      // Keep that response until final usage or the existing upstream deadline.
+      signal: drainOnCancel ? undefined : signal,
       timeoutMs,
     })
   } catch (error) {
-    return {
+    return settle({
       ok: false,
       status: 502,
       via: 'api-kernel',
@@ -140,7 +179,7 @@ export async function runApiInference({
       },
       terminalState: 'transport_error',
       transportError: true,
-    }
+    })
   }
 
   const status = Number(upstream.statusCode) || 502
@@ -162,6 +201,7 @@ export async function runApiInference({
     endpointId: picked.endpoint.id,
     model: picked.upstream_model,
     headers: { ...upstream.headers },
+    attemptCount: 1,
   }
 
   if (status >= 400) {
@@ -203,6 +243,7 @@ export async function runApiInference({
   const classifierSseState = { dataBuf: '' }
   let classifierError = null
   let classifierStopped = false
+  let streamReadError = null
   const readUpstreamLines = async (onLine) => {
     try {
       await readLines(upstream, async (line) => {
@@ -218,7 +259,19 @@ export async function runApiInference({
         await onLine(line)
       })
     } catch (error) {
-      if (!requestContext) throw error
+      if (!requestContext && !drainOnCancel) throw error
+      if (!requestContext) {
+        streamReadError = {
+          type: 'error',
+          error: {
+            type: 'api_error',
+            code: 'upstream_stream_interrupted',
+            status: 502,
+            message: 'API stream ended before terminal usage',
+          },
+        }
+        return
+      }
       classifierError = {
         type: 'error',
         error: {
@@ -277,12 +330,13 @@ export async function runApiInference({
         }
       }
     })
+    terminalError ||= streamReadError
     const failure = classifierFailure()
     if (failure) return { ...failure, committed: false }
     if (terminalError) {
       const declared = Number(terminalError.error?.status)
       const status = declared >= 400 && declared < 600 ? declared : mapUpstreamError(200, terminalError).status
-      return {
+      return settle({
         ...resultBase,
         ok: false,
         status,
@@ -291,11 +345,11 @@ export async function runApiInference({
         terminalState: 'rejected',
         committed,
         sawMessageStop,
-      }
+      })
     }
     const assembled = assembler.message
     if (!sawMessageStop) {
-      return {
+      return settle({
         ...resultBase,
         ok: false,
         body: assembled || { type: 'error', error: { message: 'empty api upstream' } },
@@ -303,11 +357,11 @@ export async function runApiInference({
         terminalState: assembled || committed ? 'incomplete' : 'rejected',
         committed,
         sawMessageStop: false,
-      }
+      })
     }
     const hop = { body: assembled, stopReason: assembled?.stop_reason, sawMessageStop: true }
     const complete = resultBase.ok && isCompleteAssistantMessage(hop)
-    return {
+    return settle({
       ...resultBase,
       ok: complete,
       body: assembled || { type: 'error', error: { message: 'empty api upstream' } },
@@ -315,7 +369,7 @@ export async function runApiInference({
       terminalState: complete ? 'verified' : 'incomplete',
       committed,
       sawMessageStop: true,
-    }
+    })
   }
 
   let state
@@ -328,12 +382,21 @@ export async function runApiInference({
 
   let committed = false
   let sawStop = false
+  let streamedUsage = null
+  let streamError = null
+  const streamState = { dataBuf: '' }
   const started = Date.now()
   let ttftMs = null
   await readUpstreamLines(async (line) => {
+    const event = consumeClaudeSSEData(line, streamState)
+    const usage =
+      event?.type === 'message_start' ? event.message?.usage : event?.type === 'message_delta' ? event.usage : null
+    if (usage && typeof usage === 'object' && !Array.isArray(usage)) streamedUsage = { ...streamedUsage, ...usage }
+    if (event?.type === 'message_stop') sawStop = true
+    if (event?.type === 'error') streamError = event
+    if (drainOnCancel && (signal?.aborted || res.destroyed || res.writableEnded)) return
     if (personaHideTokens) line = converters.hidePersonaUsageInSseLine(line, personaHideTokens, cacheTtl) || line
     if (String(line).startsWith('data:') && ttftMs == null) ttftMs = Date.now() - started
-    if (String(line).includes('message_stop')) sawStop = true
     if (!committed && String(line).startsWith('data:')) {
       committed = true
       if (protocol === 'anthropic.messages' && !res.headersSent) converters.writeSSEHeaders(res)
@@ -353,17 +416,32 @@ export async function runApiInference({
       writeChunks(converters.claudeSSELineToOpenAICompletionChunks(line, state))
     else writeChunks(converters.claudeSSELineToResponsesEvents(line, state))
   })
+  streamError ||= streamReadError
 
   const failure = classifierFailure()
-  if (failure) return { ...failure, committed, ttftMs }
+  if (failure) return { ...failure, usage: streamedUsage, committed, ttftMs }
+  if (streamError) {
+    const declared = Number(streamError.error?.status)
+    return settle({
+      ...resultBase,
+      ok: false,
+      status: declared >= 400 && declared < 600 ? declared : mapUpstreamError(200, streamError).status,
+      body: streamError,
+      usage: streamedUsage,
+      terminalState: 'rejected',
+      committed,
+      ttftMs,
+    })
+  }
 
-  return {
+  return settle({
     ...resultBase,
-    ok: resultBase.ok && (deliveryMode !== 'verified' || sawStop),
+    ok: resultBase.ok && sawStop,
+    usage: streamedUsage,
     terminalState: sawStop ? 'verified' : committed ? 'incomplete' : 'rejected',
     committed,
     ttftMs,
-  }
+  })
 }
 
 async function runOpenAIResponsesUpstream({

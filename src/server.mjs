@@ -80,7 +80,7 @@ import { ensureGuardedNodeProxy } from './lib/cluster/guarded-node-relay.mjs'
 import { createProxyExitGuardManager } from './lib/admin/proxy-exit-guard-manager.mjs'
 import { syncIpv6ProxyEgress } from './lib/vm/proxy-policy-runtime.mjs'
 import { GATEWAY_CAPABILITIES } from './lib/vm/execution-context.mjs'
-import { isTelemetryPath, telemetryInterceptResponse } from './lib/identity/telemetry-rewrite.mjs'
+import { isTelemetryPath, telemetryIngressResponse } from './lib/identity/telemetry-rewrite.mjs'
 import { openDatabase, closeDatabase } from './lib/db/database.mjs'
 import { runLegacyImport } from './lib/db/legacy-import.mjs'
 import { initVmDbSync, stopVmWatch } from './lib/vm/vm-db-sync.mjs'
@@ -1085,7 +1085,8 @@ const server = http.createServer(async (req, res) => {
     const p = url.pathname
 
     if (isTelemetryPath(p)) {
-      return json(res, 200, telemetryInterceptResponse(p))
+      const { status, body } = telemetryIngressResponse(p, cfg.telemetry_ingress_policy)
+      return json(res, status, body)
     }
 
     if (

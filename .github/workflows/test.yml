@@ -44,6 +44,13 @@ jobs:
       - run: npm run test:unit
       - name: ARM64 host preparation and rollback tests
         run: python3 -m unittest discover -s test/deploy -v
+      - name: isolated ReClaude relay regression tests
+        env:
+          PYTHONPATH: integrations/reclaude
+        run: python3 -m unittest discover -s integrations/reclaude/tests -v
+      - name: native ReClaude dispatch regression tests
+        working-directory: integrations/reclaude/native-dispatch-proxy
+        run: go test -race ./...
 
   arm64:
     runs-on: ubuntu-24.04-arm
