@@ -32,6 +32,7 @@ import { usageQueryOptions } from '@/features/overview/queries'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
 import { FleetPulse } from '@/features/vm/fleet-pulse'
 import { VmListSkeleton } from '@/features/vm/list-skeleton'
+import { NativeRelays } from '@/features/vm/native-relays'
 import { vmsListQueryOptions } from '@/features/vm/queries'
 import { usePoolSeatStream } from '@/features/vm/use-pool-seat-stream'
 import { VmActionsProvider } from '@/features/vm/vm-actions-provider'
@@ -184,6 +185,7 @@ export function VmListPage() {
         ) : undefined
       }
     >
+      <NativeRelays enabled={me.data?.role === 'admin'} />
       <QueryGate
         loading={vmsQ.isLoading}
         error={vmsQ.error}

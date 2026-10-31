@@ -68,6 +68,8 @@ class NativeServer(RelayServer):
         self.max_requests = max_requests
         self.accepted = 0
         self.counter_lock = threading.Lock()
+        self.active_requests = 0
+        self.management_pause = root / "management-paused"
         self.reaper = threading.Thread(target=self.reap, daemon=True)
         self.reaper.start()
 
@@ -95,6 +97,22 @@ def collect(observation, event):
 
 
 class NativeHandler(RelayHandler):
+    def do_GET(self):
+        if self.path != "/healthz":
+            return self.send_error_json(404, "not_found")
+        failed = self.server.relay.failed_health_checks()
+        if "native_device_revoked" in failed:
+            self.server.latch()
+        if self.server.latched:
+            failed.append("authentication_latched")
+        with self.server.counter_lock:
+            paused = self.server.management_pause.exists()
+            active = self.server.active_requests
+        self.send_json(503 if failed or paused else 200, {
+            "ok": not failed and not paused, "failed": failed,
+            "management_paused": paused, "active_requests": active,
+        })
+
     def do_POST(self):
         parsed = urlsplit(self.path)
         if parsed.path != "/v1/messages":
@@ -110,8 +128,12 @@ class NativeHandler(RelayHandler):
             return self.send_error_json(400, "invalid_query")
         if self.server.latched:
             return self.send_error_json(503, "upstream_authentication_latched")
-        if not self.server.inference.acquire(False):
-            return self.send_error_json(429, "relay_concurrency_limit")
+        with self.server.counter_lock:
+            if self.server.management_pause.exists():
+                return self.send_error_json(503, "native_not_ready")
+            if not self.server.inference.acquire(False):
+                return self.send_error_json(429, "relay_concurrency_limit")
+            self.server.active_requests += 1
         self.close_connection = True
         record = {
             "at": time.time(),
@@ -328,6 +350,8 @@ class NativeHandler(RelayHandler):
                         lease.__exit__(None, None, None)
                 finally:
                     self.server.inference.release()
+                    with self.server.counter_lock:
+                        self.server.active_requests -= 1
 
 
 def main():

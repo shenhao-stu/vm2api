@@ -46,9 +46,16 @@ def native_options(body):
         "output_config",
         "context_management",
         "tool_choice",
+        "temperature",
     }
     if not isinstance(body, dict) or set(body) - fields:
         raise ContractError("unsupported_request_parameter")
+    # Legacy Messages clients (including Sub2API's account test) send the
+    # default explicitly. Native CC omits this retired control; both mean 1.
+    # Never pretend a non-default sampler can be represented by the CLI.
+    temperature = body.get("temperature", 1)
+    if type(temperature) not in (int, float) or temperature != 1:
+        raise ContractError("unsupported_temperature")
     maximum = body.get("max_tokens")
     if type(maximum) is not int or not 1 <= maximum <= 128000:
         raise ContractError("unsupported_max_tokens")
@@ -98,7 +105,8 @@ def native_options(body):
 
 def configuration(body):
     result = copy.deepcopy(
-        {k: v for k, v in body.items() if k not in {"messages", "metadata", "stream"}}
+        {k: v for k, v in body.items()
+         if k not in {"messages", "metadata", "stream", "temperature"}}
     )
     for tool in result.get("tools", []):
         tool.pop("cache_control", None)

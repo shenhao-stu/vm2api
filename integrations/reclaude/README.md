@@ -426,8 +426,11 @@ group until admission succeeds. Removing its key/group must preserve usage rows.
 
 ## Tests
 
+Main VM console status, bounded logs and native Relay start/stop are described in
+[CONSOLE.md](CONSOLE.md). They are opt-in and preserve the existing Pro lifecycle.
+
 ```sh
-python3 -m unittest discover -s integrations/reclaude/tests -v
+PYTHONPATH=integrations/reclaude python3 -m unittest discover -s integrations/reclaude/tests -v
 node --test test/unit/relay-egress-bootstrap.test.mjs \
   test/unit/api-passthrough.test.mjs test/unit/api-stream-accounting.test.mjs \
   test/unit/api-backend.test.mjs \

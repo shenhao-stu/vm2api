@@ -121,7 +121,7 @@ class NativeHTTPTests(unittest.TestCase):
             "k" * 40,
             self.root,
             factory,
-            limits=Limits(models=("claude-sonnet-5-5",), concurrency=2),
+            limits=Limits(models=("claude-sonnet-5-5", "claude-fable-5-1"), concurrency=2),
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -229,6 +229,42 @@ class NativeHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(data.count(b"event: message_stop"), 1)
         self.assertEqual(self.audit()[0]["usage"]["output_tokens"], 5)
+
+    def test_fable_admin_test_default_temperature_json_and_sse(self):
+        for stream in (False, True):
+            self.identity = str(uuid.uuid4())
+            status, data = self.request(self.body(
+                model="claude-fable-5-1", temperature=1, stream=stream,
+                system=[{"type": "text", "text": "Offline fixture.",
+                         "cache_control": {"type": "ephemeral"}}],
+            ))
+            self.assertEqual(status, 200)
+            if stream:
+                self.assertEqual(data.count(b"event: message_stop"), 1)
+            else:
+                self.assertEqual(json.loads(data)["model"], "claude-fable-5-1")
+        self.assertEqual([r["attempts"] for r in self.audit(2)], [1, 1])
+
+    def test_management_pause_blocks_new_calls_but_preserves_inflight(self):
+        self.release = threading.Event()
+        result = []
+        thread = threading.Thread(target=lambda: result.append(self.request()))
+        thread.start()
+        deadline = time.monotonic() + 2
+        while not self.created and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(self.server.active_requests, 1)
+        self.server.management_pause.touch()
+        self.assertEqual(self.request()[0], 503)
+        self.assertEqual(len(self.created), 1)
+        self.release.set()
+        thread.join(3)
+        self.assertEqual(result[0][0], 200)
+        self.assertEqual(self.audit()[0]["usage"]["output_tokens"], 5)
+        deadline = time.monotonic() + 1
+        while self.server.active_requests and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(self.server.active_requests, 0)
 
     def test_provider_refusal_is_terminal_without_retry_or_auth_latch(self):
         self.refusal = True
