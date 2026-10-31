@@ -1,9 +1,33 @@
 import copy
 import unittest
-from native_bridge_session import history_shape, signature, configuration
+from native_bridge_session import history_shape, signature, configuration, fresh_prompt, native_blocks
 
 
 class HistorySemantics(unittest.TestCase):
+    def test_sub_account_test_annotations_do_not_reach_cli(self):
+        messages = [{"role": "user", "content": [{"type": "text", "text": "hi",
+                     "cache_control": {"type": "ephemeral"}}]}]
+        before = copy.deepcopy(messages)
+        self.assertEqual(fresh_prompt(messages), [{"type": "text", "text": "hi"}])
+        self.assertEqual(messages, before)
+
+    def test_followup_and_tool_result_annotations_are_owned_by_cli(self):
+        content = [{"type": "tool_result", "tool_use_id": "tool_fixture",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                    "content": [{"type": "text", "text": "cache_control is user text",
+                                 "cache_control": {"type": "ephemeral"}}]}]
+        before = copy.deepcopy(content)
+        cleaned = native_blocks(content)
+        self.assertNotIn("cache_control", cleaned[0])
+        self.assertEqual(cleaned[0]["content"], [{"type": "text", "text": "cache_control is user text"}])
+        self.assertEqual(native_blocks(cleaned), cleaned)
+        self.assertEqual(content, before)
+
+    def test_native_tool_input_named_cache_control_is_not_metadata(self):
+        content = [{"type": "tool_use", "id": "t", "name": "Read",
+                    "input": {"cache_control": {"ttl": "business-data"}}}]
+        self.assertEqual(native_blocks(content), content)
+
     def setUp(self):
         self.block = {
             "type": "tool_use",

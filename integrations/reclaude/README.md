@@ -388,6 +388,22 @@ transparent DNS redirection and the bridge forwarding DROP rule remain required.
 
 ## Acceptance observations
 
+The native CLI owns prompt-cache placement. Caller `cache_control` annotations
+are removed from conversation blocks, including tool-result content, before
+CLI input. Tool arguments and schema properties with that name remain data.
+Mixing a caller's five-minute block with the CLI's later one-hour block otherwise
+causes an upstream validation error; the one-dispatch guard correctly refuses
+the CLI's automatic corrective retry. Never replay an already consumed request.
+
+Native Relay sessions set the documented `ENABLE_CLAUDEAI_MCP_SERVERS=false`
+to avoid fetching the account's personal Claude.ai connectors. Explicit caller
+tools still use the isolated `--mcp-config`; native authorization, policy checks
+and telemetry remain enabled. This also removes unnecessary connector startup
+work, but measured cold-start savings are not a model-latency guarantee.
+
+References: [cache TTL ordering](https://platform.claude.com/docs/en/build-with-claude/prompt-caching),
+[native connector setting](https://code.claude.com/docs/en/settings-reference#disableclaudeaiconnectors).
+
 The adapter requests identity encoding and incrementally validates/decompresses
 upstream gzip with an expanded-byte limit. SSE terminal/usage observation runs
 on decoded bytes; truncated, unsupported or oversized compression fails explicitly.

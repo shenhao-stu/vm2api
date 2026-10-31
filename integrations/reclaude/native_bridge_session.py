@@ -191,29 +191,31 @@ def fresh_prompt(messages):
         b
         for m in messages
         if m["role"] == "user"
-        for b in text_blocks(m.get("content"))
+        for b in native_blocks(m.get("content"))
     ]
     if any(b.get("type") != "text" for b in blocks):
         raise ContractError("prototype_only_accepts_initial_text")
     return blocks
 
 
+def native_blocks(content):
+    """CLI owns cache placement; caller annotations are not conversation data."""
+    blocks = text_blocks(content)
+    for block in blocks:
+        block.pop("cache_control", None)
+        if block["type"] == "tool_result":
+            block["content"] = native_blocks(block.get("content", ""))
+    return blocks
+
+
 def message_shape(message):
     result = copy.deepcopy(message)
-    result["content"] = text_blocks(result.get("content"))
+    result["content"] = native_blocks(result.get("content"))
     for block in result["content"]:
-        block.pop("cache_control", None)
         if block.get("type") == "tool_use" and block.get("caller") == {
             "type": "direct"
         }:
             block.pop("caller")
-        if block.get("type") == "tool_result" and isinstance(block.get("content"), str):
-            block["content"] = text_blocks(block["content"])
-        if block.get("type") == "tool_result" and isinstance(
-            block.get("content"), list
-        ):
-            for item in block["content"]:
-                item.pop("cache_control", None)
     return canonical(result)
 
 
@@ -325,6 +327,7 @@ class Session:
                 "CLAUDE_CODE_MAX_RETRIES": "0",
                 "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "1",
                 "CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES": "0",
+                "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
                 "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0",
                 "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT": "360000",
                 "MCP_TOOL_TIMEOUT": "360000",
@@ -684,7 +687,7 @@ class Session:
                     )
                 if any(m.get("role") != "system" for m in tail[1:]):
                     raise ContractError("unsupported_history_tail")
-                blocks = text_blocks(tail[0]["content"])
+                blocks = native_blocks(tail[0]["content"])
                 ids = [
                     b.get("tool_use_id")
                     for b in blocks
