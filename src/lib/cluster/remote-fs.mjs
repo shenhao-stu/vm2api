@@ -48,30 +48,88 @@ function sftpError(err, what) {
 
 /** SFTP WRITE payloads stay under the 32 KiB every server accepts. */
 const WRITE_CHUNK = 32 * 1024
+const WRITE_CONCURRENCY = 8
+const closedChannels = new WeakSet()
+const channelWaiters = new WeakMap()
+
+function onSftpFailure(sftp, callback) {
+  let entry = channelWaiters.get(sftp)
+  if (!entry) {
+    const waiters = new Set()
+    const failed = (err) => {
+      closedChannels.add(sftp)
+      for (const reject of waiters) reject(err)
+    }
+    const closed = () => failed(new Error('SFTP channel closed'))
+    entry = { waiters, failed, closed }
+    channelWaiters.set(sftp, entry)
+    sftp.once('close', closed)
+    sftp.once('error', failed)
+  }
+  entry.waiters.add(callback)
+  return () => {
+    entry.waiters.delete(callback)
+    if (entry.waiters.size) return
+    sftp.removeListener('close', entry.closed)
+    sftp.removeListener('error', entry.failed)
+    channelWaiters.delete(sftp)
+  }
+}
+
+function sftpCall(sftp, fn, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    if (closedChannels.has(sftp) || sftp.destroyed) return reject(new Error('SFTP channel closed'))
+    let timer
+    let settled = false
+    let unsubscribe = () => {}
+    const finish = (err, value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      unsubscribe()
+      err ? reject(err) : resolve(value)
+    }
+    unsubscribe = onSftpFailure(sftp, finish)
+    timer = setTimeout(() => finish(new Error('SFTP request timed out')), timeoutMs)
+    try {
+      fn(finish)
+    } catch (err) {
+      finish(err)
+    }
+  })
+}
 
 /**
  * Atomic, symlink-safe write. `owner` is only set when the SSH user is root (the
  * slot then runs as 10000+n and must own its files); a non-root SSH user already is the slot uid.
  */
-export async function writeRemoteFile(sftp, file, data, { mode = 0o600, owner = null } = {}) {
+export async function writeRemoteFile(sftp, file, data, { mode = 0o600, owner = null, timeoutMs = 30_000 } = {}) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1) throw new RangeError('Invalid SFTP request timeout')
   if (!Buffer.isBuffer(data)) data = Buffer.from(data)
   const dir = file.slice(0, file.lastIndexOf('/'))
   const tmp = `${dir}/.kin-${crypto.randomBytes(8).toString('hex')}.tmp`
+  const request = (fn) => sftpCall(sftp, fn, timeoutMs)
   let handle = null
   try {
-    handle = await call((cb) => sftp.open(tmp, 'wx', { mode }, cb))
-    for (let off = 0; off < data.length; off += WRITE_CHUNK) {
-      const len = Math.min(WRITE_CHUNK, data.length - off)
-      await call((cb) => sftp.write(handle, data, off, len, off, cb))
+    handle = await request((cb) => sftp.open(tmp, 'wx', { mode }, cb))
+    for (let start = 0; start < data.length; start += WRITE_CHUNK * WRITE_CONCURRENCY) {
+      const writes = []
+      for (let off = start; off < Math.min(data.length, start + WRITE_CHUNK * WRITE_CONCURRENCY); off += WRITE_CHUNK) {
+        const len = Math.min(WRITE_CHUNK, data.length - off)
+        writes.push(request((cb) => sftp.write(handle, data, off, len, off, cb)))
+      }
+      const failed = (await Promise.allSettled(writes)).find((result) => result.status === 'rejected')
+      if (failed) throw failed.reason
     }
-    await call((cb) => sftp.fchmod(handle, mode, cb))
-    if (owner) await call((cb) => sftp.fchown(handle, owner.uid, owner.gid, cb))
-    await call((cb) => sftp.close(handle, cb))
+    await request((cb) => sftp.fchmod(handle, mode, cb))
+    if (owner) await request((cb) => sftp.fchown(handle, owner.uid, owner.gid, cb))
+    await request((cb) => sftp.close(handle, cb))
     handle = null
-    await call((cb) => sftp.ext_openssh_rename(tmp, file, cb))
+    await request((cb) => sftp.ext_openssh_rename(tmp, file, cb))
   } catch (err) {
-    if (handle) await call((cb) => sftp.close(handle, cb)).catch(() => {})
-    await call((cb) => sftp.unlink(tmp, cb)).catch(() => {})
+    const cleanup = (fn) => sftpCall(sftp, fn, Math.min(timeoutMs, 2_000)).catch(() => {})
+    if (handle) await cleanup((cb) => sftp.close(handle, cb))
+    await cleanup((cb) => sftp.unlink(tmp, cb))
     throw sftpError(err, `写入 ${file} 失败`)
   }
 }
