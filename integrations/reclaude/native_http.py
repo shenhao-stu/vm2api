@@ -15,7 +15,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from adapter import Limits, Rejection, RelayHandler, RelayServer, load_relay_key
+from adapter import Limits, Rejection, RelayHandler, RelayServer, load_relay_key, request_trace
 from native_bridge_session import ContractError, RequestRejected, Session, Turn
 from native_session_pool import SessionPool, memory_pressure
 from native_health import NativeHealth, validate_official
@@ -42,6 +42,7 @@ class NativeServer(RelayServer):
         prepared_idle_seconds=120,
         memory_high_bytes=0,
         memory_current_file=Path("/sys/fs/cgroup/memory.current"),
+        allow_history_import=False,
     ):
         if type(memory_high_bytes) is not int or memory_high_bytes < 0:
             raise ValueError("invalid_memory_high_bytes")
@@ -69,6 +70,7 @@ class NativeServer(RelayServer):
             recover=recover,
             prepared_idle_seconds=prepared_idle_seconds,
             under_pressure=lambda: memory_pressure(memory_current_file, memory_high_bytes),
+            allow_history_import=allow_history_import,
         )
         self.memory_high_bytes = memory_high_bytes
         self.maintenance_error = None
@@ -150,6 +152,7 @@ class NativeHandler(RelayHandler):
             "management_paused": paused, "active_requests": active,
             "pool": self.server.pool.snapshot(),
             "memory_high_bytes": self.server.memory_high_bytes,
+            "history_import_enabled": self.server.pool.allow_history_import,
         })
 
     def do_POST(self):
@@ -210,6 +213,7 @@ class NativeHandler(RelayHandler):
         try:
             raw, body = self.read_message()
             self.request_body_read = True
+            record.update(request_trace(body, len(raw)))
             record.update(
                 {
                     "model": body["model"],
@@ -436,6 +440,7 @@ def main():
     p.add_argument("--session-budget-usd", type=float)
     p.add_argument("--idle-seconds", type=float, default=1800)
     p.add_argument("--allow-prewarm", action="store_true")
+    p.add_argument("--allow-history-import", action="store_true")
     p.add_argument("--prepared-idle-seconds", type=float, default=120)
     p.add_argument("--memory-high-bytes", type=int, default=0)
     p.add_argument("--memory-current-file", type=Path, default=Path("/sys/fs/cgroup/memory.current"))
@@ -463,6 +468,8 @@ def main():
             dispatch_proxy=args.dispatch_proxy,
             restore=True,
             session_budget_usd=args.session_budget_usd,
+            history_profile=(args.home / '.rec/claude/accounts' / str(args.binding) / 'config'
+                             if args.allow_history_import else None),
         )
 
     def proof():
@@ -496,6 +503,7 @@ def main():
         prepared_idle_seconds=args.prepared_idle_seconds,
         memory_high_bytes=args.memory_high_bytes,
         memory_current_file=args.memory_current_file,
+        allow_history_import=args.allow_history_import,
     )
 
     def stop(*_):
@@ -513,6 +521,7 @@ def main():
                 "idle_seconds": args.idle_seconds,
                 "prepared_idle_seconds": server.pool.prepared_idle_seconds,
                 "memory_high_bytes": args.memory_high_bytes,
+                "history_import_enabled": args.allow_history_import,
             }
         )
     )

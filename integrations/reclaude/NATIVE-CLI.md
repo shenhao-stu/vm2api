@@ -40,17 +40,17 @@ on the strength of a single successful response.
 ## Supported contract
 
 `POST /v1/messages` supports JSON or SSE responses, text prompts and system
-context, caller-defined tools with text results, adaptive thinking, output effort
+context, caller-defined tools, adaptive thinking, output effort
 and an explicit output-token limit. Unknown or unsupported controls are rejected
 before a model dispatch or session creation, rather than silently ignored. The implementation does
 not claim byte-for-byte transparent API forwarding.
 
 Every request needs `metadata.user_id` containing a canonical session UUID, an
 actual Claude Code JSON user ID with `session_id`, or the native legacy user-ID
-format. A new session starts with user text. Subsequent requests must contain the
+format. By default a new session starts with user text. Subsequent requests must contain the
 exact prior history and unchanged model/system/tool configuration. Cache-control
 annotations and the equivalent text-block representation are normalized for
-comparison. Arbitrary imported conversations, compaction, media inputs and
+comparison. Compaction, general media prompts and
 changing a session's model, system or tools are currently unsupported. An
 explicit `max_tokens` or output `effort` change is applied by resuming the
 original native conversation at its latest verified assistant checkpoint. These
@@ -63,13 +63,43 @@ through MCP and has no server Read/Bash tool enabled. A tool result must match
 the exact pending tool-call set. The tool wait is bounded; an abandoned request
 does not authorize another model call.
 
-A user message may contain the complete pending text tool-result set together
+A user message may contain the complete pending tool-result set together
 with ordinary text. The backend stops the waiting native process and resumes at
 that tool-use assistant's genuine UUID, then submits the complete user message.
 The text stays in the user role; it is not moved to a system-context hook. This
-also permits output-limit or effort changes on a tool continuation. Pure tool
+also permits output-limit or effort changes on a tool continuation. Text-only tool
 results with unchanged controls keep the resident MCP path. Wrong, missing or
 duplicate tool IDs are rejected before changing the live conversation.
+
+Tool results may contain text, image, document, search-result and declared
+tool-reference blocks. Structured results use native resume with the complete
+user message; they are not flattened into prose or put into a system prompt.
+Protocol tool names are translated to the registered MCP namespace; tool inputs
+and text are unchanged. The CLI resolves tool references using its own catalogue.
+Invalid results, undeclared references and results after ordinary user text are
+rejected before a model grant. Server-side toolsets remain outside this subset.
+
+### Optional caller history import
+
+`--allow-history-import` permits a new caller session to supply prior user and
+assistant messages. The adapter validates their tool-result graph, writes a new
+private transcript under this native binding's configuration directory, and
+uses native `--resume` at the last supplied assistant. Only the new user tail
+gets a dispatch grant. Historical turns are context, never regenerated calls;
+the new request still incurs the provider's normal context-token cost.
+
+This uses the JSONL resume format verified with the deployed CLI 2.1.304. Its
+schema is version-dependent: rerun `tests/offline_tool_history.py` with the real
+binary, a synthetic loopback provider and networking disabled before upgrading.
+No machine, telemetry, version or usage records are reconstructed. Transcript
+UUIDs and paths are generated locally, never accepted from a caller. Files are
+exclusive-create and 0600. Existing failed, in-flight or awaiting-tools state
+cannot be overwritten by an import. Changing an existing session's history or
+immutable configuration still fails, even with this option enabled.
+
+The health response exposes `history_import_enabled`. Leave the flag off for
+deployments that require callers to begin fresh. Ordinary Pro slots do not use
+this backend or option.
 
 Idle CLI processes can be reclaimed and restored through native `--resume` and
 `--resume-session-at`, using the original native conversation and a verified

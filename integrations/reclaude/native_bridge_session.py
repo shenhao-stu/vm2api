@@ -2,7 +2,7 @@
 
 Run an actual CLI and carry caller tools over MCP. There is no credential,
 identity, telemetry, request-header or native executable rewrite in this module.
-The caller must supply a fresh session; unsupported history is rejected.
+Caller history import is opt-in and never dispatches historical turns.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 import urllib.request
+from native_history import HistoryError, import_plan, write_transcript
 
 
 class ContractError(ValueError):
@@ -82,7 +83,7 @@ def native_options(body):
         raise ContractError("invalid_stream")
     if not isinstance(body.get("metadata", {}), dict):
         raise ContractError("invalid_metadata")
-    tool_schema(body.get("tools", []))
+    names = {t['name'] for t in tool_schema(body.get("tools", []))}
     systems = text_blocks(body.get("system", ""))
     if any(block["type"] != "text" for block in systems):
         raise ContractError("unsupported_system_content")
@@ -96,7 +97,12 @@ def native_options(body):
             "system",
         }:
             raise ContractError("invalid_message")
-        text_blocks(message.get("content"))
+        blocks = text_blocks(message.get("content"))
+        for block in blocks:
+            if block['type'] == 'tool_result':
+                for child in text_blocks(block.get('content', '')):
+                    if child['type'] == 'tool_reference' and child['tool_name'] not in names:
+                        raise ContractError('unknown_tool_reference')
     return {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(maximum)}, [
         "--effort",
         output.get("effort", "medium"),
@@ -177,6 +183,7 @@ def text_blocks(content):
         return [{"type": "text", "text": content}]
     if not isinstance(content, list):
         raise ContractError("invalid_content")
+    non_result_seen = False
     for block in content:
         if (
             not isinstance(block, dict)
@@ -184,21 +191,53 @@ def text_blocks(content):
             or block["type"] == "text" and not isinstance(block.get("text"), str)
         ):
             raise ContractError("invalid_content_block")
+        if block["type"] in {"image", "document"}:
+            validate_tool_content(block)
         if block["type"] == "tool_result":
+            if non_result_seen:
+                raise ContractError("tool_results_must_precede_text")
             inner = block.get("content", "")
             if (
                 not isinstance(block.get("tool_use_id"), str)
                 or type(block.get("is_error", False)) is not bool
                 or not isinstance(inner, (str, list))
-                or isinstance(inner, list) and any(
-                    not isinstance(item, dict)
-                    or item.get("type") != "text"
-                    or not isinstance(item.get("text"), str)
-                    for item in inner
-                )
             ):
                 raise ContractError("invalid_text_tool_result")
+            for child in text_blocks(inner):
+                validate_tool_content(child)
+        else:
+            non_result_seen = True
     return copy.deepcopy(content)
+
+
+def validate_tool_content(block):
+    """Validate data shapes without fetching URLs or converting data to prose."""
+    kind = block['type']
+    if kind == 'text':
+        return
+    if kind == 'tool_reference':
+        name = block.get('tool_name')
+        if isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,64}', name):
+            return
+    if kind in {'image', 'document'}:
+        source = block.get('source')
+        if isinstance(source, dict):
+            source_type = source.get('type')
+            url = source.get('url')
+            if source_type == 'url' and isinstance(url, str) and url.startswith('https://'):
+                return
+            media = source.get('media_type')
+            image = (kind == 'image' and source_type == 'base64'
+                     and media in ['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
+            document = (kind == 'document' and (source_type, media) in
+                        [('text', 'text/plain'), ('base64', 'application/pdf')])
+            if isinstance(source.get('data'), str) and (image or document):
+                return
+    if kind == 'search_result' and all(isinstance(block.get(k), str) for k in ['source', 'title']):
+        content = block.get('content')
+        if isinstance(content, list) and all(b['type'] == 'text' for b in text_blocks(content)):
+            return
+    raise ContractError('unsupported_or_invalid_tool_content')
 
 
 def fresh_prompt(messages):
@@ -280,6 +319,28 @@ def tool_schema(tools):
     return result
 
 
+def dispatch_blocks(content):
+    """Only protocol tool names cross the MCP namespace, never tool arguments."""
+    result = native_blocks(content)
+    for block in result:
+        if block['type'] == 'tool_use':
+            block['name'] = 'mcp__caller__' + block['name']
+        elif block['type'] == 'tool_reference':
+            block['tool_name'] = 'mcp__caller__' + block['tool_name']
+        elif block['type'] == 'tool_result' and isinstance(block.get('content'), list):
+            block['content'] = dispatch_blocks(block['content'])
+    return result
+
+
+def initial_request(body, allow_history_import=False):
+    if not allow_history_import or not any(m.get('role') == 'assistant' for m in body['messages']):
+        return [], fresh_prompt(body['messages'])
+    try:
+        return import_plan([message_shape(m) for m in body['messages']])
+    except HistoryError as exc:
+        raise ContractError(str(exc)) from None
+
+
 class Turn:
     """Collect genuine native API events, changing only registered MCP tool names."""
 
@@ -334,6 +395,7 @@ class Session:
         dispatch_proxy=None,
         session_budget_usd=None,
         restore=False,
+        history_profile=None,
     ):
         native_env, self.options = native_options(body)
         self.budget_options = []
@@ -369,6 +431,7 @@ class Session:
         self.timeout = timeout
         self.require_policy = require_policy
         self.dispatch_proxy = dispatch_proxy
+        self.history_profile = Path(history_profile) if history_profile else None
         self.dispatch_process = None
         self.dispatch_address = None
         self.last_grant_id = None
@@ -552,7 +615,7 @@ class Session:
             changed = self.validate_configuration(body)
             if not self.history:
                 try:
-                    fresh_prompt(body["messages"])
+                    initial_request(body, self.history_profile is not None)
                 except ContractError as exc:
                     raise RequestRejected(str(exc)) from None
             if self.failed:
@@ -836,7 +899,7 @@ class Session:
             if request_signature in self.seen:
                 raise ContractError("request_already_consumed")
             if not self.history:
-                blocks = fresh_prompt(body["messages"])
+                imported, blocks = initial_request(body, self.history_profile is not None)
                 mutation_started = True
                 if changed:
                     self.restart_for_request(body)
@@ -844,7 +907,19 @@ class Session:
                 self.seen.add(request_signature)
                 self.history = copy.deepcopy(body["messages"])
                 self.checkpoint("in_flight")
-                self.start(blocks)
+                if imported:
+                    # A new caller-owned transcript; no other native session is read.
+                    self.close()
+                    self.process = self.reader = self.dispatch_process = None
+                    self.dispatch_address = None
+                    self.events = queue.Queue()
+                    self.initialize_id = self.initialize_response = None
+                    self.process_has_turn = False
+                    self.resume_uuid = write_transcript(
+                        self.history_profile, self.directory, self.native_id,
+                        [{**m, 'content': dispatch_blocks(m['content'])} for m in imported],
+                    )
+                self.start(dispatch_blocks(blocks))
             else:
                 messages = body["messages"]
                 tail = messages[len(self.history) :]
@@ -883,10 +958,6 @@ class Session:
                         if block.get("type") == "text":
                             continue
                         content = text_blocks(block.get("content", ""))
-                        if any(x.get("type") != "text" for x in content):
-                            raise ContractError(
-                                "prototype_only_accepts_text_tool_results"
-                            )
                         results[block["tool_use_id"]] = {
                             "content": content,
                             "isError": bool(block.get("is_error", False)),
@@ -908,6 +979,7 @@ class Session:
                 # assistant instead, preserving the caller's whole user message.
                 resume_tools = bool(results) and (
                     changed or any(b.get("type") == "text" for b in blocks)
+                    or any(c['type'] != 'text' for r in results.values() for c in r['content'])
                 )
                 if changed or resume_tools or self.suspended:
                     self.restart_for_request(body)
@@ -933,7 +1005,7 @@ class Session:
                         json.dumps(
                             {
                                 "type": "user",
-                                "message": {"role": "user", "content": blocks},
+                                "message": {"role": "user", "content": dispatch_blocks(blocks)},
                                 "client_composed": True,
                             }
                         )

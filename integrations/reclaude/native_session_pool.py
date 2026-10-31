@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 
-from native_bridge_session import ContractError, fresh_prompt, native_options
+from native_bridge_session import ContractError, initial_request, native_options
 
 
 def memory_pressure(path, high_bytes):
@@ -79,6 +79,7 @@ class SessionPool:
         recover=None,
         prepared_idle_seconds=120,
         under_pressure=lambda: False,
+        allow_history_import=False,
     ):
         if type(capacity) is not int or not 1 <= capacity <= 10 or not 0 < idle_seconds <= 86400:
             raise ValueError("invalid_native_pool_limits")
@@ -93,6 +94,7 @@ class SessionPool:
             clock,
         )
         self.recover = recover
+        self.allow_history_import = allow_history_import
         self.under_pressure = under_pressure
         self.prepared_idle_seconds = min(idle_seconds, prepared_idle_seconds)
         self.entries = {}
@@ -178,7 +180,7 @@ class SessionPool:
                     if existing and self.recover is None:
                         raise ContractError("native_session_expired_no_replay")
                     if not existing:
-                        fresh_prompt(body["messages"])
+                        initial_request(body, self.allow_history_import)
                 pressure = self.under_pressure()
                 if pressure or (entry is None and len(self.entries) >= self.capacity):
                     retiring = self.reserve_idle(exclude=key)
