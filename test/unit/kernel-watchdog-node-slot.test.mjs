@@ -87,7 +87,7 @@ test('a node slot that answers on its relay is left alone', async () => {
   assert.deepEqual(ensured, [])
 })
 
-test('a genuinely dead remote kernel behind a live relay keeps the bounded L4/L5 budget', async () => {
+test('an authoritatively unhealthy remote kernel keeps the bounded L4/L5 budget', async () => {
   kernelFaults.delete('slot-a1')
   const ensured = []
   const faults = []
@@ -97,7 +97,7 @@ test('a genuinely dead remote kernel behind a live relay keeps the bounded L4/L5
     listTargets: () => [{ id: 'slot-a1', node_id: 'node-a', status: 'running', runtime: { type: 'docker' } }],
     homeDirFor: (vm) => `/opt/vm2api/vms/${vm.id}/cli-home`,
     probeVm: (vm) => watchdogProbeVm(vm, { relayPaths: RELAY, exists: () => true }),
-    health: async () => null,
+    health: async () => ({ status: 200, engine: 'rust', healthy: false, unhealthy_reason: 'cli restarts exhausted' }),
     observeRuntime: async () => ({ state: 'running' }),
     ensure: async (exec) => {
       assert.equal(exec.vm.runtime.kernel_socket, '/relay/node-a/slots/slot-a1/kernel.sock')

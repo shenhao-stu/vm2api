@@ -269,6 +269,8 @@ export function createKernelWatchdog({
     // Permission/transport failures and deliberately paused containers never authorize recovery.
     if (!['running', 'missing', 'stopped', 'restarting'].includes(observed?.state)) return
     if (observed.state !== 'running') return reviveDownContainer(vm, observed.state)
+    // A remote container can be running while its SSH relay cannot return kernel health.
+    if (vmNodeId(vm) && !rustKernelProcessUp(current)) return
     if (!admitRestart(vm, reason, now())) return
     console.warn(`[kernel-watchdog] ${vm.id} restarting container: ${reason}`)
     const result = await ensure(exec, { timeoutMs: config.timeout_ms })
