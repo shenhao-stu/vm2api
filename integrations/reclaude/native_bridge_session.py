@@ -22,7 +22,8 @@ import threading
 import time
 import uuid
 import urllib.request
-from native_history import HistoryError, import_plan, write_transcript
+from native_history import (HistoryError, active_efforts, import_plan, trailing_system_text,
+                            validate_system_messages, write_transcript)
 
 
 class ContractError(ValueError):
@@ -75,6 +76,7 @@ def native_options(body):
     if (
         not isinstance(output, dict)
         or set(output) - {"effort"}
+        or not isinstance(output.get("effort", "medium"), str)
         or output.get("effort", "medium")
         not in {"low", "medium", "high", "xhigh", "max"}
     ):
@@ -103,10 +105,27 @@ def native_options(body):
                 for child in text_blocks(block.get('content', '')):
                     if child['type'] == 'tool_reference' and child['tool_name'] not in names:
                         raise ContractError('unknown_tool_reference')
+    try:
+        validate_system_messages(history_shape(messages))
+    except HistoryError as exc:
+        raise ContractError(str(exc)) from None
     return {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(maximum)}, [
         "--effort",
-        output.get("effort", "medium"),
+        effective_effort(body),
     ]
+
+
+def effective_effort(body, leading_only=False):
+    effort = body.get('output_config', {}).get('effort', 'medium')
+    if not leading_only:
+        for effort in active_efforts(body.get('messages', []), effort):
+            pass
+        return effort
+    for message in body.get('messages', []):
+        if message['role'] != 'system':
+            break
+        effort = message.get('output_config', {}).get('effort', effort)
+    return effort
 
 
 def legacy_configuration(body):
@@ -130,7 +149,7 @@ def configuration(body):
         "system": caller_system(body.get("system", "")),
         "tools": tool_schema(body.get("tools", [])),
         "max_tokens": body.get("max_tokens"),
-        "output_config": {"effort": body.get("output_config", {}).get("effort", "medium")},
+        "output_config": {"effort": effective_effort(body)},
     }
 
 
@@ -298,8 +317,9 @@ def caller_system(content):
 def initial_system(body):
     systems = [{'type': 'text', 'text': caller_system(body.get('system', ''))}]
     for message in body["messages"]:
-        if message.get("role") == "system":
-            systems.extend(text_blocks(message.get("content")))
+        if message.get("role") != "system":
+            break
+        systems.extend(text_blocks(message.get("content")))
     if any(block.get("type") != "text" for block in systems):
         raise ContractError("prototype_only_accepts_text_system")
     return "\n".join(block["text"] for block in systems)
@@ -934,16 +954,21 @@ class Session:
                     self.resume_uuid = write_transcript(
                         self.history_profile, self.directory, self.native_id,
                         [{**m, 'content': dispatch_blocks(m['content'])} for m in imported],
+                        initial_effort=effective_effort(body, leading_only=True),
                     )
+                (self.directory / 'context.pending.json').write_text(
+                    json.dumps(trailing_system_text(history_shape(body['messages'])))
+                )
                 self.start(dispatch_blocks(blocks))
             else:
                 messages = body["messages"]
                 tail = messages[len(self.history) :]
+                user_tail = [m for m in tail if m.get('role') != 'system']
                 if (
-                    not tail
+                    not user_tail
                     or history_shape(messages[: len(self.history)])
                     != history_shape(self.history)
-                    or tail[0].get("role") != "user"
+                    or user_tail[0].get("role") != "user"
                 ):
                     raise ContractError(
                         "history_prefix_mismatch "
@@ -954,9 +979,9 @@ class Session:
                             )
                         )
                     )
-                if any(m.get("role") != "system" for m in tail[1:]):
+                if len(user_tail) != 1:
                     raise ContractError("unsupported_history_tail")
-                blocks = native_blocks(tail[0]["content"])
+                blocks = native_blocks(user_tail[0]["content"])
                 ids = [
                     b.get("tool_use_id")
                     for b in blocks
@@ -981,7 +1006,7 @@ class Session:
                 elif any(b.get("type") != "text" for b in blocks):
                     raise ContractError("unexpected_tool_result_or_nontext_followup")
                 context_blocks = [
-                    b for m in tail[1:] for b in text_blocks(m["content"])
+                    b for m in tail if m.get('role') == 'system' for b in text_blocks(m["content"])
                 ]
                 if any(
                     b.get("type") != "text" or not isinstance(b.get("text"), str)

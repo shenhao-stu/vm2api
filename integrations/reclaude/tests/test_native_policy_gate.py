@@ -106,7 +106,7 @@ class PolicyGate(unittest.TestCase):
         self.assertFalse(s.failed)
         self.assertIsNone(s.process)
         body["model"] = "fixture"
-        body["messages"].append({"role": "system", "content": "different startup context"})
+        body["messages"].insert(0, {"role": "system", "content": "different startup context"})
         with self.assertRaisesRegex(ContractError, "session_configuration_changed"):
             s.prepare_request(body)
         self.assertFalse(s.failed)

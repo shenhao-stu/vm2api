@@ -11,18 +11,84 @@ class HistoryError(ValueError):
     pass
 
 
+def active_efforts(messages, initial_effort):
+    """Effort controls activate at new user input, not a tool-result-only turn."""
+    active = pending = initial_effort
+    new_input = False
+    for message in messages:
+        role = message['role']
+        if role == 'user':
+            content = message['content']
+            new_input = bool(content) if isinstance(content, str) else any(
+                b['type'] != 'tool_result' and (b['type'] != 'text' or b['text'])
+                for b in content)
+            if new_input:
+                active = pending
+        elif role == 'system':
+            pending = message.get('output_config', {}).get('effort', pending)
+            if new_input:
+                active = pending
+        else:
+            new_input = False
+        yield active
+
+
+def validate_system_messages(messages):
+    """Content-bearing system turns follow user input, before the next assistant."""
+    previous, index = None, 0
+    while index < len(messages):
+        message = messages[index]
+        if message['role'] != 'system':
+            previous = message['role']
+            index += 1
+            continue
+        has_text = False
+        while index < len(messages) and messages[index]['role'] == 'system':
+            message = messages[index]
+            if set(message) - {'role', 'content', 'output_config'}:
+                raise HistoryError('unsupported_system_message_control')
+            if any(b['type'] != 'text' for b in message['content']):
+                raise HistoryError('unsupported_system_message_content')
+            output = message.get('output_config', {})
+            if (not isinstance(output, dict) or set(output) - {'effort'}
+                    or output and (not isinstance(output.get('effort'), str)
+                    or output['effort'] not in {'low', 'medium', 'high', 'xhigh', 'max'})):
+                raise HistoryError('unsupported_system_message_control')
+            has_text |= any(b['text'] for b in message['content'])
+            index += 1
+        # Leading system messages retain the existing top-level compatibility.
+        following = messages[index]['role'] if index < len(messages) else None
+        if has_text and previous is not None and (previous != 'user' or following not in {None, 'assistant'}):
+            raise HistoryError('invalid_system_message_position')
+
+
+def trailing_system_text(messages):
+    """Only the new tail's system content; history is carried by the transcript."""
+    tail = []
+    for message in reversed(messages):
+        if message['role'] != 'system':
+            break
+        text = '\n'.join(b['text'] for b in message['content'])
+        if text:
+            tail.append(text)
+    return list(reversed(tail))
+
+
 def import_plan(messages):
     """Require a complete tool graph and one new user tail; never fetch history."""
-    conversation = list(messages)
-    while conversation and conversation[0]['role'] == 'system':
-        conversation.pop(0)
+    validate_system_messages(messages)
+    first_user = next((i for i, m in enumerate(messages) if m['role'] != 'system'), len(messages))
+    conversation = list(messages[first_user:])
+    turns = [m for m in conversation if m['role'] != 'system']
     if (not conversation or conversation[0]['role'] != 'user'
-            or conversation[-1]['role'] != 'user'):
+            or not turns or turns[-1]['role'] != 'user'):
         raise HistoryError('invalid_imported_history_roles')
     pending, seen = set(), set()
     last_assistant = None
     for index, message in enumerate(conversation):
         role, blocks = message['role'], message['content']
+        if role == 'system':
+            continue
         if role not in {'user', 'assistant'}:
             raise HistoryError('unsupported_imported_history_role')
         ids, text_started = [], False
@@ -58,11 +124,12 @@ def import_plan(messages):
             last_assistant = index
     if last_assistant is None:
         raise HistoryError('imported_history_requires_assistant')
-    tail = [block for message in conversation[last_assistant + 1:] for block in message['content']]
+    tail = [block for message in conversation[last_assistant + 1:]
+            if message['role'] == 'user' for block in message['content']]
     return conversation[:last_assistant + 1], tail
 
 
-def write_transcript(profile, directory, native_id, messages):
+def write_transcript(profile, directory, native_id, messages, initial_effort=None):
     """Use CLI 2.1.304's native JSONL resume format, with our own UUIDs and cwd."""
     directory = Path(directory).resolve()
     project_key = re.sub(r'[^a-zA-Z0-9]', '-', str(directory))
@@ -74,11 +141,25 @@ def write_transcript(profile, directory, native_id, messages):
     path = target / (native_id + '.jsonl')
     parent = None
     with os.fdopen(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), 'w') as out:
-        for message in messages:
+        for message, effort in zip(messages, active_efforts(messages, initial_effort)):
+            if message['role'] == 'system':
+                text = '\n'.join(b['text'] for b in message['content'])
+                if not text:
+                    continue
             entry = {'parentUuid': parent, 'isSidechain': False, 'userType': 'external',
                      'cwd': str(directory), 'sessionId': native_id, 'type': message['role'],
                      'message': message, 'uuid': str(uuid.uuid4()),
                      'timestamp': datetime.now(timezone.utc).isoformat()}
+            if message['role'] == 'system':
+                entry.pop('message')
+                entry.update({
+                    'type': 'attachment',
+                    'attachment': {'type': 'hook_additional_context', 'content': [text],
+                                   'hookName': 'UserPromptSubmit', 'hookEvent': 'UserPromptSubmit'},
+                    'rendered': [{'content': text}], 'renderedRole': 'system',
+                })
+            elif message['role'] == 'assistant' and effort is not None:
+                entry['perTurnEffort'] = effort
             parent = entry['uuid']
             out.write(json.dumps(entry) + '\n')
         out.flush()
