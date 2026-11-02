@@ -107,6 +107,20 @@ exclusive-create and 0600. Existing failed, in-flight or awaiting-tools state
 cannot be overwritten by an import. Changing an existing session's history or
 immutable configuration still fails, even with this option enabled.
 
+Text-only mid-conversation system messages keep their system role and position.
+They follow a user turn (including tool results) and precede an assistant or end
+the input. Historical system turns use the CLI's persisted system attachment;
+new tail instructions use the existing single-use context hook. They are never
+promoted to the initial system prompt or converted into user text. Consecutive
+system turns retain their order. Per-message `output_config.effort` is represented
+by the CLI's per-turn effort records and the current turn's native effort option;
+empty effort-only messages do not become user text or trigger a turn themselves.
+Changes after tool-result-only input wait for the next user turn with new input,
+using the same active/pending effort calculation for imported and current turns.
+Other per-message controls, `clear_at` and tool additions/removals are rejected
+until their native representation is verified. Existing paid sessions retain
+their original transcript and hashes.
+
 The health response exposes `history_import_enabled`. Leave the flag off for
 deployments that require callers to begin fresh. Ordinary Pro slots do not use
 this backend or option.
