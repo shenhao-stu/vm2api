@@ -45,7 +45,7 @@ import {
   mergeOpenAIQuotaPolicy,
   normalizeOpenAIQuotaPolicy,
 } from '../pool/openai-quota-policy.mjs'
-import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
+import { probeRustHealth } from '../transport/kernel-router.mjs'
 import { requestKernelReloadWhenIdle, syncClaudeKernelConfigs } from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
@@ -659,7 +659,7 @@ export function createRoutingRuntime(ctx) {
       stickyRouter: ctx.stickyRouter,
       accountQuota: ctx.accountQuota,
       runtimeRepo,
-      workerHealth: rustKernelHealth,
+      workerHealth: probeRustHealth,
       config: poolSchedulerConfig(),
     })
     setPool(poolScheduler)

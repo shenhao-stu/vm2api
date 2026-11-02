@@ -94,10 +94,21 @@ function cacheKey(exec) {
   return String(exec?.vmId || exec?.vm?.id || '')
 }
 
-export function rememberRustHealth(exec, ready) {
+export function rememberRustHealth(exec, ready, at = Date.now()) {
   const key = cacheKey(exec)
   if (!key || !ready?.ok) return
-  rustHealthCache.set(key, { at: Date.now(), health: ready.health || null })
+  rustHealthCache.set(key, { at, health: ready.health || null, maxAgeMs: ready.maxAgeMs ?? Infinity })
+}
+
+/** Share a new admission probe, never renew the scheduler's cached observation. */
+export async function probeRustHealth(exec, options) {
+  const at = Date.now()
+  const health = await rustKernelHealth(exec, options)
+  const key = cacheKey(exec)
+  if (key && health?.ok === true && health.vm_id === key && rustKernelReachable(health)) {
+    rememberRustHealth(exec, { ok: true, health, maxAgeMs: 2000 }, at)
+  } else if (key) clearRustHealthCache(key)
+  return health
 }
 
 export function peekRustHealth(exec, ttlMs, now = Date.now()) {
@@ -106,7 +117,7 @@ export function peekRustHealth(exec, ttlMs, now = Date.now()) {
   if (!key) return null
   const hit = rustHealthCache.get(key)
   if (!hit) return null
-  if (now - hit.at > ttlMs) return null
+  if (now < hit.at || now - hit.at > Math.min(ttlMs, hit.maxAgeMs)) return null
   return hit
 }
 
