@@ -121,6 +121,23 @@ def collect(observation, event):
         observation.event(event)
 
 
+def safe_thinking_summary(thinking):
+    """Bounded diagnostic enums only; never retain arbitrary caller values or keys."""
+    if not isinstance(thinking, dict):
+        return {"shape": "other"}
+    keys = sorted(key for key in ("type", "display", "budget_tokens") if key in thinking)
+    result = {"shape": "object", "keys": keys, "unknown_key_count": len(thinking) - len(keys)}
+    for field, allowed in (
+        ("type", ("adaptive", "enabled", "disabled")),
+        ("display", ("summarized", "omitted", "updates", "highlights")),
+    ):
+        value = thinking.get(field)
+        result["mode" if field == "type" else field] = (
+            "absent" if field not in thinking else value if value in allowed else "other"
+        )
+    return result
+
+
 class NativeHandler(RelayHandler):
     def send_json(self, status, body):
         if not getattr(self, "request_body_read", False):
@@ -196,6 +213,7 @@ class NativeHandler(RelayHandler):
         expired = threading.Event()
         observation = Turn([])
         lease = None
+        body = None
 
         def expire():
             expired.set()
@@ -332,6 +350,8 @@ class NativeHandler(RelayHandler):
             )
             if expired.is_set():
                 code = "native_request_deadline"
+            if code == "unsupported_thinking_configuration" and isinstance(body, dict):
+                record["thinking"] = safe_thinking_summary(body.get("thinking"))
             status = (
                 exc.status
                 if isinstance(exc, Rejection)

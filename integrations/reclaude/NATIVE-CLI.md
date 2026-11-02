@@ -52,11 +52,25 @@ exact prior history and unchanged model/system/tool configuration. Cache-control
 annotations and the equivalent text-block representation are normalized for
 comparison. Compaction, general media prompts and
 changing a session's model, system or tools are currently unsupported. An
-explicit `max_tokens` or output `effort` change is applied by resuming the
+explicit `max_tokens`, output `effort` or supported thinking-display change is applied by resuming the
 original native conversation at its latest verified assistant checkpoint. These
 controls are never dropped merely to make a configuration comparison pass.
 Equivalent defaults, system text representations and cache annotations reuse
 the resident process. Structured `output_config.format` remains unsupported.
+
+Adaptive thinking supports explicit `display: "summarized"` and `"omitted"`
+through the unmodified CLI's `--thinking adaptive --thinking-display` options.
+For `"omitted"`, the CLI's `CLAUDE_CODE_THINKING_DISPLAY_UPDATES=0` control
+also prevents its automatic conversion to updates. The original inherited
+environment value or absence is restored when that display is removed or changed.
+Changing or removing that display resumes the same verified conversation;
+previous display flags do not carry into the next process. Missing thinking,
+plain adaptive thinking and the previously accepted `adaptive` + `"updates"`
+retain their existing native-default behavior. The legacy `"updates"` value does
+not force an updates response and is not translated into another display.
+`enabled` with a token budget, `disabled`, `"highlights"` and unknown thinking
+fields remain unsupported: native model-specific conversion or effort clamping
+must not silently change those controls.
 
 When the caller is itself Claude Code, its leading
 `x-anthropic-billing-header: cc_version=...` system line is runtime metadata,

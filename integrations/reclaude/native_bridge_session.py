@@ -34,6 +34,21 @@ class RequestRejected(ContractError):
     """Invalid input rejected before changing a native conversation."""
 
 
+def thinking_configuration(body):
+    """Keep legacy native defaults; carry only explicitly representable displays."""
+    thinking = body.get("thinking")
+    if thinking in [None, {"type": "adaptive"}, {"type": "adaptive", "display": "updates"}]:
+        # `updates` was already accepted as the native default. It is not a
+        # --thinking-display choice and must not be mapped to another display.
+        return None
+    if thinking not in [
+        {"type": "adaptive", "display": "summarized"},
+        {"type": "adaptive", "display": "omitted"},
+    ]:
+        raise ContractError("unsupported_thinking_configuration")
+    return copy.deepcopy(thinking)
+
+
 def native_options(body):
     """Accept only the tested native CLI contract; never silently ignore controls."""
     fields = {
@@ -61,12 +76,7 @@ def native_options(body):
     maximum = body.get("max_tokens")
     if type(maximum) is not int or not 1 <= maximum <= 128000:
         raise ContractError("unsupported_max_tokens")
-    if body.get("thinking") not in [
-        None,
-        {"type": "adaptive"},
-        {"type": "adaptive", "display": "updates"},
-    ]:
-        raise ContractError("unsupported_thinking_configuration")
+    thinking = thinking_configuration(body)
     context = {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}
     if body.get("context_management") not in [None, context]:
         raise ContractError("unsupported_context_management")
@@ -109,10 +119,15 @@ def native_options(body):
         validate_system_messages(history_shape(messages))
     except HistoryError as exc:
         raise ContractError(str(exc)) from None
-    return {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(maximum)}, [
+    environment = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(maximum)}
+    if thinking and thinking["display"] == "omitted":
+        # Native CC otherwise upgrades an explicit omitted display to updates.
+        environment["CLAUDE_CODE_THINKING_DISPLAY_UPDATES"] = "0"
+    return environment, [
         "--effort",
         effective_effort(body),
-    ]
+    ] + (["--thinking", "adaptive", "--thinking-display", thinking["display"]]
+         if thinking else [])
 
 
 def effective_effort(body, leading_only=False):
@@ -144,18 +159,20 @@ def legacy_configuration(body):
 
 def configuration(body):
     """The validated subset's effective native configuration, not JSON spelling."""
+    thinking = thinking_configuration(body)
     return {
         "model": body.get("model"),
         "system": caller_system(body.get("system", "")),
         "tools": tool_schema(body.get("tools", [])),
         "max_tokens": body.get("max_tokens"),
         "output_config": {"effort": effective_effort(body)},
+        **({"thinking": thinking} if thinking else {}),
     }
 
 
 def fixed_configuration(body):
     return {k: v for k, v in configuration(body).items()
-            if k not in {"max_tokens", "output_config"}}
+            if k not in {"max_tokens", "output_config", "thinking"}}
 
 
 def canonical(value):
@@ -447,6 +464,9 @@ class Session:
             self.budget_options = ["--max-budget-usd", str(session_budget_usd)]
             self.options += self.budget_options
         self.command, self.environment = list(command), dict(environment)
+        self.inherited_thinking_display_updates = self.environment.get(
+            "CLAUDE_CODE_THINKING_DISPLAY_UPDATES"
+        )
         self.environment.pop("CLAUDE_CODE_RETRY_WATCHDOG", None)
         self.environment.update(native_env)
         self.environment.update(
@@ -639,6 +659,11 @@ class Session:
         self.result = self.result_message_id = self.last_native_message_id = None
         self.suspended = False
         native_env, options = native_options(body)
+        # A turn's omitted-display override must never become the next turn's
+        # native default. Restore the constructor's inherited value or absence.
+        self.environment.pop("CLAUDE_CODE_THINKING_DISPLAY_UPDATES", None)
+        if self.inherited_thinking_display_updates is not None:
+            self.environment["CLAUDE_CODE_THINKING_DISPLAY_UPDATES"] = self.inherited_thinking_display_updates
         self.environment.update(native_env)
         self.options = options + self.budget_options
         self.body_signature = signature(configuration(body))
