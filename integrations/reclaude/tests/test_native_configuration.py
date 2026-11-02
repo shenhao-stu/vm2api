@@ -6,7 +6,8 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch, Mock
 
-from native_bridge_session import Session, ContractError, configuration, legacy_configuration, signature
+from native_bridge_session import (Session, ContractError, configuration, fixed_configuration,
+                                   legacy_configuration, signature)
 
 
 class ConfigurationCompatibilityTests(unittest.TestCase):
@@ -40,6 +41,41 @@ class ConfigurationCompatibilityTests(unittest.TestCase):
     def test_turn_controls_are_validated_without_locking_to_initial_values(self):
         follow = self.checkpoint()
         self.session.validate_configuration({**follow, 'max_tokens': 2048, 'output_config': {'effort': 'high'}})
+
+    def test_thinking_display_changes_are_mutable_native_controls(self):
+        follow = self.checkpoint()
+        for display in ('summarized', 'omitted'):
+            with self.subTest(display=display):
+                changed = {**follow, 'thinking': {'type': 'adaptive', 'display': display}}
+                self.assertTrue(self.session.validate_configuration(changed))
+                self.assertEqual(fixed_configuration(changed), fixed_configuration(self.body))
+                # A version-two checkpoint predating thinking support keeps its
+                # fixed hash and resumes the same verified assistant boundary.
+                recovered = Session(self.path, ['unused'], {}, changed, restore=True)
+                self.assertEqual(recovered.native_id, self.session.native_id)
+                self.assertEqual(recovered.resume_uuid, self.session.resume_uuid)
+                self.assertIn(display, recovered.options)
+
+    def test_omitted_display_override_restores_the_original_environment_after_resume(self):
+        follow = self.checkpoint()
+        key = 'CLAUDE_CODE_THINKING_DISPLAY_UPDATES'
+        for value in (None, '1', 'true', '0', 'false'):
+            with self.subTest(inherited=value):
+                environment = {} if value is None else {key: value}
+                original = environment.copy()
+                omitted = {**follow, 'thinking': {'type': 'adaptive', 'display': 'omitted'}}
+                recovered = Session(self.path, ['unused'], environment, omitted, restore=True)
+                try:
+                    for thinking in ({'type': 'adaptive', 'display': 'summarized'}, None,
+                                     {'type': 'adaptive', 'display': 'updates'}):
+                        self.assertEqual(recovered.environment[key], '0')
+                        recovered.restart_for_request({**follow, 'thinking': thinking})
+                        self.assertEqual(recovered.environment.get(key), value)
+                        self.assertEqual(key in recovered.environment, value is not None)
+                        recovered.restart_for_request(omitted)
+                    self.assertEqual(environment, original)
+                finally:
+                    recovered.close()
 
     def test_changed_history_rejects_before_reconfiguration_or_checkpoint_mutation(self):
         follow = self.checkpoint()

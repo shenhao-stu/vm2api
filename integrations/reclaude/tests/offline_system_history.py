@@ -76,8 +76,9 @@ cli_hash = hashlib.sha256(cli.read_bytes()).hexdigest()
 base = {'model': 'claude-opus-5-5', 'max_tokens': 1024, 'system': 'SYNTHETIC_SYSTEM', 'messages': [{'role': 'user', 'content': 'SYNTHETIC_ORIGINAL'}], 'tools': [{'name': 'Read', 'input_schema': {'type': 'object', 'properties': {'path': {'type': 'string'}}}}]}
 sessions = []
 
-def start(name, body, restore=False):
-    s = Session(root / name, command, env, body, timeout=30, restore=restore, history_profile=root / 'profile')
+def start(name, body, restore=False, environment=None):
+    s = Session(root / name, command, env if environment is None else environment, body,
+                timeout=30, restore=restore, history_profile=root / 'profile')
     sessions.append(s)
     return s
 
@@ -254,6 +255,121 @@ try:
         checks['effort_duplicate_rejected_without_dispatch'] = 'request_already_consumed' in str(exc) and len(calls) == before
     assert len(calls) == 14
     checks['fourteen_new_synthetic_requests_no_replay'] = True
+
+    # Explicit thinking displays are mutable controls on the same real native
+    # conversation. Returning to the legacy default must drop the old flag.
+    td = start('thinking-display', base)
+    wire = run(td, base)
+    native_default = copy.deepcopy(wire.get('thinking'))
+    thinking_native = td.native_id
+    default_environment = copy.deepcopy(td.environment)
+    previous_pid = td.process.pid
+    summarized = {**follow(td), 'thinking': {'type': 'adaptive', 'display': 'summarized'}}
+    summarized['messages'][-1]['content'] = 'THINKING_SUMMARIZED_USER'
+    wire = run(td, summarized)
+    assert wire['thinking']['type'] == 'adaptive' and wire['thinking']['display'] == 'summarized'
+    assert wire['output_config']['effort'] == 'medium'
+    assert td.native_id == thinking_native and td.process.pid != previous_pid
+    assert_order(wire, ['SYNTHETIC_ORIGINAL', 'SYNTHETIC_REPLY_15', 'THINKING_SUMMARIZED_USER'])
+    checks['summarized_display_resumes_same_native_history_without_effort_change'] = True
+
+    reply[0] = 'tools'
+    omitted = {**follow(td), 'thinking': {'type': 'adaptive', 'display': 'omitted'}}
+    omitted['messages'][-1]['content'] = 'THINKING_OMITTED_TOOL_USER'
+    wire = run(td, omitted)
+    assert wire['thinking']['display'] == 'omitted'
+    assert td.native_id == thinking_native and len(td.pending_ids) == 2
+    checks['omitted_display_preserves_real_native_tool_use'] = True
+
+    pending_ids = sorted(td.pending_ids)
+    previous_pid = td.process.pid
+    pure_results = {**follow(td), 'thinking': {'type': 'adaptive', 'display': 'summarized'}}
+    pure_results['messages'][-1]['content'] = [
+        {'type': 'tool_result', 'tool_use_id': identifier, 'content': 'THINKING_PURE_RESULT_' + str(index)}
+        for index, identifier in enumerate(pending_ids)
+    ]
+    wire = run(td, pure_results)
+    assert wire['thinking']['display'] == 'summarized'
+    assert td.native_id == thinking_native and td.process.pid != previous_pid
+    results = [b for m in wire['messages'] if m['role'] == 'user'
+               for b in (m['content'] if isinstance(m['content'], list) else [])
+               if b['type'] == 'tool_result' and b['tool_use_id'] in pending_ids]
+    assert sorted(b['tool_use_id'] for b in results) == pending_ids
+    assert all('THINKING_PURE_RESULT_' + str(i) in json.dumps(results) for i in range(2))
+    checks['display_change_on_text_only_tool_results_restarts_without_losing_results'] = True
+
+    pending_ids = sorted(td.pending_ids)
+    mixed_display = {**follow(td), 'thinking': {'type': 'adaptive', 'display': 'omitted'}}
+    mixed_display['messages'][-1]['content'] = [
+        {'type': 'tool_result', 'tool_use_id': identifier, 'content': 'THINKING_RESULT_' + str(index)}
+        for index, identifier in enumerate(pending_ids)
+    ] + [{'type': 'text', 'text': 'THINKING_MIXED_USER_TEXT'}]
+    reply[0] = 'text'
+    wire = run(td, mixed_display)
+    assert wire['thinking']['display'] == 'omitted'
+    results = [b for m in wire['messages'] if m['role'] == 'user'
+               for b in (m['content'] if isinstance(m['content'], list) else [])
+               if b['type'] == 'tool_result' and b['tool_use_id'] in pending_ids]
+    assert sorted(b['tool_use_id'] for b in results) == pending_ids
+    assert all('THINKING_RESULT_' + str(i) in json.dumps(results) for i in range(2))
+    assert positions(wire, 'THINKING_MIXED_USER_TEXT')[-1][1] == 'user'
+    assert td.native_id == thinking_native and not td.pending_ids
+    checks['display_change_on_tools_keeps_results_ids_and_user_text'] = True
+
+    default_follow = follow(td)
+    default_follow['messages'][-1]['content'] = 'THINKING_DEFAULT_USER'
+    wire = run(td, default_follow)
+    assert wire.get('thinking') == native_default
+    assert '--thinking-display' not in td.native_cli_argv
+    assert td.environment == default_environment and td.native_id == thinking_native
+    checks['return_to_native_default_has_no_display_flag_or_environment_residue'] = True
+
+    previous_pid = td.process.pid
+    legacy_updates = {**follow(td), 'thinking': {'type': 'adaptive', 'display': 'updates'}}
+    legacy_updates['messages'][-1]['content'] = 'THINKING_LEGACY_UPDATES_USER'
+    wire = run(td, legacy_updates)
+    assert wire.get('thinking') == native_default
+    assert '--thinking-display' not in td.native_cli_argv and td.process.pid == previous_pid
+    assert_order(wire, ['THINKING_SUMMARIZED_USER', 'THINKING_OMITTED_TOOL_USER',
+                        'THINKING_MIXED_USER_TEXT', 'THINKING_DEFAULT_USER',
+                        'THINKING_LEGACY_UPDATES_USER'])
+    checks['legacy_updates_keeps_existing_native_default_without_remapping'] = True
+
+    restored_display = {**follow(td), 'thinking': {'type': 'adaptive', 'display': 'omitted'}}
+    restored_display['messages'][-1]['content'] = 'THINKING_RESTORED_DISPLAY_USER'
+    td.close(graceful=True)
+    td = start('thinking-display', restored_display, True)
+    wire = run(td, restored_display)
+    assert wire['thinking']['display'] == 'omitted' and td.native_id == thinking_native
+    assert_order(wire, ['THINKING_SUMMARIZED_USER', 'THINKING_OMITTED_TOOL_USER',
+                        'THINKING_MIXED_USER_TEXT', 'THINKING_DEFAULT_USER',
+                        'THINKING_LEGACY_UPDATES_USER', 'THINKING_RESTORED_DISPLAY_USER'])
+    checks['default_checkpoint_restores_explicit_display_with_original_history_and_native_id'] = True
+    assert len(calls) == 22
+    checks['twenty_two_new_synthetic_requests_no_replay'] = True
+    td.close(graceful=True)
+
+    # A non-default inherited value also survives an omitted-display round trip.
+    updates_key = 'CLAUDE_CODE_THINKING_DISPLAY_UPDATES'
+    inherited_environment = {**env, updates_key: 'false'}
+    inherited = start('thinking-inherited-env', base, environment=inherited_environment)
+    wire = run(inherited, base)
+    inherited_default = copy.deepcopy(wire.get('thinking'))
+    inherited_native = inherited.native_id
+    for display in ('omitted', 'summarized'):
+        request = {**follow(inherited), 'thinking': {'type': 'adaptive', 'display': display}}
+        request['messages'][-1]['content'] = 'THINKING_INHERITED_' + display.upper()
+        wire = run(inherited, request)
+        assert wire['thinking']['display'] == display
+        assert wire['output_config']['effort'] == 'medium' and inherited.native_id == inherited_native
+        assert inherited.environment[updates_key] == ('0' if display == 'omitted' else 'false')
+    wire = run(inherited, follow(inherited))
+    assert wire.get('thinking') == inherited_default
+    assert inherited.environment[updates_key] == inherited_environment[updates_key] == 'false'
+    assert '--thinking-display' not in inherited.native_cli_argv
+    checks['explicit_nondefault_inherited_environment_survives_display_round_trip'] = True
+    assert len(calls) == 26
+    checks['twenty_six_new_synthetic_requests_no_replay'] = True
     summary = {'checks': checks, 'fixture_calls': len(calls), 'real_provider_calls': 0, 'os_denies_non_loopback_network': True, 'ok': all(checks.values()), 'cli_sha256': cli_hash, 'candidate_sha256': source_hashes}
     (root / 'calls.synthetic.private.json').write_text(json.dumps(calls, indent=2))
     (root / 'receipt.safe.json').write_text(json.dumps(summary, indent=2))

@@ -282,6 +282,36 @@ class NativeHTTPTests(unittest.TestCase):
         self.assertFalse(self.created)
         self.assertTrue(all(row["attempts"] == 0 for row in self.audit()))
 
+    def test_unsupported_thinking_audit_contains_only_safe_shape_enums(self):
+        secret_values = ['PRIVATE_MODE', 'PRIVATE_DISPLAY', 'PRIVATE_KEY',
+                         'PRIVATE_VALUE', 'PRIVATE_BUDGET', 'PRIVATE_BODY']
+        invalid = [
+            ({'type': secret_values[0], 'display': secret_values[1],
+              secret_values[2]: secret_values[3], 'budget_tokens': secret_values[4]},
+             {'shape': 'object', 'mode': 'other', 'display': 'other',
+              'keys': ['budget_tokens', 'display', 'type'], 'unknown_key_count': 1}),
+            ({'type': 'enabled', 'budget_tokens': secret_values[4]},
+             {'shape': 'object', 'mode': 'enabled', 'display': 'absent',
+              'keys': ['budget_tokens', 'type'], 'unknown_key_count': 0}),
+            ({'type': [], 'display': {'PRIVATE_KEY': 'PRIVATE_VALUE'}},
+             {'shape': 'object', 'mode': 'other', 'display': 'other',
+              'keys': ['display', 'type'], 'unknown_key_count': 0}),
+            ('PRIVATE_VALUE', {'shape': 'other'}),
+        ]
+        for index, (thinking, expected) in enumerate(invalid, 1):
+            with self.subTest(index=index):
+                status, raw = self.request(self.body(
+                    thinking=thinking, messages=[{'role': 'user', 'content': secret_values[5]}]))
+                self.assertEqual(status, 400)
+                self.assertIn(b'unsupported_thinking_configuration', raw)
+                record = self.audit(index)[-1]
+                self.assertEqual(record['thinking'], expected)
+                self.assertEqual(record['attempts'], 0)
+                for value in secret_values:
+                    self.assertNotIn(value, json.dumps(record) + raw.decode())
+        self.assertFalse(self.created)
+        self.assertEqual(self.server.accepted, 0)
+
     def test_invalid_initial_shapes_do_not_poison_the_session(self):
         invalid = [
             {"metadata": []},
