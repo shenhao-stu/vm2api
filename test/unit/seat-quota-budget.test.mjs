@@ -5,14 +5,18 @@ import os from 'node:os'
 import path from 'node:path'
 import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
+import { AccountRuntimeRepo } from '../../src/lib/db/repos/account-runtime-repo.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { mapUpstreamError, quotaWindowError } from '../../src/lib/core/errors.mjs'
 
 const MODEL = 'claude-sonnet-5-5'
 
-function fixture(t, { second = null, grace = 0 } = {}) {
+function fixture(t, { second = null } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seat-quota-'))
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  t.after(() => {
+    quota.db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
   fs.mkdirSync(path.join(root, 'vms'))
   for (const id of second ? ['vm-1', 'vm-2'] : ['vm-1']) {
     fs.writeFileSync(
@@ -43,17 +47,15 @@ function fixture(t, { second = null, grace = 0 } = {}) {
       tiers: { default: tier, pro: tier, max: tier },
     },
   })
-  const states = new Map()
+  for (const id of second ? ['vm-1', 'vm-2'] : ['vm-1']) {
+    quota.ensure({ account_id: `account-${id}`, vm_id: id, max_concurrency: 4, concurrency_override: true })
+  }
   const pool = new PoolScheduler({
     projectRoot: root,
-    runtimeRepo: {
-      get: (id) => states.get(id) || null,
-      clearExpired() {},
-      upsert: (row) => states.set(row.account_id, { ...states.get(row.account_id), ...row }),
-    },
+    runtimeRepo: new AccountRuntimeRepo(quota.db),
     accountQuota: quota,
     workerHealth: async () => ({ ok: true, healthy: true, ready_slots: 20, credential: { has_access: true } }),
-    config: { seat_grace_ms: grace, seat_budget_reserve_pct: 0.02 },
+    config: { seat_budget_reserve_pct: 0.02 },
   })
   pool.config.fallback_wait_timeout_ms = 80
   pool.config.sticky_wait_timeout_ms = 80
@@ -170,18 +172,30 @@ test('the existing large cold-request guard retains its distinct error', async (
   assert.equal(result.body.error.code, 'quota_guard_request_too_large')
 })
 
-test('a warm seat remains usable at 89%, while a fresh seat at 83% is admitted', async (t) => {
-  const { pool, setUsage } = fixture(t, { grace: 30_000 })
+test('a seated follow-up remains usable at 89%, while a new seat needs its own quota budget', async (t) => {
+  const { pool, setUsage } = fixture(t)
   setUsage('vm-1', '5h', 0.83)
-  const first = await request(pool, { seatKey: 'seat:warm' })
-  assert.equal(first.result.status, 200)
+  const active = await pool.selectAndReserve({ model: MODEL, seatKey: 'seat:warm' })
+  assert.equal(active.ok, true)
+  t.after(() => active.release())
   setUsage('vm-1', '5h', 0.89)
-  const warm = await request(pool, { seatKey: 'seat:warm' })
-  assert.equal(warm.result.status, 200)
-  assert.equal(warm.calls, 1)
+  assert.equal(pool.planner.seatOf(active.seatKey).inflight, 1)
   const fresh = await request(pool, { seatKey: 'seat:another' })
   assert.equal(fresh.result.status, 429)
   assert.equal(fresh.calls, 0)
+  const following = request(pool, { seatKey: 'seat:warm' })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(pool.seatSnapshot().seats['vm-1'].queue_depth, 1)
+  assert.equal(pool.planner.seatOf(active.seatKey).inflight, 1)
+  active.release()
+  const warm = await following
+  assert.equal(warm.result.status, 200)
+  assert.equal(warm.calls, 1)
+  assert.equal(pool.inflight.size, 0)
+  assert.equal(pool.planner.seatOf(active.seatKey), null)
+  const ended = await request(pool, { seatKey: 'seat:warm' })
+  assert.equal(ended.result.status, 429)
+  assert.equal(ended.calls, 0)
 })
 
 test('capacity held by other seats still waits and succeeds after a seat release', async (t) => {

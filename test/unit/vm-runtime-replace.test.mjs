@@ -217,30 +217,40 @@ test('writeWorkerFiles uses the desired kin-eg network even if the container is 
   assert.equal(doc.proxy_required, false)
 })
 
-test('writeWorkerFiles keeps the control-plane gid when chown succeeds', (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-worker-group-'))
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const vm = { id: 'vm-10', proxy: { id: 'px-new', host: '1.2.3.4', port: 1080 } }
-  const calls = []
-  const real = fs.chownSync
-  t.mock.method(fs, 'chownSync', (file, uid, gid) => {
-    calls.push({ file, uid, gid })
-    try {
-      real.call(fs, file, uid, gid)
-    } catch {}
+for (const privileged of [false, true]) {
+  test(`writeWorkerFiles preserves ${privileged ? 'slot ownership under root' : 'the non-root control-plane group'}`, (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-worker-group-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    const vm = { id: 'vm-10', proxy: { id: 'px-new', host: '1.2.3.4', port: 1080 } }
+    const actualRoot = process.getuid() === 0
+    const controlGid = process.getgid()
+    const slotGid = Number(process.env.KIN_VM_GID || 987)
+    const publishedGid = privileged ? slotGid : controlGid
+    t.mock.method(process, 'getuid', () => (privileged ? 0 : 1000))
+    const calls = []
+    const real = fs.chownSync
+    t.mock.method(fs, 'chownSync', (file, uid, gid) => {
+      calls.push({ file, uid, gid })
+      try {
+        real.call(fs, file, uid, gid)
+      } catch {}
+    })
+    writeWorkerFiles(vm, root, { routing: {} })
+    const runDir = path.join(root, 'vms', 'vm-10', 'run')
+    for (const name of ['.', 'worker.json', 'kernel.json']) {
+      const stat = fs.statSync(path.join(runDir, name))
+      if (actualRoot || !privileged) assert.equal(stat.gid, publishedGid, name)
+      const file = path.join(runDir, name)
+      assert.ok(
+        calls.some((call) => (call.file === file || call.file.startsWith(`${file}.`)) && call.gid === publishedGid),
+        name,
+      )
+    }
+    assert.equal(fs.statSync(path.join(runDir, 'internal.token')).mode & 0o077, 0)
+    assert.ok(calls.filter((call) => call.file === runDir).every((call) => call.gid === publishedGid))
+    assert.equal(fs.statSync(runDir).mode & 0o777, privileged ? 0o700 : 0o770)
   })
-  writeWorkerFiles(vm, root, { routing: {} })
-  const runDir = path.join(root, 'vms', 'vm-10', 'run')
-  for (const name of ['.', 'worker.json', 'kernel.json']) {
-    const stat = fs.statSync(path.join(runDir, name))
-    assert.equal(stat.gid, process.getgid(), name)
-  }
-  assert.equal(fs.statSync(path.join(runDir, 'internal.token')).mode & 0o077, 0)
-  assert.equal(
-    calls.some((call) => call.file === runDir && call.gid === Number(process.env.KIN_VM_GID || 987)),
-    false,
-  )
-})
+}
 
 test('writeWorkerFiles hands runtime files to the slot user when the gateway is root', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-worker-root-'))

@@ -84,7 +84,11 @@ const cases = [
   },
 ]
 
-async function runCase(t, fixture, { switchAfterRepair = false, repeatWithCachedSearchRepair = false } = {}) {
+async function runCase(
+  t,
+  fixture,
+  { switchAfterRepair = false, repeatWithCachedSearchRepair = false, unknownAfterRepair = false } = {},
+) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zero-retry-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const routing = {
@@ -150,8 +154,16 @@ async function runCase(t, fixture, { switchAfterRepair = false, repeatWithCached
             })
             if (hops.length === 1)
               return { ok: false, status: 400, terminalState: 'rejected', body: { error: { message: fixture.error } } }
-            if (switchAfterRepair && hops.length === 2)
+            if (unknownAfterRepair && hops.length === 2)
               return { ok: false, status: 529, terminalState: 'rejected', body: { error: { message: 'Overloaded' } } }
+            if (switchAfterRepair && hops.length === 2)
+              return {
+                ok: false,
+                status: 503,
+                upstreamExecutions: 0,
+                terminalState: 'rejected',
+                body: { error: { code: 'slot_busy', message: 'No free slot before dispatch' } },
+              }
             return structuredClone(success)
           },
         })
@@ -172,6 +184,13 @@ async function runCase(t, fixture, { switchAfterRepair = false, repeatWithCached
     assert.equal(hops.length, 2)
     await handler.handleProtocol(request, response, 'anthropic.messages', '/v1/messages')
   }
+  if (unknownAfterRepair) {
+    assert.equal(response.status, 529)
+    assert.equal(hops.length, 2)
+    assert.ok(hops.every((hop) => hop.preset === 'zero'))
+    fixture.check(hops[1].body)
+    return
+  }
   assert.equal(response.status, 200, JSON.stringify(response.body))
   assert.equal(hops.length, switchAfterRepair || repeatWithCachedSearchRepair ? 3 : 2)
   for (const [index, hop] of hops.entries()) {
@@ -188,7 +207,10 @@ for (const fixture of cases) {
   test(`slot zero keeps caller system and the ${fixture.name} repair through the real handler and runner`, (t) =>
     runCase(t, fixture))
 }
-test('a repaired request uses the next slot preset when failover switches accounts', (t) =>
+test('a repaired request uses the next slot preset after a zero-dispatch admission rejection', (t) =>
   runCase(t, cases[0], { switchAfterRepair: true }))
 test('a cached search repair survives slot rendering on the next request without another retry', (t) =>
   runCase(t, cases[2], { repeatWithCachedSearchRepair: true }))
+
+test('a repaired request stops on an overload with unknown execution instead of starting on another slot', (t) =>
+  runCase(t, cases[0], { switchAfterRepair: true, unknownAfterRepair: true }))

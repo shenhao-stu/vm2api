@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import net from 'node:net'
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import {
@@ -118,8 +119,8 @@ test('network pause preserves admission closure and requires a fresh live monito
   )
 })
 
-test('raw helper startup cannot omit the required guard config', async () => {
-  const { startEgressProcess } = await import('../../src/lib/vm/egress.mjs')
+test('failed raw helper startup still writes required guard config without claiming a live exit', async () => {
+  const { startEgressProcess, egressRunDir } = await import('../../src/lib/vm/egress.mjs')
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'exit-guard-start-'))
   const db = openDatabase({ dataDir: root })
   try {
@@ -127,18 +128,26 @@ test('raw helper startup cannot omit the required guard config', async () => {
       required: true,
       proxies: { p1: { expected_ip: policy.expected_ip, revision: policy.revision } },
     })
+    const reserve = net.createServer()
+    await new Promise((resolve) => reserve.listen(0, '127.0.0.1', resolve))
+    const port = reserve.address().port
+    await new Promise((resolve) => reserve.close(resolve))
     const result = await startEgressProcess({
       projectRoot: root,
       proxyId: 'p1',
       proxyUrl: 'socks5h://127.0.0.1:1',
       listenHost: '127.0.0.1',
-      tcpPort: 20000,
-      dnsPort: 20001,
+      tcpPort: port,
+      dnsPort: 0,
       bin: fs.existsSync('/bin/true') ? '/bin/true' : '/usr/bin/true',
       exitGuard: null,
     })
-    assert.equal(result.ok, true)
-    const config = JSON.parse(fs.readFileSync(result.configPath, 'utf8'))
+    assert.equal(result.ok, false)
+    assert.match(result.error, /did not listen/)
+    const dir = egressRunDir(root, 'p1')
+    assert.equal(fs.existsSync(path.join(dir, 'egress.pid')), false)
+    assert.equal(getProxyExitGuardState(root, 'p1').ready, false)
+    const config = JSON.parse(fs.readFileSync(path.join(dir, 'egress.json'), 'utf8'))
     assert.equal(config.exit_guard.expected_ip, policy.expected_ip)
     assert.equal(config.exit_guard.revision, policy.revision)
     assert.match(config.exit_guard.state_path, /exit-guard-state.json$/)

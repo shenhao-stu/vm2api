@@ -1,10 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
-import { DEFAULT_CLAUDE_SETTING } from '../../src/lib/protocol/seed-policy.mjs'
+import { mockLocalDockerInspect } from '../helpers/local-docker-inspect.mjs'
+import { RETIRE_LEGACY_TELEMETRY } from '../../src/lib/vm/slot-process-status.mjs'
 
 function seed(root, id) {
   const dir = path.join(root, 'vms')
@@ -87,7 +89,8 @@ test('GET seed-settings returns an empty claude.setting file as empty', async ()
   }
 })
 
-test('PUT seed-settings can follow proxy timezone and locale before writing files', async () => {
+test('PUT seed-settings can follow proxy timezone and locale before writing files', async (t) => {
+  await mockLocalDockerInspect(t, { vmIds: ['vm-01'] })
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seed-put-tz-'))
   try {
     seed(root, 'vm-01')
@@ -265,6 +268,7 @@ test('PUT seed-settings preserves newer credentials, runtime and omitted policy 
 })
 
 test('seed edits and a telemetry restart cannot override deployment telemetry off', async (t) => {
+  await mockLocalDockerInspect(t, { vmIds: ['vm-guard'], running: true })
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seed-forced-off-'))
   const savedPath = process.env.PATH
   const savedOff = process.env.VM2API_DISABLE_TELEMETRY
@@ -295,7 +299,34 @@ test('seed edits and a telemetry restart cannot override deployment telemetry of
   fs.writeFileSync(vmPath, JSON.stringify(vm))
   const run = path.join(root, 'vms', vm.id, 'run')
   fs.mkdirSync(run, { recursive: true })
-  fs.writeFileSync(path.join(run, 'worker.json'), JSON.stringify({ telemetry: { enabled: true } }))
+  fs.writeFileSync(path.join(run, 'internal.token'), 'fixture-native-token')
+  const socketDir = fs.mkdtempSync('/tmp/seed-health-')
+  const socketPath = path.join(socketDir, 'kernel.sock')
+  vm.runtime.kernel_socket = socketPath
+  fs.writeFileSync(vmPath, JSON.stringify(vm))
+  let observations = 0
+  const health = http.createServer((req, res) => {
+    if (req.url !== '/internal/health' || req.headers['x-kin-internal-token'] !== 'fixture-native-token') {
+      res.writeHead(401).end('{}')
+      return
+    }
+    const seedDoc = JSON.parse(fs.readFileSync(path.join(root, 'vms', vm.id, 'cli-home/.claude/kin-seed.json')))
+    observations++
+    // First acknowledgement still has a queued event. Publication must wait for its removal.
+    const telemetry = {
+      enabled: !seedDoc.seed_policy.telemetry_disabled,
+      state: 'disabled',
+      pending_events: observations === 1 ? 1 : 0,
+    }
+    res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({ ok: true, engine: 'rust', telemetry }))
+  })
+  await new Promise((resolve) => health.listen(socketPath, resolve))
+  t.after(async () => {
+    health.closeAllConnections()
+    await new Promise((resolve) => health.close(resolve))
+    fs.rmSync(socketDir, { recursive: true, force: true })
+  })
   const { handlePanel, response } = handler(root, {
     readBody: async () => ({
       telemetry_disabled: false,
@@ -317,15 +348,24 @@ test('seed edits and a telemetry restart cannot override deployment telemetry of
   assert.equal(data.settings_json.env.DISABLE_TELEMETRY, '1')
   assert.equal(data.settings_json.env.DO_NOT_TRACK, '1')
   assert.equal(data.settings_json.env.CUSTOM, 'kept')
-  assert.equal(JSON.parse(fs.readFileSync(path.join(run, 'worker.json'), 'utf8')).telemetry.enabled, false)
+  const nativeConfig = JSON.parse(fs.readFileSync(path.join(run, 'kernel.json'), 'utf8'))
+  assert.equal(nativeConfig.vm_id, vm.id)
+  assert.equal(nativeConfig.telemetry.proxy_id, 'px-local')
   assert.equal(data.service.ok, true)
-  assert.equal(data.service.telemetry.action, 'stopped')
+  assert.equal(data.service.action, 'applied')
+  assert.equal(data.service.enabled, false)
+  assert.equal(data.service.pending_events, 0)
+  assert.equal(data.published, true)
+  assert.equal(data.applied, true)
+  assert.ok(observations >= 2, 'a disabled policy with queued events must not be acknowledged as applied')
   const commands = fs.readFileSync(calls, 'utf8').trim().split('\n').map(JSON.parse)
   assert.equal(commands.length, 1)
-  assert.match(commands[0].at(-1), /pkill -TERM -x kin-worker/)
+  assert.equal(commands[0].at(-1), RETIRE_LEGACY_TELEMETRY)
+  assert.doesNotMatch(commands[0].at(-1), /pkill/)
 })
 
 test('native privacy opt-outs survive subsequent seed edits without changing slot bindings', async (t) => {
+  await mockLocalDockerInspect(t, { vmIds: ['vm-privacy'] })
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seed-privacy-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   seed(root, 'vm-privacy')
@@ -344,7 +384,10 @@ test('native privacy opt-outs survive subsequent seed edits without changing slo
     const { handlePanel, response } = handler(root, { readBody: async () => body })
     await handlePanel({ method: 'PUT', url: url.pathname }, {}, url)
     assert.equal(response.status, 200)
-    assert.equal(response.body.data.service, null)
+    assert.equal(response.body.data.saved, true)
+    assert.equal(response.body.data.published, true)
+    assert.equal(response.body.data.applied, false)
+    assert.equal(response.body.data.service.state, 'stopped')
     const saved = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
     const settings = JSON.parse(fs.readFileSync(path.join(root, 'vms', vm.id, 'cli-home/.claude/settings.json')))
     for (const [key, value] of Object.entries(optOuts)) {

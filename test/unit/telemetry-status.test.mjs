@@ -38,6 +38,7 @@ test('stopped VM publication does not spawn a process to retire telemetry', asyn
   let ran = false
   const result = await retireLegacyTelemetry({
     vm: { id: 'vm-03', status: 'stopped' },
+    inspect: async () => ({ State: { Running: false } }),
     run: async () => {
       ran = true
       throw new Error('must not run')
@@ -54,4 +55,20 @@ test('malformed public counters and free text error data are not leaked as nativ
   })
   assert.equal(result.telemetry.last_error, null)
   assert.ok(!JSON.stringify(result).includes('private-host'))
+})
+
+test('a stopped record cannot hide unavailable Docker runtime during telemetry retirement', async () => {
+  let ran = false
+  const result = await retireLegacyTelemetry({
+    vm: { id: 'vm-03', status: 'stopped' },
+    inspect: async () => {
+      throw new Error('fixture daemon unavailable')
+    },
+    run: async () => {
+      ran = true
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'telemetry_runtime_unavailable')
+  assert.equal(ran, false)
 })

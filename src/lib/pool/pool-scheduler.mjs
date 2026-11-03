@@ -660,7 +660,7 @@ export class PoolScheduler extends EventEmitter {
    * sticky VM until `sticky_wait_timeout_ms`, then globally until
    * `fallback_wait_timeout_ms`. A seated session's concurrency wait times out
    * after `sticky_wait_timeout_ms`. Timeouts are `pool_queue_timeout`.
-   * Finishing a request keeps the seat until sticky TTL.
+   * Finishing the last in-flight or queued request frees the seat.
    */
   async selectSeat({
     model,

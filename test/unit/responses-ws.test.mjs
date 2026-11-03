@@ -793,6 +793,7 @@ test('real handleProtocol: an ended WebSocket response logs once after the handl
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-responses-ws-finish-'))
   writeGptVm(root, 'vm-gpt-a')
   const finishCalls = []
+  const keyCalls = []
   const live = await listenWithHandleProtocol(root, {
     requestLog: {
       start: () => ({ request_id: 'ws-finish', t0: Date.now() }),
@@ -800,7 +801,16 @@ test('real handleProtocol: an ended WebSocket response logs once after the handl
         finishCalls.push(bag)
       },
     },
-    apiKeyStore: { recordUsage() {}, release() {} },
+    apiKeyStore: {
+      acquire() {
+        keyCalls.push('acquire')
+        return { ok: true }
+      },
+      recordUsage() {},
+      release() {
+        keyCalls.push('release')
+      },
+    },
     codexOps: {
       streamCodexKernel: async ({ onEvent }) => {
         await onEvent(
@@ -822,6 +832,7 @@ test('real handleProtocol: an ended WebSocket response logs once after the handl
     assert.equal(finishCalls.length, 1)
     assert.equal(finishCalls[0].final_state, 'verified')
     assert.equal(finishCalls[0].error_code, null)
+    assert.deepEqual(keyCalls, ['acquire', 'release'])
   } finally {
     ws?.terminate()
     await live.close()

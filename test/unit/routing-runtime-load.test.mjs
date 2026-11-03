@@ -6,6 +6,7 @@ import path from 'node:path'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import { createRoutingRuntime } from '../../src/lib/admin/routing-runtime.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
+import { mockLocalDockerInspect } from '../helpers/local-docker-inspect.mjs'
 
 function runtimeFor(file) {
   return createRoutingRuntime({ routingConfigPath: file })
@@ -479,7 +480,8 @@ test('persistRoutingPatch merges a valid vm patch', async () => {
   }
 })
 
-test('native interval publication reports an unreachable remote VM as failed, not queued success', async () => {
+test('native interval publication reports an unreachable remote VM as failed, not queued success', async (t) => {
+  const engine = await mockLocalDockerInspect(t, { vmIds: ['vm-claude'], running: false })
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-telemetry-'))
   const vms = path.join(root, 'vms')
   const routingFile = path.join(root, 'routing.json')
@@ -503,6 +505,10 @@ test('native interval publication reports an unreachable remote VM as failed, no
     const runtime = persistHarness(root, routingFile, routingConfig)
     const changed = await runtime.persistRoutingPatch({ telemetry: { upload_interval_seconds: 3600 } })
     assert.deepEqual(changed.telemetry_sync, { updated: 1, queued: 0, skipped: 0, failed: ['vm-node'] })
+    assert.deepEqual(
+      engine.requests.map((request) => request.method),
+      ['GET'],
+    )
     assert.equal(JSON.parse(fs.readFileSync(routingFile, 'utf8')).telemetry.upload_interval_seconds, 3600)
     assert.equal(kernel('vm-claude').upload_interval_seconds, 3600)
     const localSeed = JSON.parse(

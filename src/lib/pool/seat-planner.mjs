@@ -7,10 +7,10 @@
  * device are two seats. Seat capacity is the VM's `session_slots`;
  * concurrency and RPM stay with PoolScheduler.reserve().
  *
- * A seat stays taken after its last request ends. It frees only when sticky
- * TTL expires, or when the scheduler drops it because the home left the pool
- * (unschedulable, quota, credential, failover). `graceMs` is unused; the
- * field remains so older routing config still loads.
+ * A seat frees when its last request ends and no follow-up is queued on
+ * that VM. Sticky TTL remembers the preferred VM without occupying a slot.
+ * Ineligible homes and failover drop the seat. `graceMs` remains only for
+ * compatibility with older routing config.
  *
  * Queues:
  *   vmQueue[vm]  `conc` tickets: a seated session waiting for VM concurrency.
