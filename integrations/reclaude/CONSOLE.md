@@ -145,6 +145,19 @@ The default native worker still waits for the organizational policy confirmation
 
 For account-window billing, set `quota_kind` to `account_windows` in the Chrome reader and set `account_windows` in the NAS agent config with its `path`, `org` and `account_id`. Use a separate installed reader and snapshot for each account. The existing `carpool` reader keeps the USD format. The optional `app_url` selects an allowlisted official portal with the login for that account. Percentage windows and dollar balances are displayed separately. When multiple devices use the same subscription, they share its official allowance.
 
+Install `official_windows.py` alongside the management agent and
+`publish_official_windows.py`. The reader's publisher command runs
+`python3 publish_official_windows.py MANAGEMENT_CONFIG` with the observation on
+stdin. The publisher verifies the configured organization, account and current
+native device, then atomically replaces only a newer observation. It never
+changes authorization, scheduling, cooldowns or exit guards.
+
+An official zero-percent window with a null reset is valid: no new session
+window is active. A nonzero window requires a reset time. Expired observations
+remain visible as stale; they never become synthetic zeroes. Keep each account's
+browser login available for its own reader. A missing login preserves the last
+observation and marks it stale instead of reading another account's quota.
+
 Accounts that share a Sub2API pool can reference one operator-owned JSON file using `shared_routing_profile` in each forced-command broker config. Start from `shared-routing.example.json`, fill in the intended shared group IDs, and apply its model mapping, priority, concurrency and cooldown rules through the native account API. Status reports `shared_policy_matches`. Resume checks the shared policy before changing scheduling. Pausing a revoked account remains possible during configuration drift.
 
 Sub2API's native scheduler can keep a healthy session on its selected account and choose another available account when a failure precedes dispatch. A temporary-unschedulable rule matching HTTP 400 `native_request_consumed_no_replay` makes Sub2API treat the error as a failover signal. Leave that rule out. A consumed request or an already-streaming response must keep its original outcome. Preserve the native runtime's no-replay response and its evidence.
