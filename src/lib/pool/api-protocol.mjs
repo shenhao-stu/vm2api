@@ -59,9 +59,10 @@ export function anthropicClientHeaders(headers) {
 }
 
 async function readLines(stream, onLine) {
+  stream.setEncoding('utf8')
   let buf = ''
   for await (const chunk of stream) {
-    buf += chunk.toString('utf8')
+    buf += chunk
     let idx
     while ((idx = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, idx)

@@ -17,7 +17,7 @@ const start = { type: 'message_start', message: { usage } }
 const delta = { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 12 } }
 const stop = { type: 'message_stop' }
 
-async function stream(t, events) {
+async function stream(t, events, splitText) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-accounting-'))
   fs.mkdirSync(path.join(root, 'run'))
   const wire = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')
@@ -27,7 +27,14 @@ async function stream(t, events) {
     req.on('end', () => {
       attempts++
       res.writeHead(200, { 'content-type': 'text/event-stream' })
-      res.end(wire)
+      if (splitText) {
+        const bytes = Buffer.from(wire)
+        const splitAt = bytes.indexOf(splitText) + 1
+        res.write(bytes.subarray(0, splitAt))
+        setTimeout(() => res.end(bytes.subarray(splitAt)), 25)
+      } else {
+        res.end(wire)
+      }
     })
   })
   await new Promise((resolve) => server.listen(path.join(root, 'run/api-kernel.sock'), resolve))
@@ -95,4 +102,12 @@ test('an API stream error remains a failure even if followed by a terminal frame
   assert.equal(result.status, 503)
   assert.equal(result.terminalState, 'rejected')
   assert.deepEqual(result.usage, usage)
+})
+
+test('split UTF-8 characters survive realtime SSE forwarding with final usage', async (t) => {
+  const text = { type: 'content_block_delta', delta: { type: 'text_delta', text: '你好' } }
+  const { result, received, wire } = await stream(t, [start, text, delta, stop], '你好')
+  assert.equal(received, wire)
+  assert.equal(result.terminalState, 'verified')
+  assert.deepEqual(result.usage, { ...usage, output_tokens: 12 })
 })

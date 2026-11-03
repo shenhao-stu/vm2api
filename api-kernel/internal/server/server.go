@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 
@@ -94,7 +95,26 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	var dst io.Writer = w
+	if mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mediaType == "text/event-stream" {
+		dst = eventStreamWriter{writer: w, controller: http.NewResponseController(w)}
+	}
+	_, _ = io.Copy(dst, resp.Body)
+}
+
+// Flush bytes as they arrive. net/http can otherwise hold a short event
+// until more data arrives or the upstream closes the stream.
+type eventStreamWriter struct {
+	writer     io.Writer
+	controller *http.ResponseController
+}
+
+func (s eventStreamWriter) Write(p []byte) (int, error) {
+	n, err := s.writer.Write(p)
+	if err == nil {
+		err = s.controller.Flush()
+	}
+	return n, err
 }
 
 func jsonQuote(s string) string {
