@@ -117,11 +117,22 @@ export async function probeRustHealth(exec, { remainingBudgetMs, ...options } = 
     Date.now() < deadline
   ) {
     // Only GET /health is repeated. Never infer a dead CLI from a lost SSH reply.
+    const firstCode = health.code
     at = Date.now()
     health = await rustKernelHealth(exec, {
       ...options,
       timeoutMs: Math.min(REMOTE_HEALTH_RECHECK_MS, deadline - at),
     })
+    console.warn(
+      '[kernel-health]',
+      JSON.stringify({
+        vm_id: cacheKey(exec),
+        first_code: firstCode,
+        final_status: health?.status || 0,
+        ready: rustKernelReachable(health),
+        recheck_ms: Date.now() - at,
+      }),
+    )
   }
   const key = cacheKey(exec)
   if (key && health?.ok === true && health.vm_id === key && rustKernelReachable(health)) {
