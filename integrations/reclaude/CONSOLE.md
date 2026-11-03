@@ -44,9 +44,9 @@ The NAS agent config names its existing `home`, `binding`, `container`, `unit`,
 - Native container/HOME, OAuth daemon and telemetry remain running and intact.
   Buttons intentionally control the Relay worker, not device enrollment or the
   host VM. Container state is displayed separately.
-  Completed turns retain their verified continuation checkpoint. A conversation
-  awaiting an external tool result is not restart-resumable: stopping the worker
-  ends that tool wait, and the incomplete-turn guard prevents automatic replay.
+  Completed turns retain their verified continuation checkpoint. A completed
+  tool-use turn can resume after the idle CLI is suspended, with exactly the
+  pending caller tool results. Failed/in-flight turns remain blocked.
 - A confirmed native revocation or auth latch pauses the dedicated account before
   persisting management evidence. A 30-second read-only watcher performs this
   check without model requests. It never rebinds, rearms an exit guard, accepts a
@@ -76,12 +76,23 @@ locations plus the management route. Run `nginx -t` and gracefully reload only
 Nginx. Retain the original assets and all other locations for rollback. This does
 not change the main gateway image or implicitly restart its slots/exit helpers.
 Persist and document this frontend overlay for the next full gateway upgrade.
+Check every local JavaScript/CSS URL referenced by the actual index, including
+its module imports, and open the keys page in a real browser. An index returning
+200 does not prove its assets exist. When assets use `/assets/`, serve that path
+from the same build, with the prior gateway as a fallback for old hashed files.
 
 Before replacing the separate HTTP worker, pause only its Sub account, drain and
 back up the exact source/unit hashes. Keep the original native daemon and guard.
 Afterwards compare all protected Pro slots, keys, proxies, concurrency and guest
 start times. On failure leave the new account paused, repair or roll back only
 these independent components; never restore entire databases or OAuth homes.
+
+With history import enabled, callers may return after completing additional
+turns elsewhere. Their history must still contain the exact saved prefix and a
+complete tool-result graph. The adapter preserves the old native transcript,
+imports the extended context into a new segment in the same authenticated
+session directory, and dispatches only the final new user input. Changed prefix,
+model/system, unfinished paid turns and duplicate requests remain rejected.
 
 Tests use local fixtures and a network-disabled genuine CLI, including Fable,
 default sampling, terminal SSE, authorization failure, drain and original-IP

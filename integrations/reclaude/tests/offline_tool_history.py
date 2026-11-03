@@ -86,6 +86,27 @@ try:
  systems=[block['text'] for block in wire['system'] if block['type']=='text']
  checks['native_generates_own_runtime_header']=len([s for s in systems if s.startswith('x-anthropic-billing-header:')])==1 and '2.1.111.caller' not in '\n'.join(systems)
  checks['runtime_boundary_keeps_caller_instructions']=any(s=='CALLER_INSTRUCTIONS_PRESERVED' for s in systems)
+ # A caller can complete turns on another permitted route, then return with
+ # an exact prefix. Carry that context without dispatching any historic turn.
+ external={**base,'messages':copy.deepcopy(runtime_session.history)+[
+  {'role':'user','content':'EXTERNAL_COMPLETED_USER'},
+  {'role':'assistant','content':'EXTERNAL_COMPLETED_ANSWER'},
+  {'role':'user','content':'ONLY_NEW_ADVANCED_USER'}], 'system':runtime_body['system']}
+ old_native=runtime_session.native_id;wire=run(runtime_session,external)
+ checks['advanced_idle_context_only_dispatches_final_user']=all(x in json.dumps(wire['messages']) for x in ['EXTERNAL_COMPLETED_USER','EXTERNAL_COMPLETED_ANSWER','ONLY_NEW_ADVANCED_USER']) and runtime_session.native_id!=old_native
+ checks['advanced_context_preserves_original_transcript']=any((root/'profile/projects').glob('*/'+old_native+'.jsonl'))
+ t=start('external-tools',base);reply[0]='tools';run(t,base);old_native=t.native_id
+ external={**base,'messages':copy.deepcopy(t.history)+[
+  {'role':'user','content':[{'type':'tool_result','tool_use_id':i,'content':'EXTERNAL_TOOL_RESULT'}for i in sorted(t.pending_ids)]},
+  {'role':'assistant','content':'EXTERNAL_TOOL_ANSWER'},
+  {'role':'user','content':'FINAL_NEW_TOOL_FOLLOWUP'}]}
+ t.expire_tool_wait();t=start('external-tools',external,True);reply[0]='text';wire=run(t,external)
+ checks['advanced_tools_restore_has_one_dispatch']=t.native_id!=old_native and all(x in json.dumps(wire['messages'])for x in ['EXTERNAL_TOOL_RESULT','EXTERNAL_TOOL_ANSWER','FINAL_NEW_TOOL_FOLLOWUP'])
+ before=len(calls)
+ for changed in [external,{**external,'model':'different'}]:
+  try:list(t.request(changed));raise AssertionError('duplicate or model change accepted')
+  except ContractError:pass
+ checks['advanced_turn_keeps_duplicate_and_model_protection']=len(calls)==before
  receipt={'checks':checks,'fixture_calls':len(calls),'real_provider_calls':0,'ok':all(checks.values())}
  (root/'calls.synthetic.json').write_text(json.dumps(calls,indent=2));(root/'receipt.safe.json').write_text(json.dumps(receipt,indent=2));print(json.dumps(receipt));assert receipt['ok']
 finally:
