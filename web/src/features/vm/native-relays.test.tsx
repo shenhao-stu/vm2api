@@ -245,6 +245,38 @@ describe('native Relay VM management', () => {
     ).toEqual(['0', '100'])
     expect(doc.querySelectorAll('.meter-capped')).toHaveLength(1)
   })
+  it('shows an official weekly limit even before Sub has a cooldown', () => {
+    const now = 1793728000000
+    const item = {
+      ...relay,
+      runtime: {
+        ...relay.runtime,
+        official_windows: {
+          five_hour: { used_percent: 0, resets_at_ms: null },
+          seven_day: { used_percent: 100, resets_at_ms: now + 86400000 },
+          observed_at_ms: now,
+          source_updated_ms: now,
+          stale: false,
+        },
+      },
+    }
+    expect(relayState(item, now)).toBe('周额度已满')
+    expect(scheduleLabel(item, now)).toBe('已开启')
+    expect(relayUsageModel(item, now).windows[0].pct).toBe(0)
+    expect(relayUsageModel(item, now).stale).toBe(false)
+    expect(
+      relayState(
+        {
+          ...item,
+          runtime: {
+            ...item.runtime,
+            official_windows: { ...item.runtime.official_windows, stale: true },
+          },
+        },
+        now
+      )
+    ).toBe('运行中')
+  })
   it('rejects invalid quota amounts without fabricating a valid reading', () => {
     const item = {
       ...relay,

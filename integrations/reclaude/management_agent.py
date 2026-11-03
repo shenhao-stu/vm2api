@@ -1,7 +1,5 @@
 """Fixed-target NAS agent. Stops only the HTTP worker; native OAuth stays alive."""
 import json
-import math
-from datetime import datetime
 import os
 from pathlib import Path
 import subprocess
@@ -12,6 +10,7 @@ import urllib.request
 
 from management import guard_status, read_tail
 from native_health import NativeHealth
+from official_windows import normalize_windows
 
 
 def run(args, timeout=15):
@@ -35,27 +34,7 @@ def account_windows(config):
     try:
         with Path(source["path"]).open() as stream:
             data = json.loads(stream.read(2048))
-        if (data["binding"], data["org"], data["account_id"]) != (
-            config["binding"], source["org"], source["account_id"]
-        ):
-            return None
-        observed, updated = data["observed_at_ms"], data["source_updated"]
-        now = time.time() * 1000
-        if not 0 < updated <= observed <= now + 10000:
-            return None
-        result = {}
-        for key in ("five_hour", "seven_day"):
-            window = data["windows"][key]
-            used = window["used_percent"]
-            reset = datetime.fromisoformat(window["resets_at"].replace("Z", "+00:00"))
-            if type(used) not in (float, int) or not math.isfinite(used) or used < 0 or reset.tzinfo is None:
-                return None
-            result[key] = {"used_percent": used, "resets_at_ms": int(reset.timestamp() * 1000)}
-        result["observed_at_ms"] = observed
-        result["source_updated_ms"] = updated
-        result["stale"] = (now - observed > 900000 or now - updated > 7200000
-                           or any(result[key]["resets_at_ms"] <= now for key in ("five_hour", "seven_day")))
-        return result
+        return normalize_windows(config, data, time.time() * 1000)
     except (OSError, KeyError, TypeError, ValueError, OverflowError):
         return None
 

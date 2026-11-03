@@ -58,7 +58,8 @@ ACCOUNT_WINDOWS = """(async () => {
     const windows = {};
     for (const key of ['five_hour', 'seven_day']) {
         const w = account.usage_snapshot?.[key];
-        if (!w || !Number.isFinite(w.utilization) || w.utilization < 0 || !Number.isFinite(Date.parse(w.resets_at))) return null;
+        if (!w || !Number.isFinite(w.utilization) || w.utilization < 0) return null;
+        if (w.resets_at === null ? w.utilization !== 0 : !Number.isFinite(Date.parse(w.resets_at))) return null;
         windows[key] = {used_percent:w.utilization, resets_at:w.resets_at};
     }
     return {ok:true, org:ids.org_id, account_id:ids.account_id, binding:ids.binding, source_updated:account.usage_updated_at, observed_at_ms:Date.now(), windows};

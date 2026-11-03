@@ -31,8 +31,8 @@ export type NativeRelay = {
   }
   runtime: {
     official_windows?: {
-      five_hour: { used_percent: number; resets_at_ms: number }
-      seven_day: { used_percent: number; resets_at_ms: number }
+      five_hour: { used_percent: number; resets_at_ms: number | null }
+      seven_day: { used_percent: number; resets_at_ms: number | null }
       observed_at_ms: number
       source_updated_ms: number
       stale: boolean
@@ -104,7 +104,22 @@ export function relayState(relay: NativeRelay, now = Date.now()) {
   )
     return '已暂停'
   if (scheduleLabel(relay, now) === '冷却中') return '额度冷却'
-  return relay.runtime.http_ready ? '运行中' : 'Relay 待检查'
+  if (!relay.runtime.http_ready) return 'Relay 待检查'
+  const windows = relay.runtime.official_windows
+  if (windows && !windows.stale) {
+    for (const [label, row] of [
+      ['周额度已满', windows.seven_day],
+      ['5H额度已满', windows.five_hour],
+    ] as const) {
+      if (
+        row.used_percent >= 100 &&
+        row.resets_at_ms != null &&
+        row.resets_at_ms > now
+      )
+        return label
+    }
+  }
+  return '运行中'
 }
 
 export function scheduleResetAt(
