@@ -1,4 +1,5 @@
 import { SubscriptionError } from '../vm/subscription-network.mjs'
+import { clashSubscriptionStatus, dispatchClashSubscription } from '../vm/clash-subscriptions.mjs'
 
 export async function handleProxySubscriptions({ req, res, url, manager, readBody, json, role }) {
   res.setHeader('Cache-Control', 'no-store')
@@ -9,13 +10,23 @@ export async function handleProxySubscriptions({ req, res, url, manager, readBod
   const base = '/api/panel/proxy-subscriptions'
   try {
     let result
+    if (url.pathname === '/api/panel/proxies/clash') {
+      if (req.method === 'GET') return json(res, 200, { ok: true, ...clashSubscriptionStatus(manager.view()) })
+      if (req.method === 'POST')
+        return json(res, 200, {
+          ok: true,
+          ...(await dispatchClashSubscription(manager, await readBody(req, 3 * 1024 * 1024))),
+        })
+      return json(res, 405, { ok: false, error: { code: 'method_not_allowed', message: '不支持的订阅操作' } })
+    }
     if (req.method === 'GET' && url.pathname === base) result = manager.view()
     else if (req.method === 'POST' && url.pathname === base)
       result = await manager.import(await readBody(req, 3 * 1024 * 1024))
     else {
       const match = url.pathname.match(/^\/api\/panel\/proxy-subscriptions\/(sub-[a-f0-9]{16})(\/refresh)?$/)
       if (!match) return json(res, 404, { ok: false, error: { code: 'not_found', message: '订阅操作不存在' } })
-      if (req.method === 'POST' && match[2]) result = await manager.import({ id: match[1] })
+      if (req.method === 'POST' && match[2]) result = await manager.refresh(match[1])
+      else if (req.method === 'PATCH' && !match[2]) result = manager.configure(match[1], await readBody(req, 16384))
       else if (req.method === 'DELETE' && !match[2]) result = await manager.remove(match[1])
       else return json(res, 405, { ok: false, error: { code: 'method_not_allowed', message: '不支持的订阅操作' } })
     }
@@ -30,6 +41,8 @@ export async function handleProxySubscriptions({ req, res, url, manager, readBod
         subscription_limit: 413,
         subscription_busy: 409,
         subscription_bound: 409,
+        subscription_bound_changed: 409,
+        subscription_refresh_failed: 502,
         subscription_not_found: 404,
       }[error.code] || 400
     return json(res, status, { ok: false, error: { code: error.code, message: error.message } })

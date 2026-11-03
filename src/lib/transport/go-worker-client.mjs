@@ -1,3 +1,4 @@
+import { createStreamTiming as createHopTiming } from './stream-timing.mjs'
 import http from 'node:http'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
@@ -720,6 +721,7 @@ export async function streamGoWorker({
   }
   let committed = false
   const timing = createStreamTiming()
+  const hopTiming = createHopTiming()
   const requestId = randomUUID()
   const stopCancel = cancelOnAbort(exec, signal, requestId)
   try {
@@ -741,6 +743,7 @@ export async function streamGoWorker({
           repaired,
         })
     reportEnvelope(onEnvelope, prepared.envelope)
+    hopTiming.mark('worker_dispatch_ms')
     const response = await workerRequest(exec, {
       method: 'POST',
       requestPath,
@@ -751,6 +754,7 @@ export async function streamGoWorker({
       timeoutMode: 'first-byte',
       headers: { te: 'trailers' },
     })
+    hopTiming.mark('worker_headers_ms')
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, 1024 * 1024)
@@ -758,6 +762,7 @@ export async function streamGoWorker({
         ok: false,
         status: response.statusCode || 0,
         via: 'go-worker-stream',
+        timing: hopTiming.snapshot(),
         body: parseJson(data, response.statusCode),
         headers,
         committed: false,
@@ -804,6 +809,7 @@ export async function streamGoWorker({
     const observeSseEvent = (event) => {
       if (!event) return event
       timing.observe(event, receivedAt)
+      hopTiming.observe(event)
       if (event.type === 'response_headers' && event.headers && typeof event.headers === 'object') {
         sseRateHeaders = { ...sseRateHeaders, ...event.headers }
       }
@@ -840,8 +846,10 @@ export async function streamGoWorker({
       // message_stop is the protocol terminal event, but the kernel still sends
       // job_done and its trailers afterward. Keep reading until the worker
       // closes the response so a normal completion is not mistaken for cancel.
+      response.setEncoding('utf8')
       for await (const chunk of response) {
         receivedAt = Date.now()
+        hopTiming.mark('first_chunk_ms')
         buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
         let newline
         while ((newline = buffer.indexOf('\n')) >= 0) {
@@ -925,6 +933,7 @@ export async function streamGoWorker({
         ok: response.statusCode === 200 && !lastError && complete,
         status: response.statusCode || 0,
         via: 'go-worker-stream',
+        timing: hopTiming.snapshot(),
 
         body: lastError || assembled || { type: 'message', role: 'assistant', content: [] },
         headers: rateHeaders,
@@ -947,6 +956,7 @@ export async function streamGoWorker({
     if (signal?.aborted) {
       return clientCancelledResult({
         via: 'go-worker-stream',
+        timing: hopTiming.snapshot(),
         ...timing.snapshot(),
         committed,
       })
@@ -955,6 +965,7 @@ export async function streamGoWorker({
       ok: false,
       status: error.status === 413 ? 413 : 0,
       via: 'go-worker-stream',
+      timing: hopTiming.snapshot(),
       body: {
         type: 'error',
         error: {

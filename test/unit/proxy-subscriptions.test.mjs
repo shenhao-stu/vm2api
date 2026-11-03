@@ -113,7 +113,7 @@ test('dangerous fields, aliases, unsupported transports and oversize sources rej
   assert.throws(() => parseSubscription(JSON.stringify([node])), rejectCode('subscription_invalid'))
   assert.throws(() => parseSubscription('x'.repeat(2 * 1024 * 1024 + 1)), rejectCode('subscription_limit'))
   assert.throws(
-    () => parseSubscription(JSON.stringify(Array.from({ length: 257 }, () => JSON.parse(fixture()).proxies[0]))),
+    () => parseSubscription(JSON.stringify(Array.from({ length: 513 }, () => JSON.parse(fixture()).proxies[0]))),
     rejectCode('subscription_limit'),
   )
 })

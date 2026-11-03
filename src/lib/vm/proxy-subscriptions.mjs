@@ -1,8 +1,9 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import { parseSubscription } from './subscription-parse.mjs'
-import { SubscriptionRuntime } from './subscription-runtime.mjs'
+import { SubscriptionRuntime, renderSubscriptionConfig } from './subscription-runtime.mjs'
 import { subscriptionPortRange } from './instance-scope.mjs'
 import {
   fetchSubscription,
@@ -13,6 +14,24 @@ import {
 } from './subscription-network.mjs'
 
 const MAX_NODES = 512
+export const SUBSCRIPTION_REFRESH_MINUTES = 360
+const scheduleAt = (now, minutes) => new Date(now + minutes * 60000).toISOString()
+function refreshMinutes(value = SUBSCRIPTION_REFRESH_MINUTES) {
+  if (!Number.isInteger(value) || value < 15 || value > 10080) throw new SubscriptionError()
+  return value
+}
+function refreshPolicy(input, previous, hasUrl, now) {
+  if (input.auto_refresh !== undefined && typeof input.auto_refresh !== 'boolean') throw new SubscriptionError()
+  const interval = refreshMinutes(input.refresh_interval_minutes ?? previous?.refresh_interval_minutes)
+  const automatic = input.auto_refresh ?? (hasUrl && (previous?.auto_refresh ?? !previous))
+  if (automatic && !hasUrl) throw new SubscriptionError()
+  return {
+    auto_refresh: !!automatic,
+    refresh_interval_minutes: interval,
+    next_refresh_at: automatic ? scheduleAt(now, interval) : null,
+  }
+}
+const runtimeConfig = (nodes) => renderSubscriptionConfig(nodes, { controller: '127.0.0.1:1', secret: 'comparison' })
 const emptyState = (range) => ({ version: 1, nextPort: range.first, profiles: [], nodes: [] })
 const bound = (pool, id) => (pool?.snapshot().proxies.find((proxy) => proxy.id === id)?.bound_vm_ids || []).length > 0
 
@@ -60,9 +79,14 @@ export class ProxySubscriptions {
     resolver = resolvePublicHost,
     operationTimeoutMs = 45000,
     portRange = subscriptionPortRange(),
+    now = Date.now,
   }) {
+    this.now = now
+    this.timer = null
+    this.dueRunning = false
     this.portRange = Object.freeze({ ...portRange })
     this.dir = path.join(dataDir, 'subscriptions')
+    this.legacyStateFile = path.join(dataDir, 'clash', 'subscriptions.json')
     this.keyFile = process.env.VM2API_SUBSCRIPTION_KEY_FILE || path.join(this.dir, 'key')
     this.file = path.join(this.dir, 'state.enc')
     this.pool = proxyPool
@@ -78,6 +102,7 @@ export class ProxySubscriptions {
   }
 
   prepareStorage() {
+    if (fs.existsSync(this.legacyStateFile)) throw new SubscriptionError('subscription_storage')
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 })
     if (!fs.lstatSync(this.dir).isDirectory() || fs.lstatSync(this.dir).isSymbolicLink())
       throw new SubscriptionError('subscription_storage')
@@ -198,6 +223,12 @@ export class ProxySubscriptions {
         name: profile.name,
         source: profile.source,
         updated_at: profile.updatedAt,
+        auto_refresh: profile.auto_refresh === true,
+        refresh_interval_minutes: profile.refresh_interval_minutes ?? SUBSCRIPTION_REFRESH_MINUTES,
+        last_attempt_at: profile.last_attempt_at ?? null,
+        last_success_at: profile.last_success_at ?? null,
+        next_refresh_at: profile.next_refresh_at ?? null,
+        last_error: profile.last_error ?? null,
         node_count: this.state.nodes.filter((node) => node.profileId === profile.id && !node.retained).length,
         retained_count: this.state.nodes.filter((node) => node.profileId === profile.id && node.retained).length,
       })),
@@ -222,11 +253,13 @@ export class ProxySubscriptions {
         this.loaded = true
       }
       const next = await withDeadline(action(), this.operationTimeoutMs, 'subscription_fetch')
-      await this.runtime.validate(next.nodes)
       const previous = this.state
+      const unchanged =
+        this.runtime.status().running && isDeepStrictEqual(runtimeConfig(previous.nodes), runtimeConfig(next.nodes))
+      if (!unchanged) await this.runtime.validate(next.nodes)
       const poolBefore = structuredClone(this.pool.state)
       try {
-        await this.runtime.apply(next.nodes)
+        if (!unchanged) await this.runtime.apply(next.nodes)
         this.syncPool(next)
         const removed = previous.nodes.filter((node) => !next.nodes.some((item) => item.id === node.id))
         for (const node of removed) {
@@ -256,17 +289,19 @@ export class ProxySubscriptions {
     }
   }
 
-  async import(input = {}) {
+  async import(input = {}, { protectBound = false } = {}) {
     return this.mutate(async () => {
       if (input.id && !this.state.profiles.some((item) => item.id === input.id))
         throw new SubscriptionError('subscription_not_found')
       const existing = this.state.profiles.find((item) => item.id === input.id)
       const name = String(input.name ?? existing?.name ?? '代理订阅').trim()
       if (!name || name.length > 100 || /[\x00-\x1f\x7f]/.test(name)) throw new SubscriptionError()
-      const url = input.url ?? existing?.url
-      const text = input.content ?? existing?.content
+      const hasSource = input.url !== undefined || input.content !== undefined
+      const url = hasSource ? input.url : existing?.url
+      const text = hasSource ? input.content : existing?.content
       if ((!url && !text) || (url && text)) throw new SubscriptionError()
       if (url) sourceUrl(url)
+      const policy = refreshPolicy(input, existing, !!url, this.now())
       const nodes = parseSubscription(url ? await this.fetcher(url) : text)
       const hosts = new Map()
       const uniqueHosts = [...new Set(nodes.map((node) => node.config.server))]
@@ -283,7 +318,21 @@ export class ProxySubscriptions {
         name,
         source: url ? 'url' : 'text',
         ...(url ? { url } : { content: text }),
-        updatedAt: new Date().toISOString(),
+        updatedAt: new Date(this.now()).toISOString(),
+        ...policy,
+        last_attempt_at: new Date(this.now()).toISOString(),
+        last_success_at: new Date(this.now()).toISOString(),
+        last_error: null,
+      }
+      // A saved-source refresh cannot replace even a pinned public address of a bound route.
+      if (protectBound && existing) {
+        for (const old of this.state.nodes.filter(
+          (node) => node.profileId === existing.id && bound(this.pool, node.proxyId),
+        )) {
+          const next = nodes.find((node) => node.hash === old.hash)
+          if (!next || hosts.get(next.config.server) !== old.address)
+            throw new SubscriptionError('subscription_bound_changed')
+        }
       }
       return reconcileSubscription(
         this.state,
@@ -314,7 +363,73 @@ export class ProxySubscriptions {
     })
   }
 
+  configure(id, input = {}) {
+    if (this.busy) throw new SubscriptionError('subscription_busy')
+    const previous = this.state.profiles.find((profile) => profile.id === id)
+    if (!previous) throw new SubscriptionError('subscription_not_found')
+    const profile = { ...previous, ...refreshPolicy(input, previous, !!previous.url, this.now()) }
+    const next = { ...this.state, profiles: this.state.profiles.map((item) => (item.id === id ? profile : item)) }
+    this.save(next)
+    this.state = next
+    return this.view()
+  }
+
+  async refresh(id) {
+    if (this.busy) throw new SubscriptionError('subscription_busy')
+    const previous = this.state.profiles.find((profile) => profile.id === id)
+    if (!previous) throw new SubscriptionError('subscription_not_found')
+    try {
+      return await this.import({ id }, { protectBound: true })
+    } catch (error) {
+      const code = error.code === 'subscription_bound_changed' ? error.code : 'subscription_refresh_failed'
+      const profile = {
+        ...previous,
+        last_attempt_at: new Date(this.now()).toISOString(),
+        last_error: code,
+        next_refresh_at: previous.auto_refresh ? scheduleAt(this.now(), 15) : null,
+      }
+      const next = { ...this.state, profiles: this.state.profiles.map((item) => (item.id === id ? profile : item)) }
+      this.save(next)
+      this.state = next
+      throw new SubscriptionError(code)
+    }
+  }
+
+  startScheduler() {
+    if (this.timer) return
+    this.timer = setInterval(() => {
+      void this.runDue().catch(() => {})
+    }, 60000)
+    this.timer.unref?.()
+    void this.runDue().catch(() => {})
+  }
+
+  stopScheduler() {
+    if (this.timer) clearInterval(this.timer)
+    this.timer = null
+  }
+
+  async runDue() {
+    if (this.dueRunning || this.busy || !this.loaded || !this.runtime.status().available) return
+    this.dueRunning = true
+    try {
+      const due = this.state.profiles.filter(
+        (profile) =>
+          profile.url &&
+          profile.auto_refresh &&
+          (!profile.next_refresh_at || Date.parse(profile.next_refresh_at) <= this.now()),
+      )
+      for (const profile of due) {
+        if (this.busy) break
+        await this.refresh(profile.id).catch(() => {})
+      }
+    } finally {
+      this.dueRunning = false
+    }
+  }
+
   async close() {
+    this.stopScheduler()
     await this.runtime.close()
   }
 }

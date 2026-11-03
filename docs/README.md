@@ -1,11 +1,13 @@
 # 文档
 
 - [DEPLOY.md](DEPLOY.md) — 安装与升级（含 `deploy/install.sh` 一键安装 / 更新）
+- [DOCKER_IMAGE.md](DOCKER_IMAGE.md) — 本分叉 GitHub Actions 一键构建镜像与 Compose 部署
 - [nginx-shell.md](nginx-shell.md) — 集群 / 槽运维终端 WebSocket 连不上时查 nginx Upgrade
 - [FORMAT.md](FORMAT.md) — 本地与 CI 同一套格式（Biome / gofmt / Prettier，LF）
 - [API.md](API.md) — `/v1`
 - [RISK.md](RISK.md) — 封控拦截（蒸馏 → 硬正则 → 拒答缓存 → 决策模型 → 放行出站）
 - [PANEL_API.md](PANEL_API.md) — 管理台 API
+- [CLASH.md](CLASH.md) — Clash 订阅导入与可选 Mihomo 旁路
 - [redaction/README.md](redaction/README.md) — Node 清洗阶段可启停脱敏插件与 Web 控制面板设计（尚未实施）
 - [ISSUE_BACKLOG.md](ISSUE_BACKLOG.md) — open issue 复核后暂不修复的清单（2026-10-28）
 - 抄本：[deploy/env.example](deploy/env.example) · [deploy/vm2api.service](deploy/vm2api.service)

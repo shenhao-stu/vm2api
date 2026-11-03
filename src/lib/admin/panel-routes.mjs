@@ -5681,7 +5681,11 @@ export function createPanelHandler(ctx) {
           role: panelIdentity(req).role,
         })
       }
-      if (p === '/api/panel/proxy-subscriptions' || p.startsWith('/api/panel/proxy-subscriptions/')) {
+      if (
+        p === '/api/panel/proxies/clash' ||
+        p === '/api/panel/proxy-subscriptions' ||
+        p.startsWith('/api/panel/proxy-subscriptions/')
+      ) {
         return handleProxySubscriptions({
           req,
           res,

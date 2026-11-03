@@ -108,7 +108,10 @@ export async function probeRustHealth(exec, { remainingBudgetMs, ...options } = 
   let at = Date.now()
   const budget = Number(remainingBudgetMs)
   const deadline = remainingBudgetMs != null && Number.isFinite(budget) ? at + Math.max(0, budget) : Infinity
-  let health = await rustKernelHealth(exec, options)
+  const initialOptions = Number.isFinite(deadline)
+    ? { ...options, timeoutMs: Math.min(options.timeoutMs ?? 3000, Math.max(1, deadline - at)) }
+    : options
+  let health = await rustKernelHealth(exec, initialOptions)
   if (
     vmNodeId(exec?.vm) &&
     !options.signal?.aborted &&

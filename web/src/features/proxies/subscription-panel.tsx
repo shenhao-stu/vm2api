@@ -17,6 +17,11 @@ type Subscription = {
   source: 'url' | 'text'
   node_count: number
   retained_count: number
+  auto_refresh?: boolean
+  refresh_interval_minutes?: number
+  next_refresh_at?: string | null
+  last_success_at?: string | null
+  last_error?: string | null
 }
 type SubscriptionView = {
   runtime: { available: boolean; running: boolean }
@@ -40,6 +45,7 @@ function AdminSubscriptionPanel() {
   })
   const [source, setSource] = useState<'url' | 'text'>('url')
   const [name, setName] = useState('')
+  const [editingId, setEditingId] = useState<string | null>(null)
   const [value, setValue] = useState('')
   const [deleting, setDeleting] = useState<Subscription | null>(null)
   const mutation = useMutation({
@@ -60,6 +66,7 @@ function AdminSubscriptionPanel() {
       client.setQueryData(queryKey, view)
       setValue('')
       setName('')
+      setEditingId(null)
       setDeleting(null)
       toast.success('订阅代理已更新')
       await refreshProxies()
@@ -142,9 +149,26 @@ function AdminSubscriptionPanel() {
         />
       )}
       <p className='mt-2 text-[11px] text-muted-foreground'>
-        支持 VLESS、VMess、Shadowsocks、Trojan、Hysteria2、TUIC、SOCKS5 和
-        HTTP。导入后在代理池中绑定控制面本机槽位；刷新保留仍在使用的旧节点。
+        支持 Clash 配置与协议链接，包括
+        VLESS、VMess、SS/SSR、Trojan、Hysteria、TUIC、AnyTLS、Snell、Mieru、WireGuard、SSH、SOCKS5
+        和 HTTP。链接默认每 6 小时刷新；已绑定线路变化时保留原配置。
       </p>
+      {editingId ? (
+        <p className='mt-2 text-xs'>
+          正在重新导入 {name}。已绑定旧节点会保留，新配置成为独立节点。
+          <Button
+            size='sm'
+            variant='ghost'
+            onClick={() => {
+              setEditingId(null)
+              setName('')
+              setValue('')
+            }}
+          >
+            取消
+          </Button>
+        </p>
+      ) : null}
       <Button
         className='mt-3'
         size='sm'
@@ -153,6 +177,7 @@ function AdminSubscriptionPanel() {
         onClick={() =>
           mutation.mutate({
             body: {
+              ...(editingId ? { id: editingId } : {}),
               ...(name.trim() ? { name: name.trim() } : {}),
               [source === 'url' ? 'url' : 'content']: value.trim(),
             },
@@ -165,7 +190,7 @@ function AdminSubscriptionPanel() {
         {(query.data?.profiles || []).map((profile) => (
           <div
             key={profile.id}
-            className='flex items-center gap-2 rounded-md bg-muted/40 p-2 text-xs'
+            className='flex flex-wrap items-center gap-2 rounded-md bg-muted/40 p-2 text-xs'
           >
             <span className='min-w-0 flex-1 truncate'>
               {profile.name} · {profile.node_count} 个节点
@@ -173,6 +198,19 @@ function AdminSubscriptionPanel() {
                 ? ` · 保留 ${profile.retained_count}`
                 : ''}
             </span>
+            <Button
+              size='sm'
+              variant='ghost'
+              disabled={mutation.isPending}
+              onClick={() => {
+                setEditingId(profile.id)
+                setName(profile.name)
+                setSource(profile.source)
+                setValue('')
+              }}
+            >
+              重新导入
+            </Button>
             <Button
               size='icon'
               variant='ghost'
@@ -193,6 +231,72 @@ function AdminSubscriptionPanel() {
             >
               <Trash2 className='size-3.5' />
             </Button>
+            {profile.source === 'url' ? (
+              <div className='flex w-full flex-wrap items-center gap-2 text-muted-foreground'>
+                <Button
+                  size='sm'
+                  variant='ghost'
+                  disabled={mutation.isPending || !available}
+                  onClick={() =>
+                    mutation.mutate({
+                      route: `/${profile.id}`,
+                      method: 'PATCH',
+                      body: { auto_refresh: !profile.auto_refresh },
+                    })
+                  }
+                >
+                  {profile.auto_refresh ? '暂停自动刷新' : '开启自动刷新'}
+                </Button>
+                <label className='flex items-center gap-1'>
+                  间隔（分钟）
+                  <Input
+                    type='number'
+                    aria-label={`${profile.name} 刷新间隔`}
+                    className='h-7 w-24'
+                    key={`${profile.id}-${profile.refresh_interval_minutes}`}
+                    defaultValue={profile.refresh_interval_minutes ?? 360}
+                    min={15}
+                    max={10080}
+                    disabled={mutation.isPending || !available}
+                    onBlur={(event) => {
+                      const minutes = Number(event.target.value)
+                      if (
+                        !Number.isInteger(minutes) ||
+                        minutes < 15 ||
+                        minutes > 10080
+                      ) {
+                        toast.error('刷新间隔应为 15–10080 分钟')
+                        return
+                      }
+                      if (minutes !== profile.refresh_interval_minutes)
+                        mutation.mutate({
+                          route: `/${profile.id}`,
+                          method: 'PATCH',
+                          body: { refresh_interval_minutes: minutes },
+                        })
+                    }}
+                  />
+                </label>
+                {profile.next_refresh_at ? (
+                  <span>
+                    下次：{new Date(profile.next_refresh_at).toLocaleString()}
+                  </span>
+                ) : null}
+                {profile.last_success_at ? (
+                  <span>
+                    上次成功：
+                    {new Date(profile.last_success_at).toLocaleString()}
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
+            {profile.last_error ? (
+              <p role='status' className='w-full text-destructive'>
+                {profile.last_error === 'subscription_bound_changed'
+                  ? '已绑定线路发生变化，已保留原配置。检查后可手动重新导入。'
+                  : '刷新失败，已保留原配置。'}
+              </p>
+            ) : null}
           </div>
         ))}
       </div>

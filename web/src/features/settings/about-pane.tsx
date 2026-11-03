@@ -185,58 +185,71 @@ export function AboutPane() {
               rel='noreferrer'
               className='inline-flex items-center gap-1 text-sm text-primary hover:underline'
             >
-              GitHub Release
+              {data?.managed_release ? '托管分支' : 'GitHub Release'}
               <ExternalLink className='size-3.5' />
             </a>
           ) : null}
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>一键更新</CardTitle>
-        </CardHeader>
-        <CardContent className='space-y-3'>
-          <p className='text-sm text-muted-foreground'>
-            在宿主机执行。保留 .env / vms / data。本地槽同步 kernel 与
-            CLI；集群槽按同一份 kernel、cli-node 和 Go
-            遥测重建镜像并换容器，不改凭证和指纹。
-          </p>
-          <pre className='overflow-x-auto rounded-md bg-muted px-3 py-2 font-mono text-xs'>
-            {data?.upgrade_command ||
-              'curl -sSL https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install.sh | sudo bash -s -- upgrade'}
-          </pre>
-          <div className='flex flex-wrap gap-2'>
-            <Button
-              size='sm'
-              variant='outline'
-              onClick={() => {
-                const command = data?.upgrade_command
-                if (!command) return
-                copyText(command)
-                  .then(() => toast.success('已复制'))
-                  .catch(() => toast.error('复制失败'))
-              }}
-            >
-              <Copy />
-              复制命令
-            </Button>
-            <Button
-              size='sm'
-              disabled={
-                checkFailed ||
-                !data?.update_available ||
-                upgrade.isPending ||
-                updateRunning
-              }
-              onClick={() => setConfirmOpen(true)}
-            >
-              <ArrowUpCircle />
-              从面板发起
-            </Button>
-          </div>
-        </CardContent>
-      </Card>
+      {data?.managed_release ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>托管更新</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className='text-sm text-muted-foreground'>
+              此实例跟随 {data.release_channel}，使用经过验证的托管镜像更新。
+            </p>
+          </CardContent>
+        </Card>
+      ) : (
+        <Card>
+          <CardHeader>
+            <CardTitle>一键更新</CardTitle>
+          </CardHeader>
+          <CardContent className='space-y-3'>
+            <p className='text-sm text-muted-foreground'>
+              在宿主机执行。保留 .env / vms / data。本地槽同步 kernel 与
+              CLI；集群槽按同一份 kernel、cli-node 和 Go
+              遥测重建镜像并换容器，不改凭证和指纹。
+            </p>
+            <pre className='overflow-x-auto rounded-md bg-muted px-3 py-2 font-mono text-xs'>
+              {data?.upgrade_command ||
+                'curl -sSL https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install.sh | sudo bash -s -- upgrade'}
+            </pre>
+            <div className='flex flex-wrap gap-2'>
+              <Button
+                size='sm'
+                variant='outline'
+                onClick={() => {
+                  const command = data?.upgrade_command
+                  if (!command) return
+                  copyText(command)
+                    .then(() => toast.success('已复制'))
+                    .catch(() => toast.error('复制失败'))
+                }}
+              >
+                <Copy />
+                复制命令
+              </Button>
+              <Button
+                size='sm'
+                disabled={
+                  checkFailed ||
+                  !data?.update_available ||
+                  upgrade.isPending ||
+                  updateRunning
+                }
+                onClick={() => setConfirmOpen(true)}
+              >
+                <ArrowUpCircle />
+                从面板发起
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       <Card>
         <CardHeader>

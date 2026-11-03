@@ -622,7 +622,9 @@ test('egress config carries dns_upstream only when configured', async () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('egress readiness checks the exact listener without opening a connection', { skip: process.platform !== 'linux' }, async (t) => {
+test('egress readiness checks the exact listener without opening a connection', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-listen-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   let accepted = 0
@@ -660,7 +662,9 @@ test('egress readiness checks the exact listener without opening a connection', 
   assert.equal(egressListening(root, proxyId, 100).reason, 'not_listening')
 })
 
-test('DNS override changes restart the helper and disabling clears the override', { skip: process.platform !== 'linux' }, async (t) => {
+test('DNS override changes restart the helper and disabling clears the override', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
   const fx = egressFixture(t, 'px-dns-override')
   const original = await fx.start()
   assert.equal(original.ok, true)
@@ -770,4 +774,46 @@ test('a Node argument named kin-egress is never accepted or signalled as the nat
   assert.equal(stopEgressProcess(fx.root, fx.base.proxyId).ok, true)
   assert.equal(fs.existsSync(fx.pidFile), false)
   assert.equal(child.kill(0), true)
+})
+
+test('host namespace exit wait does not treat a missing local PID as a reaped host helper', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-host-reap-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const killed = path.join(root, 'killed')
+  const log = path.join(root, 'calls')
+  fs.writeFileSync(
+    path.join(root, 'docker'),
+    `#!${process.execPath}
+const fs = require('node:fs')
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n')
+if (args.includes('test')) process.exit(fs.existsSync(${JSON.stringify(killed)}) ? 1 : 0)
+if (args.some((arg) => arg.includes('kill -KILL'))) { fs.writeFileSync(${JSON.stringify(killed)}, '1'); process.exit(0) }
+process.exit(2)
+`,
+    { mode: 0o755 },
+  )
+  const module = new URL('../../src/lib/vm/egress.mjs', import.meta.url).href
+  const child = spawn(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `
+    import { waitEgressExit } from ${JSON.stringify(module)}
+    const result = await waitEgressExit(99999999, { termTimeoutMs: 0, killGraceMs: 1000 })
+    if (!result.ok) process.exit(2)
+  `,
+    ],
+    {
+      env: { ...process.env, PATH: `${root}:${process.env.PATH}`, KIN_EGRESS_CMD_PREFIX: 'host-adapter' },
+      stdio: 'pipe',
+    },
+  )
+  const [code] = await once(child, 'exit')
+  assert.equal(code, 0)
+  assert.equal(fs.existsSync(killed), true, 'host helper must be observed and terminated before reporting it reaped')
+  const calls = fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse)
+  assert.ok(calls.some((args) => args.includes('test') && args.includes('/proc/99999999')))
+  assert.ok(calls.every((args) => args.includes('--pid') && args.includes('host')))
 })

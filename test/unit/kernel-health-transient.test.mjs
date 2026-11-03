@@ -111,3 +111,16 @@ test('a read-only recheck respects the remaining request budget', async (t) => {
   assert.deepEqual(f.counts(), { healthCalls: 2, inferenceCalls: 0 })
   assert.ok(performance.now() - start < 230)
 })
+
+for (const remaining of [0, 20]) {
+  test(`first health probe respects ${remaining}ms admission budget without inference`, async (t) => {
+    const f = await fixture(t, ({ reply }) => reply(500))
+    const start = performance.now()
+    const result = await f.send({ slotWaitMs: remaining })
+    assert.equal(result.ok, false)
+    assert.equal(result.upstreamExecutions, 0)
+    assert.equal(f.counts().inferenceCalls, 0)
+    assert.ok(f.counts().healthCalls <= 1)
+    assert.ok(performance.now() - start < 300)
+  })
+}

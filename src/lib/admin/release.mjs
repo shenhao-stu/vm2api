@@ -285,10 +285,41 @@ export function clearReleaseCache() {
   releaseCache.error = null
 }
 
-export async function buildUpdateStatus({ projectRoot: root, currentVersion, upgrade, fetchImpl, now, cacheMs } = {}) {
+export async function buildUpdateStatus({
+  projectRoot: root,
+  currentVersion,
+  upgrade,
+  fetchImpl,
+  now,
+  cacheMs,
+  env = process.env,
+} = {}) {
   const project = projectRoot(root)
   const current = currentVersion || readLocalVersion(project)
   const entries = loadChangelog(project)
+  if (env.VM2API_RELEASE_CHANNEL === 'hosted') {
+    return {
+      current,
+      current_tag: normalizeTag(current),
+      latest: null,
+      latest_tag: null,
+      update_available: false,
+      check_status: 'pinned',
+      release_channel: 'dev/hosted',
+      managed_release: true,
+      repo: 'shenhao-stu/vm2api',
+      html_url: 'https://github.com/shenhao-stu/vm2api/tree/dev/hosted',
+      published_at: null,
+      name: 'Claude 托管分支',
+      notes: '此实例使用 dev/hosted 的已验证镜像，由运维部署更新。',
+      changelog: changelogSince(entries, current),
+      needs_wrap_cli_sync: false,
+      upgrade_command: '',
+      check_command: '',
+      source_error: null,
+      ...(upgrade ? { upgrade } : {}),
+    }
+  }
   const remote = await fetchLatestRelease({ fetchImpl, now, cacheMs })
   const latest = remote.error ? null : remote.release?.version || null
   const newer = changelogSince(entries, current)
@@ -443,6 +474,12 @@ export async function startHostUpgrade({
   fetchImpl,
   now,
 } = {}) {
+  if ((env || process.env).VM2API_RELEASE_CHANNEL === 'hosted') {
+    return {
+      status: 409,
+      error: { code: 'hosted_release_pinned', message: '此实例使用 dev/hosted 的已验证镜像，请通过托管发布流程更新。' },
+    }
+  }
   const requested = version != null && String(version).trim() !== '' ? parseReleaseTag(version) : null
   if (version != null && String(version).trim() !== '' && !requested) {
     return {

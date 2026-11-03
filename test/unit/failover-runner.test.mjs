@@ -240,6 +240,7 @@ test('slot_busy spill serves the turn elsewhere but keeps the session pinned', a
         ? {
             ok: false,
             status: 503,
+            upstreamExecutions: 0,
             terminalState: 'rejected',
             body: { error: { type: 'api_error', code: 'slot_busy', message: 'no free slot' } },
           }
@@ -509,6 +510,99 @@ test('proxy transport error notifies onProxyFailure then rotates', async () => {
   assert.equal(failures[0].vmId, 'vm-01')
   assert.equal(failures[0].reason, 'proxy_transport_failure')
 })
+
+test('proxy transport error replays the same seat once before parking it', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({
+    scheduler,
+    config: { same_account_retry_delay_ms: 0 },
+  })
+  const seen = []
+  let calls = 0
+  const result = await runner.run({
+    requestId: 'req-proxy-replay',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      calls++
+      return calls === 1 ? upstreamNetworkError() : success('recovered')
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.attemptCount, 1)
+  assert.deepEqual(seen, ['account-1', 'account-1'])
+  assert.equal(scheduler.cooldowns.length, 0)
+})
+
+test('proxy transport error parks the seat only after the replay is spent', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({
+    scheduler,
+    config: { same_account_retry_delay_ms: 0 },
+  })
+  const seen = []
+  const result = await runner.run({
+    requestId: 'req-proxy-park',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      return upstreamNetworkError()
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.status, 502)
+  assert.deepEqual(seen, ['account-1', 'account-1'])
+  assert.equal(scheduler.cooldowns.length, 1)
+  assert.equal(scheduler.cooldowns[0].update.reason, 'proxy_transport_failure')
+  assert.ok(scheduler.cooldowns[0].update.until > Date.now())
+})
+
+test('proxy transport error parks immediately when the hop was too slow to replay', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({
+    scheduler,
+    config: {
+      same_account_retry_delay_ms: 0,
+      same_account_retry_max_hop_ms: 0,
+    },
+  })
+  let calls = 0
+  const result = await runner.run({
+    requestId: 'req-proxy-slow',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: () => {
+      calls++
+      return upstreamNetworkError()
+    },
+  })
+  assert.equal(result.status, 502)
+  assert.equal(calls, 1)
+  assert.equal(scheduler.cooldowns.length, 1)
+  assert.equal(scheduler.cooldowns[0].update.reason, 'proxy_transport_failure')
+})
+
+function upstreamNetworkError(message = 'SOCKS proxy dial failed') {
+  return {
+    ok: false,
+    status: 502,
+    terminalState: 'transport_error',
+    transportError: true,
+    committed: false,
+    upstreamExecutions: 0,
+    body: {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        code: 'upstream_network_error',
+        message,
+        details: { upstream_type: 'api_error', upstream_status: 502 },
+      },
+    },
+  }
+}
 
 function badGateway(message = 'net/http: timeout awaiting response headers') {
   return {
@@ -859,7 +953,7 @@ test('cli-hop signature 400 is not repaired when signature_repair is off', async
   assert.equal(calls, 1)
 })
 
-test('thinking-only hop moves to the next slot and returns the later text', async () => {
+test('thinking-only hop returns incomplete without starting another generation', async () => {
   const scheduler = new Scheduler([candidate(1)])
   let n = 0
   const select = scheduler.selectAndReserve.bind(scheduler)
@@ -896,14 +990,13 @@ test('thinking-only hop moves to the next slot and returns the later text', asyn
       return success('full answer')
     },
   })
-  assert.equal(calls, 2)
-  assert.equal(result.ok, true)
-  assert.equal(result.finalState, 'verified')
-  assert.equal(result.body.content[0].text, 'full answer')
-  assert.equal(result.body.stop_reason, 'end_turn')
+  assert.equal(calls, 1)
+  assert.equal(result.ok, false)
+  assert.equal(result.finalState, 'incomplete')
+  assert.equal(result.body.error.code, 'incomplete_response')
 })
 
-test('a replayable incomplete hop tries a free VM before repeating the same one', async () => {
+test('an incomplete hop never duplicates generation on a free VM', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const parked = []
   const runner = new FailoverRunner({
@@ -932,10 +1025,10 @@ test('a replayable incomplete hop tries a free VM before repeating the same one'
       }
     },
   })
-  assert.equal(result.ok, true)
-  assert.equal(result.vmId, 'vm-02')
-  assert.equal(result.attemptCount, 2)
-  assert.deepEqual(seen, ['vm-01', 'vm-02'])
+  assert.equal(result.ok, false)
+  assert.equal(result.vmId, 'vm-01')
+  assert.equal(result.attemptCount, 1)
+  assert.deepEqual(seen, ['vm-01'])
   assert.deepEqual(parked, [])
 })
 
@@ -1079,6 +1172,7 @@ test('failed hops before a cross-account VM move persist that VM outbound sessio
     {
       ok: false,
       status: 503,
+      upstreamExecutions: 0,
       terminalState: 'rejected',
       body: { type: 'error', error: { type: 'api_error', message: 'worker unavailable' } },
     },
@@ -1214,7 +1308,7 @@ test('streamed plan limit writes the hard block and rotates to another account',
   assert.equal(cooled.update.until, 9_999_999_999_999)
 })
 
-test('fast 502 retries the same account once without cooldown', async () => {
+test('unknown-execution 502 stops without account cooldown', async () => {
   const scheduler = new Scheduler([candidate(1)])
   const runner = new FailoverRunner({
     scheduler,
@@ -1233,13 +1327,13 @@ test('fast 502 retries the same account once without cooldown', async () => {
   assert.equal(result.ok, false)
   assert.equal(result.status, 502)
   assert.equal(result.body.error.code, 'upstream_transport_error')
-  assert.equal(result.via, 'pool-failover')
+  assert.equal(result.via, undefined)
   assert.notEqual(result.body.error.code, 'server_overloaded')
-  assert.deepEqual(seen, ['account-1', 'account-1'])
+  assert.deepEqual(seen, ['account-1'])
   assert.equal(scheduler.cooldowns.length, 0)
 })
 
-test('a retryable 502 moves to a free account before retrying the same one', async () => {
+test('unknown-execution 502 does not move to a free account', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const runner = new FailoverRunner({
     scheduler,
@@ -1256,9 +1350,9 @@ test('a retryable 502 moves to a free account before retrying the same one', asy
       return success('recovered')
     },
   })
-  assert.equal(result.ok, true)
-  assert.equal(result.accountId, 'account-2')
-  assert.deepEqual(seen, ['account-1', 'account-2'])
+  assert.equal(result.ok, false)
+  assert.equal(result.accountId, 'account-1')
+  assert.deepEqual(seen, ['account-1'])
   assert.equal(scheduler.cooldowns.length, 0)
 })
 
@@ -1619,7 +1713,7 @@ test('a full pool queue answers 529 immediately with retry-after >= 1s', async (
   assert.equal(result.retryAfterSec, 1)
 })
 
-test('one VM gets at most three executions for a request, hidden retries included', async () => {
+test('hidden past retries do not permit another incomplete generation', async () => {
   const scheduler = new Scheduler([candidate(1)])
   const seen = []
   const runner = new FailoverRunner({
@@ -1650,8 +1744,8 @@ test('one VM gets at most three executions for a request, hidden retries include
   assert.equal(result.status, 502)
   assert.equal(result.body.error.code, 'incomplete_response')
   assert.equal(result.vmId, 'vm-01')
-  assert.equal(result.attemptCount, 2)
-  assert.deepEqual(seen, ['vm-01', 'vm-01'])
+  assert.equal(result.attemptCount, 1)
+  assert.deepEqual(seen, ['vm-01'])
 })
 
 test('a hop that failed with a kernel-named cause ends with that cause, not incomplete_response', async () => {
@@ -1681,7 +1775,7 @@ test('a hop that failed with a kernel-named cause ends with that cause, not inco
   })
   assert.equal(result.status, 502)
   assert.equal(result.body.error.code, 'upstream_network_error')
-  assert.ok(seen.includes('vm-02'), 'a network failure moves on to another VM')
+  assert.deepEqual(seen, ['vm-01'], 'unknown execution must not move to another VM')
   assert.deepEqual(scheduler.cooldowns, [], 'no account is penalised for it')
 })
 
@@ -1696,7 +1790,7 @@ function genericConnectionFailure(message = 'Connection error.') {
 }
 
 for (const message of ['Connection error.', 'provider error: provider error: Connection error.']) {
-  test(`a single eligible slot recovers from a generic coded connection failure: ${message}`, async () => {
+  test(`a generic coded connection failure stops with unknown execution: ${message}`, async () => {
     const scheduler = new Scheduler([candidate(1)])
     const failures = []
     const runner = new FailoverRunner({
@@ -1711,9 +1805,9 @@ for (const message of ['Connection error.', 'provider error: provider error: Con
       model: 'claude-sonnet-5-5',
       callAttempt: () => (++calls === 1 ? genericConnectionFailure(message) : success()),
     })
-    assert.equal(calls, 2)
-    assert.equal(result.status, 200)
-    assert.equal(result.finalState, 'verified')
+    assert.equal(calls, 1)
+    assert.equal(result.status, 502)
+    assert.equal(result.finalState, 'incomplete')
     assert.equal(result.vmId, 'vm-01')
     assert.deepEqual(scheduler.cooldowns, [])
     assert.deepEqual(failures, [])
@@ -1721,7 +1815,7 @@ for (const message of ['Connection error.', 'provider error: provider error: Con
 }
 
 for (const [name, config, expectedCalls] of [
-  ['default same-account limit', {}, 2],
+  ['default same-account limit', {}, 1],
   ['zero same-account retries', { max_same_account_retries: 0 }, 1],
   ['spent total budget', { max_total_attempts: 1 }, 1],
   ['spent hop duration', { same_account_retry_max_hop_ms: 0 }, 1],
@@ -1747,7 +1841,7 @@ for (const [name, config, expectedCalls] of [
   })
 }
 
-test('the fifth candidate is reached after four VMs fail', async () => {
+test('the fifth candidate is reached after four authoritative predispatch rejections', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3), candidate(4), candidate(5)])
   const seen = []
   const result = await new FailoverRunner({
@@ -1763,6 +1857,7 @@ test('the fifth candidate is reached after four VMs fail', async () => {
       return {
         ok: false,
         status: 529,
+        upstreamExecutions: 0,
         terminalState: 'rejected',
         body: { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } },
       }
@@ -2041,6 +2136,35 @@ test('an all-rest pool 503 carries Retry-After for the next window open', async 
   assert.equal(result.retryAfterSec, 91)
 })
 
+for (const committed of [false, true]) {
+  test(`transport window permits only pre-content recovery (committed=${committed})`, async () => {
+    const scheduler = new Scheduler([candidate(1)])
+    const runner = new FailoverRunner({
+      scheduler,
+      config: {
+        same_account_retry_delay_ms: 0,
+        same_account_retry_max_hop_ms: 1,
+        transport_retry_max_hop_ms: 1000,
+      },
+    })
+    let calls = 0
+    const result = await runner.run({
+      requestId: 'transport-window',
+      canonicalBody: { model: 'claude-sonnet-test' },
+      model: 'claude-sonnet-test',
+      callAttempt: async ({ onCommit }) => {
+        calls++
+        if (calls > 1) return success('recovered')
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        if (committed) onCommit()
+        return { ...upstreamNetworkError(), committed }
+      },
+    })
+    assert.equal(calls, committed ? 1 : 2)
+    assert.equal(result.ok, !committed)
+  })
+}
+
 test('org OAuth refusal pauses that slot and the family request hops to another', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const pauses = []
@@ -2082,3 +2206,68 @@ test('org OAuth refusal pauses that slot and the family request hops to another'
   assert.equal(pauses[0].policy.reason, 'organization_disabled')
   assert.equal(pauses[0].policy.detail.status, 403)
 })
+
+for (const executionEvidence of [undefined, 1]) {
+  for (const thrown of [false, true]) {
+    test(`unknown or executed transport failure is not replayed (evidence=${executionEvidence}, thrown=${thrown})`, async () => {
+      const scheduler = new Scheduler([candidate(1), candidate(2)])
+      let calls = 0
+      let released = 0
+      const select = scheduler.selectAndReserve.bind(scheduler)
+      scheduler.selectAndReserve = async (args) => ({ ...(await select(args)), release: () => released++ })
+      const diagnostics = []
+      const result = await new FailoverRunner({ scheduler }).run({
+        requestId: 'no-replay',
+        model: 'claude-test',
+        canonicalBody: { model: 'claude-test' },
+        onAttempt: (value) => diagnostics.push(value),
+        callAttempt: () => {
+          calls++
+          const usage = { input_tokens: 5, output_tokens: 3 }
+          if (thrown)
+            throw Object.assign(new Error('ECONNRESET after POST'), { upstreamExecutions: executionEvidence, usage })
+          return { ...upstreamNetworkError(), upstreamExecutions: executionEvidence, usage }
+        },
+      })
+      assert.equal(calls, 1)
+      assert.equal(released, 1)
+      assert.equal(result.policy.replayAllowed, false)
+      assert.equal(result.policy.decision.action, 'return')
+      assert.deepEqual(result.usage, { input_tokens: 5, output_tokens: 3 })
+      assert.equal(diagnostics.length, 1)
+    })
+  }
+}
+
+for (const content of [[], [{ type: 'thinking', thinking: 'partial generation', signature: 'sig' }]]) {
+  test(`released incomplete generation is not restarted (blocks=${content.length})`, async () => {
+    const scheduler = new Scheduler([candidate(1), candidate(2)])
+    let calls = 0
+    const result = await new FailoverRunner({ scheduler }).run({
+      requestId: 'incomplete-no-replay',
+      model: 'claude-test',
+      canonicalBody: { model: 'claude-test' },
+      callAttempt: () => {
+        calls++
+        return {
+          ok: true,
+          status: 200,
+          committed: false,
+          executionReleased: true,
+          terminalState: 'verified',
+          body: {
+            type: 'message',
+            role: 'assistant',
+            content,
+            stop_reason: null,
+            usage: { input_tokens: 9, output_tokens: 7 },
+          },
+        }
+      },
+    })
+    assert.equal(calls, 1)
+    assert.equal(result.status, 502)
+    assert.equal(result.body.error.code, 'incomplete_response')
+    assert.deepEqual(result.usage, { input_tokens: 9, output_tokens: 7 })
+  })
+}

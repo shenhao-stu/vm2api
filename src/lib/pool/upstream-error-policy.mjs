@@ -236,6 +236,20 @@ function continueWithoutCooldown({ scope, reason, retrySameAccount = true } = {}
   }
 }
 
+/**
+ * Route health is independent of replay permission. A transport failure can
+ * quarantine this exit even when execution is unknown and the request must stop.
+ */
+function proxyTransportFailure(now) {
+  return {
+    scope: 'proxy',
+    action: 'continue-and-cooldown',
+    reason: 'proxy_transport_failure',
+    cooldownUntil: now + 60_000,
+    retrySameAccount: true,
+  }
+}
+
 function claudeStopReasonOf(result) {
   return assistantStopReason(result)
 }
@@ -429,12 +443,7 @@ function classifyUpstreamResultRaw(
       return continueWithoutCooldown({ scope: 'worker', reason: 'upstream_network_error', retrySameAccount: true })
     }
     if (isProxyFailure('', message)) {
-      return {
-        scope: 'proxy',
-        action: 'continue-and-cooldown',
-        reason: 'proxy_transport_failure',
-        cooldownUntil: now + 60_000,
-      }
+      return proxyTransportFailure(now)
     }
     return continueWithoutCooldown({ scope: 'worker', reason: 'upstream_network_error', retrySameAccount: false })
   }
@@ -457,12 +466,7 @@ function classifyUpstreamResultRaw(
   }
   if (result.transportError || status === 0) {
     if (isProxyFailure(workerCode, message)) {
-      return {
-        scope: 'proxy',
-        action: 'continue-and-cooldown',
-        reason: 'proxy_transport_failure',
-        cooldownUntil: now + 60_000,
-      }
+      return proxyTransportFailure(now)
     }
     return continueWithoutCooldown({
       scope: 'worker',
@@ -654,12 +658,52 @@ function classifyUpstreamResultRaw(
   return { scope: 'request', action: 'stop', reason: `http_${status}`, cooldownUntil: null }
 }
 
+/** The absence of downstream output does not prove the provider did no work. */
+export function mayReplayUpstreamResult(result = {}, policy = {}) {
+  if (result.committed || result.responseSent) return false
+  const usage = result.usage || result.body?.usage || {}
+  if (
+    [
+      'input_tokens',
+      'output_tokens',
+      'cache_read_input_tokens',
+      'cache_creation_input_tokens',
+      'prompt_tokens',
+      'completion_tokens',
+    ].some((key) => Number(usage[key]) > 0)
+  )
+    return false
+  const reason = String(policy.reason || '')
+  if (reason === 'incomplete_assistant' || reason === 'empty_response') return false
+  const uncertain =
+    result.transportError === true ||
+    Number(result.status || 0) === 0 ||
+    policy.scope === 'stream' ||
+    /network|transport|timeout|connection|kernel_error|kernel_unavailable|cli_error/.test(reason)
+  if (uncertain) {
+    return result.transportError === true && result.committed === false && result.upstreamExecutions === 0
+  }
+  if (result.upstreamExecutions === 0) return true
+  // Explicit request/auth/quota rejection did not start a generation. A timeout,
+  // partial stream, or a generic server failure provides no such guarantee.
+  const status = Number(result.status)
+  return status >= 400 && status < 500 && status !== 408 && status !== 425 && result.terminalState !== 'incomplete'
+}
+
 export function classifyUpstreamResult(result, opts) {
-  return attachFailureDecision(classifyUpstreamResultRaw(result, opts))
+  const policy = classifyUpstreamResultRaw(result, opts)
+  const retry = policy.action === 'repair-and-retry' || shouldContinue(policy)
+  return attachFailureDecision(
+    retry && !mayReplayUpstreamResult(result, policy)
+      ? { ...policy, replayAllowed: false, retrySameAccount: false }
+      : policy,
+  )
 }
 
 export function shouldContinue(policy) {
-  return policy?.action === 'continue' || policy?.action === 'continue-and-cooldown'
+  return (
+    policy?.replayAllowed !== false && (policy?.action === 'continue' || policy?.action === 'continue-and-cooldown')
+  )
 }
 
 export function normalizeModelKey(model) {

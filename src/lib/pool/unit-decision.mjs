@@ -21,6 +21,7 @@ const ORIGIN_BY_SCOPE = {
 }
 
 export function decisionAction(policy = {}) {
+  if (policy.replayAllowed === false) return 'return'
   if (policy.action === 'repair-and-retry') return 'repair'
   if (policy.retrySameAccount && (policy.action === 'continue' || policy.action === 'continue-and-cooldown')) {
     return 'retry_same'

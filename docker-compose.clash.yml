@@ -1,0 +1,6 @@
+# Compatibility overlay: use the gateway's one managed Mihomo process.
+# No additional sidecar or public controller/listener is created. See docs/CLASH.md.
+services:
+  vm2api:
+    environment:
+      VM2API_MIHOMO_BIN: /usr/local/bin/mihomo

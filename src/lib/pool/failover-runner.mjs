@@ -40,6 +40,7 @@ const DEFAULTS = {
   max_same_account_retries: 1,
   same_account_retry_delay_ms: 500,
   same_account_retry_max_hop_ms: 10_000,
+  transport_retry_max_hop_ms: 30_000,
   signature_repair: false,
 }
 
@@ -375,7 +376,8 @@ function executionsOf(result) {
 }
 
 function incompleteHopResult(result, policy, extras = {}) {
-  const failed = hasKernelFailureCode(result) ? { ...result, ok: false } : incompleteAssistantClientError(result)
+  const preserved = { ...result, usage: usageOf(result) }
+  const failed = hasKernelFailureCode(result) ? { ...preserved, ok: false } : incompleteAssistantClientError(preserved)
   return {
     ...failed,
     via: result?.via || 'pool-failover',
@@ -403,6 +405,15 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
     last_status: lastResult?.status ?? null,
   }
   if (CAPACITY_SELECTION_REASONS.has(reason)) return poolOverloadedError(details)
+  if (reason === 'pool_egress_unavailable') {
+    const failed = poolError(
+      'pool_egress_unavailable',
+      'Bound proxy transport is temporarily unavailable; retry later',
+      details,
+    )
+    failed.retryAfterSec = Math.max(1, Math.ceil((Number(details.retry_after_ms) || 1000) / 1000))
+    return failed
+  }
   if (reason === 'pool_rate_limited') return poolRateLimitedError(details)
   if (reason === 'quota_guard_request_too_large') return quotaGuardTooLargeError(details)
   const quota = quotaWindowError(reason, { until: selected?.quota_until })
@@ -419,6 +430,11 @@ function applyCooldown(scheduler, selected, policy, model, { diagnosticPin = fal
   // VM / master pin is a diagnostic. A 401 from the wrong inbound class
   // must not forever-park a Setup Token that has no refresh by design.
   if (diagnosticPin && (policy.reason === 'oauth_no_refresh' || policy.reason === 'oauth_revoked')) {
+    return
+  }
+  if (policy.reason === 'proxy_transport_failure' && selected?.egressLease) {
+    selected.egressLease.failure()
+    scheduler.notifyCapacity?.()
     return
   }
   scheduler.markCooldown(selected, {
@@ -473,6 +489,7 @@ export class FailoverRunner {
   }
 
   noteUnitHealth(selected, policy, result) {
+    if (verifiedSuccess(result)) selected?.egressLease?.success()
     const circuit = this.scheduler?.unitCircuit
     if (!circuit || !selected?.accountId) return
     if (policy?.circuit) circuit.recordFailure(selected.accountId)
@@ -733,9 +750,10 @@ export class FailoverRunner {
     }
     // A unit that just failed replayably waits behind every other free seat.
     let avoid = null
+    let attemptSerial = 0
 
     for (;;) {
-      const attemptNo = budget.hops + 1
+      const attemptNo = ++attemptSerial
       if (signal?.aborted || isClientCancelledResult(lastResult)) {
         return { ...clientCancelledResult(lastResult || {}), via: 'pool-failover', ...attribution() }
       }
@@ -824,6 +842,7 @@ export class FailoverRunner {
       }
       if (!selected?.ok) {
         const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
+        if (selected.reason === 'pool_egress_unavailable') return { ...exhausted, ...attribution() }
         return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
       }
       repairPending = false
@@ -852,6 +871,7 @@ export class FailoverRunner {
       let policy
       let committed = false
       let hopNoted = false
+      let dispatched = false
       const noteHop = (value) => {
         if (hopNoted) return
         hopNoted = true
@@ -899,6 +919,7 @@ export class FailoverRunner {
             },
           )
         }
+        dispatched = true
         result = await callAttempt({
           candidate: selected,
           body,
@@ -979,7 +1000,7 @@ export class FailoverRunner {
         this.attemptsRepo?.complete?.(requestId, attemptNo, {
           upstreamStatus: result?.status ?? null,
           errorScope: policy.scope,
-          action: policy.action,
+          action: policy.replayAllowed === false ? 'stop' : policy.action,
           cooldownUntil: policy.cooldownUntil,
           downstreamCommitted: result?.committed || committed,
           terminalState,
@@ -1026,7 +1047,7 @@ export class FailoverRunner {
           releaseStickySlots()
           return { ...result, ...attribution(), finalState: 'verified' }
         }
-        if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
+        if (policy.action === 'repair-and-retry' && policy.replayAllowed !== false && !repaired && !result?.committed) {
           repaired = true
           repairPolicy = { action: policy.action, reason: policy.reason }
           repairPending = true
@@ -1036,7 +1057,25 @@ export class FailoverRunner {
           requestBody = repairAnthropicRequest(requestBody, policy)
           continue
         }
-        applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
+        // A seat that can still replay this hop must not be parked first: the
+        // cooldown is account-scoped, so applying it here would block the replay
+        // itself and turn one transient hop blip into a full blackout on a
+        // one-seat pool. It is applied as soon as no replay is possible.
+        const hopMs = Date.now() - attemptStarted
+        const replayable =
+          shouldContinue(policy) &&
+          !isCredentialDeath(policy) &&
+          budget.allowSameUnit(
+            selected.accountId,
+            policy,
+            hopMs,
+            policy.reason === 'proxy_transport_failure'
+              ? this.config.same_account_retry_max_hop_ms <= 0
+                ? 0
+                : this.config.transport_retry_max_hop_ms
+              : this.config.same_account_retry_max_hop_ms,
+          )
+        if (!replayable) applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
         if (policy.pauseSchedule) this.pauseUnit(selected, policy, result)
         if (!pinVmId && isCredentialDeath(policy)) {
           this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
@@ -1047,16 +1086,16 @@ export class FailoverRunner {
         }
         if (!shouldContinue(policy)) {
           releaseStickySlots()
+          if (isRetryableEmptyHop(policy)) return incompleteHopResult(result, policy, attribution())
           return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
         }
         policy = await this.recoverCredential(selected, policy)
-        const hopMs = Date.now() - attemptStarted
         if (isRetryableEmptyHop(policy)) {
           if (!emptyHopReleased(result) || pinVmId) return incompleteHopResult(result, policy, attribution())
           this.retireOutboundSession(selected, bindKeys)
           freshSlot = true
         }
-        if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
+        if (replayable) {
           budget.noteSameUnit(selected.accountId)
           avoid = new Set([selected.accountId, selected.vmId])
           continue
@@ -1064,7 +1103,7 @@ export class FailoverRunner {
         budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } catch (error) {
         const invalidCache = error?.status === 400 && error.body?.error?.code === 'invalid_cache_control'
-        noteHop(invalidCache ? { upstreamExecutions: 0 } : null)
+        noteHop(!dispatched || invalidCache || error?.upstreamExecutions === 0 ? { upstreamExecutions: 0 } : null)
         if (error?.code === 'response_sent') {
           this.attemptsRepo?.complete?.(requestId, attemptNo, {
             upstreamStatus: 403,
@@ -1122,6 +1161,9 @@ export class FailoverRunner {
           status: 0,
           transportError: true,
           committed,
+          upstreamExecutions: !dispatched || error?.upstreamExecutions === 0 ? 0 : undefined,
+          usage: error?.usage,
+          timing: error?.timing,
           terminalState: committed ? 'incomplete' : 'transport_error',
           body: {
             type: 'error',
@@ -1150,17 +1192,34 @@ export class FailoverRunner {
         this.attemptsRepo?.complete?.(requestId, attemptNo, {
           upstreamStatus: 0,
           errorScope: policy.scope,
-          action: policy.action,
+          action: policy.replayAllowed === false ? 'stop' : policy.action,
           cooldownUntil: policy.cooldownUntil,
           downstreamCommitted: committed,
           terminalState: result.terminalState,
           latencyMs: Date.now() - attemptStarted,
         })
+        if (typeof onAttempt === 'function') await onAttempt({ attemptNo, selected, result, policy })
         if (committed || !shouldContinue(policy)) {
+          applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
           releaseStickySlots()
           return { ...result, ...attribution(), finalState: result.terminalState, policy }
         }
-        applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
+        // Same rule as the result path: never park a seat that can still replay
+        // this hop, or the account-scoped cooldown blocks the replay itself.
+        const hopMs = Date.now() - attemptStarted
+        const replayable =
+          !isCredentialDeath(policy) &&
+          budget.allowSameUnit(
+            selected.accountId,
+            policy,
+            hopMs,
+            policy.reason === 'proxy_transport_failure'
+              ? this.config.same_account_retry_max_hop_ms <= 0
+                ? 0
+                : this.config.transport_retry_max_hop_ms
+              : this.config.same_account_retry_max_hop_ms,
+          )
+        if (!replayable) applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
         if (!pinVmId && isCredentialDeath(policy)) {
           this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
           if (familyKey) {
@@ -1169,8 +1228,7 @@ export class FailoverRunner {
           }
         }
         policy = await this.recoverCredential(selected, policy)
-        const hopMs = Date.now() - attemptStarted
-        if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
+        if (replayable) {
           budget.noteSameUnit(selected.accountId)
           avoid = new Set([selected.accountId, selected.vmId])
           continue

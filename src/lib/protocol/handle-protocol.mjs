@@ -1,3 +1,4 @@
+import { attemptDiagnostic } from './attempt-diagnostic.mjs'
 /**
  * /v1 protocol handler. URLs, auth, and response envelopes stay with the
  * server wiring; this factory owns convert → pool → Go/Rust hop → client.
@@ -1360,7 +1361,6 @@ export function createHandleProtocol(deps) {
       clientStream && protocol === 'anthropic.messages' ? createAnthropicSseErrorRemapper() : null
     // One keepalive for the whole Claude stream, including session/seat queues
     // and the gaps between failover attempts. OpenAI keeps its per-attempt one.
-    let activeAttemptCommit = null
     const anthropicKeepalive =
       clientStream && protocol === 'anthropic.messages' && streamKeepaliveMs > 0
         ? createDownstreamKeepalive({
@@ -1371,9 +1371,8 @@ export function createHandleProtocol(deps) {
               if (res.writableEnded || res.destroyed) return
               if (!res.headersSent) writeSSEHeaders(res)
               res.write(chunk)
-              // A queue ping commits the HTTP response only. The slot commits
-              // while an attempt is active, same as an in-attempt ping.
-              activeAttemptCommit?.()
+              // Keepalive commits HTTP headers, not inference content.
+              // Only the worker content callback closes the replay boundary.
             },
           })
         : null
@@ -1711,6 +1710,13 @@ export function createHandleProtocol(deps) {
             },
           }
         },
+        onAttempt: ({ attemptNo, result, policy }) => {
+          const attempts = logBag.hop_meta?.attempt_diagnostics || []
+          logBag.hop_meta = {
+            ...logBag.hop_meta,
+            attempt_diagnostics: [...attempts, attemptDiagnostic(attemptNo, result, policy)].slice(-16),
+          }
+        },
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
           if (!clientStream) {
             return streamAndAssembleClaudeMessage({
@@ -1752,12 +1758,9 @@ export function createHandleProtocol(deps) {
                 if (res.writableEnded || res.destroyed) return
                 if (!res.headersSent) writeSSEHeaders(res)
                 res.write(chunk)
-                // A ping is already a downstream byte. Commit so a later upstream
-                // failure cannot switch slots onto this socket.
-                onCommit()
+                // A protocol keepalive is not generated content.
               },
             })
-          if (anthropicKeepalive) activeAttemptCommit = onCommit
           keepalive.arm()
           try {
             return await dispatchStreamInference({
@@ -1817,7 +1820,6 @@ export function createHandleProtocol(deps) {
             })
           } finally {
             if (anthropicKeepalive) {
-              activeAttemptCommit = null
               anthropicKeepalive.endAttempt()
             } else keepalive.stop()
           }

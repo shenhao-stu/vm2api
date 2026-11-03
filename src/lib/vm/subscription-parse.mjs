@@ -1,18 +1,29 @@
 import crypto from 'node:crypto'
 import { parseDocument, isAlias, isCollection } from 'yaml'
-import { MAX_SOURCE_BYTES, SubscriptionError, validEndpointHost } from './subscription-network.mjs'
+import { MAX_SOURCE_BYTES, SubscriptionError, validEndpointHost, isPublicAddress } from './subscription-network.mjs'
 
-export const MAX_SUBSCRIPTION_NODES = 256
+export const MAX_SUBSCRIPTION_NODES = 512
 const set = (text) => new Set(text.split(' '))
-const TYPES = set('ss vmess vless trojan hysteria2 tuic socks5 http')
+const TYPES = set('ss ssr vmess vless trojan hysteria hysteria2 tuic socks5 http snell wireguard ssh mieru anytls')
 const COMMON = set(
-  'name type server port udp tls skip-cert-verify servername sni client-fingerprint fingerprint alpn network',
+  'name type server port udp tls skip-cert-verify name-cert-verify servername sni client-fingerprint fingerprint alpn network tfo mptcp',
 )
 const FIELDS = {
   ss: set('cipher password udp-over-tcp'),
   vmess: set('uuid alterId cipher packet-encoding'),
   vless: set('uuid flow packet-encoding'),
   trojan: set('password'),
+  ssr: set('cipher password obfs obfs-param protocol protocol-param'),
+  snell: set('psk version reuse'),
+  hysteria: set(
+    'auth auth-str protocol obfs up down ports recv-window-conn recv-window disable_mtu_discovery fast-open',
+  ),
+  anytls: set('password idle-session-check-interval idle-session-timeout min-idle-session'),
+  mieru: set('username password transport multiplexing port-range'),
+  ssh: set('username password host-key host-key-algorithms'),
+  wireguard: set(
+    'ip ipv6 private-key public-key pre-shared-key reserved mtu remote-dns-resolve dns persistent-keepalive',
+  ),
   hysteria2: set('password obfs obfs-password up down ports mport hop-interval'),
   tuic: set(
     'uuid password token congestion-controller udp-relay-mode reduce-rtt heartbeat-interval request-timeout disable-sni',
@@ -27,10 +38,14 @@ const OPTIONS = {
   'http-opts': set('method path headers'),
   'reality-opts': set('public-key short-id'),
   'ech-opts': set('enable config query-server-name'),
+  'obfs-opts': set('mode host'),
 }
 const TRANSPORTS = { vmess: set('tcp ws grpc h2 http'), vless: set('tcp ws grpc h2 http'), trojan: set('tcp ws grpc') }
 const OPTION_TRANSPORT = { 'ws-opts': 'ws', 'grpc-opts': 'grpc', 'h2-opts': 'h2', 'http-opts': 'http' }
-const BOOLEAN = set('udp tls skip-cert-verify udp-over-tcp reduce-rtt disable-sni')
+const BOOLEAN = set(
+  'udp tls skip-cert-verify udp-over-tcp reduce-rtt disable-sni reuse disable_mtu_discovery fast-open remote-dns-resolve tfo mptcp',
+)
+const STRING_ARRAYS = set('alpn host-key host-key-algorithms dns')
 const invalid = () => {
   throw new SubscriptionError()
 }
@@ -78,10 +93,18 @@ export function sanitizeNode(input) {
   config.name = name
   for (const [key, value] of Object.entries(config)) {
     if (COMMON.has(key) || FIELDS[config.type].has(key)) {
-      if (key === 'alpn' ? !strings(value) : !scalar(value)) invalid()
+      if (key === 'reserved') {
+        if (
+          !Array.isArray(value) ||
+          value.length !== 3 ||
+          !value.every((v) => Number.isInteger(v) && v >= 0 && v <= 255)
+        )
+          invalid()
+      } else if (STRING_ARRAYS.has(key) ? !strings(value) : !scalar(value)) invalid()
       if (BOOLEAN.has(key) && typeof value !== 'boolean') invalid()
     } else if (OPTIONS[key]) {
       if (!object(value)) invalid()
+      if (key === 'obfs-opts' && config.type !== 'snell') invalid()
       if (OPTION_TRANSPORT[key] && config.network !== OPTION_TRANSPORT[key]) invalid()
       if (key === 'reality-opts' && (!['vless', 'vmess'].includes(config.type) || config.tls !== true)) invalid()
       for (const [option, item] of Object.entries(value)) {
@@ -97,6 +120,7 @@ export function sanitizeNode(input) {
             invalid()
         } else if (!scalar(item) && !strings(item)) invalid()
       }
+      if (key === 'ech-opts' && value.enable !== undefined && typeof value.enable !== 'boolean') invalid()
       if (key === 'ech-opts' && value['query-server-name'] && !validEndpointHost(value['query-server-name'])) invalid()
     } else invalid()
   }
@@ -106,10 +130,24 @@ export function sanitizeNode(input) {
     (typeof config.uuid !== 'string' || !/^[a-f\d-]{32,36}$/i.test(config.uuid))
   )
     invalid()
-  if (['ss', 'trojan', 'hysteria2'].includes(config.type) && (typeof config.password !== 'string' || !config.password))
+  if (
+    ['ss', 'ssr', 'trojan', 'hysteria2', 'anytls'].includes(config.type) &&
+    (typeof config.password !== 'string' || !config.password)
+  )
     invalid()
-  if (config.type === 'ss' && (typeof config.cipher !== 'string' || !config.cipher)) invalid()
+  if (['ss', 'ssr'].includes(config.type) && (typeof config.cipher !== 'string' || !config.cipher)) invalid()
   if (config.type === 'tuic' && !(config.token || (config.uuid && config.password))) invalid()
+  if (config.type === 'snell' && !config.psk) invalid()
+  if (config.type === 'hysteria' && !(config.auth || config['auth-str'])) invalid()
+  if (['ssh', 'mieru'].includes(config.type) && (!config.username || !config.password)) invalid()
+  if (config.type === 'wireguard') {
+    for (const key of ['private-key', 'public-key'])
+      if (typeof config[key] !== 'string' || !/^[A-Za-z0-9+/]{43}=$/.test(config[key])) invalid()
+    if (config['pre-shared-key'] && !/^[A-Za-z0-9+/]{43}=$/.test(config['pre-shared-key'])) invalid()
+    // DNS servers are endpoints too; require public literals so no rebinding is possible.
+    if (config.dns?.some((host) => !isPublicAddress(host))) throw new SubscriptionError('subscription_blocked')
+  }
+  if (config['port-range'] !== undefined) config['port-range'] = portRanges(config['port-range'])
   if (config.mport !== undefined) {
     const ports = portRanges(config.mport)
     if (config.ports !== undefined && portRanges(config.ports) !== ports) invalid()

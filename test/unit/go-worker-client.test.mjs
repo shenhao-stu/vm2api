@@ -1407,3 +1407,42 @@ unixTest('Codex clients enforce the panel limit on their serialized envelope', a
     await fx.close()
   }
 })
+
+unixTest('streamGoWorker preserves UTF-8 code points split across transport chunks', async () => {
+  const text = '你好，托管 🌏'
+  const fx = await fixture((req, res) => {
+    req.resume()
+    res.setHeader('content-type', 'text/event-stream')
+    writeData(res, {
+      type: 'message_start',
+      message: { type: 'message', role: 'assistant', content: [], usage: { input_tokens: 3 } },
+    })
+    writeData(res, { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
+    const chunk = Buffer.from(
+      `data: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } })}\n\n`,
+    )
+    const split = chunk.indexOf(Buffer.from('你')) + 1
+    res.write(chunk.subarray(0, split))
+    setTimeout(() => {
+      res.write(chunk.subarray(split))
+      writeData(res, { type: 'content_block_stop', index: 0 })
+      writeData(res, { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 6 } })
+      writeData(res, { type: 'message_stop' })
+      res.end()
+    }, 5)
+  })
+  try {
+    const lines = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-test', stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      onEvent: (line) => lines.push(line),
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.body.content[0].text, text)
+    assert.equal(result.usage.output_tokens, 6)
+    assert.ok(!lines.join('').includes('�'))
+  } finally {
+    await fx.close()
+  }
+})

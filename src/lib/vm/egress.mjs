@@ -14,6 +14,7 @@ import { socksProxyUrl } from './socks-address.mjs'
 import { exitGuardConfigForProxy, getProxyExitGuardPolicy, getProxyExitGuardState } from './proxy-exit-guard.mjs'
 import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
 import { assertInstanceOwner, egressIdentity } from './instance-scope.mjs'
+import { createEgressBridge } from './egress-network.mjs'
 
 export const EGRESS_BIN = process.env.KIN_EGRESS_BIN || '/opt/kin-gateway/bin/kin-egress'
 export const LOCAL_EGRESS_ID = 'px-local'
@@ -122,12 +123,6 @@ export function portsForProxy(proxyId) {
   return egressIdentity(egressArtifactId(proxyId)).ports
 }
 
-function networkLabelArgs(proxyId) {
-  return Object.entries(egressIdentity(egressArtifactId(proxyId)).labels).flatMap(([key, value]) => [
-    '--label', `${key}=${value}`,
-  ])
-}
-
 export function gatewayFromSubnet(subnet) {
   const m = String(subnet || '').match(/^(\d+\.\d+\.\d+)\.(\d+)\/\d+$/)
   return m ? `${m[1]}.1` : ''
@@ -187,7 +182,7 @@ export function iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
 
 function commandPrefix(name) {
   const raw = String(process.env.KIN_EGRESS_CMD_PREFIX || '').trim()
-  if (!raw || !['ss', 'iptables'].includes(name)) return []
+  if (!raw || !['ss', 'iptables', 'ip'].includes(name)) return []
   return raw.split(/\s+/).filter(Boolean)
 }
 
@@ -237,7 +232,11 @@ function pidAlive(pid) {
   const n = Number(pid)
   if (!Number.isInteger(n) || n <= 0) return false
   if (!commandPrefix('ss').length) {
-    try { process.kill(n, 0) } catch { return false }
+    try {
+      process.kill(n, 0)
+    } catch {
+      return false
+    }
   } else if (!sh(pidNamespaceCommand(['sh', '-c', `kill -0 ${n} 2>/dev/null`])).ok) return false
   if (process.platform !== 'linux' && !commandPrefix('ss').length) return true
   const stat = processText(n, 'stat')
@@ -255,7 +254,11 @@ function readPid(file) {
 function processText(pid, file) {
   const target = `/proc/${Number(pid)}/${file}`
   if (!commandPrefix('ss').length) {
-    try { return fs.readFileSync(target, 'utf8') } catch { return '' }
+    try {
+      return fs.readFileSync(target, 'utf8')
+    } catch {
+      return ''
+    }
   }
   const result = sh(pidNamespaceCommand(['cat', target]))
   return result.ok ? result.stdout : ''
@@ -264,7 +267,11 @@ function processText(pid, file) {
 function processLink(pid, file) {
   const target = `/proc/${Number(pid)}/${file}`
   if (!commandPrefix('ss').length) {
-    try { return fs.readlinkSync(target) } catch { return '' }
+    try {
+      return fs.readlinkSync(target)
+    } catch {
+      return ''
+    }
   }
   const result = sh(pidNamespaceCommand(['readlink', target]))
   return result.ok ? result.stdout : ''
@@ -280,7 +287,10 @@ function ownsEgressProcess(pid, configPath, { allowDeleted = false } = {}) {
   if (!pidAlive(pid)) return false
   const exe = processLink(pid, 'exe')
   const deleted = exe.endsWith(' (deleted)')
-  if ((deleted && !allowDeleted) || !/^kin-egress(?:-[a-zA-Z0-9._-]+)?$/.test(path.basename(exe.replace(/ \(deleted\)$/, ''))))
+  if (
+    (deleted && !allowDeleted) ||
+    !/^kin-egress(?:-[a-zA-Z0-9._-]+)?$/.test(path.basename(exe.replace(/ \(deleted\)$/, '')))
+  )
     return false
   const args = processText(pid, 'cmdline').split('\0').filter(Boolean)
   const configIndex = args.indexOf('-config')
@@ -308,17 +318,25 @@ function ownsEgressProcess(pid, configPath, { allowDeleted = false } = {}) {
 function egressProcessPids() {
   if (!commandPrefix('ss').length) {
     if (process.platform !== 'linux') return []
-    return fs.readdirSync('/proc').filter((name) => /^[1-9][0-9]*$/.test(name))
-      .filter((pid) => /^kin-egress(?:-[a-zA-Z0-9._-]+)?$/.test(path.basename(processLink(pid, 'exe').replace(/ \(deleted\)$/, ''))))
+    return fs
+      .readdirSync('/proc')
+      .filter((name) => /^[1-9][0-9]*$/.test(name))
+      .filter((pid) =>
+        /^kin-egress(?:-[a-zA-Z0-9._-]+)?$/.test(path.basename(processLink(pid, 'exe').replace(/ \(deleted\)$/, ''))),
+      )
       .map(Number)
   }
   const probe = pidNamespaceCommand([
-    'sh', '-c',
+    'sh',
+    '-c',
     'for dir in /proc/[1-9]*; do exe=$(readlink "$dir/exe" 2>/dev/null) || continue; name=${exe##*/}; name=${name%" (deleted)"}; case "$name" in kin-egress|kin-egress-*) basename "$dir";; esac; done; true',
   ])
   const result = sh(probe)
   if (!result.ok) return []
-  return result.stdout.split(/\s+/).map(Number).filter((pid) => Number.isInteger(pid) && pid > 0)
+  return result.stdout
+    .split(/\s+/)
+    .map(Number)
+    .filter((pid) => Number.isInteger(pid) && pid > 0)
 }
 
 function staleEgressPids(configPath, exceptPid = 0) {
@@ -349,7 +367,13 @@ export function readEgressListenTcp(projectRoot, proxyId) {
 export function inspectEgressNetwork(proxyId, run = docker) {
   const name = networkName(proxyId)
   if (!name) return null
-  const r = run(['network', 'inspect', '-f', '{{range .IPAM.Config}}{{.Subnet}}|{{.Gateway}}{{end}}|{{json .Labels}}', name])
+  const r = run([
+    'network',
+    'inspect',
+    '-f',
+    '{{range .IPAM.Config}}{{.Subnet}}|{{.Gateway}}{{end}}|{{json .Labels}}',
+    name,
+  ])
   if (!r.ok) return null
   const [subnet, gateway, rawLabels] = String(r.stdout || '').split('|')
   const labels = rawLabels ? JSON.parse(rawLabels) : {}
@@ -363,25 +387,18 @@ export function inspectEgressNetwork(proxyId, run = docker) {
   }
 }
 
-export function ensureEgressNetwork(proxyId, run = docker) {
+export function ensureEgressNetwork(proxyId, run = docker, runIp = (args) => sh(['ip', ...args])) {
   const name = networkName(proxyId)
   const br = bridgeName(proxyId)
   if (!name) return { ok: false, error: 'proxy_id_required' }
   const existing = inspectEgressNetwork(proxyId, run)
   if (existing?.subnet) return { ok: true, ...existing, reused: true }
-  const created = run([
-    'network',
-    'create',
-    '--ipv6=false',
-    '--opt',
-    `com.docker.network.bridge.name=${br}`,
-    '--opt',
-    'com.docker.network.bridge.enable_ip_masquerade=false',
-    '--opt',
-    'com.docker.network.bridge.enable_icc=false',
-    ...networkLabelArgs(proxyId),
-    name,
-  ])
+  const created = createEgressBridge(name, br, {
+    masquerade: false,
+    runDocker: run,
+    runIp,
+    labels: egressIdentity(egressArtifactId(proxyId)).labels,
+  })
   if (!created.ok && !/already exists/i.test(created.stderr || '')) {
     return { ok: false, error: created.stderr || 'docker network create failed' }
   }
@@ -658,6 +675,10 @@ const EGRESS_KILL_GRACE_MS = 3000
 function egressProcessAbsent(pid) {
   const n = Number(pid)
   if (!Number.isInteger(n) || n <= 0) return true
+  if (commandPrefix('ss').length) {
+    const probe = sh(pidNamespaceCommand(['test', '-d', `/proc/${n}`]), { timeout: 2000 })
+    return !probe.ok && probe.code === 1
+  }
   if (process.platform === 'linux') {
     try {
       return !fs.existsSync(`/proc/${n}`)
@@ -783,26 +804,19 @@ function waitListen(host, port, timeoutMs = 8000, ownerPid = 0) {
   return false
 }
 
-export function ensureLocalProxyEgress(proxy, { runDocker = docker } = {}) {
+export function ensureLocalProxyEgress(proxy, { runDocker = docker, runIp = (args) => sh(['ip', ...args]) } = {}) {
   const proxyId = proxy?.id || LOCAL_EGRESS_ID
   const name = networkName(proxyId)
   const br = bridgeName(proxyId)
   if (!name) return { ok: false, error: 'proxy_id_required' }
   const existing = inspectEgressNetwork(proxyId, runDocker)
   if (existing?.subnet) return { ok: true, mode: 'local', ...existing, reused: true, proxy_id: proxyId }
-  const created = runDocker([
-    'network',
-    'create',
-    '--ipv6=false',
-    '--opt',
-    `com.docker.network.bridge.name=${br}`,
-    '--opt',
-    'com.docker.network.bridge.enable_ip_masquerade=true',
-    '--opt',
-    'com.docker.network.bridge.enable_icc=false',
-    ...networkLabelArgs(proxyId),
-    name,
-  ])
+  const created = createEgressBridge(name, br, {
+    masquerade: true,
+    runDocker,
+    runIp,
+    labels: egressIdentity(egressArtifactId(proxyId)).labels,
+  })
   if (!created.ok && !/already exists/i.test(created.stderr || '')) {
     return { ok: false, error: created.stderr || 'docker network create failed' }
   }
@@ -837,7 +851,7 @@ export async function ensureProxyEgress(projectRoot, proxy, opts = {}) {
     return { ok: false, error: error.reason || error.code || 'exit_guard_blocked' }
   }
   opts = { ...opts, exitGuard }
-  if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, { runDocker: opts.runDocker })
+  if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, opts)
   return runExclusiveProxyEgress(projectRoot, proxy?.id, () => startProxyEgress(projectRoot, proxy, opts))
 }
 
@@ -846,6 +860,7 @@ export async function startProxyEgress(
   proxy,
   {
     runDocker = docker,
+    runIp = (args) => sh(['ip', ...args]),
     runIptables = iptables,
     dnsUpstream = configuredDnsUpstream(),
     dnsEmptyTypes = configuredDnsEmptyTypes(),
@@ -860,7 +875,7 @@ export async function startProxyEgress(
   const proxyId = proxy?.id
   const proxyUrl = boundProxyUrl(proxy)
   if (!proxyId || !proxyUrl) return { ok: false, error: 'bound SOCKS5 id and url required; refusing fallback' }
-  const net = ensureEgressNetwork(proxyId, runDocker)
+  const net = ensureEgressNetwork(proxyId, runDocker, runIp)
   if (!net.ok) return net
   const listenHost = listenHostOverride || net.gateway || gatewayFromSubnet(net.subnet)
   if (!listenHost) return { ok: false, error: 'egress network gateway missing' }

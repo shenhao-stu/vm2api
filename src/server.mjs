@@ -425,6 +425,7 @@ try {
 }
 const proxySubscriptions = new ProxySubscriptions({ dataDir, proxyPool })
 await proxySubscriptions.start()
+proxySubscriptions.startScheduler()
 proxyPool.startScheduler()
 
 // 首次安装的出口池是空的，槽没有可绑出口就起不来。本机出口永远成立，先补上。

@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { EgressCircuit, egressKey } from './egress-circuit.mjs'
 import { getVm, listVms, markUnschedulable, migrateVmSchedule } from '../vm/vm-registry.mjs'
 import { vmCliHomePath, vmJsonPath } from '../vm/execution-context.mjs'
 import {
@@ -106,6 +107,7 @@ function clampWaitTimeoutMs(value, fallback) {
 export function normalizePoolRouting(pool = {}) {
   const next = { ...(pool && typeof pool === 'object' ? pool : {}) }
   delete next.max_waiters_per_account
+  next.egress_circuit_enabled = next.egress_circuit_enabled !== false
   next.strategy = next.strategy === 'fill' ? 'fill' : 'balanced'
   next.queue_max = clampNumber(next.queue_max, DEFAULT_POOL_ROUTING.queue_max, QUEUE_MAX_MIN, QUEUE_MAX_MAX)
   next.seat_grace_ms = clampNumber(next.seat_grace_ms, DEFAULT_POOL_ROUTING.seat_grace_ms, 0, SEAT_GRACE_MAX_MS)
@@ -233,6 +235,9 @@ function emptyPoolFailure(model, candidates, now = Date.now()) {
   if (isFableModel(model)) return { reason: 'fable_requires_max', retry_after_ms: null }
   if ((candidates?.rejections?.quota_guard_request_too_large || 0) > 0) {
     return { reason: 'quota_guard_request_too_large', retry_after_ms: null }
+  }
+  if (candidates?.egress_until != null) {
+    return { reason: 'pool_egress_unavailable', retry_after_ms: Math.max(1000, candidates.egress_until - now) }
   }
   const { rate_limited: limited = null, overloaded = null } = candidates?.cooldowns || {}
   if (overloaded != null) {
@@ -400,6 +405,7 @@ export class PoolScheduler extends EventEmitter {
       stickyTtlMs: () => (Number(this.stickyRouter?.config?.ttl_seconds) || 86400) * 1000,
       onChange: () => this.emit('change'),
     })
+    this.egressCircuit = new EgressCircuit()
     this.unitCircuit = unitCircuit
     if (runtimeRepo) this.unitCircuit.bindRepo(runtimeRepo)
     this.restoreStickySeats()
@@ -814,14 +820,16 @@ export class PoolScheduler extends EventEmitter {
             sessionVm: sticky.vmId || '',
             familyVm: familyGated ? '' : familyVm,
           })
+          // Also wake existing queue tickets when their last healthy exit opens.
+          if (!candidates.length) {
+            const empty = emptyPoolFailure(model, candidates)
+            return { ...fail(empty.reason), ...empty }
+          }
 
           if (!ticket) {
             const granted = this.openNewSeat(seatKey, candidates, { avoided, homes, deviceKey: machineKey })
             if (granted) return finish(granted)
-            if (!candidates.length) {
-              const empty = emptyPoolFailure(model, candidates)
-              return { ...fail(empty.reason), ...empty }
-            }
+
             if (!allowWait || now >= failoverDeadline) return fail('all_accounts_busy')
             let home = null
             for (const entry of homes) {
@@ -1109,7 +1117,10 @@ export class PoolScheduler extends EventEmitter {
         const quota = quotaRejection(kind, eligibility.until, now)
         if (quota) candidates.quotaRejections.push(quota)
         else candidates.otherRejections += 1
-        if (kind === 'rate_limited' || kind === 'overloaded') {
+        if (kind === 'egress_unavailable') {
+          const until = Number(eligibility.until) || now + 1000
+          candidates.egress_until = candidates.egress_until == null ? until : Math.min(candidates.egress_until, until)
+        } else if (kind === 'rate_limited' || kind === 'overloaded') {
           const until = Number(eligibility.until) || 0
           const prev = candidates.cooldowns[kind]
           candidates.cooldowns[kind] = prev == null ? until : Math.min(prev, until)
@@ -1190,6 +1201,10 @@ export class PoolScheduler extends EventEmitter {
       if (!(pinned && gate.reason === 'vm_unschedulable')) return gate
     }
     if (!slotHasBoundProxy(vm)) return { ok: false, reason: 'proxy_required' }
+    if (!pinned && this.config.egress_circuit_enabled) {
+      const egress = this.egressCircuit.inspect(egressKey(vm), now)
+      if (!egress.ok) return { ok: false, reason: 'egress_unavailable', until: egress.until }
+    }
     const workerProxyEndpoint = this.projectRoot ? readWorkerProxyEndpoint(this.projectRoot, vm.id) : undefined
     const egressMode = this.projectRoot ? readWorkerEgressMode(this.projectRoot, vm.id) : ''
     const proxySync = evaluateProxySync({ vm, workerProxyEndpoint, egressMode })
@@ -1851,6 +1866,15 @@ export class PoolScheduler extends EventEmitter {
       if (quotaReservation) this.accountQuota?.release?.(candidate.accountId)
       return null
     }
+    const egressLease =
+      !pinned && this.config.egress_circuit_enabled && egressKey(candidate.vm)
+        ? this.egressCircuit.admit(egressKey(candidate.vm))
+        : null
+    if (egressLease && !egressLease.ok) {
+      if (quotaReservation) this.accountQuota?.release?.(candidate.accountId)
+      if (circuitHold?.probe) this.unitCircuit?.releaseProbe?.(candidate.accountId)
+      return null
+    }
     // Admission hooks may release an existing reservation. Use the live count
     // rather than restoring occupancy from before those hooks ran.
     this.inflight.set(candidate.accountId, (this.inflight.get(candidate.accountId) || 0) + 1)
@@ -1859,6 +1883,7 @@ export class PoolScheduler extends EventEmitter {
     let released = false
     return {
       reserved: true,
+      egressLease,
       slotIndex: null,
       release: () => {
         if (released) return
@@ -1870,6 +1895,7 @@ export class PoolScheduler extends EventEmitter {
         this.bumpVmInflight(candidate.vmId, -1)
         this.accountQuota?.release?.(candidate.accountId)
         if (circuitHold?.probe) this.unitCircuit?.releaseProbe?.(candidate.accountId)
+        egressLease?.release()
         this.planner.pump(candidate.vmId)
         this.notifyCapacity(candidate.accountId)
       },
@@ -2105,6 +2131,12 @@ export class PoolScheduler extends EventEmitter {
       for (const entry of bucket.values()) wakeEntry(entry)
     }
     this.planner.pumpAll()
+    // An outage can invalidate queued routes without freeing any seat.
+    // Let those wait loops reevaluate immediately instead of on refresh.
+    for (const ticket of this.planner.globalQueue) wakeEntry(ticket)
+    for (const queue of this.planner.vmQueues.values()) {
+      for (const ticket of queue) wakeEntry(ticket)
+    }
   }
 
   /**

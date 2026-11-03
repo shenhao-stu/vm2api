@@ -12,6 +12,13 @@ case "$command" in
     exec docker run --rm --network host --pid host --privileged nicolaka/netshoot \
       ss "$@"
     ;;
+  ip)
+    case "$*" in
+      '-j -4 route show table all'|'-j -4 address show') ;;
+      *) exit 127 ;;
+    esac
+    exec docker run --rm --network host --pid host --privileged --entrypoint ip nicolaka/netshoot "$@"
+    ;;
   iptables)
     exec docker run --rm --network host --pid host --privileged --entrypoint iptables nicolaka/netshoot "$@"
     ;;

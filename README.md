@@ -1,3 +1,5 @@
+> **Claude 托管分支 `dev/hosted`**：整合 dofastted 上游、Fwind43 的代理与传输改进，以及 shenhao-stu 的固定出口、权限和可观测性改进。ReClaude native relay 不包含在本分支。详见 [整合说明](docs/operations/hosted-integration.md) 与 [同宿主实例隔离](docs/operations/hosted-isolation.md)。
+
 > 此分支支持 [代理订阅导入与安全部署](docs/PROXY_SUBSCRIPTIONS.md)：Clash/URI 节点、加密订阅状态、私有代理监听、管理员刷新；默认仅监听回环地址。
 
 <div align="center">
@@ -42,6 +44,8 @@
 ---
 
 # 🇨🇳 简体中文
+
+> 本分叉包含 Clash 订阅导入；可在 [GitHub Actions](https://github.com/Fwind43/vm2api/actions/workflows/docker-image.yml) 一键构建双架构镜像 `ghcr.io/fwind43/vm2api:latest`，使用方法见 [镜像部署指南](docs/DOCKER_IMAGE.md)。
 
 ## 目录
 - [💡 项目概览](#-项目概览)

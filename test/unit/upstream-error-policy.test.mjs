@@ -116,7 +116,7 @@ test('entitlement 429 stops without poisoning pool', () => {
   assert.equal(policy.action, 'stop')
 })
 
-test('wrap Connection error retries the same account', () => {
+test('wrap Connection error without execution proof cannot retry', () => {
   const policy = classifyUpstreamResult({
     status: 200,
     ok: false,
@@ -125,12 +125,13 @@ test('wrap Connection error retries the same account', () => {
     body: { error: { type: 'api_error', message: 'provider error: provider error: Connection error.' } },
   })
   assert.equal(policy.scope, 'worker')
+  assert.equal(policy.replayAllowed, false)
   assert.equal(policy.action, 'continue')
   assert.equal(policy.reason, 'wrap_connection_error')
-  assert.equal(policy.retrySameAccount, true)
+  assert.equal(policy.retrySameAccount, false)
 })
 
-test('a coded generic connection error allows bounded recovery without blaming the proxy', () => {
+test('a coded generic connection error is uncertain without blaming the proxy', () => {
   for (const message of [
     'Connection error.',
     'provider error: provider error: Connection error.',
@@ -143,9 +144,10 @@ test('a coded generic connection error allows bounded recovery without blaming t
       body: { error: { code: 'upstream_network_error', message } },
     })
     assert.equal(policy.scope, 'worker', message)
+    assert.equal(policy.replayAllowed, false)
     assert.equal(policy.action, 'continue')
     assert.equal(policy.reason, 'upstream_network_error')
-    assert.equal(policy.retrySameAccount, true)
+    assert.equal(policy.retrySameAccount, false)
     assert.equal(policy.cooldownUntil, null)
   }
 })
@@ -224,14 +226,15 @@ test('response-header timeout does not cool the account', () => {
     { now: 1000 },
   )
   assert.equal(policy.scope, 'provider')
+  assert.equal(policy.replayAllowed, false)
   assert.equal(policy.action, 'continue')
   assert.equal(policy.reason, 'provider_timeout')
   assert.equal(policy.cooldownUntil, null)
-  assert.equal(policy.retrySameAccount, true)
-  assert.equal(shouldContinue(policy), true)
+  assert.equal(policy.retrySameAccount, false)
+  assert.equal(shouldContinue(policy), false)
 })
 
-test('generic 502 overload switches units through the circuit, not a 15s cooldown', () => {
+test('generic 502 records circuit health without replaying unknown execution', () => {
   const policy = classifyUpstreamResult(
     {
       status: 502,
@@ -239,14 +242,15 @@ test('generic 502 overload switches units through the circuit, not a 15s cooldow
     },
     { now: 1000 },
   )
+  assert.equal(policy.replayAllowed, false)
   assert.equal(policy.action, 'continue')
   assert.equal(policy.reason, 'provider_overloaded')
   assert.equal(policy.cooldownUntil, null)
   assert.equal(policy.circuit, true)
   assert.equal(policy.decision.scope, 'unit')
-  assert.equal(policy.decision.action, 'next_unit')
+  assert.equal(policy.decision.action, 'return')
   assert.equal(policy.retrySameAccount, false)
-  assert.equal(shouldContinue(policy), true)
+  assert.equal(shouldContinue(policy), false)
 })
 
 test('incomplete 502 is an empty hop, not account overload', () => {
@@ -261,9 +265,10 @@ test('incomplete 502 is an empty hop, not account overload', () => {
   )
   assert.equal(policy.scope, 'stream')
   assert.equal(policy.reason, 'empty_response')
+  assert.equal(policy.replayAllowed, false)
   assert.equal(policy.action, 'continue')
   assert.equal(policy.cooldownUntil, null)
-  assert.equal(policy.retrySameAccount, true)
+  assert.equal(policy.retrySameAccount, false)
 })
 
 test('slot_busy 503 does not park the account', () => {
@@ -283,7 +288,7 @@ test('slot_busy 503 does not park the account', () => {
   assert.equal(policy.retrySameAccount, false)
 })
 
-test('a 502 plan-limit message switches accounts until the reset named in the text', () => {
+test('a 502 plan-limit message records quota reset but cannot prove zero execution', () => {
   const now = Date.parse('2026-09-23T12:37:10Z')
   const policy = classifyUpstreamResult(
     {
@@ -302,7 +307,7 @@ test('a 502 plan-limit message switches accounts until the reset named in the te
   assert.equal(policy.reason, 'account_quota_exhausted')
   assert.equal(policy.cooldownUntil, Date.parse('2026-09-23T23:20:00Z'))
   assert.equal(policy.rememberRefusal, undefined)
-  assert.equal(shouldContinue(policy), true)
+  assert.equal(shouldContinue(policy), false)
 })
 
 test('200 + streamed plan-limit error is account quota, not http_200 stop', () => {
@@ -340,7 +345,7 @@ test('extra usage required stays a request-scoped entitlement stop', () => {
   assert.equal(policy.reason, 'entitlement_required')
 })
 
-test('empty_response retries the same account', () => {
+test('empty_response does not authorize another generation', () => {
   const policy = classifyUpstreamResult(
     {
       ok: false,
@@ -351,8 +356,8 @@ test('empty_response retries the same account', () => {
     { now: 1000 },
   )
   assert.equal(policy.reason, 'empty_response')
-  assert.equal(policy.retrySameAccount, true)
-  assert.equal(shouldContinue(policy), true)
+  assert.equal(policy.retrySameAccount, false)
+  assert.equal(shouldContinue(policy), false)
 })
 
 test('client cancel stops and an upstream reset is not a cancel', () => {
@@ -405,11 +410,12 @@ test('529 stays on the overload column and does not open the unit circuit', () =
     { now: 1000 },
   )
   assert.equal(policy.scope, 'provider')
+  assert.equal(policy.replayAllowed, false)
   assert.equal(policy.action, 'continue')
   assert.equal(policy.reason, 'provider_overloaded')
   assert.equal(policy.cooldownUntil, null)
   assert.equal(policy.circuit, undefined)
-  assert.equal(policy.decision.action, 'next_unit')
+  assert.equal(policy.decision.action, 'return')
 })
 
 test('signature error has one scoped repair', () => {
@@ -514,7 +520,7 @@ test('7d_oi 429 cools fable family not the account', () => {
   assert.equal(policy.cooldownUntil, now + 90_000)
 })
 
-test('thinking-only verified hop retries the same account', () => {
+test('thinking-only verified hop does not authorize another generation', () => {
   const policy = classifyUpstreamResult({
     ok: true,
     status: 200,
@@ -527,10 +533,11 @@ test('thinking-only verified hop retries the same account', () => {
       stop_reason: null,
     },
   })
+  assert.equal(policy.replayAllowed, false)
   assert.equal(policy.action, 'continue')
   assert.equal(policy.reason, 'incomplete_assistant')
-  assert.equal(policy.retrySameAccount, true)
-  assert.equal(shouldContinue(policy), true)
+  assert.equal(policy.retrySameAccount, false)
+  assert.equal(shouldContinue(policy), false)
 })
 
 test('text plus end_turn is success even without ok flag', () => {
@@ -962,4 +969,19 @@ test('disabled organization 400 is an org pause, not an invalid request', () => 
   assert.equal(policy.reason, 'organization_disabled')
   assert.equal(policy.pauseSchedule, true)
   assert.equal(shouldContinue(policy), true)
+})
+
+test('a late request or quota error with measured generation usage cannot authorize replay', () => {
+  for (const status of [400, 429]) {
+    const policy = classifyUpstreamResult({
+      status,
+      committed: false,
+      terminalState: 'rejected',
+      usage: { input_tokens: 4, output_tokens: 2 },
+      body: { error: { message: status === 400 ? 'final assistant message must end with a user' : 'rate limited' } },
+    })
+    assert.equal(policy.replayAllowed, false)
+    assert.equal(shouldContinue(policy), false)
+    assert.equal(policy.decision.action, 'return')
+  }
 })

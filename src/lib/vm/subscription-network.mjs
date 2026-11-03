@@ -17,6 +17,8 @@ export class SubscriptionError extends Error {
         subscription_not_found: '订阅不存在',
         subscription_busy: '另一项订阅操作正在进行',
         subscription_bound: '订阅包含已绑定节点，请先解除绑定',
+        subscription_bound_changed: '已绑定线路发生变化，已保留原配置；请检查后手动重新导入',
+        subscription_refresh_failed: '订阅刷新失败，已保留原配置',
       }[code] || '代理订阅操作失败',
     )
     this.code = code

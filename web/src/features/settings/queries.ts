@@ -14,12 +14,15 @@ export type ChangelogEntry = {
 }
 
 export type ReleaseStatus = {
+  managed_release?: boolean
+  release_channel?: string
+
   current: string
   current_tag: string
   latest: string | null
   latest_tag: string | null
   update_available: boolean | null
-  check_status: 'ok' | 'failed'
+  check_status: 'ok' | 'failed' | 'pinned'
   html_url: string
   published_at: string | null
   name: string | null

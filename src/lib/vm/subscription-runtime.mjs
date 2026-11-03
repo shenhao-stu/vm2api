@@ -10,7 +10,11 @@ export function renderSubscriptionConfig(nodes, { controller, secret }) {
   const proxies = nodes.map((node) => {
     const config = structuredClone(node.config)
     if (!isPublicAddress(node.address)) throw new SubscriptionError('subscription_blocked')
-    if ((config.tls || ['trojan', 'hysteria2', 'tuic'].includes(config.type)) && !config.sni && !config.servername) {
+    if (
+      (config.tls || ['trojan', 'hysteria', 'hysteria2', 'tuic', 'anytls'].includes(config.type)) &&
+      !config.sni &&
+      !config.servername
+    ) {
       config[['vless', 'vmess'].includes(config.type) ? 'servername' : 'sni'] = config.server
     }
     if (config.network === 'ws') {
@@ -31,7 +35,13 @@ export function renderSubscriptionConfig(nodes, { controller, secret }) {
     'external-controller-cors': { 'allow-origins': [], 'allow-private-network': false },
     'geo-auto-update': false,
     profile: { 'store-selected': false, 'store-fake-ip': false },
-    dns: { enable: false },
+    // Fixed policy supports HTTPS/type-65 queries for ECH; supplier DNS never executes.
+    dns: {
+      enable: true,
+      ipv6: true,
+      'default-nameserver': ['1.1.1.1', '8.8.8.8'],
+      nameserver: ['https://cloudflare-dns.com/dns-query', 'https://dns.google/dns-query'],
+    },
     proxies,
     listeners: nodes.map((node) => ({
       name: node.id,
