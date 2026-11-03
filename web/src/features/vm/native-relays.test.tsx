@@ -6,9 +6,11 @@ import {
   canResumeSchedule,
   scheduleLabel,
   relayState,
+  scheduleResetAt,
   type NativeRelay,
 } from './native-relay-state'
 import { NativeRelays } from './native-relays'
+import { relayUsageModel } from './relay-usage-model'
 
 const relay: NativeRelay = {
   id: 'native-fixture',
@@ -140,16 +142,16 @@ describe('native Relay VM management', () => {
         stale: true,
       },
     })
-    for (const value of ['1.25', '12.5', '81', '80', '缺少计价', '已过期']) {
+    for (const value of ['1.25', '12.5', '81', '80', '缺少计价', '待更新']) {
       expect(html).toContain(value)
     }
     const doc = new Window().document
     doc.body.innerHTML = html
-    const meter = doc.querySelector('[role=meter]')
-    expect(meter?.getAttribute('aria-valuenow')).toBe('100')
-    expect(meter?.getAttribute('aria-valuetext')).toContain('101.25%')
+    expect(doc.querySelectorAll('[role=meter]')).toHaveLength(0)
+    expect(doc.body.textContent).toContain('$81.00 / $80.00')
+    expect(doc.body.textContent).not.toContain('0%')
     expect(doc.body.textContent).toContain('$7.25')
-    expect(render(true)).toContain('等待官方额度')
+    expect(render(true)).toContain('官方未提供 5H / 7D 百分比')
   })
   it('keeps personal percentage windows separate from the other account', () => {
     const personal = {
@@ -175,7 +177,94 @@ describe('native Relay VM management', () => {
     expect(cards).toHaveLength(2)
     expect(cards[0].textContent).not.toContain('98%')
     expect(cards[1].textContent).toContain('98%')
-    expect(cards[1].querySelectorAll('progress')).toHaveLength(2)
+    expect(cards[1].querySelectorAll('[role=meter]')).toHaveLength(2)
+    expect(cards[1].querySelectorAll('progress')).toHaveLength(0)
+    for (const card of cards) {
+      const quota = card.querySelector('[aria-label="ReClaude 官方套餐窗口"]')
+      expect(quota?.textContent).toContain('5H')
+      expect(quota?.textContent).toContain('7D')
+      expect(quota?.textContent).toContain('套餐')
+    }
+  })
+  it('does not turn unknown scheduling or an exit latch into ready', () => {
+    expect(relayState({ ...relay, sub: { schedulable: null } })).toBe(
+      '调度状态未知'
+    )
+    expect(
+      relayState({ ...relay, guard: { ...relay.guard, latched: true } })
+    ).toBe('出口待检查')
+    expect(
+      relayState({
+        ...relay,
+        runtime: { ...relay.runtime, container_running: false },
+      })
+    ).toBe('原生环境待检查')
+    const a = Date.parse('2026-11-04T02:00:00+08:00')
+    const b = Date.parse('2026-11-04T11:00:00+08:00')
+    const limited = {
+      ...relay,
+      sub: {
+        schedulable: true,
+        rate_limit_reset_at: new Date(a).toISOString(),
+        temp_unschedulable_until: new Date(b).toISOString(),
+      },
+    }
+    expect(scheduleResetAt(limited, a)).toBe(b)
+    expect(relayState(limited, a)).toBe('额度冷却')
+    expect(relayState(limited, b)).toBe('运行中')
+    expect(scheduleResetAt(limited, b)).toBeNull()
+  })
+  it('preserves unknown versus zero and the last reading after reset', () => {
+    const item = {
+      ...relay,
+      runtime: {
+        ...relay.runtime,
+        official_windows: {
+          five_hour: { used_percent: 0, resets_at_ms: 1800000000000 },
+          seven_day: { used_percent: 105, resets_at_ms: 1800000000001 },
+          observed_at_ms: 1799999999000,
+          source_updated_ms: 1799999999000,
+          stale: false,
+        },
+      },
+    }
+    const before = relayUsageModel(item, 1799999999999)
+    const after = relayUsageModel(item, 1800000000002)
+    expect(before.stale).toBe(false)
+    expect(after.stale).toBe(true)
+    expect(after.windows.map((w) => w.pct)).toEqual([0, 105])
+    expect(
+      relayUsageModel(relay, 1800000000002).windows.map((w) => w.pct)
+    ).toEqual([null, null])
+    const doc = new Window().document
+    doc.body.innerHTML = render(true, item)
+    expect(
+      [...doc.querySelectorAll('[role=meter]')].map((m) =>
+        m.getAttribute('aria-valuenow')
+      )
+    ).toEqual(['0', '100'])
+    expect(doc.querySelectorAll('.meter-capped')).toHaveLength(1)
+  })
+  it('rejects invalid quota amounts without fabricating a valid reading', () => {
+    const item = {
+      ...relay,
+      official_quota: {
+        used_usd: 1,
+        quota_usd: 0,
+        observed_at_ms: 1,
+        resets_at_ms: null,
+        stale: false,
+      },
+      usage: {
+        last_5h_usd: NaN,
+        total_usd: -1,
+        unpriced_requests: 0,
+        first_at: null,
+      },
+    }
+    const model = relayUsageModel(item, 100)
+    expect(model.quota).toBeNull()
+    expect(model.rows.every((r) => r.value === undefined)).toBe(true)
   })
   it('does not show the administrative runtime to non-admins', () => {
     expect(render(false)).toBe('')

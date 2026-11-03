@@ -1,133 +1,73 @@
+import { cn } from '@/lib/utils'
 import type { NativeRelay } from './native-relay-state'
+import { QuotaWindowRow } from './quota-window-row'
+import { relayUsageModel } from './relay-usage-model'
 
-const short = new Intl.NumberFormat('en-US', {
+const currency = new Intl.NumberFormat('en-US', {
   style: 'currency',
   currency: 'USD',
-})
-const percent = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 })
-const time = new Intl.DateTimeFormat('zh-CN', {
-  timeZone: 'Asia/Shanghai',
-  month: '2-digit',
-  day: '2-digit',
-  hour: '2-digit',
-  minute: '2-digit',
-  hour12: false,
 })
 const exactTime = (ms: number) =>
   new Date(ms).toLocaleString('zh-CN', {
     timeZone: 'Asia/Shanghai',
     hour12: false,
   })
+const money = (value: number | undefined) =>
+  value === undefined
+    ? '—'
+    : value > 0 && value < 0.01
+      ? '<$0.01'
+      : currency.format(value)
 
-function money(n: number | undefined) {
-  if (n === undefined) return '—'
-  return n > 0 && n < 0.01 ? '<$0.01' : short.format(n)
-}
-
-export function RelayUsageCard({ relay }: { relay: NativeRelay }) {
-  const windows = relay.runtime.official_windows
-  const q = relay.official_quota
-  const usage = relay.usage
-  const pct = q ? (100 * q.used_usd) / q.quota_usd : 0
-  const fill = Math.min(100, pct)
-  const rows = [
-    ['5H', usage?.last_5h_usd],
-    ['7D', usage?.last_7d_usd],
-    ['总计', usage?.total_usd],
-  ] as const
+export function RelayUsageCard({
+  relay,
+  now,
+}: {
+  relay: NativeRelay
+  now: number
+}) {
+  const { windows, quota, stale, rows } = relayUsageModel(relay, now)
   return (
     <>
-      <section
-        aria-label='ReClaude 官方套餐窗口'
-        className='space-y-1.5 text-sm'
-      >
-        {windows ? (
-          <>
-            <h4 className='text-xs text-muted-foreground'>套餐已用</h4>
-            {(
-              [
-                ['5H', windows.five_hour],
-                ['7D', windows.seven_day],
-              ] as const
-            ).map(([label, row]) => (
-              <div key={label} className='flex items-center gap-2 text-xs'>
-                <span>{label}</span>
-                <progress
-                  aria-label={label + ' 套餐已用'}
-                  className='h-1.5 flex-1 accent-emerald-500'
-                  max={100}
-                  value={Math.min(row.used_percent, 100)}
-                />
-                <b>{percent.format(row.used_percent)}%</b>
-                <span
-                  className='text-muted-foreground'
-                  title={exactTime(row.resets_at_ms)}
-                >
-                  {time.format(row.resets_at_ms)} 重置
-                </span>
-              </div>
-            ))}
-            {windows.stale && (
-              <span className='text-xs text-muted-foreground'>上次记录</span>
-            )}
-          </>
-        ) : (
-          <>
-            <div className='flex items-baseline justify-between gap-2'>
-              <span className='text-muted-foreground'>套餐已用 / 总额</span>
-              <b
-                className='font-mono tabular-nums'
-                title={q ? `${q.used_usd} / ${q.quota_usd} USD` : undefined}
-              >
-                {q ? `${money(q.used_usd)} / ${money(q.quota_usd)}` : '—'}
-              </b>
-            </div>
-            {q ? (
-              <>
-                <div className='flex items-center gap-3'>
-                  <div
-                    role='meter'
-                    aria-label='官方套餐已用比例'
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                    aria-valuenow={fill}
-                    aria-valuetext={`已用 ${percent.format(pct)}%`}
-                    className='h-1.5 flex-1 overflow-hidden rounded-full bg-muted'
-                  >
-                    <div
-                      className={`h-full rounded-full ${q.stale ? 'bg-muted-foreground' : pct >= 100 ? 'bg-destructive' : 'bg-emerald-500'}`}
-                      style={{ width: `${fill}%` }}
-                    />
-                  </div>
-                  <span className='font-mono text-xs font-semibold'>
-                    {percent.format(pct)}%
-                  </span>
-                </div>
-                <div className='flex justify-between text-xs text-muted-foreground'>
-                  <span title={q.resets_at_ms ? exactTime(q.resets_at_ms) : ''}>
-                    重置{' '}
-                    {q.resets_at_ms
-                      ? time.format(q.resets_at_ms) + ' 北京时间'
-                      : '待定'}
-                  </span>
-                  {q.stale && <span>已过期</span>}
-                </div>
-              </>
-            ) : (
-              <p className='text-xs text-muted-foreground'>等待官方额度</p>
-            )}
-          </>
-        )}
+      <section aria-label='ReClaude 官方套餐窗口' className='grid gap-1'>
+        <h4 className='flex h-5 justify-between text-xs text-muted-foreground'>
+          <span>官方额度</span>
+          {stale && (
+            <span title='保留上次读数，重置后等待官方更新'>待更新</span>
+          )}
+        </h4>
+        {windows.map((w) => (
+          <QuotaWindowRow key={w.label} w={w} now={now} hasToken quiet />
+        ))}
+        <div
+          className='flex h-5 items-center justify-between gap-2 text-xs'
+          title='官方套餐美元额度；与 5H / 7D 百分比及本 Relay 用量独立'
+        >
+          <span className='text-muted-foreground'>套餐</span>
+          <span
+            className='font-mono tabular-nums'
+            title={quota ? undefined : '官方未提供美元总额'}
+          >
+            {quota
+              ? `${money(quota.used_usd)} / ${money(quota.quota_usd)}`
+              : '—'}
+          </span>
+        </div>
       </section>
-      <section aria-label='本 Relay 已记用量' className='border-t pt-2 text-sm'>
+      <section aria-label='本 Relay 已记用量' className='hairline-t pt-2'>
         <h4 className='mb-1 text-xs text-muted-foreground'>vm2api 用量</h4>
-        <dl className='space-y-1'>
-          {rows.map(([label, value]) => (
+        <dl className='grid gap-1'>
+          {rows.map(({ label, value }) => (
             <div
               key={label}
-              className={`flex justify-between ${label === '总计' ? 'border-t pt-1 font-semibold' : ''}`}
+              className={cn(
+                'flex h-5 items-center justify-between text-xs',
+                label === '总计' && 'hairline-t font-semibold'
+              )}
             >
-              <dt>{label}</dt>
+              <dt className={label === '总计' ? '' : 'text-muted-foreground'}>
+                {label}
+              </dt>
               <dd
                 title={value === undefined ? undefined : `${value} USD`}
                 className='font-mono tabular-nums'
@@ -137,9 +77,9 @@ export function RelayUsageCard({ relay }: { relay: NativeRelay }) {
             </div>
           ))}
         </dl>
-        {!!usage?.unpriced_requests && (
+        {!!relay.usage?.unpriced_requests && (
           <small className='text-muted-foreground'>
-            {usage.unpriced_requests} 条缺少计价
+            {relay.usage.unpriced_requests} 条缺少计价
           </small>
         )}
       </section>
@@ -149,12 +89,19 @@ export function RelayUsageCard({ relay }: { relay: NativeRelay }) {
 
 export function RelayUsageDetail({ relay }: { relay: NativeRelay }) {
   const q = relay.official_quota
-  return q ? (
-    <p className='text-xs text-muted-foreground'>
-      官方已用 {q.used_usd} / {q.quota_usd} USD
-      <br />
-      {q.resets_at_ms && <>重置 {exactTime(q.resets_at_ms)} · </>}同步{' '}
-      {exactTime(q.observed_at_ms)}（北京）
-    </p>
-  ) : null
+  const windows = relay.runtime.official_windows
+  return (
+    <div className='space-y-1 text-xs text-muted-foreground'>
+      {!windows && <p>官方未提供 5H / 7D 百分比，显示为 —。</p>}
+      {windows && <p>窗口同步 {exactTime(windows.observed_at_ms)}（北京）</p>}
+      {q && (
+        <p>
+          套餐已用 {money(q.used_usd)} / {money(q.quota_usd)}，
+          {q.resets_at_ms ? `重置 ${exactTime(q.resets_at_ms)}` : '重置待定'}
+          。同步 {exactTime(q.observed_at_ms)}（北京）
+        </p>
+      )}
+      <p>官方额度可能包含同组织其他设备；下方用量仅属于本 Relay。</p>
+    </div>
+  )
 }

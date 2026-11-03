@@ -84,7 +84,7 @@ export function scheduleLabel(relay: NativeRelay, now = Date.now()) {
     : '已开启'
 }
 
-export function relayState(relay: NativeRelay) {
+export function relayState(relay: NativeRelay, now = Date.now()) {
   if (relay.management_unavailable) return '管理连接待检查'
   if (
     relay.authorization_latched ||
@@ -93,9 +93,29 @@ export function relayState(relay: NativeRelay) {
   )
     return '授权锁存'
   if (relay.sub.shared_policy_matches === false) return '调度配置待核对'
-  if (!relay.guard.ready) return '出口待检查'
+  if (!relay.guard.ready || relay.guard.latched) return '出口待检查'
   if (relay.runtime.failed_checks.length) return '原生环境待检查'
-  if (!relay.runtime.http_active || !relay.sub.schedulable) return '已暂停'
-  if (scheduleLabel(relay) === '冷却中') return '额度 / 冷却中'
+  if (!relay.runtime.container_running) return '原生环境待检查'
+  if (relay.sub.schedulable == null) return '调度状态未知'
+  if (
+    !relay.runtime.http_active ||
+    relay.runtime.management_paused ||
+    !relay.sub.schedulable
+  )
+    return '已暂停'
+  if (scheduleLabel(relay, now) === '冷却中') return '额度冷却'
   return relay.runtime.http_ready ? '运行中' : 'Relay 待检查'
+}
+
+export function scheduleResetAt(
+  relay: NativeRelay,
+  now: number
+): number | null {
+  const times = [
+    relay.sub.rate_limit_reset_at,
+    relay.sub.temp_unschedulable_until,
+  ]
+    .map((value) => (value ? Date.parse(value) : NaN))
+    .filter((value) => value > now)
+  return times.length ? Math.max(...times) : null
 }

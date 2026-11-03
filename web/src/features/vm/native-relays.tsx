@@ -2,6 +2,8 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { api, isApiError } from '@/lib/api'
+import { resetCountdown, fmtResetClock } from '@/lib/fable-status'
+import { useNow } from '@/hooks/use-now'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -14,6 +16,7 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import {
   canResumeSchedule,
   scheduleLabel,
+  scheduleResetAt,
   relayState,
   type NativeRelay,
 } from './native-relay-state'
@@ -30,6 +33,7 @@ const successMessage = {
 
 export function NativeRelays({ enabled }: { enabled: boolean }) {
   const qc = useQueryClient()
+  const now = useNow()
   const [action, setAction] = useState<{
     relay: NativeRelay
     verb: 'start' | 'stop'
@@ -108,54 +112,72 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
         {query.data.items.map((relay) => (
           <article
             key={relay.id}
-            className='min-w-0 space-y-3 rounded-xl border bg-card p-4 text-card-foreground'
+            className='relative flex min-w-0 flex-col gap-2.5 rounded-[10px] bg-muted/50 p-3 ps-3.5 text-card-foreground shadow-[inset_0_0_0_1px_var(--hairline)]'
           >
-            <header>
+            <header className='space-y-1.5'>
               <div className='flex items-center justify-between gap-2'>
-                <h3 className='truncate font-semibold' title={relay.name}>
+                <h3
+                  className='truncate text-[13px] font-semibold'
+                  title={relay.name}
+                >
                   {relay.name}
                 </h3>
                 <span className='shrink-0 rounded bg-muted px-1.5 py-0.5 text-xs'>
-                  {relayState(relay)}
+                  {relayState(relay, now)}
                 </span>
               </div>
-              <p className='mt-1 text-xs text-muted-foreground'>
-                {relay.guard.expected_ip} · 席位{' '}
-                {relay.runtime.active_requests ?? '—'}/{relay.concurrency}
+              <p className='flex items-center gap-2 text-xs text-muted-foreground'>
+                <span>{relay.node} · 原生</span>
+                <span className='font-mono tabular-nums' title='锁定的出口 IP'>
+                  {relay.guard.expected_ip}
+                </span>
               </p>
             </header>
-            <RelayUsageCard relay={relay} />
-            <div className='flex items-center justify-between gap-2 border-t pt-3'>
-              <div>
+            <RelayUsageCard relay={relay} now={now} />
+            <div className='hairline-t mt-auto flex min-h-9 items-center justify-between gap-2 pt-2'>
+              <span className='text-xs text-muted-foreground'>
+                席位{' '}
+                <b className='font-mono text-foreground tabular-nums'>
+                  {relay.runtime.active_requests ?? '—'}/{relay.concurrency}
+                </b>
+              </span>
+              <div className='flex items-center gap-2'>
                 <label
                   htmlFor={`schedule-${relay.id}`}
-                  className='text-sm font-medium'
+                  className='text-xs text-muted-foreground'
+                  title='共享池新请求调度；不会中断在途请求或解除额度冷却'
                 >
-                  共享池调度
+                  共享调度
                 </label>
-                <p className='text-xs text-muted-foreground'>
-                  {scheduleLabel(relay)} · 在途请求不受影响
-                </p>
+                <Switch
+                  id={`schedule-${relay.id}`}
+                  aria-label={`${relay.name} · 共享池调度`}
+                  checked={relay.sub.schedulable === true}
+                  disabled={
+                    change.isPending ||
+                    relay.management_unavailable ||
+                    relay.sub.schedulable == null ||
+                    (!relay.sub.schedulable && !canResumeSchedule(relay))
+                  }
+                  onCheckedChange={(checked) =>
+                    change.mutate({
+                      relay,
+                      verb: checked ? 'resume_schedule' : 'pause_schedule',
+                    })
+                  }
+                />
               </div>
-              <Switch
-                id={`schedule-${relay.id}`}
-                aria-label={`${relay.name} · 共享池调度`}
-                checked={relay.sub.schedulable === true}
-                disabled={
-                  change.isPending ||
-                  relay.management_unavailable ||
-                  relay.sub.schedulable == null ||
-                  (!relay.sub.schedulable && !canResumeSchedule(relay))
-                }
-                onCheckedChange={(checked) =>
-                  change.mutate({
-                    relay,
-                    verb: checked ? 'resume_schedule' : 'pause_schedule',
-                  })
-                }
-              />
             </div>
-            <details className='border-t pt-2 text-sm'>
+            <p
+              className='text-xs text-muted-foreground'
+              title={fmtResetClock(scheduleResetAt(relay, now)) ?? undefined}
+            >
+              {scheduleLabel(relay, now)}
+              {relay.sub.schedulable && scheduleResetAt(relay, now)
+                ? ` · ${resetCountdown(scheduleResetAt(relay, now), now)} 后到期`
+                : ' · 在途请求不受影响'}
+            </p>
+            <details className='hairline-t pt-2 text-xs'>
               <summary className='cursor-pointer text-muted-foreground'>
                 详情与控制
               </summary>
@@ -163,7 +185,7 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
                 <RelayUsageDetail relay={relay} />
                 <p className='text-xs text-muted-foreground'>
                   {relay.node} · 设备 {relay.binding} · Sub{relay.sub_account} ·
-                  调度{scheduleLabel(relay)}
+                  调度{scheduleLabel(relay, now)}
                 </p>
                 <p className='text-xs break-words text-muted-foreground'>
                   {relay.models.join(' · ')}
