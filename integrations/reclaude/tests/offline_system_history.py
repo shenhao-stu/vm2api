@@ -19,6 +19,8 @@ if output:
 calls = []
 reply = ['text']
 checks = {}
+expire_thread = [False]
+turn_attempts = [0]
 
 class Fixture(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -39,6 +41,25 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             return self.deny()
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         calls.append(body)
+        if expire_thread[0]:
+            turn_attempts[0] += 1
+            code = ('native_dispatch_already_consumed' if turn_attempts[0] > 1
+                    else 'thread_not_found' if body.get('thread', {}).get('type') == 'continue'
+                    else None)
+            if code:
+                status = 429 if turn_attempts[0] > 1 else 404
+                error = json.dumps({'type': 'error', 'error': {
+                    'type': 'api_error' if status == 429 else 'not_found_error',
+                    'message': code, 'details': {'error_code': code},
+                }}).encode()
+                self.send_response(status)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(error)))
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.wfile.write(error)
+                self.close_connection = True
+                return
         i = len(calls)
         blocks = [{'type': 'tool_use', 'id': 'tool_A_' + str(i), 'name': 'mcp__caller__Read', 'input': {'path': 'synthetic-A'}}, {'type': 'tool_use', 'id': 'tool_B_' + str(i), 'name': 'mcp__caller__Read', 'input': {'path': 'synthetic-B'}}] if reply[0] == 'tools' else [{'type': 'text', 'text': ''}]
         events = [{'type': 'message_start', 'message': {'id': 'msg_' + str(i), 'type': 'message', 'role': 'assistant', 'model': body['model'], 'content': [], 'stop_reason': None, 'usage': {'input_tokens': 100 + i, 'output_tokens': 0, 'cache_read_input_tokens': i, 'cache_creation_input_tokens': 3 * i, 'cache_creation': {'ephemeral_5m_input_tokens': i, 'ephemeral_1h_input_tokens': 2 * i}}}}]
@@ -370,6 +391,17 @@ try:
     checks['explicit_nondefault_inherited_environment_survives_display_round_trip'] = True
     assert len(calls) == 26
     checks['twenty_six_new_synthetic_requests_no_replay'] = True
+    inherited_tether = {**env, 'CLAUDE_CODE_TETHER_LIVE': '1'}
+    safe_thread = start('expired-provider-thread', base, environment=inherited_tether)
+    run(safe_thread, base)
+    expire_thread[0] = True
+    wire = run(safe_thread, follow(safe_thread))
+    assert turn_attempts[0] == 1 and 'thread' not in wire
+    assert positions(wire, 'SYNTHETIC_ORIGINAL') and positions(wire, 'SYNTHETIC_FOLLOW')
+    assert not safe_thread.failed and inherited_tether['CLAUDE_CODE_TETHER_LIVE'] == '1'
+    checks['expired_provider_thread_needs_no_corrective_replay'] = True
+    checks['full_history_and_single_dispatch_survive_inherited_thread_opt_in'] = True
+    assert len(calls) == 28
     summary = {'checks': checks, 'fixture_calls': len(calls), 'real_provider_calls': 0, 'os_denies_non_loopback_network': True, 'ok': all(checks.values()), 'cli_sha256': cli_hash, 'candidate_sha256': source_hashes}
     (root / 'calls.synthetic.private.json').write_text(json.dumps(calls, indent=2))
     (root / 'receipt.safe.json').write_text(json.dumps(summary, indent=2))
