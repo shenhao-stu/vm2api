@@ -6,9 +6,10 @@ import {
 } from 'react'
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
-import { Download, Link2, RefreshCw } from 'lucide-react'
+import { Download, LifeBuoy, Link2, RefreshCw } from 'lucide-react'
 import { credEndpointLabel, credEndpointOf } from '@/lib/cred-type'
 import { fmtAgo, fmtNum, fmtUsd } from '@/lib/format'
+import { subscriptionListLabel } from '@/lib/subscription-expiry'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
 import { slotCredentialLabel } from '@/lib/vm-kind'
@@ -17,12 +18,14 @@ import {
   credentialStatus,
   poolStatus,
   restrictionCopy,
+  vmNextAction,
   seatTitle,
   vmFailedAt,
 } from '@/lib/vm-status'
 import { vmTotalCost, vmTotalTokens } from '@/lib/vm-usage'
 import { StatusMark } from '@/components/status-mark'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
+import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
 import { runtimeTypeLabel, runtimeTypeOf } from '@/features/vm/machine-spec'
 import {
   SchedulableSwitch,
@@ -58,6 +61,10 @@ const TIER_VARS: Record<string, CSSProperties> = {
     '--tf': 'var(--tier-codex-fg)',
   } as CSSProperties,
 }
+
+/** 不可调度里需要换票的原因（其余走「恢复服务」）。 */
+const CREDENTIAL_DEATH =
+  /^(oauth_|no_credential$|credential_|organization_disabled$)/
 
 /** 等级只占左沿一截色标与徽标，不再整卡染色——机架是一块底，等级是标签。 */
 export function tierStyle(vm: Vm): CSSProperties | undefined {
@@ -121,8 +128,9 @@ export function BladeControls({
 }
 
 /**
- * 席位容量：一条按「已用 / 设置上限」缩放的定宽条，取代逐格画席位。
- * 上限可设到 20，逐格画会把底栏撑出卡片；容量条宽度与上限无关。
+ * 席位容量：一条按「已用 / 设置上限」缩放的定宽条。
+ * 已用只含正在跑的请求，以及已排在这台 VM 上的后续请求。对话结束即释放。
+ * 悬浮列出实际占着槽的 session。上限可设到 20，容量条宽度与上限无关。
  */
 export function VmSeats({
   vm,
@@ -284,16 +292,34 @@ export function BladeCallout({
   state: BladeState
 }) {
   const actions = useVmActions()
-  const canCred = useVmPerms().credential
+  const perms = useVmPerms()
+  const canCred = perms.credential
   if (state === 'dead') {
     const failed = vmFailedAt(vm)
     const ago = failed ? fmtAgo(new Date(failed).toISOString()) : ''
+    // 凭证类死因去重新授权；代理 / 启动 / 待确认等去「恢复服务」诊断。
+    const fixByService =
+      vm.schedule_state === 'unschedulable' &&
+      !CREDENTIAL_DEATH.test(String(vm.unschedulable_reason || ''))
+    const detail = vm.unschedulable_detail || {}
+    const note = String(
+      vm.refresh_error || detail.message || detail.raw || ''
+    ).trim()
     return (
       <Callout
         tone='bad'
         title={`${credentialStatus(vm).text || '无效凭证'}${ago ? ` · ${ago}` : ''}`}
         action={
-          canCred ? (
+          fixByService ? (
+            perms.power ? (
+              <CalloutAction
+                icon={<LifeBuoy />}
+                onClick={() => actions.openRecovery(vm)}
+              >
+                恢复服务
+              </CalloutAction>
+            ) : null
+          ) : canCred ? (
             <CalloutAction
               icon={<Link2 />}
               onClick={() => actions.openReauth(vm)}
@@ -303,9 +329,9 @@ export function BladeCallout({
           ) : null
         }
       >
-        {vm.refresh_error ? (
+        {note ? (
           <span className='truncate font-mono text-[11.5px] opacity-90'>
-            {String(vm.refresh_error)}
+            {note}
           </span>
         ) : null}
         {lifeLine(vm, accounts)}
@@ -316,19 +342,19 @@ export function BladeCallout({
     return (
       <Callout
         tone='none'
-        title='未绑定账号'
+        title='待导入凭证'
         action={
           canCred ? (
             <CalloutAction
               icon={<Download />}
               onClick={() => actions.openReauth(vm)}
             >
-              绑定凭证
+              导入凭证
             </CalloutAction>
           ) : null
         }
       >
-        <span>绑定后进入探测，再按结果入池。</span>
+        <span>{vmNextAction(vm)}</span>
       </Callout>
     )
   }
@@ -408,6 +434,7 @@ export const VmBlade = memo(function VmBlade({
   const state = bladeState(vm)
   const large = size === 'l'
   const email = String(vm.email || '')
+  const sub = subscriptionListLabel(vm, now)
   const restricted = zoneOf(vm) === 'restricted'
   return (
     <article
@@ -437,7 +464,10 @@ export const VmBlade = memo(function VmBlade({
             </span>
           ) : null}
         </span>
-        <TierBadge vm={vm} />
+        <div className='flex items-center gap-1'>
+          <ActiveVmBadge vm={vm} />
+          <TierBadge vm={vm} />
+        </div>
         <span
           title={email || undefined}
           className={cn(
@@ -452,6 +482,17 @@ export const VmBlade = memo(function VmBlade({
         >
           {slotCredentialLabel(vm)}
         </span>
+        <span
+          className={cn(
+            'col-span-2 truncate font-mono text-[11px] tabular-nums',
+            sub.tone === 'bad' && 'text-[color:var(--status-bad)]',
+            sub.tone === 'warn' && 'text-[color:var(--status-warn)]',
+            sub.tone === 'muted' && 'text-muted-foreground'
+          )}
+          title={sub.title}
+        >
+          {sub.text}
+        </span>
         {restricted && state !== 'dead' ? (
           <StatusMark
             variant='pill'
@@ -464,6 +505,11 @@ export const VmBlade = memo(function VmBlade({
         ) : null}
       </div>
       <SpecLine vm={vm} />
+      {state === 'live' && vmNextAction(vm) ? (
+        <p className='text-[11.5px] text-muted-foreground'>
+          {vmNextAction(vm)}
+        </p>
+      ) : null}
       {state === 'live' ? (
         <BladeUsage vm={vm} accounts={accounts} now={now} />
       ) : state === 'unprobed' ? (

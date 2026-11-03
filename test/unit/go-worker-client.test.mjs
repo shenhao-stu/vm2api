@@ -18,6 +18,7 @@ import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
 import { callerAutoCompactWindow, defaultSeedPolicy, sanitizeInboundBody } from '../../src/lib/protocol/seed-policy.mjs'
 import { extractOpenaiUsage } from '../../src/lib/protocol/openai-usage.mjs'
 import { callRustKernel, rustKernelHealth } from '../../src/lib/transport/rust-kernel-client.mjs'
+import { callCodexKernel, streamCodexKernel } from '../../src/lib/transport/codex-kernel-client.mjs'
 import { forwardApi, readApiJson } from '../../src/lib/transport/api-kernel-client.mjs'
 
 test('restoreUncommittedHop keeps a structured upstream code', () => {
@@ -158,7 +159,8 @@ test('cli-hop envelope keeps role=system turns that the VM betas do not declare'
     identity: null,
     cliHop: true,
   })
-  assert.ok(out.body.betas.includes('mid-conversation-system-2026-04-07'))
+  // 9ecee337: mid-conversation-system is GA in 2.1.303; role=system stays without the beta.
+  assert.ok(!out.body.betas.includes('mid-conversation-system-2026-04-07'))
   assert.deepEqual(
     out.body.messages.map((message) => message.role),
     ['user', 'system', 'assistant', 'user'],
@@ -220,6 +222,39 @@ test('setup-token cli-hop summarizes hidden thinking by default and keeps update
   })
   assert.equal(passed.body.thinking.display, 'updates')
   assert.ok(passed.body.betas.includes('thinking-display-updates-2026-08-18'))
+})
+
+test('cli-hop appends inline-tools when a message carries a tool_definition', () => {
+  const block = {
+    type: 'tool_addition',
+    tool: {
+      type: 'tool_definition',
+      definition: { name: 'lookup', description: 'lookup', input_schema: { type: 'object' } },
+    },
+  }
+  const out = finalizeWorkerPayload({
+    body: {
+      model: 'claude-opus-5-5',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'system', content: [{ type: 'text', text: 'note' }, block] },
+      ],
+    },
+    reqHeaders: { 'anthropic-beta': 'inline-tools-2026-09-15' },
+    exec: { homeDir: '', vm: { claude: { mode: 'setup-token', scope: 'user:inference' } } },
+    identity: null,
+    cliHop: true,
+  })
+  assert.ok(out.body.betas.includes('inline-tools-2026-09-15'))
+  assert.equal(out.body.messages[1].content[1].tool.type, 'tool_definition')
+  const plain = finalizeWorkerPayload({
+    body: { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hi' }] },
+    reqHeaders: { 'anthropic-beta': 'inline-tools-2026-09-15' },
+    exec: { homeDir: '', vm: { claude: { mode: 'setup-token', scope: 'user:inference' } } },
+    identity: null,
+    cliHop: true,
+  })
+  assert.ok(!plain.body.betas.includes('inline-tools-2026-09-15'))
 })
 
 const unix = process.platform !== 'win32'
@@ -304,6 +339,73 @@ unixTest('callGoWorker sends envelope over authenticated Unix socket', async () 
     })
     assert.equal(result.ok, true)
     assert.equal(result.terminalState, 'verified')
+    assert.equal(result.body.content[0].text, 'ok')
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('callGoWorker and streamGoWorker report exactly the envelope they post', async () => {
+  const posted = []
+  const fx = await fixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    posted.push(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+    if (posted.length === 1) {
+      res.setHeader('content-type', 'application/json')
+      res.setHeader('x-terminal-state', 'verified')
+      res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'ok' }] }))
+      return
+    }
+    res.setHeader('content-type', 'text/event-stream')
+    res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_env"}}\n\n')
+    res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n')
+    res.end()
+  })
+  try {
+    const reported = []
+    const body = {
+      model: 'claude-opus-5-5',
+      system: [{ type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.296.abc; cc_entrypoint=sdk-cli;' }],
+      messages: [{ role: 'user', content: 'hi' }],
+    }
+    await callGoWorker({ exec: fx.exec, body, cliHop: true, onEnvelope: (envelope) => reported.push(envelope) })
+    await streamGoWorker({
+      exec: fx.exec,
+      body: { ...body, stream: true },
+      cliHop: true,
+      onEnvelope: (envelope) => reported.push(envelope),
+    })
+    assert.equal(reported.length, 2)
+    for (const [i, envelope] of reported.entries()) {
+      const { request_id: _id, ...sent } = posted[i]
+      // 日志拿到的就是 POST 出去的那份：cli-hop 补上的 betas、补齐的 cch 都在里面。
+      assert.deepEqual(JSON.parse(JSON.stringify(envelope)), sent)
+      assert.ok(Array.isArray(envelope.body.betas))
+      assert.match(envelope.body.system[0].text, /\bcch=[0-9a-f]{5};/)
+    }
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('a throwing envelope observer does not fail the hop', async () => {
+  const fx = await fixture(async (req, res) => {
+    req.resume()
+    await new Promise((resolve) => req.on('end', resolve))
+    res.setHeader('content-type', 'application/json')
+    res.setHeader('x-terminal-state', 'verified')
+    res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'ok' }] }))
+  })
+  try {
+    const result = await callGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-test', messages: [{ role: 'user', content: 'hi' }] },
+      onEnvelope: () => {
+        throw new Error('observer broke')
+      },
+    })
+    assert.equal(result.ok, true)
     assert.equal(result.body.content[0].text, 'ok')
   } finally {
     await fx.close()
@@ -412,6 +514,58 @@ unixTest('streamGoWorker accepts message_stop before delayed EOF', async () => {
     assert.equal(result.terminalState, 'verified')
     assert.equal(result.committed, true)
     assert.ok(lines.some((line) => line.includes('message_stop')))
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('fragmented final-header diagnostics do not start idle timing, commit, or reach downstream', async () => {
+  const fx = await fixture((req, res) => {
+    req.resume()
+    res.setHeader('content-type', 'text/event-stream')
+    res.write('event: kin_outbound_head')
+    setImmediate(() => res.write('ers\ndata: {"type":"kin_outbound_headers","headers":{"content-length":"123"}}\n\n'))
+    setTimeout(() => res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n'), 1200)
+  })
+  try {
+    const lines = []
+    const snapshots = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-test', messages: [{ role: 'user', content: 'hi' }] },
+      timeoutMs: 5000,
+      idleTimeoutMs: 10,
+      onOutboundHeaders: (headers) => snapshots.push(headers),
+      onEvent: (line) => lines.push(line),
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.ttftMs, null)
+    assert.deepEqual(snapshots, [{ 'content-length': '123' }])
+    assert.doesNotMatch(lines.join('\n'), /kin_outbound_headers|content-length/)
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('final headers survive an upstream error without becoming a downstream commit', async () => {
+  const fx = await fixture((req, res) => {
+    req.resume()
+    res.setHeader('content-type', 'text/event-stream')
+    res.write(
+      'event: kin_outbound_headers\ndata: {"type":"kin_outbound_headers","headers":{"x-stainless-retry-count":"1"}}\n\n',
+    )
+    res.end('event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"busy"}}\n\n')
+  })
+  try {
+    const snapshots = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-test', messages: [{ role: 'user', content: 'hi' }] },
+      onOutboundHeaders: (headers) => snapshots.push(headers),
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.committed, false)
+    assert.deepEqual(snapshots, [{ 'x-stainless-retry-count': '1' }])
   } finally {
     await fx.close()
   }
@@ -1144,4 +1298,112 @@ test('workerHealth fails closed when socket is absent', async () => {
     { timeoutMs: 20 },
   )
   assert.equal(result.ok, false)
+})
+
+for (const call of [callGoWorker, streamGoWorker]) {
+  unixTest(`${call.name} maps plain-text kernel 413 without losing structured errors`, async () => {
+    for (const structured of [false, true]) {
+      const upstream = {
+        error: { type: 'invalid_request_error', code: 'context_length_exceeded', message: 'specific limit' },
+      }
+      const fx = await fixture((req, res) => {
+        req.resume()
+        res.writeHead(413, { 'content-type': structured ? 'application/json' : 'text/plain' })
+        res.end(structured ? JSON.stringify(upstream) : 'Failed to buffer the request body: length limit exceeded')
+      })
+      try {
+        const result = await call({ exec: fx.exec, envelope: { body: { input: 'hi' } } })
+        assert.equal(result.status, 413)
+        assert.equal(result.ok, false)
+        assert.equal(result.transportError, false)
+        if (structured) assert.deepEqual(result.body, upstream)
+        else {
+          assert.equal(result.body.error.code, 'body_too_large')
+          assert.equal(result.body.error.type, 'invalid_request_error')
+          assert.equal(result.body.error.details.retryable, false)
+        }
+      } finally {
+        await fx.close()
+      }
+    }
+  })
+
+  unixTest(`${call.name} limits the exact UTF-8 envelope including request_id`, async () => {
+    let requests = 0
+    const envelope = { body: { input: '你好' }, headers: { 'session-id': 'example' } }
+    const bytes = Buffer.byteLength(JSON.stringify({ ...envelope, request_id: 'x'.repeat(36) }))
+    const fx = await fixture(async (req, res) => {
+      requests++
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      assert.equal(Buffer.concat(chunks).length, bytes)
+      res.writeHead(400, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { code: 'fixture_reached' } }))
+    })
+    try {
+      const oversized = await call({ exec: fx.exec, envelope, maxRequestBytes: bytes - 1 })
+      assert.equal(oversized.status, 413)
+      assert.equal(oversized.body.error.code, 'body_too_large')
+      assert.equal(oversized.body.error.details.retryable, false)
+      assert.equal(oversized.transportError, false)
+      assert.equal(requests, 0)
+      const exact = await call({ exec: fx.exec, envelope, maxRequestBytes: bytes })
+      assert.equal(exact.status, 400)
+      assert.equal(exact.body.error.code, 'fixture_reached')
+      assert.equal(requests, 1)
+    } finally {
+      await fx.close()
+    }
+  })
+}
+
+for (const mode of ['first-byte', 'idle']) {
+  unixTest(`streamGoWorker enforces ${mode} timeout after kernel headers`, async () => {
+    const fx = await fixture((req, res) => {
+      req.resume()
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.flushHeaders()
+      if (mode === 'idle') writeData(res, { type: 'response.output_text.delta', delta: 'hello' })
+    })
+    const controller = new AbortController()
+    const safety = setTimeout(() => controller.abort(), 5000)
+    try {
+      const result = await streamGoWorker({
+        exec: fx.exec,
+        envelope: { body: { input: 'hi' } },
+        timeoutMs: mode === 'first-byte' ? 20 : 4000,
+        idleTimeoutMs: 20,
+        signal: controller.signal,
+      })
+      assert.equal(result.body.error.code, 'worker_timeout')
+      assert.match(result.body.error.message, new RegExp(mode))
+      assert.equal(result.committed, mode === 'idle')
+    } finally {
+      clearTimeout(safety)
+      controller.abort()
+      await fx.close()
+    }
+  })
+}
+
+unixTest('Codex clients enforce the panel limit on their serialized envelope', async () => {
+  let requests = 0
+  const fx = await fixture((req, res) => {
+    requests++
+    req.resume()
+    res.writeHead(400).end('{}')
+  })
+  try {
+    fx.exec.vm.runtime.codex_kernel_socket = fx.exec.vm.runtime.worker_socket
+    const envelope = { body: { input: 'x'.repeat(8 * 1024 * 1024) } }
+    for (const call of [callCodexKernel, streamCodexKernel]) {
+      const result = await call({ exec: fx.exec, envelope, routing: { failover: { max_request_mib: 8 } } })
+      assert.equal(result.status, 413)
+      assert.equal(result.body.error.code, 'body_too_large')
+      assert.equal(result.transportError, false)
+    }
+    assert.equal(requests, 0)
+  } finally {
+    await fx.close()
+  }
 })

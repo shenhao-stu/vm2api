@@ -18,6 +18,9 @@ import {
   scheduleStateLabel,
   vmCircuit,
   vmCircuitTitle,
+  vmRunning,
+  vmNextAction,
+  vmServiceStatus,
 } from './vm-status'
 
 function liveVm(over: Partial<Vm> = {}): Vm {
@@ -694,5 +697,152 @@ describe('rest period (working window) is scheduling, not cooldown or credential
 
   it('credential cell still answers the credential question', () => {
     expect(credentialStatus(resting).key).not.toBe('rest')
+  })
+})
+
+describe('four-state schedule model (backend resolveSlotState)', () => {
+  it('不可调度 shows the backend reason and groups with the dead zone', () => {
+    const vm = liveVm({
+      schedule_state: 'unschedulable',
+      schedulable: false,
+      unschedulable_reason: 'organization_disabled',
+      unschedulable_text: '组织禁用',
+    })
+    expect(scheduleStateLabel(vm)).toBe('不可调度')
+    expect(poolStatus(vm)).toMatchObject({
+      key: 'unschedulable',
+      text: '不可调度 · 组织禁用',
+      cls: 'bad',
+    })
+    expect(accountStatus(vm).text).toBe('不可调度 · 组织禁用')
+    expect(fleetGroup(vm)).toBe('unschedulable')
+    expect(fleetCounts([vm]).unschedulable).toBe(1)
+    expect(
+      restrictionCopy({
+        ...vm,
+        unschedulable_detail: { status: 403, message: 'OAuth not allowed' },
+      })
+    ).toBe('不可调度 · 组织禁用：OAuth not allowed')
+  })
+
+  it('a slot that never had a ticket stays 未使用, not an error', () => {
+    const vm = liveVm({
+      has_token: false,
+      has_refresh: false,
+      schedule_state: 'unschedulable',
+      unschedulable_reason: 'no_credential',
+      unschedulable_text: '无凭证',
+      availability: { key: 'none', usable: false, text: '无凭证' },
+    })
+    expect(fleetGroup(vm)).toBe('none')
+  })
+
+  it('restriction text comes from the backend table', () => {
+    const vm = liveVm({
+      schedule_state: 'restricted',
+      restriction_reason: 'maintenance',
+      restriction_text: '维护中',
+      restriction_scope: 'slot',
+    })
+    expect(poolStatus(vm).text).toBe('维护中')
+    expect(restrictionCopy(vm)).toBe('维护中')
+    expect(fleetGroup(vm)).toBe('restricted')
+  })
+
+  it('seats full is 受限 for new sessions only', () => {
+    const vm = liveVm({
+      schedule_state: 'restricted',
+      restriction_reason: 'seats_full',
+      restriction_text: '席位满',
+      restriction_scope: 'new_session',
+      seats_used: 4,
+      seats_max: 4,
+    })
+    expect(poolStatus(vm)).toMatchObject({
+      key: 'seats',
+      text: '席位满',
+      cls: 'caution',
+    })
+    expect(fleetGroup(vm)).toBe('restricted')
+    expect(scheduleStateLabel(vm)).toBe('受限')
+  })
+
+  it('a circuit restriction keeps the circuit tone', () => {
+    const vm = liveVm({
+      schedule_state: 'restricted',
+      restriction_reason: 'circuit_open',
+      restriction_text: '熔断中',
+      restriction_scope: 'slot',
+    })
+    expect(poolStatus(vm)).toMatchObject({
+      key: 'circuit',
+      text: '熔断中',
+      cls: 'bad',
+    })
+  })
+})
+
+describe('hosted operator readiness', () => {
+  it('distinguishes a running empty slot from a service-ready account', () => {
+    const vm = liveVm({
+      has_token: false,
+      availability: { key: 'none', usable: false },
+      status: 'running',
+    })
+    expect(vmRunning(vm)).toBe(true)
+    expect(vmServiceStatus(vm).text).toBe('待导入凭证')
+    expect(vmNextAction(vm)).toContain('Claude Cookie')
+    expect(vmRunning(liveVm({ status: undefined }))).toBe(false)
+  })
+
+  it('never presents remote unknown or unhealthy runtime as ready', () => {
+    const vm = liveVm({ node_id: 'node-one', status: 'running' })
+    expect(vmServiceStatus(vm).key).toBe('unknown')
+    expect(
+      vmServiceStatus(vm, { rust_health: { process_up: false } }).key
+    ).toBe('unreachable')
+    expect(
+      vmServiceStatus(vm, {
+        rust_health: { process_up: true, reachable: false, ready_slots: 0 },
+      }).key
+    ).toBe('waiting')
+    expect(
+      vmServiceStatus(vm, {
+        rust_health: { process_up: true, reachable: true, ready_slots: 1 },
+      }).text
+    ).toBe('可接单')
+  })
+
+  it('keeps operator pause, maintenance, quota and capacity recovery distinct', () => {
+    const manual = liveVm({
+      schedule_state: 'off',
+      schedulable: false,
+      schedule_manual: true,
+    })
+    expect(vmServiceStatus(manual).text).toBe('人工暂停')
+    expect(vmNextAction(manual)).toContain('打开调度')
+    const hold = liveVm({
+      schedule_state: 'restricted',
+      restriction_reason: 'maintenance',
+      schedule_hold: { reason: 'maintenance' },
+    })
+    expect(vmNextAction(hold)).toContain('维护任务')
+    const quota = liveVm({
+      schedule_state: 'restricted',
+      restriction_reason: 'quota_5h_safety',
+    })
+    expect(vmNextAction(quota)).toContain('额度窗口重置')
+    const busy = liveVm({ seats_used: 1, seats_max: 1 })
+    expect(vmServiceStatus(busy).key).toBe('seats')
+    expect(vmNextAction(busy)).toContain('已有会话继续运行')
+  })
+
+  it('does not advise changing credentials for a fixed egress guard failure', () => {
+    const vm = liveVm({
+      schedule_state: 'unschedulable',
+      unschedulable_reason: 'exit_guard_unverified',
+    })
+    expect(vmNextAction(vm)).toContain('固定出口')
+    expect(vmNextAction(vm)).not.toContain('重新导入')
   })
 })

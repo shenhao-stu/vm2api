@@ -1,7 +1,7 @@
 const LS_TOKEN = 'kin_console_token'
 const LS_USER = 'kin_console_user'
 const LS_BASE = 'kin_api_base'
-const COOKIE = 'kin_panel_token'
+const COOKIE = import.meta.env.VITE_PANEL_COOKIE_NAME || 'kin_panel_token'
 
 export { LS_TOKEN, LS_USER, LS_BASE, COOKIE }
 
@@ -58,7 +58,7 @@ export function expirePanelSession() {
 
 export function setSession(token: string, user?: string) {
   clearClientCookie(COOKIE)
-  clearClientCookie('kin_console_token')
+  if (COOKIE === 'kin_panel_token') clearClientCookie('kin_console_token')
   if (token) {
     panelSessionExpiredHandled = false
     localStorage.setItem(LS_TOKEN, token)
@@ -70,7 +70,7 @@ export function clearSession() {
   localStorage.removeItem(LS_TOKEN)
   localStorage.removeItem(LS_USER)
   clearClientCookie(COOKIE)
-  clearClientCookie('kin_console_token')
+  if (COOKIE === 'kin_panel_token') clearClientCookie('kin_console_token')
 }
 
 export function storedUser(): string {

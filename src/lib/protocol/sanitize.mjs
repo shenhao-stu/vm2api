@@ -1,3 +1,4 @@
+import { repairAutoModeReminders } from './auto-mode-reminder.mjs'
 import { defaultMaxTokensForModel } from './model-policy.mjs'
 
 /**
@@ -169,9 +170,18 @@ export function promoteSystemToBlocks(system) {
  * blocks. Kernel restamp and applyCacheBreakpoints only hang markers on blocks,
  * so every inbound protocol must leave this shape before persona / hop.
  */
-export function canonicalizeClaudeMessagesShape(body) {
+export function canonicalizeClaudeMessagesShape(body, { preserveContentShape = false } = {}) {
   if (!body || typeof body !== 'object') return body
   const out = { ...body }
+  if (preserveContentShape) {
+    if (Array.isArray(out.messages)) {
+      out.messages = out.messages.map((message) => {
+        if (!message || message.role === 'system' || typeof message.content !== 'string') return message
+        return { ...message, content: [{ type: 'text', text: message.content }] }
+      })
+    }
+    return out
+  }
   if (out.system != null) out.system = promoteSystemToBlocks(out.system)
   if (Array.isArray(out.messages)) {
     out.messages = out.messages.map((message) => {
@@ -182,18 +192,13 @@ export function canonicalizeClaudeMessagesShape(body) {
   return out
 }
 
-export function sanitizeAnthropicBody(body, { strictPassthrough = false } = {}) {
+export function sanitizeAnthropicBody(body, { preserveContentShape = false } = {}) {
   if (!body || typeof body !== 'object') return body
-  if (strictPassthrough) {
-    const out = { ...body }
-    normalizeStop(out)
-    return out
-  }
 
   const out = copyOfficialAnthropicFields(body)
   applyStructuredOutput(out, body)
 
-  if (Array.isArray(out.system)) {
+  if (!preserveContentShape && Array.isArray(out.system)) {
     const blocks = out.system
       .map((b) => {
         if (typeof b === 'string') return { type: 'text', text: b }
@@ -214,9 +219,8 @@ export function sanitizeAnthropicBody(body, { strictPassthrough = false } = {}) 
   if (Array.isArray(out.tools) && out.tools.length === 0) delete out.tools
   // Do not overwrite caller max_tokens (thinking budget). Only fill if missing.
   if (!out.max_tokens) out.max_tokens = defaultMaxTokensForModel(out.model)
-  if (out.tool_choice && !out.tools) delete out.tool_choice
   normalizeStop(out)
-  return canonicalizeClaudeMessagesShape(out)
+  return canonicalizeClaudeMessagesShape(out, { preserveContentShape })
 }
 
 /**
@@ -240,6 +244,7 @@ export function sanitizeAnthropicBody(body, { strictPassthrough = false } = {}) 
  */
 export function normalizeAnthropicMessages(body, { keepMidConversationSystem = true } = {}) {
   if (!body || !Array.isArray(body.messages)) return body
+  repairAutoModeReminders(body)
 
   const keepMessageEffort = modelSupportsPerMessageEffort(body.model)
   const systemParts = []
@@ -264,8 +269,7 @@ export function normalizeAnthropicMessages(body, { keepMidConversationSystem = t
         continue
       }
       if (!seenUser || !keepMidConversationSystem) {
-        const text = contentToPlainText(message.content)
-        if (text) systemParts.push(text)
+        appendLiftedSystemMessage(systemParts, mapped, message)
         if (effort) liftedContentEffort = effort
         continue
       }
@@ -289,6 +293,7 @@ export function normalizeAnthropicMessages(body, { keepMidConversationSystem = t
   }
 
   body.messages = merged
+  repairAutoModeReminders(body)
   if (systemParts.length) body.system = appendSystemParts(body.system, systemParts)
   if (!keepMessageEffort && (trailingEmptyEffort || liftedContentEffort)) {
     applyLiftedEffort(body, trailingEmptyEffort || liftedContentEffort)
@@ -307,22 +312,40 @@ export function liftMidConversationSystemMessages(body) {
   return normalizeAnthropicMessages({ ...body, messages: body.messages.slice() }, { keepMidConversationSystem: false })
 }
 
-function contentToPlainText(content) {
-  if (typeof content === 'string') return content.trim()
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (typeof part === 'string') return part
-        if (part?.type === 'text' || part?.type === 'input_text' || part?.type === 'output_text') {
-          return part.text || ''
-        }
-        return ''
-      })
-      .filter((text) => String(text).trim())
-      .join('\n')
-      .trim()
+/**
+ * Append lifted instructions to local output arrays without flattening blocks.
+ * A leading system keeps its cache controls. For instructions lifted from the
+ * middle of a conversation, keep their controls at the preceding history
+ * boundary: moving a 5m control into system can put it before a message's 1h
+ * control and make an otherwise valid request fail. Dedicated text anchors
+ * preserve every control without overwriting existing markers or attaching one
+ * to thinking. Instruction text still belongs to system, and tool results stay
+ * first in the following user message. Empty per-turn controls remain untouched.
+ */
+export function appendLiftedSystemMessage(systemParts, messages, message) {
+  const content = message.content
+  const parts = Array.isArray(content) ? content : [content]
+  const blocks = parts.flatMap((part) => {
+    if (typeof part === 'string') return part ? [{ type: 'text', text: part }] : []
+    if (!part || typeof part !== 'object' || typeof part.text !== 'string' || !part.text) return []
+    if (part.type != null && !['text', 'input_text', 'output_text'].includes(part.type)) return []
+    return [stripIllegalContentBlock({ ...part, type: 'text' })]
+  })
+  const previousIndex = messages.findLastIndex((item) => item.role === 'user' || item.role === 'assistant')
+  const anchors = []
+  for (const block of blocks) {
+    if (previousIndex < 0 || !block.cache_control) {
+      systemParts.push(block)
+      continue
+    }
+    const { cache_control, ...instruction } = block
+    systemParts.push(instruction)
+    anchors.push({ type: 'text', text: '\u200b', cache_control })
   }
-  return String(content?.text || '').trim()
+  if (anchors.length) {
+    const previous = messages[previousIndex]
+    messages[previousIndex] = { ...previous, content: [...asContentBlocks(previous.content), ...anchors] }
+  }
 }
 
 function keptAnthropicMessage(message, role) {
@@ -454,11 +477,9 @@ function asContentBlocks(content) {
 }
 
 function appendSystemParts(existing, parts) {
-  const extra = parts.filter(Boolean)
-  if (!extra.length) return existing
-  const blocks = extra.map((text) => ({ type: 'text', text }))
-  if (existing == null || existing === '') return blocks
-  return [...promoteSystemToBlocks(existing), ...blocks]
+  if (!parts.length) return existing
+  if (existing == null || existing === '') return parts
+  return [...promoteSystemToBlocks(existing), ...parts]
 }
 
 function normalizeStop(out) {

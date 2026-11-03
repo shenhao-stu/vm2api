@@ -15,6 +15,7 @@ import {
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 import { GroupsRepo } from '../../src/lib/db/repos/groups-repo.mjs'
 import { gateVerdict } from '../../src/lib/protocol/intercept-stats.mjs'
+import { UsageLogsView } from '../../src/lib/db/repos/usage-logs-view.mjs'
 
 function tmpStore(mode = 'normal') {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-rlog-'))
@@ -114,6 +115,33 @@ test('summary persists protocol usage detail (cache/model/ttft/stop_reason)', ()
   assert.equal(row.upstream_model, 'claude-sonnet-5')
   assert.equal(row.stop_reason, 'end_turn')
   assert.equal(row.total_cost, 0.0000926)
+})
+
+test('OpenAI log totals count cached input once and distinguish unknown from zero cache writes', (t) => {
+  const store = tmpStore('normal')
+  t.after(() => {
+    store.db.close()
+    fs.rmSync(store.dataDir, { recursive: true, force: true })
+  })
+  for (const cacheWrite of [undefined, 0, 20]) {
+    const ctx = store.start(
+      { method: 'POST', headers: {}, socket: {} },
+      { protocol: 'openai.responses', pathName: '/v1/responses' },
+    )
+    store.finish(ctx, {
+      status: 200,
+      model: 'gpt-5.4',
+      usage: {
+        input_tokens: 1000,
+        output_tokens: 50,
+        input_tokens_details: { cached_tokens: 800, ...(cacheWrite == null ? {} : { cache_write_tokens: cacheWrite }) },
+      },
+    })
+    const row = new UsageLogsView(store.db).listBatch({ limit: 10 }).logs.find((r) => r.requestId === ctx.request_id)
+    assert.equal(row.inputTokens, 200 - (cacheWrite ?? 0))
+    assert.equal(row.totalTokens, 1050)
+    assert.equal(row.cacheCreationInputTokens, cacheWrite ?? null)
+  }
 })
 
 test('backfillMissingCosts restores actual cost with the stored group multiplier', () => {
@@ -496,6 +524,29 @@ test('cache breakdown without a split bills 5m unless cache_ttl is explicitly 1h
   assert.equal(hour.cache_creation_1h_tokens, 9)
 })
 
+test('cache breakdown puts the total beyond a partial split into the fallback TTL (#678)', () => {
+  const store = tmpStore('normal')
+  const sum = store.finish(
+    store.start(
+      { method: 'POST', headers: {}, socket: {} },
+      { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+    ),
+    {
+      status: 200,
+      model: 'claude-opus-5-5',
+      upstream_model: 'claude-opus-5-5',
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_creation_input_tokens: 14890,
+        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 119 },
+      },
+    },
+  )
+  assert.equal(sum.cache_creation_5m_tokens, 14771)
+  assert.equal(sum.cache_creation_1h_tokens, 119)
+})
+
 test('finish persists web_search_requests from server_tool_use', () => {
   const store = tmpStore('normal')
   const sum = store.finish(
@@ -585,6 +636,22 @@ test('operator debug mode stores full redacted body', () => {
   assert.deepEqual(dbg[0].hop_meta.params.dropped, ['max_tokens'])
 })
 
+test('debug records retain final header provenance and a separate redacted worker envelope', () => {
+  const store = tmpStore('debug')
+  const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { protocol: 'anthropic.messages' })
+  store.finish(ctx, {
+    status: 200,
+    outbound_headers_source: 'cli_final',
+    outbound_headers: { accept: 'application/json, text/event-stream', authorization: 'Bearer final-secret' },
+    worker_envelope_headers: { 'x-app': 'cli', authorization: 'Bearer envelope-secret' },
+  })
+  const [record] = store.listDebug({ limit: 1 })
+  assert.equal(record.outbound_headers_source, 'cli_final')
+  assert.equal(record.outbound_headers.accept, 'application/json, text/event-stream')
+  assert.equal(record.outbound_headers.authorization, '***REDACTED***')
+  assert.deepEqual(record.worker_envelope_headers, { 'x-app': 'cli', authorization: '***REDACTED***' })
+})
+
 test('outbound bodies are stored only when the operator configured debug, not via caller headers', () => {
   const outbound = { body: { system: 'gateway persona overlay' }, headers: { 'x-app': 'cli' } }
   const record = (store, headers) => {
@@ -594,6 +661,8 @@ test('outbound bodies are stored only when the operator configured debug, not vi
       inbound_body: { model: 'm' },
       outbound_body: outbound.body,
       outbound_headers: outbound.headers,
+      outbound_headers_source: 'cli_final',
+      worker_envelope_headers: outbound.headers,
     })
     return store.getDebug(ctx.request_id)
   }
@@ -603,6 +672,8 @@ test('outbound bodies are stored only when the operator configured debug, not vi
     assert.equal(forced.inbound_body, undefined)
     assert.equal(forced.outbound_body, undefined)
     assert.equal(forced.outbound_headers, undefined)
+    assert.equal(forced.outbound_headers_source, undefined)
+    assert.equal(forced.worker_envelope_headers, undefined)
   }
   const operator = record(tmpStore('debug'), {})
   assert.deepEqual(operator.outbound_body, outbound.body)
@@ -659,6 +730,22 @@ test('summaries persist in sqlite across store re-open', () => {
   assert.equal(listed.length, 1)
   assert.equal(listed[0].api_key_id, 'key_p')
   assert.equal(s2.snapshot().total_rows, 1)
+})
+test('a jev block keeps the posted state beside the category', () => {
+  const store = tmpStore()
+  const state = '[current ask]\n[user message 4]\n请只改测试。'
+  const row = logOne(store, {
+    status: 403,
+    via: 'jev',
+    final_state: 'policy_blocked',
+    error_code: 'policy_blocked',
+    intercept: gateVerdict({ kind: 'block', by: 'jev', keyword: 'jailbreak' }),
+    jev_state: state,
+  })
+  assert.equal(JSON.parse(row.intercept).keyword, 'jailbreak')
+  assert.equal(row.jev_state, state)
+  const again = new RequestLogStore({ dataDir: store.dataDir, mode: 'normal' })
+  assert.equal(again.listNormal({ limit: 1 })[0].jev_state, state)
 })
 
 test('gate stats count every inbound request and keep the stored verdict', () => {
@@ -1109,4 +1196,107 @@ test('tenant log scope follows the slot owner at write time, not the current own
     [testChat.request_id],
   )
   assert.equal(store.queryNormal({}).total, 2)
+})
+
+const IMAGE_GEN_USAGE = {
+  input_tokens: 300,
+  input_tokens_details: { text_tokens: 100, image_tokens: 200 },
+  output_tokens: 1000,
+  total_tokens: 1300,
+}
+
+test('Responses image tool usage is stored and billed on top of the text model', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'openai.responses', pathName: '/v1/responses' },
+  )
+  const rec = store.finish(ctx, {
+    status: 200,
+    protocol: 'openai.responses',
+    model: 'gpt-6-luna',
+    upstream_model: 'gpt-6-luna',
+    usage: { input_tokens: 1000, output_tokens: 100 },
+    image_usage: IMAGE_GEN_USAGE,
+    image_model: 'gpt-image-2.5-sunburst',
+  })
+  const row = store.db
+    .prepare(
+      'SELECT image_model, image_usage, image_input_tokens, image_output_tokens, image_cost, total_cost, actual_cost, pricing_model FROM usage_logs WHERE id = ?',
+    )
+    .get(rec.id)
+  assert.equal(row.image_model, 'gpt-image-2.5-sunburst')
+  assert.deepEqual(JSON.parse(row.image_usage), IMAGE_GEN_USAGE)
+  assert.equal(row.image_input_tokens, 300)
+  assert.equal(row.image_output_tokens, 1000)
+  assert.ok(Math.abs(row.image_cost - 0.0321) < 1e-9)
+  assert.equal(row.pricing_model, 'gpt-6-luna')
+  assert.ok(row.total_cost > row.image_cost)
+  assert.equal(row.actual_cost, row.total_cost)
+})
+
+test('Images endpoint rows bill only the image usage', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'openai.images', pathName: '/v1/images/generations' },
+  )
+  const rec = store.finish(ctx, {
+    status: 200,
+    protocol: 'openai.images',
+    model: 'gpt-image-2.5-flare',
+    image_model: 'gpt-image-2.5-flare',
+    image_usage: IMAGE_GEN_USAGE,
+  })
+  const row = store.db
+    .prepare('SELECT image_cost, total_cost, pricing_model, input_tokens FROM usage_logs WHERE id = ?')
+    .get(rec.id)
+  assert.equal(row.pricing_model, 'gpt-image-2.5-flare')
+  assert.ok(Math.abs(row.total_cost - 0.0321) < 1e-9)
+  assert.equal(row.image_cost, row.total_cost)
+  assert.equal(row.input_tokens, 0)
+  const missing = store.finish(
+    store.start(
+      { method: 'POST', headers: {}, socket: {} },
+      { protocol: 'openai.images', pathName: '/v1/images/generations' },
+    ),
+    { status: 200, protocol: 'openai.images', model: 'gpt-image-2.5-flare', image_model: 'gpt-image-2.5-flare' },
+  )
+  assert.equal(missing.pricing_model, 'unpriced')
+  assert.equal(missing.total_cost, null)
+})
+
+test('repriceRange re-prices image usage from the stored JSON and keeps actual_cost', () => {
+  const store = tmpStore('normal')
+  const now = new Date().toISOString()
+  store.db
+    .prepare(`
+    INSERT INTO usage_logs (
+      id, request_id, created_at, protocol, model, upstream_model, status,
+      input_tokens, output_tokens, image_model, image_usage, image_input_tokens, image_output_tokens,
+      image_cost, total_cost, actual_cost, pricing_model, rate_multiplier
+    ) VALUES
+      ('log_img_tool', 'rid_img_tool', ?, 'openai.responses', 'gpt-6-luna', 'gpt-6-luna', 200, 0, 0,
+       'gpt-image-2.5-flare', ?, 300, 1000, 1, 1, 7, 'gpt-6-luna', 1),
+      ('log_img_only', 'rid_img_only', ?, 'openai.images', 'gpt-image-2.5-sunburst', NULL, 200, 0, 0,
+       'gpt-image-2.5-sunburst', ?, 300, 1000, NULL, NULL, 5, NULL, 1)
+  `)
+    .run(now, JSON.stringify(IMAGE_GEN_USAGE), now, JSON.stringify(IMAGE_GEN_USAGE))
+  const out = store.repo.repriceRange({ since: now, until: now })
+  assert.equal(out.rows, 2)
+  assert.equal(out.still_unpriced, 0)
+  const rows = Object.fromEntries(
+    store.db
+      .prepare(
+        "SELECT id, image_cost, total_cost, actual_cost, pricing_model FROM usage_logs WHERE id LIKE 'log_img_%'",
+      )
+      .all()
+      .map((r) => [r.id, r]),
+  )
+  assert.ok(Math.abs(rows.log_img_tool.image_cost - 0.0321) < 1e-9)
+  assert.ok(Math.abs(rows.log_img_tool.total_cost - 0.0321) < 1e-9)
+  assert.equal(rows.log_img_tool.actual_cost, 7)
+  assert.equal(rows.log_img_only.pricing_model, 'gpt-image-2.5-sunburst')
+  assert.ok(Math.abs(rows.log_img_only.total_cost - 0.0321) < 1e-9)
+  assert.equal(rows.log_img_only.actual_cost, 5)
 })

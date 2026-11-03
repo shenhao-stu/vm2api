@@ -9,7 +9,6 @@ import { updateOneSlot } from '../../src/lib/vm/fleet-update.mjs'
 import {
   startRemoteSlot,
   reloadRemoteSlot,
-  restartRemoteServices,
   migrateRemoteServiceContainers,
   ensureRemoteEgress,
   setRemoteProxyEgressEnabled,
@@ -65,7 +64,6 @@ test('strict guard rejects every remote activation entry before a node session i
     for (const operation of [
       () => startRemoteSlot(vm, root),
       () => reloadRemoteSlot(vm, root),
-      () => restartRemoteServices(vm, root),
       () => migrateRemoteServiceContainers(vm, root),
       () => ensureRemoteEgress({}, vm, {}),
       () => setRemoteProxyEgressEnabled(vm, root, true),

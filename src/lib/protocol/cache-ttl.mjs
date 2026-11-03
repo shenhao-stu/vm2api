@@ -113,14 +113,39 @@ export function validateCacheBreakpoints(body) {
   check(body)
 }
 
-/** Only call for a rewritten native body: every surviving marker is Node-owned. */
+/**
+ * Only call for a rewritten native body: every surviving marker is Node-owned.
+ * Explicit TTLs stay. A missing TTL takes `ttl`, or 5m once a short marker
+ * precedes it, so filling never puts a 1h after a 5m. Anthropic reads tools,
+ * system, messages, then the root automatic marker at the message tail.
+ */
 export function fillMissingCacheTtl(body, ttl = DEFAULT_CACHE_TTL) {
+  if (!body || typeof body !== 'object') return body
   const target = normalizeCacheTtl(ttl)
-  return walkCacheNodes(body, (node) => {
+  let short = false
+  const fill = (node) => {
     const control = node?.cache_control
-    if (!control || control.type !== 'ephemeral' || control.ttl != null) return node
-    return { ...node, cache_control: { ...control, ttl: target } }
-  })
+    if (!control || control.type !== 'ephemeral') return node
+    if (control.ttl != null) {
+      if (control.ttl !== '1h') short = true
+      return node
+    }
+    const next = short ? '5m' : target
+    if (next !== '1h') short = true
+    return { ...node, cache_control: { ...control, ttl: next } }
+  }
+  const out = { ...body }
+  if (Array.isArray(out.tools)) out.tools = out.tools.map(fill)
+  if (Array.isArray(out.system)) out.system = out.system.map(fill)
+  if (Array.isArray(out.messages)) {
+    out.messages = out.messages.map((message) => {
+      if (!Array.isArray(message?.content)) return message
+      const content = message.content.map(fill)
+      return content.some((block, i) => block !== message.content[i]) ? { ...message, content } : message
+    })
+  }
+  if (out.cache_control) out.cache_control = fill({ cache_control: out.cache_control }).cache_control
+  return out
 }
 
 const CACHE_TTL_MS = Object.freeze({ '5m': 5 * 60_000, '1h': 60 * 60_000 })
@@ -601,10 +626,11 @@ function dropMessageBreakpoints(messages) {
 function stampMessageTail(messages, idx, ttl) {
   const message = messages[idx]
   if (!message || typeof message !== 'object') return messages
+  const marker = ttl == null ? { type: 'ephemeral' } : { type: 'ephemeral', ttl }
   const content = message.content
   if (typeof content === 'string') {
     const next = messages.slice()
-    next[idx] = { ...message, content: [{ type: 'text', text: content, cache_control: { type: 'ephemeral', ttl } }] }
+    next[idx] = { ...message, content: [{ type: 'text', text: content, cache_control: marker }] }
     return next
   }
   if (!Array.isArray(content) || content.length === 0) return messages
@@ -615,7 +641,7 @@ function stampMessageTail(messages, idx, ttl) {
     break
   }
   if (target < 0) return messages
-  const stamped = stampNode(content[target], ttl)
+  const stamped = ttl == null ? { ...content[target], cache_control: marker } : stampNode(content[target], ttl)
   if (stamped === content[target]) return messages
   const nextContent = content.slice()
   nextContent[target] = stamped
@@ -755,8 +781,8 @@ export function applyCacheTtlToUsage(usage, ttl = DEFAULT_CACHE_TTL) {
   const five = n(out.cache_creation_5m_tokens ?? out.cache_creation?.ephemeral_5m_input_tokens)
   const hour = n(out.cache_creation_1h_tokens ?? out.cache_creation?.ephemeral_1h_input_tokens)
   const create = n(out.cache_creation_input_tokens ?? out.cache_creation_tokens)
-  let total = five + hour
-  if (!total && create) total = create
+  // message_delta can raise the total without resending the message_start split.
+  const total = Math.max(five + hour, create)
   if (!total) return out
   if (target === '1h') {
     out.cache_creation_1h_tokens = total

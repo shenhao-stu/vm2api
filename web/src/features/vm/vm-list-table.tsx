@@ -5,6 +5,7 @@ import type { StatusTone } from '@/types/status'
 import { GripVertical, RotateCcw } from 'lucide-react'
 import { expiresAtToMs, fmtResetClock } from '@/lib/fable-status'
 import { fmtNum } from '@/lib/format'
+import { subscriptionListLabel } from '@/lib/subscription-expiry'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
 import { isCodexVm, slotNameLabel } from '@/lib/vm-kind'
@@ -12,6 +13,7 @@ import {
   credentialStatus,
   fleetGroup,
   poolStatus,
+  vmNextAction,
   seatTitle,
   vmCircuitTitle,
   vmCooldown,
@@ -28,6 +30,7 @@ import {
 import { CredLaneChip, SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
+import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
 import { NodeChip } from '@/features/vm/node-chip'
 import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
 import { RuntimeChip } from '@/features/vm/runtime-chip'
@@ -211,6 +214,7 @@ function StatusCell({ vm, show }: { vm: Vm; show: StatusBarShow }) {
   const tone = poolStatus(vm)
   const inflight = Number(vm.inflight) || 0
   const health = healthModel(vm)
+  const nextAction = vmNextAction(vm)
   const showInflight =
     inflight > 0 &&
     tone.cls !== 'bad' &&
@@ -255,6 +259,11 @@ function StatusCell({ vm, show }: { vm: Vm; show: StatusBarShow }) {
             {health.text}
           </span>
         </div>
+      ) : null}
+      {nextAction ? (
+        <p className='max-w-64 text-[11px] text-muted-foreground'>
+          {nextAction}
+        </p>
       ) : null}
       {show.proxy ? <ProxyChip vm={vm} compact /> : null}
     </div>
@@ -346,13 +355,15 @@ function TierBadge({ vm }: { vm: Vm }) {
   )
 }
 
-function SlotCell({ vm }: { vm: Vm }) {
+function SlotCell({ vm, now }: { vm: Vm; now: number }) {
   const name = slotNameLabel(vm)
   const email = String(vm.email || '').trim()
+  const sub = subscriptionListLabel(vm, now)
   return (
     <div className='min-w-0 space-y-0.5 overflow-hidden'>
       <SlotIdentity vm={vm} compact className='text-sm font-medium' />
       <div className='flex min-w-0 items-center gap-1.5'>
+        <ActiveVmBadge vm={vm} />
         <TierBadge vm={vm} />
         <RuntimeChip vm={vm} />
         <NodeChip nodeId={vm.node_id} />
@@ -362,6 +373,17 @@ function SlotCell({ vm }: { vm: Vm }) {
         >
           {name}
         </span>
+      </div>
+      <div
+        className={cn(
+          'truncate font-mono text-[11px] tabular-nums',
+          sub.tone === 'bad' && 'text-[color:var(--status-bad)]',
+          sub.tone === 'warn' && 'text-[color:var(--status-warn)]',
+          sub.tone === 'muted' && 'text-muted-foreground'
+        )}
+        title={sub.title}
+      >
+        {sub.text}
       </div>
       <VmOwnerLine
         vm={vm}
@@ -383,7 +405,7 @@ const COLUMNS: Record<
   VmColumnKey,
   { label: string; cell: (ctx: CellCtx) => ReactNode }
 > = {
-  vm: { label: '账号', cell: ({ vm }) => <SlotCell vm={vm} /> },
+  vm: { label: '账号', cell: ({ vm, now }) => <SlotCell vm={vm} now={now} /> },
   sched: {
     label: '调度',
     cell: ({ vm }) => (

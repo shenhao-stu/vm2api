@@ -3,6 +3,9 @@
 export type ClusterLinkState =
   'idle' | 'connecting' | 'ready' | 'backoff' | 'error'
 
+/** linux：槽位是 Docker 容器；darwin：Apple Silicon Mac，槽位是 launchd 服务、不用 Docker。 */
+export type ClusterNodePlatform = 'linux' | 'darwin'
+
 export type ClusterApiNode = {
   id: string
   label: string
@@ -15,6 +18,8 @@ export type ClusterApiNode = {
   jump_node_id: string | null
   created_at: string
   updated_at: string
+  /** 连上后按 `uname -s` 识别；老服务端没有该字段时按 linux。 */
+  platform?: ClusterNodePlatform
   link: {
     state: ClusterLinkState
     error?: { code: string; message: string } | null
@@ -65,6 +70,10 @@ export type NodeHostStats = {
   mem_pct: number
   /** 全部 Docker 容器内存合计（扣除 inactive_file）；读不到 cgroup 时为 null。 */
   containers_mem: number | null
+  /** 根分区（macOS 为家目录所在卷），口径同 df；旧服务端没有这三项。 */
+  disk_total?: number | null
+  disk_used?: number | null
+  disk_pct?: number | null
 }
 
 export type DockerInstallJob = {
@@ -97,6 +106,12 @@ export type PreflightCheckId =
   | 'hostd'
   | 'relay'
   | 'kvm'
+  | 'runtime'
+  | 'macos'
+  | 'launchd'
+  | 'sleep'
+  | 'socket_path'
+  | 'payload'
 
 /** `ok:false` + `level:'error'` 阻断创建；`warn` 只提示。 */
 export type PreflightCheck = {
@@ -132,6 +147,7 @@ export type ClusterProbeResult = {
   host_key: { alg: string; sha256: string }
   docker: { ok: boolean; error: string | null }
   uname: string | null
+  platform?: ClusterNodePlatform
   existing_id: string | null
 }
 
@@ -151,6 +167,7 @@ export type ClusterNodePatch = {
 export type ClusterNodeUpdateProbe = {
   host_key: { alg: string; sha256: string }
   docker: { ok: boolean; error: string | null }
+  platform?: ClusterNodePlatform
   vm_count: number
   dependent_count: number
 }
@@ -219,7 +236,15 @@ export type ClusterLocalStatus = {
     running: number | null
     containers: number | null
     slots: number | null
+    /** 本机在跑的槽容器此刻实际占的内存（KVM 含虚拟机已用内存）；任一读不到为 null。 */
+    slots_mem?: number | null
     error: string | null
+  }
+  /** 控制面数据目录所在磁盘，口径同 df；旧服务端没有。 */
+  disk?: {
+    disk_total: number | null
+    disk_used: number | null
+    disk_pct: number | null
   }
   /** 本机 KVM 能力。面板非 admin 可能 403，调用方按未知处理。 */
   kvm?: {

@@ -240,8 +240,14 @@ function parseCookie(header) {
   return out
 }
 
-/** Extract panel session token: Bearer → x-panel-token → Cookie */
-export function extractPanelToken(req) {
+export function panelCookieName(env = process.env) {
+  const name = env.VM2API_PANEL_COOKIE_NAME || 'kin_panel_token'
+  if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(name)) throw new Error('Invalid VM2API_PANEL_COOKIE_NAME')
+  return name
+}
+
+/** Extract panel session token: Bearer → x-panel-token → this instance's cookie. */
+export function extractPanelToken(req, env = process.env) {
   const auth = req.headers.authorization || ''
   if (typeof auth === 'string' && auth.toLowerCase().startsWith('bearer ')) {
     const t = auth.slice(7).trim()
@@ -252,8 +258,9 @@ export function extractPanelToken(req) {
     if (t) return t
   }
   const cookies = parseCookie(req.headers.cookie)
-  if (cookies.kin_panel_token) return cookies.kin_panel_token
-  if (cookies.kin_console_token) return cookies.kin_console_token
+  const name = panelCookieName(env)
+  if (cookies[name]) return cookies[name]
+  if (name === 'kin_panel_token' && cookies.kin_console_token) return cookies.kin_console_token
   return ''
 }
 
@@ -275,9 +282,9 @@ export function panelCookieSecure(req, env = process.env) {
 }
 
 /** Build Set-Cookie for panel session (7d) */
-export function panelSessionCookie(token, { secure = true, maxAgeSec = 7 * 24 * 3600 } = {}) {
+export function panelSessionCookie(token, { secure = true, maxAgeSec = 7 * 24 * 3600, env = process.env } = {}) {
   const parts = [
-    `kin_panel_token=${encodeURIComponent(token)}`,
+    `${panelCookieName(env)}=${encodeURIComponent(token)}`,
     'Path=/',
     `Max-Age=${maxAgeSec}`,
     'HttpOnly',
@@ -287,8 +294,8 @@ export function panelSessionCookie(token, { secure = true, maxAgeSec = 7 * 24 * 
   return parts.join('; ')
 }
 
-export function clearPanelSessionCookie({ secure = true } = {}) {
-  const parts = ['kin_panel_token=', 'Path=/', 'Max-Age=0', 'HttpOnly', 'SameSite=Lax']
+export function clearPanelSessionCookie({ secure = true, env = process.env } = {}) {
+  const parts = [`${panelCookieName(env)}=`, 'Path=/', 'Max-Age=0', 'HttpOnly', 'SameSite=Lax']
   if (secure) parts.push('Secure')
   return parts.join('; ')
 }

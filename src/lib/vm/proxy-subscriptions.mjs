@@ -3,6 +3,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { parseSubscription } from './subscription-parse.mjs'
 import { SubscriptionRuntime } from './subscription-runtime.mjs'
+import { subscriptionPortRange } from './instance-scope.mjs'
 import {
   fetchSubscription,
   resolvePublicHost,
@@ -11,14 +12,16 @@ import {
   withDeadline,
 } from './subscription-network.mjs'
 
-const FIRST_PORT = 21000,
-  LAST_PORT = 22999,
-  MAX_NODES = 512,
-  MAX_PROFILES = 8
-const emptyState = () => ({ version: 1, nextPort: FIRST_PORT, profiles: [], nodes: [] })
+const MAX_NODES = 512
+const emptyState = (range) => ({ version: 1, nextPort: range.first, profiles: [], nodes: [] })
 const bound = (pool, id) => (pool?.snapshot().proxies.find((proxy) => proxy.id === id)?.bound_vm_ids || []).length > 0
 
-export function reconcileSubscription(state, profile, parsed, { isBound, credentials }) {
+export function reconcileSubscription(
+  state,
+  profile,
+  parsed,
+  { isBound, credentials, portRange = subscriptionPortRange() },
+) {
   const next = structuredClone(state)
   const old = state.nodes.filter((node) => node.profileId === profile.id)
   const hashes = new Set(parsed.map((node) => node.hash))
@@ -28,7 +31,8 @@ export function reconcileSubscription(state, profile, parsed, { isBound, credent
   const current = parsed.map((node) => {
     const previous = old.find((saved) => saved.hash === node.hash)
     if (previous) return { ...previous, ...node, retained: false }
-    if (next.nextPort > LAST_PORT) throw new SubscriptionError('subscription_limit')
+    if (next.nextPort < portRange.first || next.nextPort > portRange.last)
+      throw new SubscriptionError('subscription_limit')
     const id = `${profile.id}-${node.hash.slice(0, 16)}`
     return {
       ...node,
@@ -42,8 +46,7 @@ export function reconcileSubscription(state, profile, parsed, { isBound, credent
   })
   next.nodes = [...state.nodes.filter((node) => node.profileId !== profile.id), ...current, ...retained]
   next.profiles = [...state.profiles.filter((item) => item.id !== profile.id), profile]
-  if (next.profiles.length > MAX_PROFILES || next.nodes.length > MAX_NODES)
-    throw new SubscriptionError('subscription_limit')
+  if (next.nodes.length > MAX_NODES) throw new SubscriptionError('subscription_limit')
   return next
 }
 
@@ -56,7 +59,9 @@ export class ProxySubscriptions {
     fetcher = fetchSubscription,
     resolver = resolvePublicHost,
     operationTimeoutMs = 45000,
+    portRange = subscriptionPortRange(),
   }) {
+    this.portRange = Object.freeze({ ...portRange })
     this.dir = path.join(dataDir, 'subscriptions')
     this.keyFile = process.env.VM2API_SUBSCRIPTION_KEY_FILE || path.join(this.dir, 'key')
     this.file = path.join(this.dir, 'state.enc')
@@ -65,7 +70,7 @@ export class ProxySubscriptions {
     this.resolver = resolver
     this.operationTimeoutMs = operationTimeoutMs
     this.runtime = runtime || new SubscriptionRuntime({ binary, dir: path.join(this.dir, 'runtime') })
-    this.state = emptyState()
+    this.state = emptyState(this.portRange)
     this.key = null
     this.busy = false
     this.error = null
@@ -93,7 +98,7 @@ export class ProxySubscriptions {
     this.prepareStorage()
     if (!fs.existsSync(this.file)) {
       if (this.pool.managedProxyIds?.size) throw new SubscriptionError('subscription_storage')
-      return emptyState()
+      return emptyState(this.portRange)
     }
     const encrypted = fs.readFileSync(this.file)
     if (encrypted.length < 28 || encrypted.length > 8 * 1024 * 1024) throw new SubscriptionError('subscription_storage')
@@ -106,10 +111,16 @@ export class ProxySubscriptions {
       !Array.isArray(state.nodes) ||
       !Array.isArray(state.profiles) ||
       state.nodes.length > MAX_NODES ||
-      state.profiles.length > MAX_PROFILES ||
       !Number.isInteger(state.nextPort) ||
-      state.nextPort < FIRST_PORT ||
-      state.nextPort > LAST_PORT + 1
+      state.nextPort < this.portRange.first ||
+      state.nextPort > this.portRange.last + 1 ||
+      state.nodes.some(
+        (node) =>
+          !Number.isInteger(node.listenPort) ||
+          node.listenPort < this.portRange.first ||
+          node.listenPort > this.portRange.last,
+      ) ||
+      new Set(state.nodes.map((node) => node.listenPort)).size !== state.nodes.length
     )
       throw new SubscriptionError('subscription_storage')
     return state
@@ -280,6 +291,7 @@ export class ProxySubscriptions {
         nodes.map((node) => ({ ...node, address: hosts.get(node.config.server) })),
         {
           isBound: (id) => bound(this.pool, id),
+          portRange: this.portRange,
           credentials: (id) => ({
             username: `vm2api-${id}`,
             password: crypto.createHmac('sha256', this.key).update(id).digest('hex'),

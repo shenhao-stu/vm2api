@@ -130,7 +130,7 @@ for file do
 done
 
 compose() {
-  COMPOSE_FILE="$COMPOSE_FILE_LIST" docker compose \
+  COMPOSE_FILE="$COMPOSE_FILE_LIST" env -u DOCKER_DEFAULT_PLATFORM docker compose \
     --project-directory "$ROOT" --project-name "$PROJECT" "$@"
 }
 
@@ -198,13 +198,15 @@ fi
 attempt=0
 while [ "$attempt" -lt 45 ]; do
   if probe verify "$TAG" "$BASELINE"; then
-    # Replace the Go worker/egress payloads in-place; no VM/container rebuild.
+    # Slot payloads through the new server (it alone holds the cluster links):
+    # local slots take the new kernel/cli-node files, node slots move onto a
+    # rebuilt slot image, then every slot restarts kin-worker/kin-egress.
     # Older control-plane images may not carry the helper yet; retry on the
     # next image update instead of invalidating an otherwise verified upgrade.
     if ! docker exec "$CONTAINER" test -f /opt/vm2api/scripts/fleet-services.mjs >/dev/null 2>&1; then
-      echo "Go service refresh helper is not present in the control plane; retry after the next image update" >&2
+      echo "Slot refresh helper is not present in the control plane; retry after the next image update" >&2
     elif ! docker exec "$CONTAINER" node /opt/vm2api/scripts/fleet-services.mjs; then
-      echo "Go service-only update failed; inspect the per-slot report" >&2
+      echo "Slot payload/service refresh failed; inspect the per-slot report" >&2
       exit 1
     fi
     # A helper refresh can stop a slot after the first successful probe.

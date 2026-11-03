@@ -1,7 +1,8 @@
 import type { RuntimeType } from '@/types/panel-vm'
 
 /** `routing.compatibility.persona_preset`。PUT 严格匹配，不做别名归一化。 */
-export type PersonaPreset = 'official' | 'official_full' | 'zero' | 'custom'
+export type PersonaPreset =
+  'official' | 'official_full' | 'zero' | 'custom' | 'official_303'
 
 /** `routing.compatibility.overlay_preset`。`off` 没有模板体。 */
 export type OverlayPreset = 'off' | 'official' | 'minimal' | 'custom'
@@ -208,6 +209,7 @@ export type NotifyEvents = {
   invalid: boolean
   account_down: boolean
   account_up: boolean
+  vm_down: boolean
 }
 
 export type NotifyTelegramConfig = {

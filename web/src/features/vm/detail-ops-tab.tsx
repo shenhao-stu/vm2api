@@ -19,6 +19,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { ChoiceTiles } from '@/components/choice-tiles'
+import { isActiveVmPointer } from '@/features/vm/active-vm'
 import { Field } from '@/features/vm/detail-section-primitives'
 import { VmEnvironmentCard } from '@/features/vm/environment-card'
 import { NodeChip } from '@/features/vm/node-chip'
@@ -125,10 +126,18 @@ export function VmOpsTab(props: VmOpsTabProps) {
         <Button
           size='sm'
           variant='outline'
-          loading={busy('/activate')}
-          onClick={() => onAction('/activate')}
+          disabled={busy('/activate') || busy('/deactivate')}
+          loading={busy('/activate') || busy('/deactivate')}
+          title={
+            isActiveVmPointer(vm)
+              ? '清空面板默认槽位，不影响调度'
+              : '写入 vms/active.json，面板默认接口指向此槽'
+          }
+          onClick={() =>
+            onAction(isActiveVmPointer(vm) ? '/deactivate' : '/activate')
+          }
         >
-          设为活跃
+          {isActiveVmPointer(vm) ? '取消活跃' : '设为活跃'}
         </Button>
         <Button
           size='sm'

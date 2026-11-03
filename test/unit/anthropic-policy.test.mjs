@@ -4,6 +4,8 @@ import {
   prepareAnthropicRequest,
   stripInvalidThinkingBlocks,
   rewriteToolNames,
+  scrubUpstreamClientBody,
+  toStandardAnthropicBody,
   restoreToolNames,
   restoreToolNamesInSSELine,
   sanitizeAnthropicBodyForBetaTokens,
@@ -773,6 +775,138 @@ test('valid unique tool names are not changed', () => {
     result.body.tools.map((tool) => tool.name),
     ['read_file', 'write_file'],
   )
+})
+
+test('third-party Hermes body is rewritten before the upstream hop', () => {
+  const result = scrubUpstreamClientBody({
+    system: [{ type: 'text', text: 'You are Hermes Agent from Nous Research. Use hermes-agent.' }],
+    tools: [
+      { name: 'read_file', description: 'Hermes Agent read' },
+      { name: 'mcp_filesystem_read', description: 'read' },
+      { type: 'web_search_20250305', name: 'web_search' },
+    ],
+    tool_choice: { type: 'tool', name: 'read_file' },
+    messages: [
+      { role: 'user', content: 'keep Hermes Agent in the user text' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 't1', name: 'mcp_filesystem_read', input: {} }],
+      },
+    ],
+  })
+  assert.equal(result.body.tools[0].name, 'mcp__read_file')
+  assert.equal(result.body.tools[1].name, 'mcp__filesystem_read')
+  assert.equal(result.body.tools[2].name, 'web_search')
+  assert.equal(result.body.tool_choice.name, 'mcp__read_file')
+  assert.equal(result.body.messages[1].content[0].name, 'mcp__filesystem_read')
+  assert.equal(result.reverse.mcp__read_file, 'read_file')
+  assert.equal(result.reverse.mcp__filesystem_read, 'mcp_filesystem_read')
+  assert.match(result.body.system[0].text, /Claude Code/)
+  assert.match(result.body.system[0].text, /Anthropic/)
+  assert.match(result.body.system[0].text, /claude-code/)
+  assert.doesNotMatch(result.body.system[0].text, /Hermes|Nous Research|hermes-agent/)
+  assert.equal(result.body.tools[0].description, 'Claude Code read')
+  assert.match(result.body.messages[0].content, /Hermes Agent/)
+})
+
+test('official Claude Code tool names stay, stray mcp_ names do not', () => {
+  const result = scrubUpstreamClientBody(
+    {
+      tools: [{ name: 'Bash' }, { name: 'mcp_filesystem_read' }],
+      messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }] }],
+    },
+    { official: true },
+  )
+  assert.equal(result.body.tools[0].name, 'Bash')
+  assert.equal(result.body.tools[1].name, 'mcp__filesystem_read')
+  assert.equal(result.body.messages[0].content[0].name, 'Bash')
+  assert.equal(result.reverse.mcp__filesystem_read, 'mcp_filesystem_read')
+  assert.equal(result.reverse.Bash, undefined)
+})
+
+test('front clean rewrites Hermes into standard Anthropic blocks before persona', () => {
+  const result = toStandardAnthropicBody({
+    model: 'claude-sonnet-5',
+    max_tokens: 32,
+    system:
+      'x-anthropic-billing-header: cc_version=9.9.9; cc_entrypoint=local-agent;\nYou are Hermes Agent from Nous Research.',
+    extra_body: { drop: true },
+    tools: [{ name: 'read_file', description: 'Hermes Agent read', input_schema: { type: 'object' } }],
+    messages: [{ role: 'user', content: 'hi' }],
+  })
+  assert.equal(result.body.extra_body, undefined)
+  assert.equal(
+    result.body.system.some((block) => /x-anthropic-billing-header/i.test(block.text)),
+    false,
+  )
+  assert.match(result.body.system.map((block) => block.text).join('\n'), /Claude Code from Anthropic/)
+  assert.deepEqual(result.body.messages[0].content, [{ type: 'text', text: 'hi' }])
+  assert.equal(result.body.tools[0].name, 'mcp__read_file')
+  assert.equal(result.body.tools[0].description, 'Claude Code read')
+  assert.equal(result.reverse.mcp__read_file, 'read_file')
+})
+
+test('duplicate names keep one canonical reference as history grows', () => {
+  const tools = [{ name: 'odoo_import_excel' }, { name: 'odoo_import_excel' }, { name: 'odoo_list_models' }]
+  const history = (count) =>
+    Array.from({ length: count }, (_, index) => ({
+      type: 'tool_use',
+      id: `toolu_${index + 1}`,
+      name: 'odoo_import_excel',
+      input: { n: index + 1 },
+    }))
+  const rewritten = (count) =>
+    rewriteToolNames({
+      tools,
+      tool_choice: { type: 'tool', name: 'odoo_import_excel' },
+      messages: [{ role: 'assistant', content: history(count) }],
+    })
+  const two = rewritten(2)
+  const three = rewritten(3)
+  const names = two.body.tools.map((tool) => tool.name)
+  assert.equal(new Set(names).size, names.length)
+  assert.equal(names[0], 'odoo_import_excel')
+  assert.match(names[1], /^kin_tool_/)
+  assert.deepEqual(
+    three.body.tools.map((tool) => tool.name),
+    names,
+  )
+  assert.equal(two.body.tool_choice.name, names[0])
+  assert.equal(three.body.tool_choice.name, names[0])
+  assert.deepEqual(
+    two.body.messages[0].content.map((block) => block.name),
+    [names[0], names[0]],
+  )
+  assert.deepEqual(
+    three.body.messages[0].content.map((block) => block.name),
+    [names[0], names[0], names[0]],
+  )
+})
+
+test('a custom tool does not reuse a reserved server tool name', () => {
+  const result = rewriteToolNames({
+    tools: [
+      { type: 'web_search_20250305', name: 'web_search' },
+      { name: 'web_search', input_schema: { type: 'object' } },
+    ],
+  })
+  assert.equal(result.body.tools[0].name, 'web_search')
+  assert.match(result.body.tools[1].name, /^kin_tool_/)
+  assert.notEqual(result.body.tools[0].name, result.body.tools[1].name)
+})
+
+test('disabled alias rewrite still dedupes legal names and rewrites illegal ones', () => {
+  const result = rewriteToolNames(
+    {
+      tools: [{ name: 'read_file' }, { name: 'read_file' }, { name: 'bad name' }],
+    },
+    { enabled: false },
+  )
+  const names = result.body.tools.map((tool) => tool.name)
+  assert.equal(names[0], 'read_file')
+  assert.match(names[1], /^kin_tool_/)
+  assert.match(names[2], /^kin_tool_/)
+  assert.equal(new Set(names).size, 3)
 })
 
 test('native Messages image_url parts become Claude image blocks', () => {

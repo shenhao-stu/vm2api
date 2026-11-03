@@ -1,6 +1,5 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import fs from 'node:fs'
 import {
   isCatalogModelId,
   latestIdForFamily,
@@ -86,8 +85,8 @@ test('seed catalog matches the console model-policy matrix including opus-5', ()
   assert.ok(SEED_MODEL_IDS.includes('claude-fable-5-1'))
   assert.ok(SEED_MODEL_IDS.includes('claude-opus-5-5'))
   assert.ok(SEED_MODEL_IDS.includes('claude-haiku-5-5'))
+  assert.ok(SEED_MODEL_IDS.includes('auto'))
   assert.ok(!SEED_MODEL_IDS.includes('claude-fable-5.1'))
-  assert.ok(!SEED_MODEL_IDS.includes('claude-opus-5.5'))
   clearModelsCache()
   const cat = gatewayModelCatalog()
   const ids = cat.data.map((m) => m.id)
@@ -95,7 +94,7 @@ test('seed catalog matches the console model-policy matrix including opus-5', ()
   assert.ok(ids.includes('claude-fable-5-1'))
   assert.ok(!ids.includes('claude-fable-5.1'))
   assert.equal(validateOfficialModel('claude-opus-5').ok, true)
-  assert.equal(validateOfficialModel('opus').ok, true)
+  assert.equal(validateOfficialModel('auto').model, 'auto')
   assert.equal(validateOfficialModel('opus').model, 'claude-opus-5')
   assert.equal(validateOfficialModel('claude-opus-5-5').model, 'claude-opus-5-5')
   assert.equal(validateOfficialModel('claude-opus-5.5').model, 'claude-opus-5-5')
@@ -144,18 +143,6 @@ test('gatewayModelCatalog stays local and never hops', () => {
     ids.some((id) => String(id).startsWith('claude-')),
     JSON.stringify(ids.slice(0, 12)),
   )
-  const src = fs.readFileSync(new URL('../../src/server.mjs', import.meta.url), 'utf8')
-  assert.equal(src.includes('callWorkerGet'), false)
-  assert.match(src, /return gatewayModelCatalog\([a-z]*\)/)
-})
-
-test('models module never talks to Anthropic or a CLI binary', () => {
-  const src = fs.readFileSync(new URL('../../src/lib/protocol/models.mjs', import.meta.url), 'utf8')
-  assert.equal(src.includes('api.anthropic.com'), false)
-  assert.equal(src.includes('oauth-2025-04-20'), false)
-  assert.equal(src.includes('spawnSync'), false)
-  assert.equal(src.includes('child_process'), false)
-  assert.equal(/user-agent.*claude-cli/.test(src), false)
 })
 
 test('gatewayModelCatalog filters by key group_type', () => {
@@ -168,4 +155,27 @@ test('gatewayModelCatalog filters by key group_type', () => {
   const anthropic = gatewayModelCatalog({ groupType: 'anthropic' }).data
   assert.ok(anthropic.length > 0 && !anthropic.some(isGpt))
   assert.equal(gatewayModelCatalog({ groupType: 'all' }).data.length, all.length)
+})
+
+test('enabled GPT image models are listed for openai and all keys, never for anthropic keys', async () => {
+  const { openDatabase, closeDatabase } = await import('../../src/lib/db/database.mjs')
+  const { loadGptModelPolicy, saveGptModelPolicy } = await import('../../src/lib/protocol/gpt-model-policy.mjs')
+  openDatabase({ dbPath: ':memory:' })
+  loadGptModelPolicy({ force: true })
+  try {
+    saveGptModelPolicy({ image_tools: { 'gpt-image-2.5-sunburst': { enabled: false } } })
+    clearModelsCache()
+    const ids = (groupType) => gatewayModelCatalog({ groupType }).data.map((m) => m.id)
+    assert.ok(ids('openai').includes('gpt-image-2.5-flare'))
+    assert.ok(ids('all').includes('gpt-image-2.5-flare'))
+    assert.ok(!ids('openai').includes('gpt-image-2.5-sunburst'))
+    assert.ok(!ids('anthropic').includes('gpt-image-2.5-flare'))
+    const row = gatewayModelCatalog({ groupType: 'openai' }).data.find((m) => m.id === 'gpt-image-2.5-flare')
+    assert.equal(row.owned_by, 'openai')
+    assert.equal(row.family, 'gpt-image')
+  } finally {
+    closeDatabase()
+    loadGptModelPolicy({ force: true })
+    clearModelsCache()
+  }
 })

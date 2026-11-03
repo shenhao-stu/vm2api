@@ -13,8 +13,10 @@ export type RequestLogItem = {
   input_tokens?: number
   output_tokens?: number
   cache_read_tokens?: number
-  cache_creation_tokens?: number
+  cache_creation_tokens?: number | null
   first_token_ms?: number
+  first_byte_ms?: number | null
+  generation_ms?: number | null
   stop_reason?: string
   /** 读出时派生、不落库；非错误行为 null。 */
   error_class?: string
@@ -42,6 +44,10 @@ export type RequestLogItem = {
   ip?: string
   /** debug 模式下网关实际回给客户端的响应；body 为原始文本（SSE）或已解析 JSON。 */
   response?: DebugResponseCapture | null
+  /** CLI fetch-boundary headers; absent for unsupported runtimes or old records. */
+  outbound_headers?: Record<string, unknown> | null
+  outbound_headers_source?: 'cli_final' | 'unavailable' | null
+  worker_envelope_headers?: Record<string, unknown> | null
   [key: string]: unknown
 }
 
@@ -73,6 +79,8 @@ export type RequestAttempt = {
   terminal_state?: string | null
   usage?: Record<string, unknown> | null
   wait_ms?: number | null
+  queue_wait_ms?: number | null
+  scheduling_ms?: number | null
   ttft_ms?: number | null
   latency_ms?: number | null
   [key: string]: unknown

@@ -1,9 +1,29 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { VmPatch } from '@/lib/api'
 import {
+  ccEntrypointFromCompat,
+  cchEnabledFromCompat,
   inheritProtocolOnSlots,
   protocolInheritPatch,
 } from './protocol-authority'
+
+describe('ccEntrypointFromCompat', () => {
+  it('defaults to cli when unset', () => {
+    expect(ccEntrypointFromCompat(undefined)).toBe('cli')
+    expect(ccEntrypointFromCompat({})).toBe('cli')
+  })
+
+  it('honors explicit sdk-cli', () => {
+    expect(ccEntrypointFromCompat({ cc_entrypoint: 'sdk-cli' })).toBe('sdk-cli')
+  })
+})
+
+describe('cchEnabledFromCompat', () => {
+  it('disables CCH assignment for explicit false', () => {
+    expect(cchEnabledFromCompat({ cch_enabled: false })).toBe(false)
+    expect(cchEnabledFromCompat(undefined)).toBe(true)
+  })
+})
 
 describe('protocolInheritPatch', () => {
   it('returns null when the slot already inherits', () => {

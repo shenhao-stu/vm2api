@@ -148,3 +148,72 @@ test('limit truncates and reports the full match count', async () => {
   assert.equal(headers['x-kin-export-total'], '4')
   assert.equal(headers['x-kin-export-truncated'], '1')
 })
+
+test('errors-only list, summary and export include committed-stream errors without changing non-2xx', async () => {
+  seed([
+    {
+      session_id: 'semantic-errors',
+      request_id: 'stream-broken',
+      status: 200,
+      error_code: 'EPIPE',
+      final_state: 'transport_error',
+    },
+    { session_id: 'semantic-errors', request_id: 'unavailable', status: 503, error_code: 'kernel_unavailable' },
+    { session_id: 'semantic-errors', request_id: 'quota', status: 429, error_code: 'quota_guard_request_too_large' },
+    { session_id: 'semantic-errors', request_id: 'success', status: 200 },
+    { session_id: 'semantic-errors', request_id: 'cancelled', status: 200, error_code: 'client_cancelled' },
+  ])
+  async function panelJSON(endpoint, query) {
+    const out = {}
+    const handler = createPanelHandler({
+      cfg: { paths: { project: root }, vm: { id: null } },
+      requireAuth(req) {
+        req.panelRole = 'admin'
+        req.panelUser = 'admin'
+        return true
+      },
+      json(_res, status, body) {
+        out.status = status
+        out.body = body
+        return true
+      },
+      readBody: async () => ({}),
+      proxyPool: { unbindVm() {} },
+    })
+    const url = `/api/panel/${endpoint}?${query}`
+    await handler({ method: 'GET', url, headers: {} }, {}, new URL(`http://localhost${url}`))
+    assert.equal(out.status, 200)
+    return out.body.data
+  }
+  const query = 'session_id=semantic-errors&errors_only=1'
+  const list = await panelJSON('usage-logs', query)
+  assert.deepEqual(
+    list.logs.map((r) => r.requestId),
+    ['quota', 'unavailable', 'stream-broken'],
+  )
+  const summary = await panelJSON('usage-logs/summary', query)
+  assert.equal(summary.totalRequests, 3)
+  assert.deepEqual(ids((await exportLogs(query)).rows), ['quota', 'unavailable', 'stream-broken'])
+  assert.deepEqual(ids((await exportLogs('session_id=semantic-errors&exclude_status_200=1')).rows), [
+    'quota',
+    'unavailable',
+  ])
+  assert.deepEqual(ids((await exportLogs('session_id=semantic-errors&status=error')).rows), [
+    'quota',
+    'unavailable',
+    'stream-broken',
+  ])
+  const committed = `${query}&status_code=200`
+  assert.deepEqual(
+    (await panelJSON('usage-logs', committed)).logs.map((r) => r.requestId),
+    ['stream-broken'],
+  )
+  assert.equal((await panelJSON('usage-logs/summary', committed)).totalRequests, 1)
+  assert.deepEqual(ids((await exportLogs(committed)).rows), ['stream-broken'])
+  assert.deepEqual(ids((await exportLogs(`${query}&status=200`)).rows), ['stream-broken'])
+  assert.deepEqual(ids((await exportLogs('session_id=semantic-errors&status=error&errors_only=0')).rows), [
+    'quota',
+    'unavailable',
+    'stream-broken',
+  ])
+})

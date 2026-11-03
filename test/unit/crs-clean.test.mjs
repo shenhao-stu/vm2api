@@ -11,8 +11,8 @@ import {
 import { applyCrsIdentityReplace, uuidFromSeed } from '../../src/lib/identity/identity-rewrite.mjs'
 import {
   applyCrsUnofficialPersona,
-  CRS_OFFICIAL_SYSTEM,
   CRS_OFFICIAL_CLI_SYSTEM,
+  CRS_OFFICIAL_SYSTEM,
 } from '../../src/lib/identity/crs-persona.mjs'
 import { hidePersonaUsage, personaHideInputTokens } from '../../src/lib/identity/crs-persona-usage.mjs'
 import {
@@ -177,18 +177,6 @@ test('sanitize drops empty content and prefixes assistant-first history', () => 
   assert.deepEqual(out.messages[1].content, [{ type: 'text', text: 'hello' }])
 })
 
-test('strict passthrough keeps invalid roles for official wire', () => {
-  const out = sanitizeAnthropicBody(
-    {
-      model: 'claude-sonnet-5',
-      max_tokens: 8,
-      messages: [{ role: 'admin', content: 'x' }],
-    },
-    { strictPassthrough: true },
-  )
-  assert.equal(out.messages[0].role, 'admin')
-})
-
 test('toClaudeMessages anthropic passthrough remaps admin role', () => {
   const { claude, mode } = toClaudeMessages('anthropic.messages', {
     model: 'claude-sonnet-5',
@@ -224,7 +212,14 @@ test('normalizeAnthropicMessages is idempotent for legal turns', () => {
   ])
 })
 
-test('OpenAI chat unofficial rewrite is official 5-block plus caller --system append', () => {
+// e358143c: caller system no longer joins top-level system; it is wrapped in <system-reminder>
+// at the front of the first user turn, and Environment rides as a role=system message.
+function assertOfficialHead(out) {
+  assert.match(out.system[0].text, /^x-anthropic-billing-header: /)
+  assert.equal(out.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
+}
+
+test('OpenAI chat unofficial rewrite keeps the official head and moves caller --system into the first user turn', () => {
   const { claude } = toClaudeMessages('openai.chat', {
     model: 'claude-haiku-4-5-20251001',
     messages: [
@@ -236,17 +231,17 @@ test('OpenAI chat unofficial rewrite is official 5-block plus caller --system ap
   })
   assert.deepEqual(claude.stop_sequences, ['END'])
   const cleaned = applyCrsUnofficialPersona(claude, { officialClient: false })
-  assert.equal(cleaned.system.length, 6)
-  assert.equal(cleaned.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
-  assert.equal(cleaned.system[5].text, 'you are a linter')
-  assert.match(JSON.stringify(cleaned.messages[0].content), /MANDATORY constraints for this turn/)
-  assert.ok(JSON.stringify(cleaned.messages[0].content).includes('hi'))
+  assertOfficialHead(cleaned)
+  assert.equal(JSON.stringify(cleaned.system).includes('you are a linter'), false)
+  const first = JSON.stringify(cleaned.messages[0].content)
+  assert.match(first, /MANDATORY constraints for this turn/)
+  assert.ok(first.includes('<system-reminder>\\nyou are a linter\\n</system-reminder>'))
+  assert.ok(first.includes('hi'))
 })
 
-test('empty unofficial system without tools still writes official 5 blocks', () => {
+test('empty unofficial system without tools still writes the official head and no messages', () => {
   const out = applyCrsUnofficialPersona({ messages: [] }, { officialClient: false })
-  assert.equal(out.system.length, 5)
-  assert.equal(out.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
+  assertOfficialHead(out)
   assert.equal(out.messages.length, 0)
 })
 
@@ -257,18 +252,26 @@ test('official Claude Code system is not replaced or appended', () => {
   assert.equal(out.system.length, 1)
 })
 
-test('Xcode unofficial system is appended after official 5 blocks', () => {
+test('Xcode unofficial system is moved into the first user turn after the official head', () => {
+  // A mid-conversation-system model keeps Environment as a role=system turn (069ed942).
   const body = {
+    model: 'claude-opus-5-5',
     system: 'You are currently in Xcode. Help with Swift.',
     messages: [{ role: 'user', content: 'hi' }],
   }
   const out = applyCrsUnofficialPersona(body, { officialClient: false })
-  assert.equal(out.system.length, 6)
-  assert.equal(out.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
-  assert.equal(out.system[5].text, 'You are currently in Xcode. Help with Swift.')
-  assert.match(String(out.messages[0].content), /MANDATORY constraints for this turn/)
-  assert.ok(String(out.messages[0].content).includes('hi'))
-  assert.equal(out.messages.length, 1)
+  assertOfficialHead(out)
+  assert.equal(JSON.stringify(out.system).includes('Xcode'), false)
+  const first = String(out.messages[0].content)
+  assert.equal(out.messages[0].role, 'user')
+  assert.match(first, /MANDATORY constraints for this turn/)
+  assert.ok(first.includes('<system-reminder>\nYou are currently in Xcode. Help with Swift.\n</system-reminder>'))
+  assert.ok(first.endsWith('hi'))
+  assert.deepEqual(
+    out.messages.slice(1).map((message) => message.role),
+    ['system'],
+  )
+  assert.match(JSON.stringify(out.messages[1].content), /# Environment/)
 })
 
 test('legacy user_id: device becomes VM, unofficial session is minted, account from OAuth', () => {

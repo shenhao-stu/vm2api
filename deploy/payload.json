@@ -1,18 +1,18 @@
 {
-  "repo": "shenhao-stu/vm2api",
-  "release": "payload-2026.10.22-preserved",
+  "repo": "dofastted/vm2api",
+  "release": "payload-2026.11.01-codex-image-kernel",
   "files": [
     {
       "path": "bin/kin-kernel",
       "asset": "kin-kernel",
-      "size": 12892440,
-      "sha256": "8f1347ccffa6ac66d2a6625fded59ea2b9d46c3499f4f192d77cc0510a636a68"
+      "size": 13228472,
+      "sha256": "f57d4e71081bbca0b5bc2ba15886a7149c3e34c256a890ec51e084a9fcd14288"
     },
     {
       "path": "bin/kin-codex-kernel",
       "asset": "kin-codex-kernel",
-      "size": 7892048,
-      "sha256": "0ffec538a57afbe66f13832513ee4c2a27ecc970faa9367c7cb8a13551196dd3"
+      "size": 7899968,
+      "sha256": "afdb433ebf3c719eb8596e09ca6493e8f769af1aab136426e82cbcd54c9bdc4a"
     },
     {
       "path": "bin/kin-oauth-auth",
@@ -23,14 +23,32 @@
     {
       "path": "bin/kin-computer",
       "asset": "kin-computer",
-      "size": 5527768,
-      "sha256": "fa431f10321e6043ee88a4012b6dd8c515acac3a63fc40645091d1edf6334c01"
+      "size": 5531864,
+      "sha256": "a64970838469da0e3b86831212e8f6b0806e3433a65dd062f6556252403c2bb9"
+    },
+    {
+      "path": "bin/kin-worker",
+      "asset": "kin-worker",
+      "size": 16455001,
+      "sha256": "d6b29f1144cd389696fe11edd6b5a024499bfc598da6a9ac96a4c7a9f9d6071b"
+    },
+    {
+      "path": "bin/kin-egress",
+      "asset": "kin-egress",
+      "size": 9047621,
+      "sha256": "0bf1eeb0424fb341ad371fed1e40c39e68e940770222a0ac940d3340f3b4e277"
+    },
+    {
+      "path": "bin/kin-slot-gate",
+      "asset": "kin-slot-gate",
+      "size": 8120583,
+      "sha256": "78f78d59e4f61917aca202a384eb687488a8f511acfc41662d3877223431c859"
     },
     {
       "path": "share/wrap-cli/cli-node",
       "asset": "cli-node",
-      "size": 27174524,
-      "sha256": "55efe49e5dbf6cf96fc26535ec5130bbe5af87d51d043b813f289056d744e61d"
+      "size": 27933052,
+      "sha256": "8484c4c58f4b7782a190f7cab7c8aa5d1f706ae26b2d2a5cafe81af070f0611b"
     },
     {
       "path": "share/wrap-cli/cc-node",
@@ -41,8 +59,8 @@
     {
       "path": "share/wrap-cli/kin-kernel.bin",
       "asset": "kin-kernel",
-      "size": 12892440,
-      "sha256": "8f1347ccffa6ac66d2a6625fded59ea2b9d46c3499f4f192d77cc0510a636a68"
+      "size": 13228472,
+      "sha256": "f57d4e71081bbca0b5bc2ba15886a7149c3e34c256a890ec51e084a9fcd14288"
     },
     {
       "path": "share/wrap-cli/glibc239/ld-linux-x86-64.so.2",

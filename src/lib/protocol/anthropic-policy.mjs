@@ -6,6 +6,7 @@ import {
   mergeConsecutiveAnthropicMessages,
   messageHasTurnControls,
   stripIllegalContentFields,
+  sanitizeAnthropicBody,
 } from './sanitize.mjs'
 import { isAnthropicServerTool } from './web-search.mjs'
 import {
@@ -480,40 +481,77 @@ export function prepareAnthropicRequest(
   return out
 }
 
-function safeToolName(name, used) {
+function allocateToolName(name, used, { rewrite = true } = {}) {
   const original = String(name || '')
-  if (TOOL_NAME.test(original) && !used.has(original)) {
+  const legal = TOOL_NAME.test(original)
+  if ((!rewrite || legal) && legal && !used.has(original)) {
     used.add(original)
     return original
   }
   const digest = crypto.createHash('sha256').update(original).digest('hex').slice(0, 16)
   let candidate = `kin_tool_${digest}`
   let suffix = 1
-  while (used.has(candidate)) {
+  while (used.has(candidate) || !TOOL_NAME.test(candidate)) {
     candidate = `kin_tool_${digest}_${suffix++}`
   }
   used.add(candidate)
   return candidate
 }
+function rejectToolNames(message) {
+  const error = new Error(message)
+  error.status = 400
+  error.body = { type: 'error', error: { type: 'invalid_request_error', code: 'invalid_tool_name', message } }
+  throw error
+}
+
+function canonicalServerTools(tools) {
+  const seen = new Map()
+  const kept = []
+  for (const tool of tools) {
+    if (!isAnthropicServerTool(tool)) {
+      kept.push(tool)
+      continue
+    }
+    const name = String(tool?.name || '')
+    if (!TOOL_NAME.test(name)) rejectToolNames(`Server tool name '${name}' is not valid.`)
+    const previous = seen.get(name)
+    if (!previous) {
+      seen.set(name, tool)
+      kept.push(tool)
+      continue
+    }
+    if (JSON.stringify(previous) !== JSON.stringify(tool)) {
+      rejectToolNames(`Server tool '${name}' is declared more than once with different options.`)
+    }
+  }
+  return kept
+}
 
 export function rewriteToolNames(body = {}, { enabled = true } = {}) {
-  if (!enabled || !Array.isArray(body.tools) || body.tools.length === 0) {
+  if (!Array.isArray(body.tools) || body.tools.length === 0) {
     return { body, reverse: {} }
   }
   const out = clone(body)
   const used = new Set()
-  const forward = {}
+  out.tools = canonicalServerTools(out.tools)
+  for (const tool of out.tools) {
+    if (isAnthropicServerTool(tool)) used.add(String(tool.name))
+  }
   const reverse = {}
+  const declarations = new Map()
   out.tools = out.tools.map((tool) => {
     if (isAnthropicServerTool(tool)) return tool
     const original = String(tool?.name || '')
-    const rewritten = safeToolName(original, used)
-    forward[original] = rewritten
+    const rewritten = allocateToolName(original, used, { rewrite: enabled })
+    const queue = declarations.get(original) || []
+    queue.push(rewritten)
+    declarations.set(original, queue)
     reverse[rewritten] = original
     return { ...tool, name: rewritten }
   })
-  if (out.tool_choice?.name && forward[out.tool_choice.name]) {
-    out.tool_choice = { ...out.tool_choice, name: forward[out.tool_choice.name] }
+  const canonical = new Map([...declarations].map(([original, names]) => [original, names[0]]))
+  if (out.tool_choice?.name && canonical.has(out.tool_choice.name)) {
+    out.tool_choice = { ...out.tool_choice, name: canonical.get(out.tool_choice.name) }
   }
   if (Array.isArray(out.messages)) {
     out.messages = out.messages.map((message) => {
@@ -521,8 +559,8 @@ export function rewriteToolNames(body = {}, { enabled = true } = {}) {
       return {
         ...message,
         content: message.content.map((block) => {
-          if (block?.type === 'tool_use' && forward[block.name]) {
-            return { ...block, name: forward[block.name] }
+          if (block?.type === 'tool_use' && canonical.has(block.name)) {
+            return { ...block, name: canonical.get(block.name) }
           }
           return block
         }),
@@ -566,4 +604,170 @@ export function restoreToolNamesInSSELine(line, reverse = {}) {
   }
   if (payload?.message) payload.message = restoreToolNames(payload.message, reverse)
   return `${prefix} ${JSON.stringify(payload)}`
+}
+
+const CLIENT_PROSE = [
+  ['Hermes Agent', 'Claude Code'],
+  ['Hermes agent', 'Claude Code'],
+  ['Nous Research', 'Anthropic'],
+]
+const CLIENT_SLUG = /(?<![\w./:@'"`-])hermes-agent(?![\w/@-]|\.\w)/g
+
+function scrubClientProse(text) {
+  let out = String(text ?? '')
+  for (const [from, to] of CLIENT_PROSE) {
+    if (out.includes(from)) out = out.split(from).join(to)
+  }
+  return out.replace(CLIENT_SLUG, 'claude-code')
+}
+
+/** Third-party tool names Anthropic bills as extra usage. Official CC names stay. */
+export function wireToolName(name, { official = false, rewriteTools = true } = {}) {
+  const raw = String(name || '')
+  if (!raw || raw.startsWith('mcp__')) return raw
+  if (raw.startsWith('mcp_')) return `mcp__${raw.slice(4)}`
+  if (official || rewriteTools === false) return raw
+  return `mcp__${raw}`
+}
+
+/**
+ * Hermes calls this gateway as a third-party Messages client and does not apply
+ * its own OAuth identity transform. Rewrite the outbound body before either hop:
+ * product strings leave system and tool text, and tool names land on mcp__.
+ * Official Claude Code keeps its own tool names; a stray mcp_ name is still fixed.
+ */
+export function scrubUpstreamClientBody(body, { official = false, rewriteTools = true } = {}) {
+  if (!body || typeof body !== 'object') return { body, reverse: {} }
+  const out = clone(body)
+  const reverse = {}
+  const used = new Set()
+  const assigned = new Map()
+  const rename = (name) => {
+    if (assigned.has(name)) return assigned.get(name)
+    let wire = wireToolName(name, { official, rewriteTools })
+    if (!wire) return name
+    if (wire !== name) {
+      const base = wireToolName(name, { official, rewriteTools })
+      let suffix = 2
+      while (used.has(wire)) wire = `${base}_${suffix++}`
+      reverse[wire] = name
+    }
+    used.add(wire)
+    assigned.set(name, wire)
+    return wire
+  }
+  if (typeof out.system === 'string') out.system = scrubClientProse(out.system)
+  else if (Array.isArray(out.system)) out.system = out.system.map((block) => scrubTextBlock(block))
+  if (Array.isArray(out.tools)) {
+    out.tools = out.tools.map((tool) => {
+      if (!tool || typeof tool !== 'object' || isAnthropicServerTool(tool)) return tool
+      const next = { ...tool }
+      if (typeof next.name === 'string') next.name = rename(next.name)
+      if (typeof next.description === 'string') next.description = scrubClientProse(next.description)
+      return next
+    })
+  }
+  if (out.tool_choice && typeof out.tool_choice === 'object' && typeof out.tool_choice.name === 'string') {
+    const name = rename(out.tool_choice.name)
+    if (name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
+  }
+  if (Array.isArray(out.messages)) {
+    out.messages = out.messages.map((message) => scrubMessage(message, rename))
+  }
+  return { body: out, reverse }
+}
+
+function scrubTextBlock(block) {
+  if (typeof block === 'string') {
+    const text = scrubClientProse(block)
+    return text === block ? block : text
+  }
+  if (!block || typeof block !== 'object' || typeof block.text !== 'string') return block
+  const text = scrubClientProse(block.text)
+  return text === block.text ? block : { ...block, text }
+}
+
+function scrubMessage(message, rename) {
+  if (!message || typeof message !== 'object') return message
+  const systemTurn = message.role === 'system'
+  if (typeof message.content === 'string') {
+    if (!systemTurn) return message
+    const content = scrubClientProse(message.content)
+    return content === message.content ? message : { ...message, content }
+  }
+  if (!Array.isArray(message.content)) return message
+  let changed = false
+  const content = message.content.map((block) => {
+    if (!block || typeof block !== 'object') return block
+    if (block.type === 'tool_use' && typeof block.name === 'string') {
+      const name = rename(block.name)
+      if (name !== block.name) {
+        changed = true
+        return { ...block, name }
+      }
+    }
+    if (systemTurn) {
+      const next = scrubTextBlock(block)
+      if (next !== block) changed = true
+      return next
+    }
+    return block
+  })
+  return changed ? { ...message, content } : message
+}
+
+/** Map a hop tool-name table through the front rewrite so the client still sees its names. */
+export function composeToolNames(front = {}, hop = {}) {
+  const out = { ...front }
+  for (const [wire, mid] of Object.entries(hop || {})) {
+    if (!wire || wire === mid) continue
+    const client = front[mid] || mid
+    if (client !== wire) out[wire] = client
+    delete out[mid]
+  }
+  for (const [wire, client] of Object.entries(out)) {
+    if (client === wire) delete out[wire]
+  }
+  return out
+}
+
+/**
+ * Front gate: every non-classifier Messages body becomes standard Anthropic
+ * blocks before persona or either hop. Caller billing is removed here unless
+ * official passthrough is on; the project template writes its own.
+ */
+export function toStandardAnthropicBody(body, { official = false, rewriteTools = true } = {}) {
+  const shaped = sanitizeAnthropicBody(stripCallerBilling(body), { preserveContentShape: false })
+  return scrubUpstreamClientBody(shaped, { official, rewriteTools })
+}
+
+function stripBillingText(text) {
+  return String(text || '').replace(/^[ \t]*x-anthropic-billing-header:[^\n]*(?:\n|$)/gim, '')
+}
+
+function stripCallerBilling(body) {
+  if (!body || typeof body !== 'object' || body.system == null) return body
+  const keep = (block) => {
+    const raw = typeof block === 'string' ? block : block?.text
+    if (typeof raw !== 'string' || !/x-anthropic-billing-header:/i.test(raw)) return block
+    const text = stripBillingText(raw)
+    if (!text) return null
+    if (text === raw) return block
+    return typeof block === 'string' ? text : { ...block, text }
+  }
+  if (typeof body.system === 'string') {
+    const text = keep(body.system)
+    if (text === body.system) return body
+    const next = { ...body }
+    if (text) next.system = text
+    else delete next.system
+    return next
+  }
+  if (!Array.isArray(body.system)) return body
+  const system = body.system.map(keep).filter((block) => block != null)
+  if (system.length === body.system.length && system.every((block, index) => block === body.system[index])) return body
+  const next = { ...body }
+  if (system.length) next.system = system
+  else delete next.system
+  return next
 }

@@ -82,7 +82,7 @@ test('applyVmSessionSlots updates only native admission policy', () => {
   }
 })
 
-test('persistRoutingPatch reconciles inherited Claude session slots and preserves overrides', () => {
+test('persistRoutingPatch reconciles inherited Claude session slots and preserves overrides', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-session-default-'))
   const vms = path.join(root, 'vms')
   const routingFile = path.join(root, 'routing.json')
@@ -136,7 +136,7 @@ test('persistRoutingPatch reconciles inherited Claude session slots and preserve
       requestLog: { setConfig() {} },
     })
 
-    const applied = runtime.persistRoutingPatch({ inference: { session_slots: 4 } })
+    const applied = await runtime.persistRoutingPatch({ inference: { session_slots: 4 } })
 
     const inherited = JSON.parse(fs.readFileSync(path.join(vms, 'vm-inherited.json'), 'utf8'))
     const overridden = JSON.parse(fs.readFileSync(path.join(vms, 'vm-override.json'), 'utf8'))
@@ -152,7 +152,7 @@ test('persistRoutingPatch reconciles inherited Claude session slots and preserve
   }
 })
 
-test('persistRoutingPatch writes compatibility cache_ttl into Claude kernel configs', () => {
+test('persistRoutingPatch writes compatibility cache_ttl into Claude kernel configs', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-cache-ttl-'))
   const vms = path.join(root, 'vms')
   const routingFile = path.join(root, 'routing.json')
@@ -179,7 +179,7 @@ test('persistRoutingPatch writes compatibility cache_ttl into Claude kernel conf
       requestLog: { setConfig() {} },
     })
 
-    runtime.persistRoutingPatch({ compatibility: { cache_ttl: '5m' } })
+    await runtime.persistRoutingPatch({ compatibility: { cache_ttl: '5m' } })
 
     const kernel = JSON.parse(fs.readFileSync(path.join(vms, 'vm-claude', 'run', 'kernel.json'), 'utf8'))
     assert.equal(kernel.default_cache_ttl, '5m')
@@ -189,7 +189,7 @@ test('persistRoutingPatch writes compatibility cache_ttl into Claude kernel conf
   }
 })
 
-test('persistRoutingPatch writes a changed stream idle timeout into Claude kernel configs', () => {
+test('persistRoutingPatch writes a changed stream idle timeout into Claude kernel configs', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-idle-'))
   const vms = path.join(root, 'vms')
   const routingFile = path.join(root, 'routing.json')
@@ -214,11 +214,11 @@ test('persistRoutingPatch writes a changed stream idle timeout into Claude kerne
       requestLog: { setConfig() {} },
     })
 
-    const same = runtime.persistRoutingPatch({ failover: { stream_idle_timeout_ms: 600000 } })
+    const same = await runtime.persistRoutingPatch({ failover: { stream_idle_timeout_ms: 600000 } })
     assert.equal(same.kernel_persona, null)
     assert.equal(fs.existsSync(kernelFile), false)
 
-    const changed = runtime.persistRoutingPatch({ failover: { stream_idle_timeout_ms: 900000 } })
+    const changed = await runtime.persistRoutingPatch({ failover: { stream_idle_timeout_ms: 900000 } })
     assert.equal(changed.kernel_reload, 0)
     assert.equal(JSON.parse(fs.readFileSync(kernelFile, 'utf8')).idle_timeout_seconds, 900)
   } finally {
@@ -226,7 +226,7 @@ test('persistRoutingPatch writes a changed stream idle timeout into Claude kerne
   }
 })
 
-test('persistRoutingPatch writes a changed request body limit into Claude kernel configs', () => {
+test('persistRoutingPatch writes a changed request body limit into Claude kernel configs', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-body-'))
   const vms = path.join(root, 'vms')
   const routingFile = path.join(root, 'routing.json')
@@ -249,10 +249,10 @@ test('persistRoutingPatch writes a changed request body limit into Claude kernel
       },
       requestLog: { setConfig() {} },
     })
-    const same = runtime.persistRoutingPatch({ failover: { stream_idle_timeout_ms: 180000 } })
+    const same = await runtime.persistRoutingPatch({ failover: { stream_idle_timeout_ms: 180000 } })
     assert.equal(same.kernel_persona, null)
     assert.equal(fs.existsSync(kernelFile), false)
-    const changed = runtime.persistRoutingPatch({ failover: { max_request_mib: 64 } })
+    const changed = await runtime.persistRoutingPatch({ failover: { max_request_mib: 64 } })
     assert.equal(changed.kernel_reload, 0)
     assert.equal(JSON.parse(fs.readFileSync(kernelFile, 'utf8')).max_request_bytes, 64 * 1024 * 1024)
   } finally {
@@ -260,7 +260,7 @@ test('persistRoutingPatch writes a changed request body limit into Claude kernel
   }
 })
 
-test('persistRoutingPatch writes persona_preset into Claude kernel system_layout', () => {
+test('persistRoutingPatch writes persona_preset into Claude kernel system_layout', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-persona-kernel-'))
   const vms = path.join(root, 'vms')
   const routingFile = path.join(root, 'routing.json')
@@ -291,7 +291,7 @@ test('persistRoutingPatch writes persona_preset into Claude kernel system_layout
       requestLog: { setConfig() {} },
     })
 
-    const applied = runtime.persistRoutingPatch({ compatibility: { persona_preset: 'zero' } })
+    const applied = await runtime.persistRoutingPatch({ compatibility: { persona_preset: 'zero' } })
     assert.equal(applied.kernel_persona.updated, 1)
 
     const kernel = JSON.parse(fs.readFileSync(path.join(vms, 'vm-claude', 'run', 'kernel.json'), 'utf8'))
@@ -459,7 +459,7 @@ test('loadRoutingConfig normalizes a missing or invalid vm section', () => {
   }
 })
 
-test('persistRoutingPatch merges a valid vm patch', () => {
+test('persistRoutingPatch merges a valid vm patch', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-vm-persist-'))
   const routingFile = path.join(root, 'routing.json')
   const routingConfig = { concurrency: {}, tiers: {}, vm: { memory: '1g', vcpus: 2 } }
@@ -467,13 +467,57 @@ test('persistRoutingPatch merges a valid vm patch', () => {
   fs.writeFileSync(routingFile, JSON.stringify(routingConfig))
   try {
     const runtime = persistHarness(root, routingFile, routingConfig)
-    runtime.persistRoutingPatch({ vm: { memory: '4g', vcpus: 4, smbios: { product: 'Precision 5860' } } })
+    await runtime.persistRoutingPatch({ vm: { memory: '4g', vcpus: 4, smbios: { product: 'Precision 5860' } } })
     const saved = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
     assert.equal(saved.vm.memory, '4g')
     assert.equal(saved.vm.vcpus, 4)
     assert.equal(saved.vm.smbios.product, 'Precision 5860')
     assert.equal(saved.vm.smbios.manufacturer, 'Dell Inc.')
     assert.equal(saved.vm.allow_tcg, false)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('native interval publication reports an unreachable remote VM as failed, not queued success', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-telemetry-'))
+  const vms = path.join(root, 'vms')
+  const routingFile = path.join(root, 'routing.json')
+  const user = 'cd'.repeat(32)
+  const seed = { telemetry_disabled: false }
+  for (const [id, extra] of [
+    ['vm-claude', {}],
+    ['vm-node', { node_id: 'node-test' }],
+    ['vm-codex', { platform: 'openai', family: 'codex' }],
+  ]) {
+    fs.mkdirSync(path.join(vms, id, 'run'), { recursive: true })
+    fs.mkdirSync(path.join(vms, id, 'cli-home', '.claude'), { recursive: true })
+    fs.writeFileSync(path.join(vms, `${id}.json`), JSON.stringify({ id, seed_policy: seed, ...extra }))
+    fs.writeFileSync(path.join(vms, id, 'run', 'worker.json'), JSON.stringify({ vm_id: id }))
+    fs.writeFileSync(path.join(vms, id, 'cli-home', '.claude', '.claude.json'), JSON.stringify({ userID: user }))
+  }
+  const routingConfig = { concurrency: {}, tiers: {} }
+  fs.writeFileSync(routingFile, JSON.stringify(routingConfig))
+  const kernel = (id) => JSON.parse(fs.readFileSync(path.join(vms, id, 'run', 'kernel.json'), 'utf8')).telemetry
+  try {
+    const runtime = persistHarness(root, routingFile, routingConfig)
+    const changed = await runtime.persistRoutingPatch({ telemetry: { upload_interval_seconds: 3600 } })
+    assert.deepEqual(changed.telemetry_sync, { updated: 1, queued: 0, skipped: 0, failed: ['vm-node'] })
+    assert.equal(JSON.parse(fs.readFileSync(routingFile, 'utf8')).telemetry.upload_interval_seconds, 3600)
+    assert.equal(kernel('vm-claude').upload_interval_seconds, 3600)
+    const localSeed = JSON.parse(
+      fs.readFileSync(path.join(vms, 'vm-claude', 'cli-home', '.claude', 'kin-seed.json'), 'utf8'),
+    )
+    assert.equal(localSeed.seed_policy.telemetry_disabled, false)
+    assert.equal(fs.existsSync(path.join(vms, 'vm-claude', 'cli-home', '.claude', 'settings.json')), true)
+    assert.equal(fs.existsSync(path.join(vms, 'vm-claude', 'cli-home', '.claude', 'claude.setting')), true)
+    assert.equal(fs.existsSync(path.join(vms, 'vm-codex', 'run', 'kernel.json')), false)
+    assert.equal(
+      (await runtime.persistRoutingPatch({ telemetry: { upload_interval_seconds: 3600 } })).telemetry_sync,
+      null,
+    )
+    assert.equal((await runtime.persistRoutingPatch({ sticky: {} })).telemetry_sync, null)
+    assert.equal(JSON.parse(fs.readFileSync(routingFile, 'utf8')).telemetry.upload_interval_seconds, 3600)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -506,7 +550,7 @@ test('PUT /api/panel/routing rejects an invalid vm patch before persist', async 
   assert.match(response.body?.error?.message, /memory/)
 })
 
-test('persistRoutingPatch round-trips websocket gates and analytics', () => {
+test('persistRoutingPatch round-trips websocket gates and analytics', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-ws-persist-'))
   const routingFile = path.join(root, 'routing.json')
   const routingConfig = { concurrency: {}, tiers: {}, codex: { enabled: true } }
@@ -514,7 +558,7 @@ test('persistRoutingPatch round-trips websocket gates and analytics', () => {
   fs.writeFileSync(routingFile, JSON.stringify(routingConfig))
   try {
     const runtime = persistHarness(root, routingFile, routingConfig)
-    runtime.persistRoutingPatch({
+    await runtime.persistRoutingPatch({
       websocket: { enabled: false },
       codex: {
         websocket: { enabled: false },
@@ -535,6 +579,35 @@ test('persistRoutingPatch round-trips websocket gates and analytics', () => {
     assert.equal(loaded.websocket.enabled, false)
     assert.equal(loaded.codex.analytics.enabled, true)
     assert.equal(loaded.codex.upstream_transport, 'http')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('persistRoutingPatch replaces codex.model_mappings with the full table the panel sends', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-mappings-'))
+  const routingFile = path.join(root, 'routing.json')
+  const routingConfig = {
+    concurrency: {},
+    tiers: {},
+    codex: { model_mappings: { 'codex-auto-review': 'gpt-6-sol', 'my-fast': 'gpt-6-luna' } },
+  }
+  fs.writeFileSync(routingFile, JSON.stringify(routingConfig))
+  try {
+    const runtime = persistHarness(root, routingFile, routingConfig)
+    await runtime.persistRoutingPatch({
+      codex: { model_mappings: { 'codex-auto-review': 'gpt-5.5', 'my-fast': 'gpt-6-luna', other: 'gpt-6-sol' } },
+    })
+    let saved = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
+    assert.deepEqual(saved.codex.model_mappings, {
+      'codex-auto-review': 'gpt-5.5',
+      'my-fast': 'gpt-6-luna',
+      other: 'gpt-6-sol',
+    })
+    // Restoring the default removes the key; the default target comes back on normalize.
+    await runtime.persistRoutingPatch({ codex: { model_mappings: { 'my-fast': 'gpt-6-luna' } } })
+    saved = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
+    assert.deepEqual(saved.codex.model_mappings, { 'codex-auto-review': 'gpt-6-luna', 'my-fast': 'gpt-6-luna' })
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

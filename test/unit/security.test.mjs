@@ -157,3 +157,18 @@ test('existing loose panel session file is tightened on load', async () => {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('a named panel cookie does not read or clear another installation session', async () => {
+  const { extractPanelToken, panelSessionCookie, clearPanelSessionCookie, panelCookieName } = await import(
+    '../../src/lib/core/security.mjs'
+  )
+  const env = { VM2API_PANEL_COOKIE_NAME: 'kin_hosted_panel_token' }
+  const req = { headers: { cookie: 'kin_panel_token=other; kin_console_token=legacy; kin_hosted_panel_token=own' } }
+  assert.equal(extractPanelToken(req, env), 'own')
+  assert.equal(extractPanelToken({ headers: { cookie: 'kin_panel_token=other; kin_console_token=legacy' } }, env), '')
+  assert.equal(extractPanelToken(req, {}), 'other')
+  assert.match(panelSessionCookie('own', { env }), /^kin_hosted_panel_token=own;/)
+  assert.match(clearPanelSessionCookie({ env }), /^kin_hosted_panel_token=;/)
+  assert.doesNotMatch(clearPanelSessionCookie({ env }), /kin_panel_token=/)
+  assert.throws(() => panelCookieName({ VM2API_PANEL_COOKIE_NAME: 'x; Path=/' }), /Invalid/)
+})

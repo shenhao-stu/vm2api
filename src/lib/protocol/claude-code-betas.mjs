@@ -27,6 +27,8 @@ export const BETA_CONTEXT_1M = 'context-1m-2025-08-07'
 /** Request gates must be applied by the final HTTP wire owner. */
 export const BETA_THINKING_DISPLAY_UPDATES = 'thinking-display-updates-2026-08-18'
 export const BETA_DANGEROUS_TOOL_USE = 'dangerous-tool-use-2026-09-03'
+/** Mid-conversation `tool_addition.tool` of type `tool_definition`. Not in the always-on prefix. */
+export const BETA_INLINE_TOOLS = 'inline-tools-2026-09-15'
 
 const PER_TURN_MODELS = {
   'claude-haiku-5-5': true,
@@ -58,16 +60,35 @@ const MID_OUTPUT_CONFIG_MODELS = {
   'claude-mythos-5-1': true,
 }
 
+function contentHasInlineToolDefinition(content) {
+  if (!Array.isArray(content)) return false
+  for (const block of content) {
+    if (!block || typeof block !== 'object' || block.type !== 'tool_addition') continue
+    const tool = block.tool
+    if (tool && typeof tool === 'object' && tool.type === 'tool_definition') return true
+  }
+  return false
+}
+
 function hasHourCache(node) {
   if (Array.isArray(node)) return node.some(hasHourCache)
   if (!node || typeof node !== 'object') return false
   return node.cache_control?.ttl === '1h' || hasHourCache(node.content)
 }
 
+function hasCacheScope(node) {
+  if (Array.isArray(node)) return node.some(hasCacheScope)
+  if (!node || typeof node !== 'object') return false
+  return node.cache_control?.scope != null || hasCacheScope(node.content)
+}
+
 export function withRequestProtocolBetas(tokens = [], body = {}) {
   const betas = [...new Set(tokens.filter(Boolean))]
-  const add = (token) => {
-    if (!betas.includes(token)) betas.push(token)
+  const add = (token, before) => {
+    if (betas.includes(token)) return
+    const at = before ? betas.indexOf(before) : -1
+    if (at === -1) betas.push(token)
+    else betas.splice(at, 0, token)
   }
   // Catalog capabilities do not imply opt-in timing/thread/diagnostic fields.
   const model = String(body.model || '')
@@ -75,8 +96,8 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
     .pop()
     .replace(/\[1m\]/gi, '')
     .replace(/-\d{8}$/, '')
-  if (Object.hasOwn(PER_TURN_MODELS, model)) add('per-turn-control-2026-07-01')
-  if (Object.hasOwn(MID_TOOL_CHANGE_MODELS, model)) add(BETA_MID_CONVERSATION_TOOL_CHANGES)
+  if (Object.hasOwn(PER_TURN_MODELS, model)) add('per-turn-control-2026-07-01', BETA_MID_CONVERSATION_TOOL_CHANGES)
+  if (Object.hasOwn(MID_TOOL_CHANGE_MODELS, model) || model === 'auto') add(BETA_MID_CONVERSATION_TOOL_CHANGES)
   if (body.thread != null && Object.hasOwn(MID_OUTPUT_CONFIG_MODELS, model)) add(BETA_MID_CONVERSATION_OUTPUT_CONFIG)
   if (body.output_config?.effort != null) add(BETA_EFFORT)
   if (body.thinking?.display === 'updates') add(BETA_THINKING_DISPLAY_UPDATES)
@@ -106,17 +127,19 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
   if (body.cache_control?.evict_on_complete) add('prompt-caching-evict-2026-05-12')
   if (hasHourCache(body) || hasHourCache(body.system) || hasHourCache(body.tools) || hasHourCache(body.messages))
     add(BETA_EXTENDED_CACHE_TTL)
+  if (hasCacheScope(body) || hasCacheScope(body.system) || hasCacheScope(body.tools) || hasCacheScope(body.messages))
+    add(BETA_PROMPT_CACHING_SCOPE)
   if (Array.isArray(body.messages)) {
-    let hasSystem = false
     let hasClearAt = false
+    let hasInlineToolDefinition = false
     let hasMessageOutputConfig = false
     let hasMessageEffort = false
     let hasMessageFormat = false
     let hasMessageTaskBudget = false
     for (const message of body.messages) {
       if (!message || typeof message !== 'object') continue
-      if (message.role === 'system') hasSystem = true
       if (message.clear_at != null) hasClearAt = true
+      if (contentHasInlineToolDefinition(message.content)) hasInlineToolDefinition = true
       const config = message.output_config
       if (!config || typeof config !== 'object') continue
       hasMessageOutputConfig = true
@@ -124,8 +147,8 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
       if (config.format) hasMessageFormat = true
       if (config.task_budget) hasMessageTaskBudget = true
     }
-    if (hasSystem) add(BETA_MID_CONVERSATION_SYSTEM)
     if (hasClearAt) add(BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT)
+    if (hasInlineToolDefinition) add(BETA_INLINE_TOOLS)
     if (hasMessageOutputConfig) add(BETA_MID_CONVERSATION_OUTPUT_CONFIG)
     if (hasMessageEffort) add(BETA_EFFORT)
     if (hasMessageFormat) add('structured-outputs-2025-12-15')
@@ -136,7 +159,7 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
 
 export const HAIKU_BETA_HEADER = `${BETA_OAUTH},${BETA_INTERLEAVED}`
 
-/** Common 2.1.293 Messages betas; model capabilities and fields are separate gates. */
+/** Official 2.1.303 `--print` prefix. Field-gated tokens stay after it. */
 export function fullClaudeCodeMimicryBetas() {
   return [
     BETA_CLAUDE_CODE,
@@ -145,7 +168,14 @@ export function fullClaudeCodeMimicryBetas() {
     BETA_THINKING_TOKEN_COUNT,
     BETA_CONTEXT_MANAGEMENT,
     BETA_PROMPT_CACHING_SCOPE,
-    BETA_MID_CONVERSATION_SYSTEM,
+    'per-turn-control-2026-07-01',
+    BETA_MID_CONVERSATION_TOOL_CHANGES,
+    BETA_ADVANCED_TOOL_USE,
+    BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT,
+    BETA_EFFORT,
+    BETA_THINKING_BINDING_CONTROLS,
+    BETA_EXTENDED_CACHE_TTL,
+    BETA_CACHE_DIAGNOSIS,
   ]
 }
 

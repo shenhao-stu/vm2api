@@ -1,9 +1,11 @@
-# Control plane. Only source is in git: the console and Go helpers build here, and the
-# prebuilt slot payloads come from the release pinned in deploy/payload.json.
+# The console and guarded Go helpers build from source. Provider kernels and CLIs
+# use the verified release pinned in deploy/payload.json.
 
 FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web
 RUN npm install -g pnpm@10
 WORKDIR /src/web
+ARG VITE_PANEL_COOKIE_NAME=kin_panel_token
+ENV VITE_PANEL_COOKIE_NAME=$VITE_PANEL_COOKIE_NAME
 COPY web/package.json web/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY web/ ./
@@ -20,7 +22,7 @@ RUN cd api-kernel && go mod download
 COPY api-kernel/ ./api-kernel/
 RUN cd worker && go build -buildvcs=false -trimpath -o /out/kin-worker ./cmd/kin-worker \
   && go build -buildvcs=false -trimpath -o /out/kin-egress ./cmd/kin-egress \
-  && CGO_ENABLED=0 go build -buildvcs=false -trimpath -o /out/kin-slot-gate ./cmd/kin-slot-gate \
+  && go build -buildvcs=false -trimpath -o /out/kin-slot-gate ./cmd/kin-slot-gate \
   && cd ../api-kernel && go build -buildvcs=false -trimpath -o /out/kin-api-kernel ./cmd/kin-api-kernel
 
 FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS payload

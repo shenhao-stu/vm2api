@@ -18,11 +18,16 @@ import {
   clearCachePrefixSessions,
   confirmCachePrefix,
   peekCachePrefix,
-  trackCachePrefix,
+  prepareCachePrefix,
 } from '../../src/lib/protocol/cache-prefix.mjs'
 import { rewritePoolErrorForClient, mapUpstreamError } from '../../src/lib/core/errors.mjs'
 import { evaluateAccount } from '../../src/lib/pool/availability.mjs'
 import { listQuotaFromHeaders } from '../../src/lib/pool/quota-window.mjs'
+
+function track(key, body, now) {
+  const { body: _sent, ...prefix } = prepareCachePrefix(key, body, now)
+  return prefix
+}
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'kin-quota-band-'))
@@ -192,6 +197,23 @@ function schedulerProject() {
 }
 
 class RuntimeRepo {
+  constructor(accounts = null) {
+    this.accounts = accounts
+  }
+  schedulingSnapshot(ids) {
+    return new Map(
+      ids.map((id) => [
+        id,
+        {
+          state: this.get(id),
+          account: this.accounts?.get(id) ? { status: 'active', schedulable: true, ...this.accounts.get(id) } : null,
+        },
+      ]),
+    )
+  }
+  writeHeartbeat(input) {
+    this.upsert(input)
+  }
   states = new Map()
   get(id) {
     return this.states.get(id) || null
@@ -216,7 +238,7 @@ test('scheduler switches using requestRisk on the quotaRequest body estimate', a
   accountQuota.tryAcquire = (id, opts = {}) => origAcq(id, { ...opts, requestRisk: largeColdRisk })
   const pool = new PoolScheduler({
     projectRoot: root,
-    runtimeRepo: new RuntimeRepo(),
+    runtimeRepo: new RuntimeRepo(accountQuota.repo),
     accountQuota,
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
@@ -241,7 +263,7 @@ test('all in-band accounts yield quota_guard_request_too_large', async (t) => {
   accountQuota.canAccept = (id, opts = {}) => orig(id, { ...opts, requestRisk: largeColdRisk })
   const pool = new PoolScheduler({
     projectRoot: root,
-    runtimeRepo: new RuntimeRepo(),
+    runtimeRepo: new RuntimeRepo(accountQuota.repo),
     accountQuota,
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
@@ -285,7 +307,7 @@ test('peek does not record; unconfirmed attempts stay cold', () => {
   }
   assert.equal(peekCachePrefix('acc:s', body1, 0).turn, 1)
   assert.equal(peekCachePrefix('acc:s', body1, 0).confirmed, false)
-  assert.deepEqual(trackCachePrefix('acc:s', body1, 0), { turn: 1, break: null })
+  assert.deepEqual(track('acc:s', body1, 0), { turn: 1, break: null })
   const peeked = peekCachePrefix('acc:s', body2, 1)
   assert.equal(peeked.turn, 2)
   assert.equal(peeked.confirmed, false)
@@ -330,9 +352,9 @@ test('output ceiling does not make a short prompt large in the critical band', (
     messages: [...history.slice(0, n), { role: 'user', content: `follow-up ${n}` }],
   })
   const key = `${account}:${session}`
-  trackCachePrefix(key, turn(0))
+  track(key, turn(0))
   assert.equal(confirmCachePrefix(key), true)
-  trackCachePrefix(key, turn(2))
+  track(key, turn(2))
   assert.equal(confirmCachePrefix(key), true)
 
   const warm = estimateRequestRisk(turn(2), { accountId: account, sessionId: session })
@@ -381,6 +403,36 @@ test('output ceiling does not make a short prompt large in the critical band', (
   )
 })
 
+test('quota prediction respects caller cache ownership when switching away from image optimization', () => {
+  clearCachePrefixSessions()
+  const history = {
+    messages: Array.from({ length: 5 }, (_, i) => ({
+      role: 'user',
+      content: [
+        { type: 'text', text: `shot ${i}` },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: `image-${i}` } },
+      ],
+    })),
+  }
+  prepareCachePrefix('images:s', history, 0)
+  const dropped = structuredClone(history)
+  dropped.messages[0].content.pop()
+  assert.ok(prepareCachePrefix('images:s', dropped, 1).image_floor > 0)
+  confirmCachePrefix('images:s', 1)
+  dropped.messages.at(-1).content.at(-1).cache_control = { type: 'ephemeral', ttl: '1h' }
+  assert.equal(estimateRequestRisk(dropped, { accountId: 'images', sessionId: 's', now: 2 }).cold, false)
+  // Caller policy sends all remaining images, so the old trimmed prefix is cold.
+  const risk = estimateRequestRisk(dropped, {
+    accountId: 'images',
+    sessionId: 's',
+    now: 2,
+    quotaRequest: { preserveMessageCache: true },
+  })
+  const actual = prepareCachePrefix('images:s', dropped, 2, { preserveMessageCache: true })
+  assert.equal(risk.coldReason, 'prefix_break')
+  assert.equal(risk.cold, !!actual.break)
+})
+
 test('stale band still blocks a warm turn whose new user text is itself large', () => {
   clearCachePrefixSessions()
   const base = {
@@ -388,7 +440,7 @@ test('stale band still blocks a warm turn whose new user text is itself large', 
     max_tokens: 128000,
     messages: [{ role: 'user', content: 'short' }],
   }
-  trackCachePrefix('band:sess', base)
+  track('band:sess', base)
   assert.equal(confirmCachePrefix('band:sess'), true)
   const extended = {
     ...base,

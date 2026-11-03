@@ -1,3 +1,4 @@
+import { slotContainerForVm } from '../vm/instance-scope.mjs'
 /**
  * Rust gateway-worker lifecycle. kin-kernel is container PID 1.
  * Host writes credentials; slot kernel only reads AT for inference.
@@ -14,8 +15,10 @@ import {
   rustKernelBusy,
 } from './rust-kernel-client.mjs'
 import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
-import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
+import { profileForPreset } from '../identity/official-profiles.mjs'
 import { cacheTtlFromRouting, normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
+import { getModelPolicy } from '../protocol/model-policy.mjs'
+import { ccEntrypointFromRouting } from '../identity/crs-persona.mjs'
 import { setVmSchedulable, listVms, getVm } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
@@ -34,12 +37,39 @@ import {
   slotUidGidFromHomeDir,
   chownSlotRuntimeFile,
   replaceSlotOwnedFile,
+  runtimeFileOwner,
 } from '../oauth/oauth-credentials.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { buildNativeTelemetry } from '../vm/native-telemetry.mjs'
+import { RETIRE_LEGACY_TELEMETRY } from '../vm/slot-process-status.mjs'
+
+/** The native host is authenticated separately from account scheduling readiness. */
+function runtimeReady(health, allowMissingCredential) {
+  if (!allowMissingCredential) return rustKernelReachable(health)
+  return (
+    health?.vm_telemetry === true &&
+    health?.telemetry_ready === true &&
+    health?.healthy !== false &&
+    Number(health?.cli_pid) > 0
+  )
+}
 
 function normalizeAutoCompactWindow(value) {
   const windowTokens = Number(value)
   return Number.isInteger(windowTokens) && windowTokens >= 100_000 && windowTokens <= 1_000_000 ? windowTokens : null
+}
+
+const PANEL_EFFORTS = ['off', 'low', 'medium', 'high', 'xhigh', 'max']
+
+function modelEffortTable(routing, previous) {
+  if (routing == null) return previous && typeof previous === 'object' && !Array.isArray(previous) ? previous : {}
+  const models = getModelPolicy()?.models || {}
+  const out = {}
+  for (const [id, row] of Object.entries(models)) {
+    const effort = row?.params?.default_effort
+    if (PANEL_EFFORTS.includes(effort)) out[String(id).toLowerCase()] = effort
+  }
+  return out
 }
 
 const starts = new Map()
@@ -56,7 +86,10 @@ function kvmBootBudget(vm, timeoutMs) {
 
 /** Bind the VM's docker daemon into an injectable runner. */
 function slotRunner(exec, run) {
-  const env = slotHost(exec?.vm).dockerEnv()
+  const host = slotHost(exec?.vm)
+  // A macOS node has no container to exec into; its kernel is a launchd job (see startRustKernel).
+  if (host.native) return async () => ({ ok: false, code: null, stdout: '', error: 'native_node_unsupported' })
+  const env = host.dockerEnv()
   if (!env) return run
   return (args, opts = {}) => run(args, { ...opts, env })
 }
@@ -82,10 +115,7 @@ export function kernelBinPath() {
 }
 
 export function slotContainerName(exec = {}) {
-  const configured = String(exec?.vm?.runtime?.container || '').trim()
-  if (configured) return configured
-  const vmId = exec?.vmId || exec?.vm?.id || ''
-  return vmId ? `kin-${String(vmId).replace(/^vm-/, '')}` : ''
+  return slotContainerForVm({ ...exec.vm, id: exec.vmId || exec.vm?.id })
 }
 
 function syncKernelSlotCount(configPath) {
@@ -148,6 +178,7 @@ export async function reconcileCliHopRuntime(exec, { runDockerExec = runDocker }
 export function stopRustKernel(exec = {}) {
   const container = slotContainerName(exec)
   if (!container) return { ok: false, reason: 'container_missing' }
+  if (slotHost(exec?.vm).native) return { ok: false, reason: 'native_node' }
   const env = slotHost(exec?.vm).dockerEnv()
   const result = spawnSync(
     process.env.KIN_DOCKER_BIN || 'docker',
@@ -204,12 +235,12 @@ function runDocker(args, { timeoutMs = 5000, env } = {}) {
   })
 }
 
-async function waitForHealth(exec, timeoutMs) {
+async function waitForHealth(exec, timeoutMs, allowMissingCredential = false) {
   const deadline = Date.now() + Math.max(200, Number(timeoutMs) || 8000)
   let last = { ok: false, reason: 'not_ready' }
   while (Date.now() < deadline) {
     last = await rustKernelHealth(exec, { timeoutMs: 400 })
-    if (rustKernelReachable(last)) return { ok: true, reason: 'started_in_vm', health: last }
+    if (runtimeReady(last, allowMissingCredential)) return { ok: true, reason: 'started_in_vm', health: last }
     await new Promise((resolve) => setTimeout(resolve, 80))
   }
   return { ok: false, reason: 'health_timeout', health: last, error: last?.error || 'rust kernel health timeout' }
@@ -229,7 +260,7 @@ async function kernelProcessAlive(exec, runDockerExec) {
   return result?.ok === true
 }
 
-async function waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, control }) {
+async function waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, control, allowMissingCredential }) {
   const deadline = Date.now() + Math.max(200, Number(timeoutMs) || 8000)
   const started = Date.now()
   let last = { ok: false, reason: 'not_ready' }
@@ -237,7 +268,7 @@ async function waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, 
   while (Date.now() < deadline) {
     if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
     last = await rustKernelHealth(exec, { timeoutMs: 400 })
-    if (rustKernelReachable(last)) return { ok: true, reason: 'started_in_vm', health: last }
+    if (runtimeReady(last, allowMissingCredential)) return { ok: true, reason: 'started_in_vm', health: last }
     // KVM guest boot is minutes under TCG; a missing process at 1.2s is not failure.
     if (!isKvmRuntime(exec?.vm) && !checkedProcess && Date.now() - started >= 1200 && container) {
       checkedProcess = true
@@ -256,13 +287,34 @@ async function waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, 
   return { ok: false, reason: 'health_timeout', health: last, error: last?.error || 'rust kernel health timeout' }
 }
 
-export async function ensureRustKernel(exec, { timeoutMs = 30000, runDockerExec = runDocker, force = false } = {}) {
+export async function ensureRustKernel(
+  exec,
+  {
+    timeoutMs = 30000,
+    healthTimeoutMs = 800,
+    runDockerExec = runDocker,
+    force = false,
+    allowMissingCredential = false,
+  } = {},
+) {
   const vmId = exec?.vmId || exec?.vm?.id || 'unknown'
   const pending = starts.get(vmId)
-  if (pending && !force) return pending.promise
+  if (pending && !force) {
+    const result = await pending.promise
+    if (!allowMissingCredential || runtimeReady(result?.health, true)) return result
+    return { ok: false, reason: 'telemetry_not_ready', health: result?.health }
+  }
   const control = { cancelled: false }
   const run = slotRunner(exec, runDockerExec)
-  const promise = startRustKernel(exec, { timeoutMs, vmId, control, runDockerExec: run, force })
+  const promise = startRustKernel(exec, {
+    timeoutMs,
+    healthTimeoutMs,
+    vmId,
+    control,
+    runDockerExec: run,
+    force,
+    allowMissingCredential,
+  })
   const start = { promise, control }
   starts.set(vmId, start)
   try {
@@ -289,7 +341,7 @@ async function killWrapDataplane(exec, runDockerExec) {
         '  exe=$(readlink "$d/exe" 2>/dev/null || true)',
         '  case "$exe" in */qemu-*) exe=$(tr "\\000" "\\n" < "$d/cmdline" 2>/dev/null | sed -n 2p) ;; esac',
         '  case "$exe" in',
-        '    */.kin/cli-node*|*/.kin/kin-kernel*|*/.kin/glibc239/ld-linux*|/opt/kin/cli-node*|/opt/kin/kin-kernel*|/opt/kin/glibc239/ld-linux*)',
+        '    */.kin/cli-node*|*/.kin/kin-kernel*|*/.kin/glibc239/ld-linux*|*/.kin/glibc239/arm64/ld-linux*|/opt/kin/cli-node*|/opt/kin/kin-kernel*|/opt/kin/glibc239/ld-linux*|/opt/kin/glibc239/arm64/ld-linux*)',
         '      kill -KILL "${d#/proc/}" 2>/dev/null || true',
         '  esac',
         'done',
@@ -512,22 +564,38 @@ function bootWaitMs(timeoutMs, { pid1Kernel, wedged }) {
   return cap
 }
 
-async function startKvmGuestKernel(exec, { timeoutMs, control, runDockerExec, force, host, paths, container }) {
+/** Only actual Linux launches retire the old sender; healthy kernels do no extra exec. */
+async function retireLegacyTelemetryBeforeStart(exec, runDockerExec) {
+  try {
+    const retired = await runDockerExec(execArgv(exec, ['sh', '-c', RETIRE_LEGACY_TELEMETRY], { user: '0' }), {
+      timeoutMs: 5000,
+    })
+    if (retired?.ok) return { ok: true }
+  } catch {}
+  return { ok: false, reason: 'legacy_telemetry_stop_failed', error: 'Legacy telemetry process did not stop' }
+}
+
+async function startKvmGuestKernel(
+  exec,
+  { timeoutMs, control, runDockerExec, force, host, paths, container, allowMissingCredential },
+) {
   const budget = kvmBootBudget(exec.vm, timeoutMs)
   if (!force) {
-    const waited = await waitForHealth(exec, budget)
+    const waited = await waitForHealth(exec, budget, allowMissingCredential)
     if (waited?.ok) {
       waited.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
       return waited
     }
   }
+  const retired = await retireLegacyTelemetryBeforeStart(exec, runDockerExec)
+  if (!retired.ok) return retired
   await killWrapDataplane(exec, runDockerExec)
   const launched = await runDockerExec(execArgv(exec, ['systemctl', 'restart', 'kin-kernel.service'], { user: '0' }), {
     timeoutMs: Math.min(budget, 30_000),
   })
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   if (!launched?.ok) {
-    const waited = await waitForHealth(exec, budget)
+    const waited = await waitForHealth(exec, budget, allowMissingCredential)
     if (waited?.ok) {
       waited.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
       return waited
@@ -535,18 +603,33 @@ async function startKvmGuestKernel(exec, { timeoutMs, control, runDockerExec, fo
     const error = String(launched?.error || waited?.error || 'guest kernel restart failed')
     return { ok: false, reason: 'health_timeout', error }
   }
-  const started = await waitForHealthOrExit(exec, { timeoutMs: budget, container, runDockerExec, control })
+  const started = await waitForHealthOrExit(exec, {
+    timeoutMs: budget,
+    container,
+    runDockerExec,
+    control,
+    allowMissingCredential,
+  })
   if (started?.ok) {
     started.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
-    await runDockerExec(
-      execArgv(exec, ['/usr/local/bin/kin-worker', 'telemetry', '--config', '/run/kin/worker.json'], { detach: true }),
-      { timeoutMs: 5000 },
-    )
   }
   return started
 }
 
-async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force = false }) {
+/** launchd keeps the job alive; a restart is a kickstart, or a full load when the node lost the job. */
+async function startNativeKernel(exec, { timeoutMs, control, host }) {
+  const restarted = await host.restartKernel(exec.vm, projectRootFromExec(exec))
+  if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
+  if (!restarted?.ok) {
+    return { ok: false, reason: 'start_failed', error: String(restarted?.error || 'launchd restart failed') }
+  }
+  return waitForHealth(exec, timeoutMs)
+}
+
+async function startRustKernel(
+  exec,
+  { timeoutMs, healthTimeoutMs = 800, control, runDockerExec, force = false, allowMissingCredential = false },
+) {
   if (exec?.homeDir) {
     const ids = slotUidGidFromHomeDir(exec.homeDir)
     ensureOfficialCredentialLink(exec.homeDir, ids || {})
@@ -556,7 +639,7 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
   }
   const paths = rustKernelPaths(exec)
   if (!paths.socketPath) return { ok: false, reason: 'socket_missing' }
-  const existing = await rustKernelHealth(exec, { timeoutMs: 800 })
+  const existing = await rustKernelHealth(exec, { timeoutMs: healthTimeoutMs })
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   const staleWrap = wrapNewerThanKernel(exec)
   const slotMismatch =
@@ -564,11 +647,11 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
   const occupied = rustKernelBusy(existing) || wrapHopInflight(exec) > 0
   const host = slotHost(exec?.vm)
   // Credential rotation is read by the live kernel/CLI; it is not a lifecycle change.
-  if (!force && occupied && !staleWrap && !slotMismatch) {
+  if (!allowMissingCredential && !force && occupied && !staleWrap && !slotMismatch) {
     const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
     return { ok: true, reason: 'busy', health: existing, reconcile }
   }
-  if (!force && rustKernelReachable(existing) && !staleWrap && !slotMismatch) {
+  if (!force && runtimeReady(existing, allowMissingCredential) && !staleWrap && !slotMismatch) {
     const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
     return { ok: true, reason: 'already_up', health: existing, reconcile }
   }
@@ -579,21 +662,33 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
   } catch (error) {
     return { ok: false, reason: 'slot_sync_failed', error: String(error?.message || error) }
   }
+  if (host.native) return startNativeKernel(exec, { timeoutMs, control, host })
   const container = slotContainerName(exec)
   if (!container) return { ok: false, reason: 'container_missing' }
   if (isKvmRuntime(exec?.vm)) {
-    return startKvmGuestKernel(exec, { timeoutMs, control, runDockerExec, force, host, paths, container })
+    return startKvmGuestKernel(exec, {
+      timeoutMs,
+      control,
+      runDockerExec,
+      force,
+      host,
+      paths,
+      container,
+      allowMissingCredential,
+    })
   }
   const wedged = rustKernelProcessUp(existing) && !rustKernelReachable(existing) && !occupied
   const pid1Kernel = await containerKernelIsPid1(container, runDockerExec, exec?.vm)
   const waitMs = force || staleWrap || slotMismatch ? 0 : bootWaitMs(timeoutMs, { pid1Kernel, wedged })
   if (waitMs > 0) {
-    const waited = await waitForHealth(exec, waitMs)
+    const waited = await waitForHealth(exec, waitMs, allowMissingCredential)
     if (waited?.ok) {
       waited.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
       return waited
     }
   }
+  const retired = await retireLegacyTelemetryBeforeStart(exec, runDockerExec)
+  if (!retired.ok) return retired
   try {
     if (host.ownsSocketFiles) fs.rmSync(paths.socketPath, { force: true })
   } catch {}
@@ -619,17 +714,15 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
     return { ok: false, reason, error }
   }
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
-  const started = await waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, control })
+  const started = await waitForHealthOrExit(exec, {
+    timeoutMs,
+    container,
+    runDockerExec,
+    control,
+    allowMissingCredential,
+  })
   if (started?.ok) {
     started.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
-    if (pid1Kernel) {
-      await runDockerExec(
-        execArgv(exec, ['/usr/local/bin/kin-worker', 'telemetry', '--config', '/run/kin/worker.json'], {
-          detach: true,
-        }),
-        { timeoutMs: 5000 },
-      )
-    }
   }
   return started
 }
@@ -662,12 +755,21 @@ function writeKernelJsonAtomically(configPath, config, vm) {
 export function writeKernelConfig(
   projectRoot,
   vm,
-  { token, proxyUrl, proxyRequired, officialCcInference, timezone, routing } = {},
+  { token, proxyUrl, proxyRequired, officialCcInference, timezone, routing, publish = true } = {},
 ) {
-  if (!projectRoot || !vm?.id) return null
-  const runDir = path.join(projectRoot, 'vms', vm.id, 'run')
+  const root = String(process.env.KIN_SLOT_RUN_ROOT || '').trim()
+  const runDir = root ? path.join(root, vm.id) : path.join(projectRoot, 'vms', vm.id, 'run')
   const homeDir = path.join(projectRoot, 'vms', vm.id, 'cli-home')
-  fs.mkdirSync(runDir, { recursive: true, mode: 0o700 })
+  const privileged = typeof process.getuid === 'function' && process.getuid() === 0
+  const dirMode = privileged ? 0o700 : 0o2770
+  fs.mkdirSync(runDir, { recursive: true, mode: dirMode })
+  fs.chmodSync(runDir, dirMode)
+  try {
+    // Same owner as the files inside (runtimeFileOwner). Taking every digit of a named id
+    // (account2example -> 10002) disagreed with them, and the 0700 dir locked out the slot kernel (#740).
+    const owner = runtimeFileOwner(vm)
+    fs.chownSync(runDir, privileged ? owner.uid : -1, privileged ? owner.gid : process.getgid())
+  } catch {}
   const socketPath = path.join(runDir, 'kernel.sock')
   const configPath = path.join(runDir, 'kernel.json')
   const tokenPath = path.join(runDir, 'internal.token')
@@ -690,6 +792,15 @@ export function writeKernelConfig(
   // Callers pass partial vm snapshots (summaries, exec contexts); the vm json decides placement.
   const record = getVm(projectRoot, vm.id) || vm
   const host = slotHost(record)
+  // A macOS node runs the kernel on the host itself: real node paths instead of the container mounts.
+  // Unknown until that node has connected once; the slot's own start writes the config then.
+  let nodePaths = null
+  try {
+    nodePaths = host.slotPaths?.(record) || null
+  } catch (err) {
+    if (host.native) return null
+    throw err
+  }
   const claudeBin = envBin || (dataplane === 'wrap' ? host.bins.cli : host.bins.cc)
   const tz = String(timezone || vm.timezone || previous.timezone || '').trim()
   const defaultCacheTtl = routing != null ? cacheTtlFromRouting(routing) : normalizeCacheTtl(previous.default_cache_ttl)
@@ -710,11 +821,16 @@ export function writeKernelConfig(
       ? normalizeSessionIdleTtlSeconds(previous.session_idle_ttl_seconds)
       : normalizeSessionIdleTtlSeconds(routing?.inference?.session_idle_ttl_seconds)
 
+  const modelEffort = modelEffortTable(routing, previous.model_effort)
   const kind = runtimeKind(record)
   const config = {
     vm_id: vm.id,
-    socket_path: kind === 'kvm' ? '/run/kin-guest/kernel.sock' : '/run/kin/kernel.sock',
-    credential_path: '/home/kincli/.claude/credentials.json',
+    socket_path: nodePaths
+      ? `${nodePaths.run}/kernel.sock`
+      : kind === 'kvm'
+        ? '/run/kin-guest/kernel.sock'
+        : '/run/kin/kernel.sock',
+    credential_path: nodePaths ? `${nodePaths.claude}/credentials.json` : '/home/kincli/.claude/credentials.json',
     proxy_url: '',
     proxy_required: false,
     internal_token: secret,
@@ -726,7 +842,7 @@ export function writeKernelConfig(
     session_idle_ttl_seconds: sessionIdleTtlSeconds,
     max_request_bytes: requestBytes,
     max_response_bytes: 64 * 1024 * 1024,
-    max_event_bytes: 32 * 1024 * 1024,
+    max_event_bytes: 64 * 1024 * 1024,
     runtime_kind: kind,
     test_endpoints: testEndpoints,
     provider: 'local_cli',
@@ -735,10 +851,15 @@ export function writeKernelConfig(
     slots_per_worker: wrapSlotCount(vm, routing || {}),
     persona_preset: resolveSlotPersonaPreset(vm, routing || {}),
     system_layout: resolveCliSystemLayout(vm, routing || {}),
-    cli_version: OFFICIAL_CLI_VERSION,
+    // cli-node hot-reads this per job: UA, billing cc_version and CCH input follow the slot's profile.
+    cli_version: profileForPreset(resolveSlotPersonaPreset(vm, routing || {})).cliVersion,
     default_cache_ttl: defaultCacheTtl,
+    cc_entrypoint:
+      routing == null ? (previous.cc_entrypoint === 'sdk-cli' ? 'sdk-cli' : 'cli') : ccEntrypointFromRouting(routing),
     cch_enabled: cchEnabled,
     auto_compact_window: autoCompactWindow,
+    model_effort: modelEffort,
+    ...(!host.native && !isCodexVm(record) ? { telemetry: buildNativeTelemetry(record, projectRoot, routing) } : {}),
   }
 
   if (tz) config.timezone = tz
@@ -749,8 +870,11 @@ export function writeKernelConfig(
     if (oauthTokenUrl) config.oauth_token_url = oauthTokenUrl
   }
   const changed = writeKernelJsonAtomically(configPath, config, vm)
+  try {
+    fs.chmodSync(configPath, privileged ? 0o600 : 0o640)
+  } catch {}
   // kin-kernel hot-reloads kernel.json: the change must reach wherever the slot reads it.
-  if (changed) host.queueSyncRun(record, path.join(projectRoot, 'vms', vm.id))
+  if (changed && publish) host.queueSyncRun(record, path.join(projectRoot, 'vms', vm.id))
   return {
     runDir,
     socketPath,

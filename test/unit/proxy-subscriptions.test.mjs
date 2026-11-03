@@ -27,7 +27,7 @@ const fixture = (password = 'test-secret', name = 'test node') =>
   })
 const rejectCode = (code) => (error) => error instanceof SubscriptionError && error.code === code
 
-function environment(t) {
+function environment(t, options = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-subscriptions-'))
   const db = createDatabase({ dbPath: ':memory:' })
   const pool = new ProxyPool({ db })
@@ -56,6 +56,7 @@ function environment(t) {
     runtime,
     resolver: async () => ['8.8.8.8'],
     fetcher: async () => Buffer.from(fixture()),
+    ...options,
   })
   t.after(async () => {
     await manager.close()
@@ -202,6 +203,51 @@ test('import stores encrypted secrets, maps existing pool, and restart restores 
   assert.equal(pool.snapshot().proxies.length, 1)
 })
 
+test('more than eight profiles import, refresh and restore without replacing bound or disabled routes', async (t) => {
+  const { dir, manager, pool, runtime } = environment(t)
+  await manager.start()
+  for (let i = 0; i < 8; i++) await manager.import({ name: `profile ${i}`, content: fixture(`secret-${i}`) })
+  const original = structuredClone(manager.state.nodes)
+  assert.equal(pool.bind(original[0].proxyId, 'existing-vm').ok, true)
+  pool.setEnabled(original[1].proxyId, false)
+  const ninth = await manager.import({ name: 'new profile', content: fixture('secret-8') })
+  assert.equal(ninth.profiles.length, 9)
+  assert.deepEqual(manager.state.nodes.slice(0, 8), original)
+  const newProfile = ninth.profiles[8]
+  await manager.import({ id: newProfile.id, content: fixture('secret-8', 'renamed node') })
+  const saved = structuredClone(manager.state)
+  const restored = new ProxySubscriptions({ dataDir: dir, proxyPool: pool, runtime })
+  await restored.start()
+  assert.deepEqual(restored.state, saved)
+  assert.equal(pool.getProxyForVm('existing-vm').id, original[0].proxyId)
+  assert.equal(pool.snapshot().proxies.find((p) => p.id === original[1].proxyId).enabled, false)
+  assert.equal(runtime.nodes.length, 9)
+})
+
+test('aggregate node and listener limits still reject imports atomically', async (t) => {
+  const { dir, manager, pool, runtime } = environment(t)
+  const batch = (prefix) =>
+    JSON.stringify({
+      proxies: Array.from({ length: 256 }, (_, i) => JSON.parse(fixture(`${prefix}-${i}`)).proxies[0]),
+    })
+  await manager.start()
+  await manager.import({ name: 'first half', content: batch('first') })
+  await manager.import({ name: 'second half', content: batch('second') })
+  const saved = structuredClone(manager.state)
+  const poolBefore = pool.snapshot()
+  const runtimeBefore = structuredClone(runtime.nodes)
+  const diskBefore = fs.readFileSync(path.join(dir, 'subscriptions', 'state.enc'))
+  await assert.rejects(manager.import({ content: fixture('overflow') }), rejectCode('subscription_limit'))
+  assert.deepEqual(manager.state, saved)
+  assert.deepEqual(pool.snapshot(), poolBefore)
+  assert.deepEqual(runtime.nodes, runtimeBefore)
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'subscriptions', 'state.enc')), diskBefore)
+  manager.state.nextPort = 23000
+  await assert.rejects(manager.import({ content: fixture('port-overflow') }), rejectCode('subscription_limit'))
+  assert.equal(manager.state.nextPort, 23000)
+  assert.deepEqual(runtime.nodes, runtimeBefore)
+})
+
 test('refresh retains bound old credentials and stable unchanged routes; failed validation keeps previous state', async (t) => {
   const { manager, pool, runtime } = environment(t)
   await manager.start()
@@ -345,4 +391,30 @@ test('opt-in remote subscription bindings require pinned guards and survive rest
   assert.equal(pool.getProxyForVm('vm-test'), null)
   assert.equal(pool.ensureBoundToVm('vm-test'), null)
   assert.equal(pool.allocateForVm('vm-test'), null)
+})
+
+test('two instance subscription stores allocate distinct listeners and reject a changed range on restore', async (t) => {
+  const first = environment(t, { portRange: { first: 38000, last: 38001 } })
+  const second = environment(t, { portRange: { first: 38002, last: 38003 } })
+  await first.manager.start()
+  await second.manager.start()
+  await first.manager.import({ content: fixture() })
+  await second.manager.import({ content: fixture() })
+  assert.equal(first.runtime.nodes[0].listenPort, 38000)
+  assert.equal(second.runtime.nodes[0].listenPort, 38002)
+  const saved = structuredClone(first.manager.state)
+  await first.manager.import({ content: fixture('second-node') })
+  const before = structuredClone(first.manager.state)
+  await assert.rejects(first.manager.import({ content: fixture('exhausted') }), rejectCode('subscription_limit'))
+  assert.deepEqual(first.manager.state, before)
+  const wrong = new ProxySubscriptions({
+    dataDir: first.dir,
+    proxyPool: first.pool,
+    runtime: first.runtime,
+    portRange: { first: 39000, last: 39001 },
+  })
+  await assert.rejects(wrong.start(), rejectCode('subscription_storage'))
+  assert.equal(first.runtime.running, false)
+  assert.deepEqual(second.manager.state.nodes[0].listenPort, 38002)
+  assert.equal(saved.nodes[0].proxyId, before.nodes[0].proxyId)
 })

@@ -8,7 +8,7 @@ export function configuredIpv6Enabled() {
   return isDbOpen() && new SettingsRepo(getDb()).get('proxy_pool_config')?.ipv6_enabled === true
 }
 
-export function proxyBlockedReason(proxy, ipv6Enabled = configuredIpv6Enabled()) {
+export function proxyBlockedReason(proxy, ipv6Enabled = undefined) {
   const guard = getProxyExitGuardPolicy(proxy?.id)
   if (guard.required) {
     if (
@@ -20,7 +20,9 @@ export function proxyBlockedReason(proxy, ipv6Enabled = configuredIpv6Enabled())
       return 'exit_guard_unsupported_exit'
     if (!proxy?.id || !net.isIP(guard.expected_ip) || !guard.revision) return 'exit_ip_required'
   }
-  return ipv6Enabled !== true && socksProxyFamily(proxy) === 6 ? 'ipv6_disabled' : null
+  if (socksProxyFamily(proxy) !== 6) return null
+  if (ipv6Enabled === undefined) ipv6Enabled = configuredIpv6Enabled()
+  return ipv6Enabled !== true ? 'ipv6_disabled' : null
 }
 
 export function assertProxyAllowed(proxy) {

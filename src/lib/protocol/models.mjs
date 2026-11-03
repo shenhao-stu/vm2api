@@ -15,7 +15,7 @@ import {
 } from './model-policy.mjs'
 import { hasClaudeCode1mSuffix, stripClaudeCode1mSuffix } from './context-1m.mjs'
 import { isGptSeriesId } from './gpt-ids.mjs'
-import { listGptPolicyModels } from './gpt-model-policy.mjs'
+import { listGptFastAliases, listGptPolicyModels, listImageToolModels } from './gpt-model-policy.mjs'
 
 const FAMILY_ALIASES = new Map([
   ['sonnet', 'sonnet'],
@@ -42,9 +42,9 @@ export function seedModelCatalog() {
   return setModelCatalog(ids, { source: 'model-policy' })
 }
 
-function listGptPublicModels() {
+function listGptPublicModels(mappingKeys = []) {
   try {
-    return listGptPolicyModels().map((m) => ({
+    const models = listGptPolicyModels().map((m) => ({
       id: m.id,
       object: 'model',
       type: 'model',
@@ -54,6 +54,35 @@ function listGptPublicModels() {
       enabled: m.enabled !== false,
       source: 'gpt-model-policy',
     }))
+    return [
+      ...models,
+      ...listGptFastAliases({ mappingKeys }).map((m) => ({
+        ...m,
+        object: 'model',
+        type: 'model',
+        owned_by: 'openai',
+      })),
+    ]
+  } catch {
+    return []
+  }
+}
+
+/** Enabled GPT image models, listed like OpenAI's own /v1/models so clients can find them. */
+function listImagePublicModels() {
+  try {
+    return listImageToolModels()
+      .filter((m) => m.enabled)
+      .map((m) => ({
+        id: m.id,
+        object: 'model',
+        type: 'model',
+        display_name: m.display_name,
+        owned_by: 'openai',
+        family: 'gpt-image',
+        enabled: true,
+        source: 'gpt-model-policy',
+      }))
   } catch {
     return []
   }
@@ -63,12 +92,12 @@ function listGptPublicModels() {
  * Local catalog for GET /v1/models and boot. Does not touch workers.
  * groupType is the key's group_type: openai lists GPT only, anthropic lists Claude only, all lists both.
  */
-export function gatewayModelCatalog({ groupType = 'all' } = {}) {
+export function gatewayModelCatalog({ groupType = 'all', mappingKeys = [] } = {}) {
   seedModelCatalog()
   try {
     loadModelPolicy()
   } catch {}
-  const gpt = groupType === 'anthropic' ? [] : listGptPublicModels()
+  const gpt = groupType === 'anthropic' ? [] : [...listGptPublicModels(mappingKeys), ...listImagePublicModels()]
   const claude = groupType === 'openai' ? [] : listOfficialModels()
   return {
     object: 'list',
@@ -82,7 +111,8 @@ export function isCatalogModelId(id) {
   if (s.endsWith('-') || s.endsWith('.')) return false
   if (/\.md$/i.test(s)) return false
   if (/^(gpt-[a-z0-9.-]+|codex-[a-z0-9.-]+)$/i.test(s)) return s.split(/[-.]/).length >= 2
-  if (!/^claude-(opus|sonnet|haiku|fable|3)[a-z0-9.-]*$/i.test(s)) return false
+  if (!/^claude-(opus|sonnet|haiku|fable|3)[a-z0-9.-]*$/i.test(s) && s !== 'auto') return false
+  if (s === 'auto') return true
   return s.split('-').length >= 3
 }
 
@@ -169,6 +199,7 @@ export function resolveCatalogModel(raw, ids = cache.ids) {
   const want1m = hasClaudeCode1mSuffix(popped)
   const bare = stripClaudeCode1mSuffix(popped)
   const lower = bare.toLowerCase()
+  if (lower === 'auto') return { ok: true, model: 'auto' }
   if (FAMILY_ALIASES.has(lower)) {
     const fam = FAMILY_ALIASES.get(lower)
     // Bare `opus` stays on the policy target. Rank would promote claude-opus-5-5;

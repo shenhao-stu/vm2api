@@ -7,11 +7,19 @@ import path from 'node:path'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
-import { CRS_OFFICIAL_AGENT_PROMPT } from '../../src/lib/identity/crs-persona.mjs'
+import { CRS_OFFICIAL_AGENT_PROMPT, CRS_OFFICIAL_CLI_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
+import { OFFICIAL_303_HARNESS } from '../../src/lib/identity/official-profiles.mjs'
 import { sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
 import { DEFAULT_AGENT_STANDING } from '../../src/lib/identity/persona-template.mjs'
-import { resolveInferenceBackend, messagesUrl, runApiInference } from '../../src/lib/pool/api-protocol.mjs'
+import {
+  isOpenAIResponsesCommitEvent,
+  resolveInferenceBackend,
+  messagesUrl,
+  runApiInference,
+} from '../../src/lib/pool/api-protocol.mjs'
 import { createClaudeMessageAssembler, applyClaudeSSELineToMessage } from '../../src/lib/protocol/convert.mjs'
+
+const unixTest = process.platform === 'win32' ? test.skip : test
 
 function fakeResponse() {
   return { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
@@ -40,6 +48,55 @@ test('only a managed key explicitly marked api uses the Anthropic address path',
   assert.equal(resolveInferenceBackend({ apiKeyKind: 'master', headers: { 'x-kin-backend': 'api' } }), 'oauth')
   assert.equal(resolveInferenceBackend({ apiKeyKind: 'master', apiKeyRecord: { category: 'api' } }), 'oauth')
   assert.equal(resolveInferenceBackend({ headers: { 'x-kin-backend': 'api' } }), 'oauth')
+})
+
+test('tenant api-category keys cannot reach platform API endpoints', async () => {
+  const response = fakeResponse()
+  let picked = 0
+  const handler = createHandleProtocol({
+    json: (_res, status, body) => {
+      response.status = status
+      response.body = body
+      return body
+    },
+    writeSSEHeaders() {},
+    readBody: async () => ({ model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hello' }] }),
+    requireAuth: () => true,
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
+      paths: { data: os.tmpdir() },
+    },
+    requestLog: { start: () => ({ request_id: 'api-tenant-test' }), finish() {} },
+    stickyRouter: {},
+    accountQuota: {},
+    apiKeyStore: { acquire: () => ({ ok: true }), release() {}, users: { getById: () => ({ role: 'user' }) } },
+    apiScheduler: {
+      pick: () => {
+        picked += 1
+        return { ok: false }
+      },
+    },
+    apiEndpointStore: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfig: { failover: {} },
+    groupsRepo: { rateMultiplier: () => 1 },
+  })
+  const req = {
+    method: 'POST',
+    url: '/v1/messages',
+    headers: { authorization: 'Bearer sk-vm-tenant', 'user-agent': 'test-client' },
+    apiKeyKind: 'managed',
+    apiKeyRecord: { category: 'api', user_id: 'u1' },
+    once() {},
+    off() {},
+  }
+  await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
+  assert.equal(response.status, 403)
+  assert.equal(response.body.error.code, 'api_backend_forbidden')
+  assert.equal(picked, 0)
 })
 
 test('messagesUrl appends /v1/messages?beta=true', () => {
@@ -133,8 +190,29 @@ test('API backend applies the global official_full persona setting', async () =>
     assert.equal(response.status, 200)
     assert.ok(received)
     const outbound = JSON.parse(received.body)
-    assert.equal(outbound.system.length, 5)
-    assert.equal(outbound.system[3].text, `${DEFAULT_AGENT_STANDING}\n${CRS_OFFICIAL_AGENT_PROMPT}`)
+    const texts = outbound.system.map((block) => String(block.text || ''))
+    const shape = JSON.stringify({
+      system: texts.map((t) => t.slice(0, 60)),
+      roles: outbound.messages.map((m) => m.role),
+    })
+    assert.match(texts[0], /^x-anthropic-billing-header: /, shape)
+    assert.equal(texts[1], CRS_OFFICIAL_CLI_SYSTEM, shape)
+    assert.ok(texts[2].startsWith(`${DEFAULT_AGENT_STANDING}\n${OFFICIAL_303_HARNESS}`), shape)
+    assert.equal(
+      texts.some((text) => text.includes(CRS_OFFICIAL_AGENT_PROMPT.slice(0, 80))),
+      false,
+      shape,
+    )
+    // claude-haiku-4-5 rejects mid-conversation role=system: the Environment must not reach the wire as a message.
+    assert.equal(
+      outbound.messages.some((message) => message.role === 'system'),
+      false,
+      shape,
+    )
+    assert.ok(
+      texts.some((text) => text.includes('# Environment')),
+      shape,
+    )
   } finally {
     await new Promise((resolve) => kernel.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
@@ -147,6 +225,8 @@ test('OAuth cli-hop applies the resolved Protocol custom persona template', asyn
   const compatibility = {
     persona_preset: 'custom',
     persona_inject: 'rewrite',
+    // e358143c: {{timezone}} renders only when the per-preset timezone switch is on.
+    persona_timezone_presets: { custom: true },
     persona_templates: {
       custom: [{ id: 'custom', type: 'text', text: 'CUSTOM_PERSONA {{timezone}}' }],
     },
@@ -220,8 +300,10 @@ test('OAuth cli-hop applies the resolved Protocol custom persona template', asyn
     await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
     assert.equal(response.status, 503)
     assert.ok(prepared?.body)
-    assert.equal(prepared.body.system.length, 1)
-    assert.equal(prepared.body.system[0].text, 'CUSTOM_PERSONA UTC')
+    // The rendered custom prompt plus billing survives without a second
+    // official-system rebuild inserting an extra identity block.
+    assert.equal(prepared.body.system.length, 2)
+    assert.ok(prepared.body.system.some((block) => String(block.text || '').includes('CUSTOM_PERSONA UTC')))
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -883,7 +965,7 @@ test('inbound session and device keys match across API keys at the protocol entr
   }
 })
 
-test('the protocol entry hands the device seat key to the pool, independent of the API key', async () => {
+test('the protocol entry seats each client session, even on the same device', async () => {
   const { dir, router } = realStickyRouter()
   try {
     const turn = {
@@ -900,8 +982,9 @@ test('the protocol entry hands the device seat key to the pool, independent of t
       apiKeyRecord: { id: 'key-b', group_id: 1 },
     })
     assert.equal(a.skipSessionSeat, false)
-    assert.equal(a.seatKey, 'seat:dev:dev-seat')
-    assert.equal(b.seatKey, a.seatKey)
+    assert.equal(a.seatKey, 'seat:sess:sess-seat')
+    assert.equal(b.seatKey, 'seat:sess:sess-other')
+    assert.notEqual(b.seatKey, a.seatKey)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
@@ -1437,5 +1520,167 @@ test('Responses API backend returns 502 for conflicting tool arguments when the 
     kernel.closeAllConnections()
     await new Promise((resolve) => kernel.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+test('OpenAI Responses lifecycle metadata does not commit downstream output', () => {
+  for (const type of [
+    'response.created',
+    'response.queued',
+    'response.in_progress',
+    'response.metadata',
+    'keepalive',
+  ]) {
+    assert.equal(isOpenAIResponsesCommitEvent({ type }), false, type)
+  }
+  assert.equal(isOpenAIResponsesCommitEvent({ type: 'error', error: { code: 'server_is_overloaded' } }), false)
+  assert.equal(isOpenAIResponsesCommitEvent({ type: 'response.failed' }), false)
+  assert.equal(
+    isOpenAIResponsesCommitEvent({ type: 'response.output_item.added', item: { type: 'reasoning', summary: [] } }),
+    false,
+  )
+  assert.equal(isOpenAIResponsesCommitEvent({ type: 'response.output_text.delta', delta: 'hello' }), true)
+})
+
+async function runOpenAIResponsesFixture(events) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-openai-metadata-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const kernel = http.createServer((req, response) => {
+    req.resume()
+    req.on('end', () => {
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end(events.map((event) => 'data: ' + JSON.stringify(event) + '\n\n').join('') + 'data: [DONE]\n\n')
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  let wire = ''
+  const res = {
+    headersSent: false,
+    write(chunk) {
+      wire += chunk
+    },
+  }
+  try {
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res,
+      protocol: 'openai.responses',
+      clientStream: true,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'gpt-5.4', messages: [{ role: 'user', content: 'hello' }] },
+      inbound: {},
+      converters: {
+        writeSSEHeaders: () => {
+          res.headersSent = true
+        },
+      },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'openai', protocol: 'openai', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'gpt-5.4',
+        }),
+      },
+    })
+    return { result, wire, headersSent: res.headersSent }
+  } finally {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+}
+
+unixTest('API OpenAI metadata followed by overload remains uncommitted for failover', async () => {
+  const run = await runOpenAIResponsesFixture([
+    { type: 'response.created', response: { id: 'resp_meta' } },
+    { type: 'response.queued', response: { id: 'resp_meta' } },
+    { type: 'response.metadata', response: { id: 'resp_meta' } },
+    { type: 'error', error: { type: 'server_error', code: 'server_is_overloaded', status: 503, message: 'busy' } },
+    {
+      type: 'response.failed',
+      response: { error: { type: 'server_error', code: 'server_is_overloaded', status: 503, message: 'busy' } },
+    },
+  ])
+  assert.equal(run.result.ok, false)
+  assert.equal(run.result.status, 503)
+  assert.equal(run.result.committed, false)
+  assert.equal(run.headersSent, false)
+  assert.equal(run.wire, '')
+})
+
+unixTest('API OpenAI flushes buffered metadata with the first real output', async () => {
+  const run = await runOpenAIResponsesFixture([
+    { type: 'response.created', response: { id: 'resp_ok' } },
+    { type: 'response.queued', response: { id: 'resp_ok' } },
+    { type: 'response.output_text.delta', delta: 'hello' },
+    { type: 'response.completed', response: { id: 'resp_ok', output: [] } },
+  ])
+  assert.equal(run.result.ok, true)
+  assert.equal(run.result.committed, true)
+  assert.equal(run.result.terminalState, 'verified')
+  assert.match(run.wire, /response\.created/)
+  assert.match(run.wire, /response\.queued/)
+  assert.match(run.wire, /response\.output_text\.delta/)
+  assert.match(run.wire, /response\.completed/)
+})
+
+unixTest('API Anthropic preserves UTF-8 split across transport chunks in JSON and SSE', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-utf8-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const text = '你好，Claude 👋'
+  const events = [
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 6 } },
+  ]
+  const bytes = Buffer.from(completeAnthropicSse(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('')))
+  const split = bytes.indexOf(Buffer.from('你')) + 1
+  const kernel = http.createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write(bytes.subarray(0, split))
+      setTimeout(() => res.end(bytes.subarray(split)), 5)
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  t.after(async () => {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  for (const clientStream of [false, true]) {
+    let wire = ''
+    const res = { headersSent: false, write: (chunk) => { wire += String(chunk) } }
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res,
+      protocol: 'anthropic.messages',
+      clientStream,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+      inbound: {},
+      converters: {
+        createClaudeMessageAssembler,
+        applyClaudeSSELineToMessage,
+        writeSSEHeaders: () => { res.headersSent = true },
+      },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'claude-haiku-4-5',
+        }),
+      },
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.terminalState, 'verified')
+    assert.equal(result.usage.output_tokens, 6)
+    assert.ok(clientStream ? wire.includes(text) : result.body.content[0].text === text)
+    assert.equal((clientStream ? wire : JSON.stringify(result.body)).includes('\uFFFD'), false)
   }
 })

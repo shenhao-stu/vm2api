@@ -171,7 +171,7 @@ export function FleetPulse({
       )}
     >
       <Cell
-        title='状态分区'
+        title='调度分区'
         className='sm:col-span-2 xl:col-span-4'
         meta={
           <button

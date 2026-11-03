@@ -7,6 +7,13 @@
 
 import http from 'node:http'
 import net from 'node:net'
+import {
+  instanceId,
+  instanceLabels,
+  ownsInstanceResource,
+  assertInstanceOwner,
+  INSTANCE_LABEL,
+} from '../vm/instance-scope.mjs'
 import { ClusterError, forwardOutStreamLocal } from './ssh-link.mjs'
 
 export const DOCKER_SOCKET_PATH = '/var/run/docker.sock'
@@ -193,7 +200,7 @@ export function buildCreateSpec(input = {}) {
       ...(env.length ? { Env: env } : {}),
       ...(cmd.length ? { Cmd: cmd } : {}),
       ExposedPorts: exposed,
-      Labels: { 'vm2api.cluster': '1' },
+      Labels: { 'vm2api.cluster': '1', ...instanceLabels(`container:${name || 'generated'}`) },
       HostConfig: {
         PortBindings: bindings,
         RestartPolicy: { Name: restart },
@@ -255,8 +262,11 @@ export async function dockerInfo(connect) {
 }
 
 export async function listContainers(connect) {
-  const rows = await dockerJson(connect, { path: '/containers/json?all=1' })
-  return (rows || []).map(containerView)
+  const filter = instanceId()
+    ? `&filters=${encodeURIComponent(JSON.stringify({ label: [`${INSTANCE_LABEL}=${instanceId()}`] }))}`
+    : ''
+  const rows = await dockerJson(connect, { path: `/containers/json?all=1${filter}` })
+  return (rows || []).filter((row) => !instanceId() || ownsInstanceResource(row.Labels)).map(containerView)
 }
 
 export async function pullImage(connect, image, { onLog } = {}) {
@@ -311,10 +321,32 @@ export async function createAndStartContainer(connect, input) {
   return { id, name: spec.name, image: spec.image }
 }
 
+function assertContainerInstance(inspect) {
+  if (!instanceId()) return
+  try {
+    assertInstanceOwner(inspect?.Config?.Labels, null)
+  } catch (error) {
+    throw new ClusterError(403, error.code, error.message)
+  }
+}
+
+async function requireInstanceContainer(connect, id) {
+  if (!instanceId()) return
+  const inspect = await dockerJson(connect, { path: `${containerPath(id)}/json` })
+  assertContainerInstance(inspect)
+}
+
+function createInstanceLabels(labels, resourceId) {
+  if (!instanceId()) return labels
+  if (labels?.[INSTANCE_LABEL]) assertInstanceOwner(labels, null)
+  return { ...labels, ...instanceLabels(labels?.['vm2api.resource'] || resourceId) }
+}
+
 export async function containerAction(connect, id, action, { t } = {}) {
   if (!['start', 'stop', 'restart'].includes(action)) {
     throw new ClusterError(400, 'invalid_action', '不支持的容器操作')
   }
+  await requireInstanceContainer(connect, id)
   // 304 = already in the requested state; treat as success.
   const q = action === 'stop' && Number.isFinite(Number(t)) ? `?t=${Math.max(0, Number(t))}` : ''
   await dockerJson(
@@ -325,11 +357,13 @@ export async function containerAction(connect, id, action, { t } = {}) {
 }
 
 export async function removeContainer(connect, id) {
+  await requireInstanceContainer(connect, id)
   await dockerJson(connect, { method: 'DELETE', path: `${containerPath(id)}?force=1&v=1`, timeoutMs: 60_000 }, [204])
 }
 
 /** Preserve the container object for a rollback instead of deleting it. */
 export async function renameContainer(connect, id, name) {
+  await requireInstanceContainer(connect, id)
   if (!NAME_RE.test(String(name || ''))) throw new ClusterError(400, 'invalid_name', '容器名不合法')
   await dockerJson(
     connect,
@@ -341,6 +375,7 @@ export async function renameContainer(connect, id, name) {
 export async function containerLogs(connect, id, { tail = 200 } = {}) {
   const n = Math.min(5000, Math.max(1, Number.parseInt(tail, 10) || 200))
   const inspect = await dockerJson(connect, { path: `${containerPath(id)}/json` })
+  assertContainerInstance(inspect)
   const res = await dockerRequest(connect, {
     path: `${containerPath(id)}/logs?stdout=1&stderr=1&timestamps=1&tail=${n}`,
   })
@@ -356,11 +391,14 @@ export async function inspectContainerOrNull(connect, id) {
   const res = await dockerRequest(connect, { path: `${containerPath(id)}/json`, timeoutMs: 15_000 })
   if (res.status === 404) return null
   if (res.status !== 200) throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
-  return JSON.parse(res.body.toString('utf8'))
+  const inspect = JSON.parse(res.body.toString('utf8'))
+  assertContainerInstance(inspect)
+  return inspect
 }
 
 /** Create from a full Engine API body (callers own validation). Returns the container id. */
 export async function createContainerRaw(connect, name, body) {
+  if (instanceId()) body = { ...body, Labels: createInstanceLabels(body.Labels, `container:${name}`) }
   const res = await dockerRequest(connect, {
     method: 'POST',
     path: `/containers/create?name=${encodeURIComponent(name)}`,
@@ -375,6 +413,7 @@ export async function createContainerRaw(connect, name, body) {
 
 /** `docker exec -d`: fire and forget, the exit code is not observed. */
 export async function execDetached(connect, id, cmd, { user } = {}) {
+  await requireInstanceContainer(connect, id)
   const created = await dockerJson(
     connect,
     {
@@ -401,6 +440,7 @@ function execPath(execId) {
  * @returns {Promise<{ execId: string, stream: import('node:stream').Duplex }>}
  */
 export async function openExecTty(connect, id, { cmd, env = [], workingDir, cols = 80, rows = 24 } = {}) {
+  await requireInstanceContainer(connect, id)
   const created = await dockerJson(
     connect,
     {
@@ -476,11 +516,14 @@ export async function openExecTty(connect, id, { cmd, env = [], workingDir, cols
 }
 
 export async function resizeExec(connect, execId, { cols, rows }) {
+  if (instanceId()) await inspectExec(connect, execId)
   await dockerJson(connect, { method: 'POST', path: `${execPath(execId)}/resize?h=${rows}&w=${cols}` }, [200, 201])
 }
 
 export async function inspectExec(connect, execId) {
-  return dockerJson(connect, { path: `${execPath(execId)}/json`, timeoutMs: 10_000 })
+  const info = await dockerJson(connect, { path: `${execPath(execId)}/json`, timeoutMs: 10_000 })
+  if (instanceId()) await requireInstanceContainer(connect, info.ContainerID)
+  return info
 }
 
 export async function imagePresent(connect, ref) {
@@ -494,10 +537,13 @@ export async function inspectNetworkOrNull(connect, name) {
   const res = await dockerRequest(connect, { path: `/networks/${encodeURIComponent(name)}`, timeoutMs: 15_000 })
   if (res.status === 404) return null
   if (res.status !== 200) throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
-  return JSON.parse(res.body.toString('utf8'))
+  const info = JSON.parse(res.body.toString('utf8'))
+  if (instanceId()) assertInstanceOwner(info.Labels, null)
+  return info
 }
 
 export async function createNetwork(connect, body) {
+  if (instanceId()) body = { ...body, Labels: createInstanceLabels(body.Labels, `network:${body.Name}`) }
   const res = await dockerRequest(connect, { method: 'POST', path: '/networks/create', body, timeoutMs: 30_000 })
   // 409: a concurrent create won; the caller re-inspects.
   if (res.status !== 201 && res.status !== 409) {
@@ -506,6 +552,7 @@ export async function createNetwork(connect, body) {
 }
 
 export async function removeNetwork(connect, name) {
+  if (instanceId() && !(await inspectNetworkOrNull(connect, name))) return
   const res = await dockerRequest(connect, { method: 'DELETE', path: `/networks/${encodeURIComponent(name)}` })
   // 404: already gone. 403/409: a container joined meanwhile; it keeps the network.
   if (res.status === 204 || res.status === 404 || res.status === 403 || res.status === 409) return
@@ -514,6 +561,10 @@ export async function removeNetwork(connect, name) {
 
 /** Detach a container so its static IP / aliases are free for a replacement join. */
 export async function disconnectContainerFromNetwork(connect, network, container) {
+  if (instanceId()) {
+    await requireInstanceContainer(connect, container)
+    await inspectNetworkOrNull(connect, network)
+  }
   await dockerJson(
     connect,
     {
@@ -528,6 +579,10 @@ export async function disconnectContainerFromNetwork(connect, network, container
 
 /** Re-attach a container with the endpoint it had before a failed migration rollback. */
 export async function connectContainerToNetwork(connect, network, container, endpointConfig = {}) {
+  if (instanceId()) {
+    await requireInstanceContainer(connect, container)
+    await inspectNetworkOrNull(connect, network)
+  }
   await dockerJson(
     connect,
     {

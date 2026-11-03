@@ -1,0 +1,32 @@
+# Run from the isolated runtime directory, with its own .env and image tag.
+name: vm2api-hosted
+services:
+  gateway:
+    image: ${VM2API_IMAGE:?Set the verified hosted image tag}
+    container_name: ${VM2API_CONTAINER_NAME:-vm2api-hosted}
+    restart: unless-stopped
+    init: true
+    network_mode: host
+    cap_add: [NET_ADMIN, NET_RAW]
+    mem_limit: 2g
+    memswap_limit: 2560m
+    cpus: 2
+    pids_limit: 512
+    env_file: [.env]
+    environment:
+      KIN_PROJECT_ROOT: /opt/vm2api
+      KIN_DATA_DIR: /opt/vm2api/data
+      KIN_KERNEL_BIN: /opt/vm2api/bin/kin-kernel
+      KIN_EGRESS_BIN: /opt/vm2api/bin/kin-egress
+      KIN_WORKER_BIN: /opt/vm2api/bin/kin-worker
+      KIN_CODEX_KERNEL_BIN: /opt/vm2api/bin/kin-codex-kernel
+      KIN_OAUTH_AUTH_BIN: /opt/vm2api/bin/kin-oauth-auth
+      KIN_COMPUTER_BIN: /opt/vm2api/bin/kin-computer
+      KIN_API_KERNEL_BIN: /opt/vm2api/bin/kin-api-kernel
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./vms:/opt/vm2api/vms
+      - ./data:/opt/vm2api/data
+      - ./bin:/opt/vm2api/bin
+      - ./share:/opt/vm2api/share
+      - ./src/config:/opt/vm2api/src/config

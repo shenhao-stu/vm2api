@@ -8,12 +8,42 @@ import {
   projectClaudeCodeCchText,
   sealClaudeCodeCch,
 } from '../../src/lib/identity/cch.mjs'
-import {
-  CRS_OFFICIAL_AGENT_PROMPT,
-  applyCrsUnofficialPersona,
-  buildBillingAttributionText,
-} from '../../src/lib/identity/crs-persona.mjs'
+import { applyCrsUnofficialPersona, buildBillingAttributionText } from '../../src/lib/identity/crs-persona.mjs'
+import { OFFICIAL_303_HARNESS } from '../../src/lib/identity/official-profiles.mjs'
 import { finalizeWorkerPayload } from '../../src/lib/transport/go-worker-client.mjs'
+
+test('only the first canonical system billing block is normalized, projected and sealed', () => {
+  const literal = 'x-anthropic-billing-header: cc_version=example; cch=259ed;'
+  for (const system of [
+    [
+      { type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.296; cch=fffff;' },
+      { type: 'text', text: literal },
+      { type: 'text', text: `Documentation:\n${literal}` },
+    ],
+    `x-anthropic-billing-header: cc_version=2.1.296; cch=fffff;\nDocumentation:\n${literal}`,
+  ]) {
+    const body = { messages: [{ role: 'user', content: literal }], model: 'm', system }
+    const before = structuredClone(body)
+    const projected = JSON.parse(projectClaudeCodeCchText(JSON.stringify(body)))
+    assert.deepEqual(projected.messages, body.messages)
+    const sealed = sealClaudeCodeCch(body)
+    const deferred = sealClaudeCodeCch(body, { seal: false })
+    assert.deepEqual(sealed.messages, body.messages)
+    for (const result of [projected, sealed, deferred]) {
+      if (Array.isArray(system)) assert.deepEqual(result.system.slice(1), system.slice(1))
+      else assert.equal(result.system.split('\n').slice(1).join('\n'), system.split('\n').slice(1).join('\n'))
+    }
+    assert.deepEqual(sealClaudeCodeCch(sealed), sealed)
+    assert.deepEqual(body, before)
+  }
+})
+
+test('a billing example in messages or an embedded system line is not canonical billing', () => {
+  const literal = 'x-anthropic-billing-header: cc_version=example; cch=259ed;'
+  const body = { messages: [{ role: 'user', content: literal }], system: `Documentation:\n${literal}` }
+  assert.deepEqual(sealClaudeCodeCch(body), body)
+  assert.throws(() => projectClaudeCodeCchText(JSON.stringify(body)), /billing cch not found/)
+})
 
 test('xxh64 matches Python xxhash.xxh64 intdigest vectors', () => {
   const seed = CCH_XXH64_SEED
@@ -193,7 +223,7 @@ test('applyCrsUnofficialPersona keeps the placeholder until hop finalize', () =>
   assert.equal(computeClaudeCodeCch(Buffer.from(projected, 'utf8')), cch)
 })
 
-test('no inbound system still emits billing, identity, official prompt, and env', () => {
+test('no inbound system still emits billing, identity, 303 harness, and role=system env', () => {
   const sessionId = '11111111-2222-4333-8444-555555555555'
   const out = applyCrsUnofficialPersona(
     {
@@ -202,10 +232,11 @@ test('no inbound system still emits billing, identity, official prompt, and env'
     },
     { mode: 'official_prompt', sessionId },
   )
-  assert.equal(out.system.length, 4)
   assert.match(out.system[0].text, /^x-anthropic-billing-header: /)
-  assert.equal(out.system[1].text, "You are a Claude agent, built on Anthropic's Claude Agent SDK.")
-  assert.equal(out.system[2].text, CRS_OFFICIAL_AGENT_PROMPT)
-  assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', ttl: '1h' })
-  assert.match(out.system[3].text, /^# Environment\n/)
+  assert.equal(out.system[1].text, "You are Claude Code, Anthropic's official CLI for Claude.")
+  assert.equal(out.system[2].text, OFFICIAL_303_HARNESS)
+  assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', scope: 'global' })
+  assert.equal(out.system[3].text, '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')
+  assert.equal(out.messages[1].role, 'system')
+  assert.match(out.messages[1].content, /^# Environment\n/)
 })

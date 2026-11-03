@@ -57,6 +57,7 @@ export const ErrorCode = {
   API_KEY_CONCURRENCY_LIMIT: 'api_key_concurrency_limit',
   KEY_GROUP_MISMATCH: 'key_group_mismatch',
   VM_POOL_UNAVAILABLE: 'vm_pool_unavailable',
+  API_BACKEND_FORBIDDEN: 'api_backend_forbidden',
   CLAUDE_CODE_ONLY: 'claude_code_only',
   // upstream
   UPSTREAM_AUTH: 'upstream_auth_error',
@@ -139,6 +140,8 @@ const POOL_CAPACITY_MESSAGE = /no eligible|no ready api|account pool|号池没�
 const WRAP_CONNECTION_MESSAGE = /provider error:.*connection error/i
 const USAGE_POLICY_MESSAGE =
   /usage policy|legal\/aup|unable to respond to this request|violate our usage|content_filter_refusal/i
+// Billing refusal, not a content violation and not "extra usage required".
+const UNANSWERABLE_PROMPT_MESSAGE = /third[-\s]?party apps now draw from|no third[-\s]?party apps(?:\s+are)?\s+allowed/i
 
 export function isWrapConnectionError(message = '') {
   return WRAP_CONNECTION_MESSAGE.test(String(message || ''))
@@ -146,6 +149,12 @@ export function isWrapConnectionError(message = '') {
 
 export function isUsagePolicyErrorMessage(message = '') {
   return USAGE_POLICY_MESSAGE.test(String(message || ''))
+}
+
+/** Usage Policy text, or a 400/503 the upstream will not answer for this prompt. */
+export function isUnanswerablePromptMessage(message = '') {
+  const text = String(message || '')
+  return USAGE_POLICY_MESSAGE.test(text) || UNANSWERABLE_PROMPT_MESSAGE.test(text)
 }
 
 export const REFUSAL_GUARD_MESSAGE =
@@ -547,7 +556,7 @@ export function mapUpstreamError(status, body, headers = {}, { localQuotaPolicy 
       request_id,
     })
   }
-  if (isUsagePolicyErrorMessage(msg)) {
+  if (isUnanswerablePromptMessage(msg)) {
     return makeRefusalGuardError({
       requestId: request_id,
       details: {

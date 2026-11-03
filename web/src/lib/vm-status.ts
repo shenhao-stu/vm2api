@@ -1,7 +1,8 @@
-import type { Vm } from '@/types/panel-vm'
+import type { Vm, VmKernelSnapshot } from '@/types/panel-vm'
 import type { StatusTone } from '@/types/status'
 import { pct } from '@/lib/format'
 import { isCodexVm } from '@/lib/vm-kind'
+import { kernelHopReady, kernelProcessUp } from '@/lib/wrap-health'
 
 function credTextOf(vm: Vm): { text: string; key: string; tone: string } {
   const cred = vm.cred_status
@@ -262,14 +263,32 @@ export function vmCooldown(
   }
 }
 
-/** Claude 席位悬浮说明：宽限与等并发都是 `seats_used` / `queue_depth` 的子集。 */
+/** Claude 席位悬浮说明：`seats_grace` 只在重启交接的短窗口里出现。 */
 export function seatTitle(vm: Vm): string {
   const used = Number(vm.seats_used) || 0
-  const grace = Number(vm.seats_grace) || 0
+  const held = Number(vm.seats_grace) || 0
   const queued = Number(vm.queue_depth) || 0
   const conc = Number(vm.conc_waiting) || 0
   const parts = [`席位 ${used}/${Number(vm.seats_max) || 0}`]
-  if (grace) parts.push(`宽限保留 ${grace}`)
+  if (held) parts.push(`交接 ${held}`)
+  const sessions = Array.isArray(vm.seat_sessions) ? vm.seat_sessions : []
+  if (sessions.length) {
+    const labels = sessions
+      .slice()
+      .sort((a, b) => Number(a.index) - Number(b.index))
+      .map((seat) => {
+        const id = String(seat.session_id || '')
+        const short = id.length > 13 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id
+        const state =
+          seat.state === 'active'
+            ? '进行中'
+            : seat.state === 'held'
+              ? '交接'
+              : '占用'
+        return `#${Number(seat.index)} ${short || '—'} ${state}`
+      })
+    parts.push(labels.join(' · '))
+  }
   if (queued) parts.push(`排队 ${queued}${conc ? `（等并发 ${conc}）` : ''}`)
   return parts.join(' · ')
 }
@@ -284,6 +303,8 @@ export function vmCooldownTitle(vm: Vm): string {
 
 export function accountStatus(vm: Vm | undefined): StatusTone {
   if (parkedGrantDeath(vm) || vmRevoked(vm)) return invalidCredTone(vm)
+  const unschedulable = unschedulableTone(vm)
+  if (unschedulable) return { ...unschedulable, label: unschedulable.text }
   const restricted = restrictionTone(vm)
   if (restricted) return { ...restricted, label: restricted.text }
 
@@ -430,11 +451,26 @@ export function isRestrictedSchedule(vm: Vm | undefined): boolean {
   return vm.schedule_state === 'restricted' || leftoverQuotaOff(vm)
 }
 
-export function scheduleStateLabel(vm: Vm | undefined): '开' | '受限' | '关' {
+export type ScheduleStateLabel = '开' | '受限' | '关' | '不可调度'
+
+export function scheduleStateLabel(vm: Vm | undefined): ScheduleStateLabel {
   if (!vm) return '关'
+  if (vm.schedule_state === 'unschedulable') return '不可调度'
   if (isRestrictedSchedule(vm)) return '受限'
   if (vm.schedule_state === 'off' || vm.schedulable === false) return '关'
   return '开'
+}
+
+/**
+ * 不可调度：确定性错误（凭证失效、组织禁用、代理 / 启动失败、熔断升级），
+ * 只能人工「调度开」或修复动作开回。文案取后端归因表。
+ */
+export function unschedulableTone(vm: Vm | undefined): StatusTone | null {
+  if (vm?.schedule_state !== 'unschedulable') return null
+  // 从没导入过凭证的库存槽仍归「未使用」，不算出错。
+  if (vm.unschedulable_reason === 'no_credential' && !vm.has_token) return null
+  const why = vm.unschedulable_text || vm.unschedulable_reason || '错误'
+  return { key: 'unschedulable', text: `不可调度 · ${why}`, cls: 'bad' }
 }
 
 export function restrictionUntilOf(vm: Vm | undefined): number | null {
@@ -448,6 +484,12 @@ export function restrictionUntilOf(vm: Vm | undefined): number | null {
 /** 详情冷却格与限制态共用同一套文案，不另起一套冷却系统。 */
 export function restrictionCopy(vm: Vm | undefined): string {
   if (!vm) return '无限制'
+  const unschedulable = unschedulableTone(vm)
+  if (unschedulable) {
+    const detail = vm.unschedulable_detail || {}
+    const message = String(detail.message || detail.raw || '').trim()
+    return message ? `${unschedulable.text}：${message}` : unschedulable.text
+  }
   const restricted = restrictionTone(vm)
   if (restricted) return restricted.text
   if (vmCooldown(vm)) return restrictionLabel(vm, '冷却中')
@@ -455,6 +497,7 @@ export function restrictionCopy(vm: Vm | undefined): string {
 }
 
 function restrictionLabel(vm: Vm, fallback: string): string {
+  if (vm.restriction_text) return vm.restriction_text
   const raw = String(vm.availability?.text || '').trim()
   if (raw && raw !== '调度关' && vm.availability?.key !== 'off') return raw
   const reason = String(
@@ -474,6 +517,21 @@ function restrictionTone(vm: Vm | undefined): StatusTone | null {
     const reason = String(
       vm.restriction_reason || vm.availability?.reason || ''
     )
+    // 只拦新会话（席位满 / 对话窗口满 / 临近闸线）：已入座会话照常在跑。
+    if (vm.restriction_scope === 'new_session') {
+      return {
+        key: /draining/.test(reason) ? 'drain' : 'seats',
+        text: restrictionLabel(vm, '席位满'),
+        cls: 'caution',
+      }
+    }
+    if (/^circuit_/.test(reason)) {
+      return {
+        key: 'circuit',
+        text: restrictionLabel(vm, '熔断中'),
+        cls: 'bad',
+      }
+    }
     // 休息时段是操作员排班，不是上游冷却：单独成态，别引人去点「清冷却」。
     if (vm.availability?.key === 'rest' || /rest_period/.test(reason)) {
       return {
@@ -510,14 +568,16 @@ function seatsFullTone(vm: Vm | undefined): StatusTone | null {
 }
 
 /**
- * 状态优先级：吊销/废票 → 额度上限 / 门禁（受限）→ 503 熔断 → 调度关 →
- * 临近闸线 → 席位满 → 其余。受限与调度关互斥（后端 triad 先判调度关）。
- * 临近闸线仍在接单，所以排在熔断之后：熔断中的槽确实不接单，要让人看见。
+ * 状态优先级：吊销/废票 → 不可调度 → 受限（额度 / 门禁 → 熔断 → 冷却 →
+ * 临近闸线 → 席位满，后端 `resolveSlotState` 已排好）→ 调度关 → 其余。
+ * 受限、不可调度与调度关互斥（后端先判调度关）。
  */
 export function poolStatus(vm: Vm | undefined): StatusTone {
   // 吊销 / 废票先判：它可能同时带着 off / quota 的 availability.key，照 key
   // 判会显示成「调度关」，把真正的死因盖掉。
   if (parkedGrantDeath(vm) || vmRevoked(vm)) return invalidCredTone(vm)
+  const unschedulable = unschedulableTone(vm)
+  if (unschedulable) return unschedulable
   const restricted = restrictionTone(vm)
   if (restricted) return restricted
   // 调度关优先于熔断：操作员关掉的槽不显示熔断。
@@ -606,12 +666,80 @@ export function accountUsable(vm: Vm | undefined): boolean {
   return Boolean(vm?.has_token) && credentialStatus(vm).cls !== 'bad'
 }
 
+/** Runtime state is independent of credentials; unknown is never reported running. */
 export function vmRunning(vm: Vm | undefined): boolean {
   if (!vm) return false
-  const s = String(vm.status || '').toLowerCase()
-  if (s === 'stopped' || s === 'dead' || s === 'disabled') return false
-  if (!vm.has_token) return false
-  return Boolean(vm.active || s === 'running' || s === 'ok' || !s)
+  const status = String(vm.status || '').toLowerCase()
+  return status === 'running' || status === 'ok'
+}
+
+/** Operator guidance reuses the server's schedule reason and existing pool status. */
+export function vmNextAction(vm: Vm): string {
+  const status = poolStatus(vm)
+  const reason = String(
+    vm.unschedulable_reason ||
+      vm.restriction_reason ||
+      vm.schedule_hold?.reason ||
+      vm.schedule_disabled_reason ||
+      ''
+  )
+  if (status.key === 'none')
+    return isCodexVm(vm)
+      ? '在「账号」导入凭证，完成授权和连接检查后再开启调度。'
+      : '在「账号」导入 Claude Cookie，完成授权和连接检查后再开启调度。'
+  if (/exit_guard|exit_ip|fixed_egress/.test(reason))
+    return '核对绑定线路和固定出口，再按恢复流程解除保护。'
+  if (/proxy|egress/.test(reason))
+    return '检查绑定线路和出口；恢复前保留当前绑定。'
+  if (status.key === 'off') return '人工暂停中；需要接单时打开调度。'
+  if (vm.schedule_hold?.reason === 'maintenance' || reason === 'maintenance')
+    return '等待维护完成，由维护任务解除暂停。'
+  if (/node_offline|worker_unhealthy|kernel_fault|runtime_start/.test(reason))
+    return '检查服务器连接和槽服务，确认健康后恢复。'
+  if (status.cls === 'bad') return '在「账号」检查授权；凭证失效时重新导入。'
+  if (vm.restriction_scope === 'new_session' || status.key === 'seats')
+    return '已有会话继续运行，新会话等待空余容量。'
+  if (status.key === 'quota') return '等待额度窗口重置；不需要重新导入凭证。'
+  if (status.key === 'rest') return '等待下个工作时段，或调整排班。'
+  if (status.key === 'cool' || status.key === 'circuit')
+    return '等待冷却结束后重新检查，不需要重复开启调度。'
+  return ''
+}
+
+/** Credential validity and a running container alone do not prove dispatch readiness. */
+export function vmServiceStatus(
+  vm: Vm,
+  kernel?: VmKernelSnapshot | null
+): StatusTone {
+  const pool = poolStatus(vm)
+  if (pool.key === 'none') return { ...pool, text: '待导入凭证' }
+  if (pool.key === 'off') return { ...pool, text: '人工暂停' }
+  if (pool.key !== 'pool' && pool.key !== 'ok') return pool
+  const health = isCodexVm(vm)
+    ? kernel?.codex_health
+    : kernel?.rust_health || kernel?.go_health
+  if (!health)
+    return {
+      key: 'unknown',
+      cls: 'caution',
+      text: '健康待确认',
+      label: '尚未取得槽服务健康状态',
+    }
+  if (!kernelProcessUp(health))
+    return { key: 'unreachable', cls: 'bad', text: '服务不可达' }
+  if (!kernelHopReady(health))
+    return {
+      key: 'waiting',
+      cls: 'caution',
+      text: '等待可用容量',
+      label: '服务进程在运行，当前没有就绪容量',
+    }
+  return {
+    key: 'ok',
+    cls: 'ok',
+    text: '可接单',
+    label: '调度开启，槽服务已就绪',
+  }
 }
 
 /** Same mapping as codex-proxy-rs `plan_type_display`; unknown raw values pass through. */
@@ -694,7 +822,7 @@ export function vmBuckets(vms: Vm[]) {
 }
 
 export type FleetGroup =
-  'pool' | 'restricted' | 'off' | 'none' | 'bad' | 'revoke'
+  'pool' | 'restricted' | 'off' | 'none' | 'bad' | 'revoke' | 'unschedulable'
 
 /** Coarse fleet grouping for the VM list. 受限 is the triad, not 5h/7d warning. */
 export function fleetGroup(vm: Vm): FleetGroup {
@@ -702,6 +830,7 @@ export function fleetGroup(vm: Vm): FleetGroup {
   const k = status.key
   if (k === 'revoke') return 'revoke'
   if (k === 'bad') return 'bad'
+  if (k === 'unschedulable') return 'unschedulable'
   if (k === 'none') return 'none'
   if (k === 'off') return 'off'
   if (isRestrictedSchedule(vm) || k === 'cool' || k === 'rest')
@@ -720,6 +849,7 @@ export function fleetCounts(vms: Vm[]): Record<FleetGroup | 'all', number> {
     none: 0,
     bad: 0,
     revoke: 0,
+    unschedulable: 0,
   }
   for (const vm of vms) c[fleetGroup(vm)] += 1
   return c
@@ -733,7 +863,7 @@ export function fleetCounts(vms: Vm[]): Record<FleetGroup | 'all', number> {
  */
 export function vmCredDead(vm: Vm): boolean {
   const g = fleetGroup(vm)
-  return g === 'bad' || g === 'revoke'
+  return g === 'bad' || g === 'revoke' || g === 'unschedulable'
 }
 
 /**

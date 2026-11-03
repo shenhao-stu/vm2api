@@ -5,6 +5,7 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { OFFICIAL_CLAUDE_CLI_UA } from '../../src/lib/identity/vm-identity.mjs'
 import { anthropicClientHeaders } from '../../src/lib/pool/api-protocol.mjs'
 import { telemetryIngressResponse, isTelemetryPath } from '../../src/lib/identity/telemetry-rewrite.mjs'
 
@@ -181,7 +182,7 @@ test('default API behavior retains existing persona and token floor', async (t) 
   const forwarded = JSON.parse(received[0].body)
   assert.equal(forwarded.max_tokens, 128)
   assert.notDeepEqual(forwarded.system, body.system)
-  assert.equal(received[0].headers['user-agent'], undefined)
+  assert.equal(received[0].headers['user-agent'], OFFICIAL_CLAUDE_CLI_UA)
 })
 
 test('raw relay profile rejects another wire protocol before dispatch', async (t) => {

@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 
@@ -13,6 +14,19 @@ import (
 type Server struct {
 	Token string
 	Pool  *pool.Manager
+}
+
+type eventStreamWriter struct {
+	writer     io.Writer
+	controller *http.ResponseController
+}
+
+func (w eventStreamWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	if err == nil {
+		err = w.controller.Flush()
+	}
+	return n, err
 }
 
 type forwardEnv struct {
@@ -94,7 +108,11 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	var dst io.Writer = w
+	if mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mediaType == "text/event-stream" {
+		dst = eventStreamWriter{writer: w, controller: http.NewResponseController(w)}
+	}
+	_, _ = io.Copy(dst, resp.Body)
 }
 
 func jsonQuote(s string) string {

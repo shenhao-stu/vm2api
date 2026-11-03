@@ -143,6 +143,21 @@ test('request gates preserve caller opt-ins and remain isolated between requests
   assert.deepEqual(withRequestProtocolBetas(['caller-beta'], { model: 'claude-sonnet-4-6' }), ['caller-beta'])
 })
 
+test('auto gets tool-changes because it is absent from the catalog and not per-turn', () => {
+  const auto = withRequestProtocolBetas(['caller-beta'], { model: 'auto' })
+  assert.deepEqual(auto, ['caller-beta', 'mid-conversation-tool-changes-2026-07-01'])
+})
+test('a cache scope adds prompt-caching-scope and a bare marker does not', () => {
+  const scoped = withRequestProtocolBetas([], {
+    system: [{ type: 'text', text: 'harness', cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global' } }],
+  })
+  assert.ok(scoped.includes('prompt-caching-scope-2026-01-05'))
+  const plain = withRequestProtocolBetas([], {
+    system: [{ type: 'text', text: 'harness', cache_control: { type: 'ephemeral' } }],
+  })
+  assert.ok(!plain.includes('prompt-caching-scope-2026-01-05'))
+})
+
 test('explicit fallback requests arm only the corresponding server beta', () => {
   const defaultFallback = withRequestProtocolBetas([], { fallbacks: 'default' })
   assert.ok(defaultFallback.includes('server-side-fallback-2026-07-01'))
@@ -165,4 +180,35 @@ test('credit replay arms its beta only for an official bounded token', () => {
   }
   assert.deepEqual(withRequestProtocolBetas([creditBeta], { fallback_credit_token: 'credit' }), [creditBeta])
   assert.deepEqual(withRequestProtocolBetas([], {}), [])
+})
+
+test('a tool_addition tool_definition appends inline-tools and nothing else does', () => {
+  const beta = 'inline-tools-2026-09-15'
+  const definition = {
+    type: 'tool_addition',
+    tool: {
+      type: 'tool_definition',
+      definition: { name: 'lookup', description: 'lookup', input_schema: { type: 'object' } },
+    },
+  }
+  const armed = withRequestProtocolBetas(['caller-beta'], {
+    model: 'claude-opus-5-5',
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'system', content: [{ type: 'text', text: 'note' }, definition] },
+    ],
+  })
+  assert.ok(armed.includes(beta))
+  assert.equal(armed.filter((token) => token === beta).length, 1)
+  assert.equal(armed[0], 'caller-beta')
+  assert.deepEqual(withRequestProtocolBetas([beta], { messages: [{ role: 'system', content: [definition] }] }), [beta])
+  for (const messages of [
+    [{ role: 'system', content: 'note' }],
+    [{ role: 'system', content: [{ type: 'text', text: 'note' }] }],
+    [{ role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'lookup', input: {} }] }],
+    [{ role: 'system', content: [{ type: 'tool_addition', tool: { type: 'tool_reference', name: 'lookup' } }] }],
+    [{ role: 'system', content: [{ type: 'tool_addition' }] }],
+  ]) {
+    assert.ok(!withRequestProtocolBetas(['caller-beta'], { messages }).includes(beta))
+  }
 })

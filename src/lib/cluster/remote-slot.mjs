@@ -27,15 +27,16 @@ import {
   portsForProxy,
   proxyKey,
 } from '../vm/egress.mjs'
+import { assertInstanceOwner, egressIdentity, instanceId, instanceLabels, slotContainerForVm } from '../vm/instance-scope.mjs'
 import { OS_CATALOG } from '../vm/os-catalog.mjs'
 import { REMOTE_KERNEL_ENTRY, resolveKernelDataplane } from '../vm/slot-engine.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { exitGuardVmRejection, getProxyExitGuardPolicy } from '../vm/proxy-exit-guard.mjs'
 import { ensureGuardedNodeProxy, releaseGuardedNodeProxy } from './guarded-node-relay.mjs'
-import { isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
-import { slotMemory, slotDockerCpus, memoryMiB, normalizeVmConfig, VM_CONFIG_DEFAULTS } from '../vm/machine-spec.mjs'
+import { slotMemory, slotDockerCpus, memoryMiB, normalizeVmConfig } from '../vm/machine-spec.mjs'
+import { dockerEnvMap, ensureKvmMachineRecord, kvmEnvMapIncomplete, kvmMachineFields } from '../vm/kvm-machine.mjs'
 import { slotExecArgv, slotExecCmd } from '../vm/slot-exec.mjs'
 import {
   CODEX_SLOT_ROLE,
@@ -61,9 +62,11 @@ import {
   removeNetwork,
   renameContainer,
 } from './docker-remote.mjs'
+import { refreshNativeSlotPayload, currentNativePayloadDigest } from './native-slot.mjs'
 import {
   awaitSlotImageBuild,
   clusterManager,
+  isNativeNodeVm,
   nodeSession,
   parseMemoryBytes,
   remoteSlotDir,
@@ -72,6 +75,7 @@ import {
   vmNodeId,
 } from './placement.mjs'
 import { openSftp, readRemoteFileNoFollow, runRemote, shellQuote, writeRemoteFile } from './remote-fs.mjs'
+
 import {
   pushSlotBinaries,
   pushSlotFiles,
@@ -79,7 +83,7 @@ import {
   remoteSlotPath,
   removeRemoteSlotDir,
 } from './remote-slot-files.mjs'
-import { REMOTE_WORKER_BIN, slotImageSpec } from './slot-image.mjs'
+import { slotImageSpec } from './slot-image.mjs'
 
 /** Bump when the slot's mount layout changes; a running container with an older label is recreated. */
 const SLOT_LAYOUT = '3'
@@ -384,6 +388,7 @@ async function ensureRemoteNetwork(docker, { name, bridge, masquerade, labels = 
     })
     info = await inspectNetworkOrNull(docker, name)
   }
+  if (info) assertInstanceOwner(info.Labels, labels['vm2api.resource'])
   const subnet = info?.IPAM?.Config?.[0]?.Subnet || ''
   if (!subnet) throw Object.assign(new Error(`egress network ${name} has no subnet`), { code: 'egress_network_failed' })
   const gateway = info.IPAM.Config[0].Gateway || gatewayFromSubnet(subnet)
@@ -397,7 +402,7 @@ async function ensureRemoteNetwork(docker, { name, bridge, masquerade, labels = 
  */
 export function slotEgressNames(vmId) {
   const slot = containerName(vmId)
-  const tag = crypto.createHash('sha1').update(String(vmId)).digest('hex').slice(0, 10)
+  const tag = crypto.createHash('sha1').update(instanceId() ? slot : String(vmId)).digest('hex').slice(0, 10)
   return {
     slot,
     network: `${slot}-net`,
@@ -431,6 +436,7 @@ export function remoteEgressContainer({ vmId, proxyId, dir, imageRef, body, host
       User: user,
       Cmd: [`${LIVE_BIN}/kin-egress`, '-config', '/etc/kin-egress/egress.json'],
       Labels: {
+        ...instanceLabels(`slot-egress:${vmId}`),
         'kin.egress': '1',
         'kin.egress.vm': vmId,
         'kin.egress.proxy': proxyId,
@@ -476,6 +482,7 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
       name: networkName(id),
       bridge: bridgeName(id),
       masquerade: true,
+      labels: egressIdentity(LOCAL_EGRESS_ID).labels,
     })
     return { ok: true, mode: 'local', network: net.name, egress: null }
   }
@@ -498,7 +505,7 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
     name: names.network,
     bridge: names.bridge,
     masquerade: false,
-    labels: { 'kin.egress.vm': vm.id },
+    labels: { 'kin.egress.vm': vm.id, ...instanceLabels(`slot-network:${vm.id}`) },
   })
   const cfg = {
     proxy_id: proxyId,
@@ -523,6 +530,7 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
     binaryDigest,
   })
   const existing = await inspectContainerOrNull(session.docker, names.egress)
+  if (existing) assertInstanceOwner(existing.Config?.Labels, `slot-egress:${vm.id}`)
   if (!canReuseRemoteEgress(existing, digest)) {
     await runRemote(session.client, `umask 077 && mkdir -p ${shellQuote(dir)} && chmod 700 ${shellQuote(dir)}`)
     await writeRemoteFile(await openSftp(session.client), `${dir}/egress.json`, body, { mode: 0o600 })
@@ -552,13 +560,18 @@ export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {
   if (rejected) return rejected
   try {
     const session = await nodeSession(vmNodeId(vm))
-    const current = vm.runtime?.egress_container || slotEgressNames(vm.id).egress
-    const legacy = `kin-egress-${proxyKey(vm.proxy?.id)}`
+    const expected = slotEgressNames(vm.id).egress
+    const current = vm.runtime?.egress_container || expected
+    if (instanceId() && current !== expected) {
+      throw Object.assign(new Error('egress container does not belong to this instance'), { code: 'instance_scope_conflict' })
+    }
+    const legacy = instanceId() ? expected : `kin-egress-${proxyKey(vm.proxy?.id)}`
     if (enabled) {
       const blocked = proxyBlockedReason(vm.proxy)
       if (blocked) return { ok: false, code: blocked, error: blocked }
       const name = vm.runtime?.network === networkName(vm.proxy?.id) ? legacy : current
       const existing = await inspectContainerOrNull(session.docker, name)
+      if (existing) assertInstanceOwner(existing.Config?.Labels, `slot-egress:${vm.id}`)
       if (existing && !getProxyExitGuardPolicy(vm.proxy?.id).required) {
         if (!existing.State?.Running) await containerAction(session.docker, name, 'start')
         return { ok: true }
@@ -569,6 +582,7 @@ export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {
     }
     for (const name of new Set([current, legacy])) {
       const existing = await inspectContainerOrNull(session.docker, name)
+      if (existing) assertInstanceOwner(existing.Config?.Labels, `slot-egress:${vm.id}`)
       if (existing?.State?.Running) await containerAction(session.docker, name, 'stop')
     }
     await releaseGuardedNodeProxy(session.client, vm.id)
@@ -591,7 +605,8 @@ function exitOf(name, info, host) {
       dir: `${remoteSlotDir(host, vmId)}/egress`,
     }
   }
-  const proxyId = name.slice('kin-eg-'.length)
+  const resource = String(info.Labels?.['vm2api.resource'] || '')
+  const proxyId = resource.startsWith('proxy:') ? resource.slice('proxy:'.length) : name.slice('kin-eg-'.length)
   if (isLocalEgressProxy({ id: proxyId })) return { egress: null }
   const key = proxyKey(proxyId)
   return {
@@ -612,12 +627,17 @@ export async function releaseRemoteEgress(session, networkMode) {
   const name = String(networkMode || '')
   const info = name ? await inspectNetworkOrNull(session.docker, name) : null
   if (!info) return { released: false }
+  assertInstanceOwner(info.Labels, null)
   const owned = !!info.Labels?.['kin.egress.vm'] || name.startsWith('kin-eg-')
   if (!owned) return { released: false }
   if (Object.keys(info.Containers || {}).length) return { released: false, reason: 'in_use' }
   const exit = exitOf(name, info, session.host)
-  if (exit.egress && (await inspectContainerOrNull(session.docker, exit.egress))) {
-    await removeContainer(session.docker, exit.egress)
+  if (exit.egress) {
+    const helper = await inspectContainerOrNull(session.docker, exit.egress)
+    if (helper) {
+      assertInstanceOwner(helper.Config?.Labels, info.Labels?.['kin.egress.vm'] ? `slot-egress:${info.Labels['kin.egress.vm']}` : null)
+      await removeContainer(session.docker, exit.egress)
+    }
   }
   const subnet = info.IPAM?.Config?.[0]?.Subnet
   if (exit.egress && subnet) {
@@ -648,27 +668,6 @@ async function probeRemoteAccel(session, routing) {
   } catch {
     if (allowTcg) return { ok: true, accel: 'tcg' }
     return { ok: false, error: '节点没有 /dev/kvm，且未允许 TCG' }
-  }
-}
-
-function kvmMachineFields(vm) {
-  const m = vm.machine && typeof vm.machine === 'object' ? vm.machine : {}
-  const smbios = m.smbios && typeof m.smbios === 'object' ? m.smbios : {}
-  const d = VM_CONFIG_DEFAULTS
-  return {
-    vcpus: Number.isInteger(m.vcpus) ? m.vcpus : d.vcpus,
-    disk_gb: Number.isInteger(m.disk_gb) ? m.disk_gb : d.disk_gb,
-    cpu_model: m.cpu_model || d.cpu_model,
-    mac: m.mac || '',
-    smbios: {
-      manufacturer: smbios.manufacturer || d.smbios.manufacturer,
-      product: smbios.product || d.smbios.product,
-      version: smbios.version || d.smbios.version,
-      family: smbios.family || d.smbios.family,
-      serial: smbios.serial || '',
-      uuid: smbios.uuid || '',
-    },
-    disk_serial: m.disk_serial || '',
   }
 }
 
@@ -711,6 +710,7 @@ function kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, s
       'KIN_KVM_SHARES=home,run,claude',
     ],
     Labels: {
+      ...instanceLabels(`slot:${vm.id}`),
       'kin.vm': '1',
       'kin.vm.id': vm.id,
       'kin.vm.name': slotName,
@@ -769,6 +769,7 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
     // Node images bake the Claude kernel here; local slots bind-mount a different path.
     Cmd: codex ? ['sleep', 'infinity'] : [REMOTE_KERNEL_ENTRY, '--gateway-worker', '--config', '/run/kin/kernel.json'],
     Labels: {
+      ...instanceLabels(`slot:${vm.id}`),
       'kin.vm': '1',
       'kin.vm.id': vm.id,
       'kin.vm.name': slotName,
@@ -858,29 +859,53 @@ async function ensureNodeSlotImage(session, nodeId, projectRoot, kernel, runtime
 }
 
 /**
- * Current control-plane payload (kernel, cli-node, cc-node, kin-worker telemetry)
+ * Current control-plane payload (kernel, cli-node, cc-node and OAuth helpers)
  * as a slot image on this node. Same bytes local slots bind-mount; a node only
  * sees them after the content-hashed image exists and the container is recreated.
  */
 export async function refreshNodeSlotPayload(
   vm,
   projectRoot,
-  { routing, recreate = true, startFn = startRemoteSlot } = {},
+  {
+    routing,
+    recreate = true,
+    startFn = startRemoteSlot,
+    sessionFor = nodeSession,
+    inspect = inspectContainerOrNull,
+  } = {},
 ) {
   const id = vm?.id
   const nodeId = vmNodeId(vm)
   if (!id || !nodeId) return { id, ok: false, code: 'not_cluster_slot', error: '不是集群槽' }
+  if (isNativeNodeVm(vm)) return refreshNativeSlotPayload(vm, projectRoot, { routing, recreate })
   const kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
   const kind = runtimeKind(vm)
   try {
-    const session = await nodeSession(nodeId)
+    const session = await sessionFor(nodeId)
+    const running = recreate !== false && vm.status === 'running'
+    // Upgrade and the entrypoint auto-sync both land here: a slot already up on this payload stays up.
+    if (running) {
+      const ref = slotImageSpec(projectRoot, kernel, { runtime: kind }).ref
+      const info = await inspect(session.docker, slotContainerForVm(vm))
+      if (info) assertInstanceOwner(info.Config?.Labels, `slot:${vm.id}`)
+      if (info?.State?.Running && info.Config?.Image === ref) {
+        return {
+          id,
+          node_id: nodeId,
+          ok: true,
+          image: ref,
+          kernel_changed: false,
+          restarted: false,
+          kernel: { ok: true, skipped: true, reason: 'unchanged' },
+        }
+      }
+    }
     const spec = await ensureNodeSlotImage(session, nodeId, projectRoot, kernel, kind)
     if (spec.fail) return { id, node_id: nodeId, ...spec.fail }
     if (kind === 'kvm') {
       const dockerSpec = await ensureNodeSlotImage(session, nodeId, projectRoot, kernel, 'docker')
       if (dockerSpec.fail) return { id, node_id: nodeId, ...dockerSpec.fail }
     }
-    const running = recreate !== false && vm.status === 'running'
     if (!running) {
       return {
         id,
@@ -922,6 +947,60 @@ export async function refreshNodeSlotPayload(
     }
   }
 }
+export async function inspectClusterPayloadChanges(
+  projectRoot,
+  vms,
+  {
+    routing,
+    sessionFor = nodeSession,
+    inspect = inspectContainerOrNull,
+    nativeVm = isNativeNodeVm,
+    nativeDigestFor = currentNativePayloadDigest,
+  } = {},
+) {
+  const items = []
+  const nativeDigest = nativeDigestFor(projectRoot)
+  for (const vm of vms || []) {
+    if (isCodexVm(vm)) continue
+    const nodeId = vmNodeId(vm)
+    if (nativeVm(vm)) {
+      items.push({
+        id: vm.id,
+        node_id: nodeId,
+        ok: nativeDigest != null,
+        baked: true,
+        native: true,
+        code: nativeDigest ? undefined : 'native_payload_missing',
+        kernel_changed: nativeDigest != null && vm.runtime?.payload_digest !== nativeDigest,
+      })
+      continue
+    }
+    const kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
+    const spec = slotImageSpec(projectRoot, kernel, { runtime: runtimeKind(vm) })
+    const session = await sessionFor(nodeId)
+    const info = await inspect(session.docker, slotContainerForVm(vm))
+    if (info) assertInstanceOwner(info.Config?.Labels, `slot:${vm.id}`)
+    const current = String(info?.Config?.Image || '')
+    items.push({
+      id: vm.id,
+      node_id: nodeId,
+      ok: true,
+      baked: true,
+      image: spec.ref,
+      kernel_changed: current !== spec.ref,
+    })
+  }
+  const changed = items.filter((item) => item.kernel_changed)
+  return {
+    ok: true,
+    changed: changed.length > 0,
+    total: items.length,
+    ok_count: items.length,
+    failed_count: 0,
+    changed_count: changed.length,
+    items,
+  }
+}
 
 /** One image build per node+kernel+runtime, then recreate each slot onto it. */
 export async function refreshClusterSlotPayloads(
@@ -932,7 +1011,7 @@ export async function refreshClusterSlotPayloads(
   const groups = new Map()
   const items = []
   for (const vm of vms || []) {
-    // Codex inference is the host Codex kernel. The slot has no cli-node or Go telemetry.
+    // Codex inference is the host Codex kernel; this update targets Claude CLI payloads.
     if (isCodexVm(vm)) continue
     if (resolveKernelDataplane(vm, routing || {}) === 'crag' || vm?.dataplane === 'crag') {
       items.push({
@@ -1018,15 +1097,6 @@ export function codexRoleMatches(info, vm) {
   return isCodexVm(vm) ? role === CODEX_SLOT_ROLE : role !== CODEX_SLOT_ROLE
 }
 
-async function startRemoteTelemetry(docker, vm, name) {
-  const target = { ...vm, runtime: { ...(vm.runtime || {}), container: name, type: runtimeKind(vm) } }
-  const worker = isKvmRuntime(vm) ? '/opt/kin-payload/opt/kin-live/kin-worker' : REMOTE_WORKER_BIN
-  const { Cmd, User } = slotExecCmd(target, [worker, 'telemetry', '--config', '/run/kin/worker.json'], {
-    detach: true,
-  })
-  await execDetached(docker, name, Cmd, { user: User }).catch(() => {})
-}
-
 async function chownRemoteKvmBinds(session, name, vm) {
   if (!isKvmRuntime(vm)) return
   await runRemote(session.client, kvmBindChownArgv(name, vm).map(shellQuote).join(' '), { timeoutMs: 15_000 })
@@ -1056,9 +1126,17 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       projectRoot,
     })
     if (!eg.ok) return eg
-    const name = containerName(vm.id)
+    const name = slotContainerForVm(vm)
     const relays = await clusterManager().ensureSlotRelays(nodeId, vm.id)
     let existing = await inspectContainerOrNull(session.docker, name)
+    if (existing) assertInstanceOwner(existing.Config?.Labels, `slot:${vm.id}`)
+    if (kvm && existing) {
+      ensureKvmMachineRecord(vm, {
+        projectRoot,
+        containerEnv: dockerEnvMap(existing.Config?.Env),
+        persist: true,
+      })
+    }
     const matches =
       existing &&
       existing.Config?.Image === image &&
@@ -1089,7 +1167,8 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       return { ok: true, action: 'already-running', runtime: vm.runtime }
     }
     let previousNetwork = null
-    if (existing && !matches) {
+    const envBroken = kvm && existing && kvmEnvMapIncomplete(dockerEnvMap(existing.Config?.Env), existing.Config?.Env)
+    if (existing && (!matches || envBroken)) {
       previousNetwork = existing.HostConfig?.NetworkMode
       await removeContainer(session.docker, name)
       existing = null
@@ -1117,7 +1196,6 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
     }
     await containerAction(session.docker, name, 'start')
     await chownRemoteKvmBinds(session, name, vm)
-    await startRemoteTelemetry(session.docker, vm, name)
     applyRuntime(vm, { ...common, info: await inspectContainerOrNull(session.docker, name) })
     return { ok: true, action, runtime: vm.runtime }
   } catch (err) {
@@ -1142,8 +1220,9 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
       projectRoot,
     })
     if (!eg.ok) return eg
-    const name = containerName(vm.id)
+    const name = slotContainerForVm(vm)
     const existing = await inspectContainerOrNull(session.docker, name)
+    if (existing) assertInstanceOwner(existing.Config?.Labels, `slot:${vm.id}`)
     if (
       !existing ||
       existing.Config?.Image !== image ||
@@ -1171,7 +1250,6 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
       await containerAction(session.docker, name, running ? 'restart' : 'start')
       await chownRemoteKvmBinds(session, name, vm)
     }
-    await startRemoteTelemetry(session.docker, vm, name)
     applyRuntime(vm, {
       nodeId,
       name,
@@ -1202,8 +1280,9 @@ export async function migrateRemoteServiceContainers(vm, projectRoot) {
     const slotBin = `${remoteDir}/slot-bin`
     const binaries = await pushSlotBinaries(vm, projectRoot, session)
     const migrated = []
-    const slotName = vm.runtime?.container || containerName(vm.id)
+    const slotName = slotContainerForVm(vm)
     const slot = await inspectContainerOrNull(session.docker, slotName)
+    if (slot) assertInstanceOwner(slot.Config?.Labels, `slot:${vm.id}`)
     if (needsLegacyServiceMigration(slot, { sourceDir: slotBin })) {
       const body = legacyServiceContainerBody(slot, {
         name: slotName,
@@ -1219,6 +1298,7 @@ export async function migrateRemoteServiceContainers(vm, projectRoot) {
     }
     const egressName = slotEgressNames(vm.id).egress
     const egress = await inspectContainerOrNull(session.docker, egressName)
+    if (egress) assertInstanceOwner(egress.Config?.Labels, `slot-egress:${vm.id}`)
     if (needsLegacyServiceMigration(egress, { sourceDir: slotBin })) {
       const body = legacyServiceContainerBody(egress, {
         name: egressName,
@@ -1243,50 +1323,13 @@ export async function migrateRemoteServiceContainers(vm, projectRoot) {
   }
 }
 
-export async function restartRemoteServices(vm, projectRoot, { telemetryEnabled } = {}) {
-  telemetryEnabled = isTelemetryEnabled({ telemetry_disabled: telemetryEnabled !== true })
-  const rejected = exitGuardVmRejection(vm)
-  if (rejected) return rejected
-  try {
-    const session = await nodeSession(vmNodeId(vm))
-    const remoteDir = remoteSlotDir(session.host, vm.id)
-    const slotDir = path.join(projectRoot, 'vms', vm.id)
-    const name = vm.runtime?.container || containerName(vm.id)
-    const migration = await migrateRemoteServiceContainers(vm, projectRoot)
-    if (!migration.ok) return migration
-    await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
-    const target = { ...vm, runtime: { ...(vm.runtime || {}), container: name, type: runtimeKind(vm) } }
-    const stop = 'pkill -TERM -x kin-worker 2>/dev/null || true'
-    await execDetached(session.docker, name, slotExecCmd(target, ['sh', '-c', stop]).Cmd, {
-      user: slotExecCmd(target, ['sh', '-c', stop]).User,
-    })
-    await new Promise((resolve) => setTimeout(resolve, 150))
-    if (telemetryEnabled === true) await startRemoteTelemetry(session.docker, vm, name)
-    const image = slotImageSpec(projectRoot, vm.kernel || 'ubuntu-24.04')
-    const egress = await ensureRemoteEgress(session, vm, {
-      imageRef: image.ref,
-      binaryDigest: migration.binary_digest,
-      projectRoot,
-    })
-    if (!egress.ok) return { ok: false, error: egress.error, code: egress.code || 'egress_update_failed' }
-    return {
-      ok: true,
-      action: telemetryEnabled === true ? 'restarted' : 'stopped',
-      remote_dir: remoteDir,
-      binary_digest: migration.binary_digest,
-      migration: migration.migrated,
-    }
-  } catch (err) {
-    return failure(err, 'service_update_failed')
-  }
-}
-
 export async function stopRemoteSlot(vm) {
   try {
     const session = await nodeSession(vmNodeId(vm))
     await releaseGuardedNodeProxy(session.client, vm.id)
-    const name = containerName(vm.id)
+    const name = slotContainerForVm(vm)
     const info = await inspectContainerOrNull(session.docker, name)
+    if (info) assertInstanceOwner(info.Config?.Labels, `slot:${vm.id}`)
     if (!info) {
       if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true }
       return { ok: true, action: 'absent', runtime: vm.runtime || null }
@@ -1305,8 +1348,9 @@ export async function destroyRemoteSlot(vm) {
   try {
     const session = await nodeSession(vmNodeId(vm))
     await releaseGuardedNodeProxy(session.client, vm.id)
-    const name = containerName(vm.id)
+    const name = slotContainerForVm(vm)
     const info = await inspectContainerOrNull(session.docker, name)
+    if (info) assertInstanceOwner(info.Config?.Labels, `slot:${vm.id}`)
     if (info) {
       await removeContainer(session.docker, name)
       await releaseRemoteEgress(session, info.HostConfig?.NetworkMode)

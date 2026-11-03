@@ -87,6 +87,36 @@ export function VmActionsProvider({
     onError: (error: Error) => toast.error(error.message),
   })
   const {
+    mutate: activateVm,
+    isPending: activatePending,
+    variables: activateVars,
+  } = useMutation({
+    mutationFn: (vm: Vm) =>
+      api(`/api/panel/vms/${encodeURIComponent(vm.id)}/activate`, {
+        method: 'POST',
+      }),
+    onSuccess: async (_data, vm) => {
+      toast.success(`已设为活跃槽 ${vm.id}`)
+      await invalidate(vm)
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  const {
+    mutate: deactivateVm,
+    isPending: deactivatePending,
+    variables: deactivateVars,
+  } = useMutation({
+    mutationFn: (vm: Vm) =>
+      api(`/api/panel/vms/${encodeURIComponent(vm.id)}/deactivate`, {
+        method: 'POST',
+      }),
+    onSuccess: async (_data, vm) => {
+      toast.success(`已取消活跃槽 ${vm.id}`)
+      await invalidate(vm)
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  const {
     mutate: setOwner,
     isPending: ownerPending,
     variables: ownerVars,
@@ -117,6 +147,13 @@ export function VmActionsProvider({
       recoveringId: recoverPending ? (recoverVars?.id ?? null) : null,
       reset: onReset,
       remove: onDelete,
+      activate: activateVm,
+      deactivate: deactivateVm,
+      activatingId: activatePending
+        ? (activateVars?.id ?? null)
+        : deactivatePending
+          ? (deactivateVars?.id ?? null)
+          : null,
       ...(isAdmin
         ? {
             openAssignOwner: (vm: Vm) => setAssignId(vm.id),
@@ -134,6 +171,12 @@ export function VmActionsProvider({
       recoverVars,
       onReset,
       onDelete,
+      activateVm,
+      activatePending,
+      activateVars,
+      deactivateVm,
+      deactivatePending,
+      deactivateVars,
       isAdmin,
       ownerBusyId,
     ]

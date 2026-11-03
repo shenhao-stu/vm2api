@@ -1,6 +1,11 @@
 import type { Dashboard } from '@/types/panel-overview'
-import type { Vm, VmKernelSnapshot, VmProxySnap } from '@/types/panel-vm'
-import type { StatusTone } from '@/types/status'
+import type {
+  Vm,
+  VmClosedWindow,
+  VmDetailPayload,
+  VmKernelSnapshot,
+  VmProxySnap,
+} from '@/types/panel-vm'
 import {
   fableCap,
   fableCardInfo,
@@ -13,20 +18,17 @@ import { fmtNum, fmtUsd } from '@/lib/format'
 import { isCodexVm } from '@/lib/vm-kind'
 import {
   accountStatus,
-  accountUsable,
   poolStatus,
   proxyNamedLabel,
   restrictionCopy,
   restrictionUntilOf,
   scheduleStateLabel,
   vmRunning,
+  vmNextAction,
+  vmServiceStatus,
 } from '@/lib/vm-status'
-import { formatWindowSpend } from '@/lib/vm-usage'
-import {
-  kernelHopReady,
-  kernelProcessUp,
-  wrapHealthLabel,
-} from '@/lib/wrap-health'
+import { closedWindowHint, formatWindowSpend } from '@/lib/vm-usage'
+import { wrapHealthLabel } from '@/lib/wrap-health'
 import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
@@ -47,7 +49,7 @@ import { proxyHealthOf } from '@/features/vm/proxy-health'
 import { RuntimeChip } from '@/features/vm/runtime-chip'
 import { VmMemoryBlock } from '@/features/vm/vm-memory-block'
 import { VmSchedulingBlock } from '@/features/vm/vm-scheduling'
-import { telemetryView } from './telemetry-policy'
+import { telemetryEnabled } from './telemetry-policy'
 import { telemetryStatusLabel } from './telemetry-status'
 
 type Props = {
@@ -65,77 +67,28 @@ type Props = {
   conc: ConcurrencyInfo
   rpm: RpmInfo | null
   today: VmTodayCounts
+  billing?: VmDetailPayload['billing']
 }
 
-type Verdict = {
-  tone: StatusTone
-  notes: string[]
-}
-
-/**
- * 可服务跟账号 `availability` / 凭证死活走。
- * wrap `rust_health.reachable` 是 hop 就绪（process_up 且 ready_slots>=1），
- * 不能当成槽不可用。
- */
-function slotVerdict(
-  vm: Vm,
-  kernel: VmKernelSnapshot | null | undefined,
-  proxy: VmProxySnap
-): Verdict {
-  const acc = accountStatus(vm)
-  const proxyH = proxyHealthOf(vm, proxy)
-  const hop = kernel?.rust_health || kernel?.go_health
-  const notes: string[] = []
-  const proxyFailClosed =
-    !!vm.has_token && proxyH.score === 0 && proxyH.tone.cls === 'bad'
-
-  if (acc.cls === 'none') {
-    return {
-      tone: {
-        key: 'none',
-        text: '无凭证',
-        cls: 'none',
-        label: acc.text,
-      },
-      notes: [acc.text],
-    }
+/** 上一个 5H 窗口结束时的已用比例与花费；窗口翻转前没有记录。 */
+function PrevWindowMeter({ w }: { w: VmClosedWindow | null | undefined }) {
+  if (!w) {
+    return (
+      <div className='flex items-baseline justify-between gap-2'>
+        <span className='text-xs text-muted-foreground'>上个 5H 已用</span>
+        <span className='text-[11px] text-muted-foreground'>
+          暂无记录 · 窗口翻转后开始记录
+        </span>
+      </div>
+    )
   }
-  if (acc.cls === 'bad' || proxyFailClosed) {
-    const why = acc.cls === 'bad' ? acc.text : proxyH.tone.text
-    return {
-      tone: {
-        key: 'bad',
-        text: '不可服务',
-        cls: 'bad',
-        label: why,
-      },
-      notes: [why],
-    }
-  }
-  if (acc.cls === 'off') {
-    return {
-      tone: {
-        key: 'off',
-        text: '未调度',
-        cls: 'off',
-        label: acc.text,
-      },
-      notes: [acc.text],
-    }
-  }
-  if (acc.cls === 'warn' || acc.cls === 'caution') notes.push(acc.text)
-  if (hop && kernelProcessUp(hop) && !kernelHopReady(hop)) {
-    notes.push('CLI 未就绪')
-  }
-  return {
-    tone: {
-      key: 'ok',
-      text: accountUsable(vm) ? '可服务' : acc.text,
-      cls: acc.cls === 'ok' ? 'ok' : acc.cls,
-      label: notes.join(' · ') || '凭证有效',
-    },
-    notes,
-  }
+  return (
+    <Meter
+      label='上个 5H 已用'
+      value={w.used_ratio * 100}
+      hint={closedWindowHint(w)}
+    />
+  )
 }
 
 function workerLabel(value: unknown) {
@@ -173,19 +126,43 @@ export function VmStatusBoard(props: Props) {
     conc,
     rpm,
     today,
+    billing,
   } = props
-  const verdict = slotVerdict(vm, kernel, proxy)
   const proxyH = proxyHealthOf(vm, proxy)
+  const service = vmServiceStatus(vm, kernel)
+  const proxyBlocked =
+    !!vm.has_token && proxyH.score === 0 && proxyH.tone.cls === 'bad'
+  const verdict =
+    proxyBlocked && service.key !== 'off'
+      ? { ...proxyH.tone, text: '线路异常' }
+      : service
+  const nextAction = proxyBlocked
+    ? '检查绑定线路和出口；恢复前保留当前绑定。'
+    : vmNextAction(vm) ||
+      (service.key === 'unknown' || service.key === 'unreachable'
+        ? '在「运维」检查服务器连接和槽服务。'
+        : service.label || service.text)
   const fable = fableCardInfo(vm, tierKey, fableCap(dash.data))
   const reset5 = acc.reset_5h ?? vm.reset_5h
   const reset7 = acc.reset_7d ?? vm.reset_7d
   const cost5 = money(acc.window_5h_cost ?? vm.window_5h_cost ?? cost.w)
   const cost7 = money(acc.window_7d_cost ?? vm.window_7d_cost)
   const fableCost = money(acc.window_fable_cost ?? vm.window_fable_cost)
-  const spend5 = formatWindowSpend(cost5, vm.estimate_5h)
+  const live5 = formatWindowSpend(cost5, vm.estimate_5h)
+  const proj5 = billing?.window_5h_projection
+  // 本窗口用量太低算不出时，总额度借上个窗口的「花费 ÷ 结束时已用」。
+  const spend5 =
+    proj5?.source === 'previous' &&
+    proj5.total_usd != null &&
+    proj5.remaining_usd != null
+      ? {
+          costText: `${fmtUsd(cost5, 2)} / ≈${fmtUsd(proj5.total_usd, 2)}`,
+          remainText: `余 ${fmtUsd(proj5.remaining_usd, 2)}（按上个窗口）`,
+        }
+      : live5
   const spend7 = formatWindowSpend(cost7, vm.estimate_7d)
   const spendFable = formatWindowSpend(fableCost, vm.estimate_fable)
-  const telemetry = telemetryView(vm.seed_policy, kernel?.telemetry)
+  const telemetry = kernel?.telemetry
   const topology = kernel?.process_topology
   const rust = wrapHealthLabel(kernel?.rust_health)
 
@@ -197,12 +174,10 @@ export function VmStatusBoard(props: Props) {
             <div className='min-w-0'>
               <h2 className='text-lg leading-none font-semibold'>现状</h2>
               <p className='mt-1.5 text-xs text-muted-foreground'>
-                {verdict.notes.length
-                  ? verdict.notes.join(' · ')
-                  : '这槽现在可以接推理'}
+                {nextAction}
               </p>
             </div>
-            <StatusMark tone={verdict.tone} variant='pill' />
+            <StatusMark tone={verdict} variant='pill' />
           </div>
           <div className='mt-4 flex flex-wrap items-center gap-1.5'>
             {isCodexVm(vm) ? <OpenaiPlanBadge vm={vm} size='sm' /> : null}
@@ -212,7 +187,11 @@ export function VmStatusBoard(props: Props) {
             <StatusMark
               tone={{
                 key: vmRunning(vm) ? 'ok' : 'off',
-                text: vmRunning(vm) ? '运行' : '停止',
+                text: vmRunning(vm)
+                  ? '进程运行'
+                  : vm.status
+                    ? '进程未运行'
+                    : '运行状态未知',
                 cls: vmRunning(vm) ? 'ok' : 'off',
               }}
               variant='pill'
@@ -260,7 +239,7 @@ export function VmStatusBoard(props: Props) {
                 '—'
               )}
             </Field>
-            <Field label='冷却' compact>
+            <Field label='调度限制' compact>
               {restrictionCopy(vm)}
             </Field>
             <CircuitField vm={vm} now={now} />
@@ -271,18 +250,21 @@ export function VmStatusBoard(props: Props) {
           <h3 className='text-sm font-medium'>额度</h3>
           <div className='mt-3 grid gap-3'>
             {isCodexVm(vm) ? (
-              <OpenaiQuotaPanel
-                vm={vm}
-                u5={u5}
-                u7={u7}
-                now={now}
-                cost5={cost5}
-                cost7={cost7}
-              />
+              <>
+                <OpenaiQuotaPanel
+                  vm={vm}
+                  u5={u5}
+                  u7={u7}
+                  now={now}
+                  cost5={cost5}
+                  cost7={cost7}
+                />
+                <PrevWindowMeter w={billing?.prev_window_5h} />
+              </>
             ) : (
               <>
                 <Meter
-                  label='5 小时已用'
+                  label='本窗口 5H 已用'
                   value={u5}
                   gate={
                     vm.quota_policy ? vm.quota_policy.limit_5h * 100 : undefined
@@ -295,6 +277,7 @@ export function VmStatusBoard(props: Props) {
                     .filter(Boolean)
                     .join(' · ')}
                 />
+                <PrevWindowMeter w={billing?.prev_window_5h} />
                 <Meter
                   label='7 天已用'
                   value={u7}
@@ -407,7 +390,10 @@ export function VmStatusBoard(props: Props) {
                   {topology?.go_telemetry ? ' · Go telemetry' : ''}
                 </Field>
                 <Field label='遥测' compact>
-                  {telemetryStatusLabel(telemetry)}
+                  {telemetryStatusLabel(
+                    telemetry,
+                    telemetryEnabled(vm.seed_policy)
+                  )}
                 </Field>
               </>
             )}
