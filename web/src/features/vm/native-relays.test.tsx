@@ -39,9 +39,9 @@ describe('native Relay VM management', () => {
       '授权锁存'
     )
   })
-  function render(enabled: boolean, item = relay) {
+  function render(enabled: boolean, item = relay, extra: NativeRelay[] = []) {
     const client = new QueryClient()
-    client.setQueryData(['panel', 'native-relays'], { items: [item] })
+    client.setQueryData(['panel', 'native-relays'], { items: [item, ...extra] })
     return renderToStaticMarkup(
       <QueryClientProvider client={client}>
         <NativeRelays enabled={enabled} />
@@ -62,6 +62,61 @@ describe('native Relay VM management', () => {
     }
     expect(html).not.toContain('重建')
     expect(html).not.toContain('删除')
+  })
+  it('separates Relay metering and the dated official quota', () => {
+    const html = render(true, {
+      ...relay,
+      usage: {
+        total_usd: 12.5,
+        last_5h_usd: 1.25,
+        last_7d_usd: 7.25,
+        unpriced_requests: 1,
+        first_at: null,
+      },
+      official_quota: {
+        used_usd: 81,
+        quota_usd: 80,
+        observed_at_ms: 1000,
+        resets_at_ms: 2000,
+        stale: true,
+      },
+    })
+    for (const value of ['1.25', '12.5', '81', '80', '缺少计价', '已过期']) {
+      expect(html).toContain(value)
+    }
+    const doc = new Window().document
+    doc.body.innerHTML = html
+    const meter = doc.querySelector('[role=meter]')
+    expect(meter?.getAttribute('aria-valuenow')).toBe('100')
+    expect(meter?.getAttribute('aria-valuetext')).toContain('101.25%')
+    expect(doc.body.textContent).toContain('$7.25')
+    expect(render(true)).toContain('等待官方额度')
+  })
+  it('keeps personal percentage windows separate from the other account', () => {
+    const personal = {
+      ...relay,
+      id: 'second',
+      name: 'Personal Max fixture',
+      binding: 2,
+      sub_account: 52,
+      runtime: {
+        ...relay.runtime,
+        official_windows: {
+          five_hour: { used_percent: 17, resets_at_ms: 2000 },
+          seven_day: { used_percent: 98, resets_at_ms: 3000 },
+          observed_at_ms: 1000,
+          source_updated_ms: 800,
+          stale: false,
+        },
+      },
+    }
+    const doc = new Window().document
+    doc.body.innerHTML = render(true, relay, [personal])
+    const cards = doc.querySelectorAll('article')
+    expect(cards).toHaveLength(2)
+    expect(cards[0].textContent).not.toContain('98%')
+    expect(cards[1].textContent).toContain('98%')
+    expect(cards[1].querySelectorAll('progress')).toHaveLength(2)
   })
   it('does not show the administrative runtime to non-admins', () => {
     expect(render(false)).toBe('')

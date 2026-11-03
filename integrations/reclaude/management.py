@@ -3,8 +3,11 @@
 Commands and paths come only from an administrator-owned local configuration.
 No HTTP input becomes a host, command, path, account ID or authorization change.
 """
-from datetime import datetime, timezone
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 import json
+import math
+import sqlite3
 from pathlib import Path
 import subprocess
 import threading
@@ -62,6 +65,66 @@ def guard_status(config):
         return {"ready": False, "latched": True, "expected_ip": config["expected_ip"]}
 
 
+def relay_usage(config, now=None):
+    ledger = config.get("usage_ledger")
+    if not ledger:
+        return None
+    now = now or datetime.now(timezone.utc)
+    def stamp(value):
+        return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    try:
+        uri = Path(ledger["path"]).as_uri() + "?mode=ro"
+        account_id = ledger["account_id"]
+        if not isinstance(account_id, str) or not account_id:
+            return None
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.25)) as db:
+            # Final backend owns the logged cost. Older single-attempt rows
+            # may only identify it in account_id.
+            row = db.execute("""
+                SELECT sum(total_cost),
+                       sum(CASE WHEN created_at >= :since THEN total_cost ELSE 0 END),
+                       sum(CASE WHEN created_at >= :week THEN total_cost ELSE 0 END),
+                       count(*), count(total_cost), min(created_at)
+                FROM usage_logs
+                WHERE created_at <= :now AND (
+                    final_account_id = :account OR
+                    (final_account_id IS NULL AND account_id = :account AND attempt_count = 1)
+                )
+            """, {"account": account_id, "since": stamp(now - timedelta(hours=5)),
+                  "week": stamp(now - timedelta(days=7)), "now": stamp(now)}).fetchone()
+    except (KeyError, ValueError, TypeError, OSError, sqlite3.Error):
+        return None
+    total, recent, week, count, priced, first = row
+    return {"total_usd": total or 0, "last_5h_usd": recent or 0, "last_7d_usd": week or 0,
+            "unpriced_requests": count - priced, "first_at": first}
+
+
+def official_quota(config, now=None):
+    """A billing reader publishes a scoped snapshot, without web credentials."""
+    source = config.get("official_quota")
+    if not source:
+        return None
+    try:
+        with Path(source["path"]).open() as stream:
+            data = json.loads(stream.read(2048))
+        if (data["binding"], data["org_id"], data["account_id"]) != (
+                config["binding"], source["org_id"], source["account_id"]):
+            return None
+        used, limit = data["used_usd"], data["quota_usd"]
+        if any(type(n) not in (float, int) or not math.isfinite(n) for n in (used, limit)):
+            return None
+        observed, reset = data["observed_at_ms"], data["resets_at_ms"]
+        now_ms = int((now if now is not None else time.time()) * 1000)
+        if (type(observed) is not int or not 0 < observed <= now_ms or used < 0 or limit <= 0
+                or reset is not None and (type(reset) is not int or not 0 < reset < 8640000000000000)):
+            return None
+        stale = now_ms - observed > 600000 or (reset is not None and reset <= now_ms)
+        return {"used_usd": used, "quota_usd": limit, "resets_at_ms": reset,
+                "observed_at_ms": observed, "stale": stale}
+    except (KeyError, TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
 class Manager:
     def __init__(self, config, call=command):
         self.config, self.call = config, call
@@ -107,6 +170,7 @@ class Manager:
                   "binding": self.config["binding"], "sub_account": self.config["sub_account"],
                   "concurrency": self.config["concurrency"], "models": self.config["models"],
                   "observed_at": time.time(), "runtime": r, "guard": guard_status(self.config),
+                  "usage": relay_usage(self.config), "official_quota": official_quota(self.config),
                   "sub": sub, "authorization_latched": (self.root / "authorization-latch.json").exists()}
         self.cached = result
         return result
@@ -146,6 +210,8 @@ class Manager:
                 # Runtime refuses to stop until in-flight requests have drained.
                 self.runtime("stop")
             else:
+                if state["sub"].get("shared_policy_matches") is False:
+                    raise ManagementError("shared_routing_profile_changed")
                 r = state["runtime"]
                 if (state["authorization_latched"] or r.get("revoked") or r.get("auth_latched")
                         or r.get("failed_checks") or not state["guard"]["ready"]

@@ -98,3 +98,45 @@ Tests use local fixtures and a network-disabled genuine CLI, including Fable,
 default sampling, terminal SSE, authorization failure, drain and original-IP
 gates. This proves adapter compatibility without buying model calls; it is not a
 claim of a fresh paid Fable generation or permanent authorization stability.
+
+### Relay usage and official plan usage
+
+Each Relay management configuration can select a read-only SQLite ledger with
+`usage_ledger: {"path": "/private/gateway/data/kin.db", "account_id": "ek_..."}`.
+Use the native backend account ID. Rotating an inbound API key retains the
+account's usage. The rolling five-hour, seven-day and retained-history totals use
+`usage_logs.total_cost` in USD, including metered partial responses. The UI
+reports records without pricing separately. A missing ledger displays an
+unavailable state.
+
+For the official quota, configure `official_quota` with a private snapshot
+`path`, the ReClaude `org_id` and the provider's numeric `account_id`. The
+snapshot is also scoped to the configured native device `binding`.
+`quota_sync_mac.py CONFIG` uses a selected, logged-in Chrome profile through
+the installed TMWD stdio bridge. It reads the first-party billing and device
+APIs inside the browser. Only the matching organization, account, device,
+amounts and timestamps leave Chrome. Its trusted local config names the
+`profile`, `binding`, `org_id`, `account_id` and fixed argv
+`publish_command`. Use an existing private operator transport to run
+`python3 publish_official_quota.py MANAGEMENT_CONFIG` with the observation
+on stdin. The publisher checks scope, recency and order before atomic replacement.
+
+A reader interval of five minutes fits the ten-minute freshness indicator.
+When Chrome is offline, its login expires, or the reported window resets,
+the card dates the last observation. The organization window can also include
+activity from other devices. Both views are admin-only and independent of Relay
+admission and lifecycle.
+
+### Multiple native accounts
+
+Repeat `--config` for each enrolled account on the same loopback management server. Give each configuration its own Relay ID, device binding, Sub2API account, state directory and fixed broker commands. All entries use the same panel authentication URL and browser origin. Each monitor refreshes its own account. A controller outage or device revocation is reported on that account's card. Start, stop and log requests carry the Relay ID in the path. Keep one native HOME, worker port, session directory, API key and usage ledger per account.
+
+Use the account's own verified model allowlist in Sub2API. During enrollment, test through a temporary group containing only that account and reconcile each terminal response with the native and Sub2API ledgers before admitting shared traffic. The per-Relay concurrency limit applies independently.
+
+The default native worker still waits for the organizational policy confirmation. For a personal Max binding, the worker supports `--recognize-personal-max`. It requires the genuine CLI initialization to report first-party Claude Max, the same current binding and matching native OAuth profile. Managed or ambiguous accounts retain the organizational policy check. Never share a policy cache or OAuth directory across devices.
+
+For account-window billing, set `quota_kind` to `account_windows` in the Chrome reader and set `account_windows` in the NAS agent config with its `path`, `org` and `account_id`. Use a separate installed reader and snapshot for each account. The existing `carpool` reader keeps the USD format. The optional `app_url` selects an allowlisted official portal with the login for that account. Percentage windows and dollar balances are displayed separately. When multiple devices use the same subscription, they share its official allowance.
+
+Accounts that share a Sub2API pool can reference one operator-owned JSON file using `shared_routing_profile` in each forced-command broker config. Start from `shared-routing.example.json`, fill in the intended shared group IDs, and apply its model mapping, priority, concurrency and cooldown rules through the native account API. Status reports `shared_policy_matches`. Resume checks the shared policy before changing scheduling. Pausing a revoked account remains possible during configuration drift.
+
+Sub2API's native scheduler can keep a healthy session on its selected account and choose another available account when a failure precedes dispatch. A temporary-unschedulable rule matching HTTP 400 `native_request_consumed_no_replay` makes Sub2API treat the error as a failover signal. Leave that rule out. A consumed request or an already-streaming response must keep its original outcome. Preserve the native runtime's no-replay response and its evidence.

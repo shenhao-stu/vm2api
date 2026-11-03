@@ -6,6 +6,21 @@ export type NativeRelay = {
   sub_account: number
   concurrency: number
   models: string[]
+  usage?: {
+    total_usd: number
+    last_5h_usd: number
+    last_7d_usd?: number
+    unpriced_requests: number
+    first_at: string | null
+  } | null
+  official_quota?: {
+    used_usd: number
+    quota_usd: number
+    resets_at_ms: number | null
+    observed_at_ms: number
+    stale: boolean
+  } | null
+  management_unavailable?: boolean
   observed_at: number
   authorization_latched: boolean
   guard: {
@@ -15,6 +30,13 @@ export type NativeRelay = {
     observed_ip?: string
   }
   runtime: {
+    official_windows?: {
+      five_hour: { used_percent: number; resets_at_ms: number }
+      seven_day: { used_percent: number; resets_at_ms: number }
+      observed_at_ms: number
+      source_updated_ms: number
+      stale: boolean
+    } | null
     container_running: boolean
     http_active: boolean
     http_ready: boolean
@@ -23,16 +45,18 @@ export type NativeRelay = {
     auth_latched: boolean
     failed_checks: string[]
   }
-  sub: { schedulable: boolean }
+  sub: { schedulable: boolean; shared_policy_matches?: boolean }
 }
 
 export function relayState(relay: NativeRelay) {
+  if (relay.management_unavailable) return '管理连接待检查'
   if (
     relay.authorization_latched ||
     relay.runtime.revoked ||
     relay.runtime.auth_latched
   )
     return '授权锁存'
+  if (relay.sub.shared_policy_matches === false) return '调度配置待核对'
   if (!relay.guard.ready) return '出口待检查'
   if (relay.runtime.failed_checks.length) return '原生环境待检查'
   if (!relay.runtime.http_active || !relay.sub.schedulable) return '已暂停'

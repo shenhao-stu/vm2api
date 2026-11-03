@@ -1,0 +1,61 @@
+{
+  "account": {
+    "platform": "anthropic",
+    "type": "apikey",
+    "priority": 0,
+    "concurrency": 10,
+    "rate_multiplier": 1,
+    "proxy_id": null,
+    "load_factor": null,
+    "auto_pause_on_expired": true
+  },
+  "groups": [],
+  "models": [
+    "claude-fable-5-1",
+    "claude-haiku-5-5",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5"
+  ],
+  "credentials": {
+    "pool_mode": false,
+    "custom_error_codes_enabled": false,
+    "temp_unschedulable_enabled": true
+  },
+  "cooldowns": [
+    {
+      "scope": "account",
+      "keywords": [
+        "upstream_authentication_latched"
+      ],
+      "error_code": 503,
+      "description": "Persistent native auth latch; never rebind automatically",
+      "duration_minutes": 60
+    },
+    {
+      "scope": "account",
+      "keywords": [
+        "native_initialize_not_ready_no_dispatch",
+        "native_not_ready",
+        "native_policy_not_ready_no_dispatch"
+      ],
+      "error_code": 503,
+      "description": "Native readiness; no exit rearm",
+      "duration_minutes": 1
+    },
+    {
+      "scope": "account",
+      "keywords": [
+        "native_stream_incomplete",
+        "native_transport_error"
+      ],
+      "error_code": 502,
+      "description": "Incomplete native turn; never replay",
+      "duration_minutes": 1
+    }
+  ],
+  "extra": {
+    "anthropic_passthrough": true,
+    "upstream_billing_probe_enabled": false,
+    "upstream_billing_rate_sync_enabled": false
+  }
+}
