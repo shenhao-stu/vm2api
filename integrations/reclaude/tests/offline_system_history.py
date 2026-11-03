@@ -402,6 +402,45 @@ try:
     checks['expired_provider_thread_needs_no_corrective_replay'] = True
     checks['full_history_and_single_dispatch_survive_inherited_thread_opt_in'] = True
     assert len(calls) == 28
+    expire_thread[0] = False
+    slow = start('slow-caller-tools', base)
+    reply[0] = 'tools'
+    run(slow, base)
+    slow_native = slow.native_id
+    paid = len(calls)
+    slow.expire_tool_wait()
+    assert not slow.failed and slow.suspended and len(calls) == paid
+    def tool_follow(session, **fields):
+        return {**base, **fields, 'messages': copy.deepcopy(session.history) + [
+            {'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': identifier, 'content': 'SLOW_REAL_RESULT'}
+                for identifier in sorted(session.pending_ids)
+            ]},
+        ]}
+    reply[0] = 'text'
+    wire = run(slow, tool_follow(slow))
+    assert slow.native_id == slow_native and positions(wire, 'SLOW_REAL_RESULT')
+    checks['expired_tool_wait_resumes_only_new_results_without_replay'] = True
+    reply[0] = 'tools'
+    run(slow, follow(slow))
+    paused_follow = tool_follow(slow)
+    slow.expire_tool_wait()
+    slow.close()
+    slow = start('slow-caller-tools', paused_follow, True)
+    reply[0] = 'text'
+    wire = run(slow, paused_follow)
+    assert slow.native_id == slow_native and positions(wire, 'SLOW_REAL_RESULT')
+    checks['tool_wait_survives_pool_eviction_and_process_restore'] = True
+    reply[0] = 'tools'
+    run(slow, follow(slow))
+    expanded = copy.deepcopy(base['tools']) + [{'name': 'Write', 'input_schema': {'type': 'object'}}]
+    changed_tools = tool_follow(slow, tools=expanded)
+    reply[0] = 'text'
+    wire = run(slow, changed_tools)
+    assert {t['name'] for t in wire['tools']} >= {'mcp__caller__Read', 'mcp__caller__Write'}
+    assert slow.native_id == slow_native and positions(wire, 'SLOW_REAL_RESULT')
+    checks['new_tool_schema_is_applied_at_the_paid_assistant_boundary'] = True
+    assert len(calls) == 34
     summary = {'checks': checks, 'fixture_calls': len(calls), 'real_provider_calls': 0, 'os_denies_non_loopback_network': True, 'ok': all(checks.values()), 'cli_sha256': cli_hash, 'candidate_sha256': source_hashes}
     (root / 'calls.synthetic.private.json').write_text(json.dumps(calls, indent=2))
     (root / 'receipt.safe.json').write_text(json.dumps(summary, indent=2))

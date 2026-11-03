@@ -535,11 +535,17 @@ class Session:
         except (OSError, ValueError):
             raise ContractError("native_session_recovery_unavailable") from None
         version = state.get("version")
-        matching = (
-            state.get("configuration") == signature(legacy_configuration(body))
-            if version == 1 else version == 2
-            and state.get("fixed_configuration") == self.fixed_signature
-        )
+        if version == 2 and state.get("fixed_configuration") != self.fixed_signature:
+            try:
+                old_tools = json.loads((self.directory / "tools.json").read_text())
+            except (OSError, ValueError):
+                raise ContractError("native_session_recovery_unavailable") from None
+            expected = signature({**fixed_configuration(body), "tools": old_tools})
+        else:
+            expected = self.fixed_signature
+        matching = (state.get("configuration") == signature(legacy_configuration(body))
+                    if version == 1 else version == 2
+                    and state.get("fixed_configuration") in {expected, self.fixed_signature})
         if state["status"] == "prepared":
             if (
                 not matching
@@ -550,8 +556,9 @@ class Session:
             # No user input or grant existed. Start a new empty native process;
             # never resume an old paid conversation through this branch.
             self.prepared = True
+            self.adopt_checkpoint_configuration(state)
             return
-        if state["status"] != "idle":
+        if state["status"] not in {"idle", "awaiting_tools"}:
             raise ContractError("native_session_incomplete_no_replay")
         history = body["messages"][: state["history_length"]]
         if (
@@ -565,9 +572,32 @@ class Session:
         self.checkpoint_configuration = state["configuration"]
         self.history = copy.deepcopy(history)
         self.seen = {state["request_sha256"]}
+        if state["status"] == "awaiting_tools":
+            blocks = history[-1].get("content", []) if history else []
+            ids = [b.get("id") for b in blocks if isinstance(b, dict)
+                   and b.get("type") == "tool_use"]
+            tail = [m for m in body["messages"][len(history):] if m.get("role") != "system"]
+            results = [b.get("tool_use_id") for b in native_blocks(tail[0]["content"])
+                       if b.get("type") == "tool_result"] if len(tail) == 1 else []
+            if (not ids or len(tail) != 1 or tail[0].get("role") != "user"
+                    or history[-1].get("role") != "assistant"
+                    or len(set(ids)) != len(ids) or set(results) != set(ids)
+                    or len(results) != len(ids)):
+                raise ContractError("native_session_incomplete_no_replay")
+            self.pending_ids = set(ids)
+            self.suspended = True
+        self.adopt_checkpoint_configuration(state)
+
+    def adopt_checkpoint_configuration(self, state):
+        # Commit the verified boundary before tools.json changes. Keeping the
+        # existing version-two contract also makes a rollback able to resume.
+        updated = {**state, "version": 2, "configuration": self.body_signature,
+                   "fixed_configuration": self.fixed_signature}
+        if updated != state:
+            self.write_checkpoint(updated)
+        self.checkpoint_configuration = self.body_signature
 
     def checkpoint(self, status, request_sha256=None, message_id=None):
-        path = self.directory / "continuation.json"
         state = {"version": 2, "status": status, "native_id": self.native_id}
         if status == "prepared":
             state.update({
@@ -597,6 +627,11 @@ class Session:
                         "request_sha256": request_sha256,
                     }
                 )
+        self.write_checkpoint(state)
+        self.checkpoint_configuration = state.get("configuration")
+
+    def write_checkpoint(self, state):
+        path = self.directory / "continuation.json"
         temp = path.with_suffix(".tmp")
         with os.fdopen(
             os.open(temp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600), "w"
@@ -605,7 +640,6 @@ class Session:
             out.flush()
             os.fsync(out.fileno())
         os.replace(temp, path)
-        self.checkpoint_configuration = state.get("configuration")
         descriptor = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(descriptor)
@@ -619,7 +653,8 @@ class Session:
 
     def validate_configuration(self, body):
         native_options(body)
-        if signature(fixed_configuration(body)) != self.fixed_signature or (
+        fixed = {**fixed_configuration(body), "tools": self.tools}
+        if signature(fixed) != self.fixed_signature or (
             not self.history
             and initial_system(body) != (self.directory / "system.txt").read_text()
         ):
@@ -669,7 +704,14 @@ class Session:
             self.environment["CLAUDE_CODE_THINKING_DISPLAY_UPDATES"] = self.inherited_thinking_display_updates
         self.environment.update(native_env)
         self.options = options + self.budget_options
+        self.tools = tool_schema(body.get("tools", []))
         self.body_signature = signature(configuration(body))
+        self.fixed_signature = signature(fixed_configuration(body))
+        if self.history:
+            self.adopt_checkpoint_configuration(state)
+        elif self.prepared:
+            self.checkpoint("prepared")
+        (self.directory / "tools.json").write_text(json.dumps(self.tools))
 
     def prepare_request(self, body):
         """Prepare one caller's CLI without a prompt or model dispatch grant."""
@@ -1047,7 +1089,7 @@ class Session:
                 # mid-turn system attachment. Resume at the actual tool-use
                 # assistant instead, preserving the caller's whole user message.
                 resume_tools = bool(results) and (
-                    changed or any(b.get("type") == "text" for b in blocks)
+                    changed or self.suspended or any(b.get("type") == "text" for b in blocks)
                     or any(c['type'] != 'text' for r in results.values() for c in r['content'])
                 )
                 if changed or resume_tools or self.suspended:
@@ -1150,7 +1192,10 @@ class Session:
             return
         try:
             if self.pending_ids:
-                self.failed = True
+                # The paid turn already ended at a verified tool-use boundary.
+                # Stop the idle CLI before its autonomous tool timeout, keeping
+                # the checkpoint so only a new caller result can resume it.
+                self.suspended = True
                 self.close()
         finally:
             self.lock.release()
