@@ -27,7 +27,13 @@ import {
   portsForProxy,
   proxyKey,
 } from '../vm/egress.mjs'
-import { assertInstanceOwner, egressIdentity, instanceId, instanceLabels, slotContainerForVm } from '../vm/instance-scope.mjs'
+import {
+  assertInstanceOwner,
+  egressIdentity,
+  instanceId,
+  instanceLabels,
+  slotContainerForVm,
+} from '../vm/instance-scope.mjs'
 import { OS_CATALOG } from '../vm/os-catalog.mjs'
 import { REMOTE_KERNEL_ENTRY, resolveKernelDataplane } from '../vm/slot-engine.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
@@ -402,7 +408,11 @@ async function ensureRemoteNetwork(docker, { name, bridge, masquerade, labels = 
  */
 export function slotEgressNames(vmId) {
   const slot = containerName(vmId)
-  const tag = crypto.createHash('sha1').update(instanceId() ? slot : String(vmId)).digest('hex').slice(0, 10)
+  const tag = crypto
+    .createHash('sha1')
+    .update(instanceId() ? slot : String(vmId))
+    .digest('hex')
+    .slice(0, 10)
   return {
     slot,
     network: `${slot}-net`,
@@ -563,7 +573,9 @@ export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {
     const expected = slotEgressNames(vm.id).egress
     const current = vm.runtime?.egress_container || expected
     if (instanceId() && current !== expected) {
-      throw Object.assign(new Error('egress container does not belong to this instance'), { code: 'instance_scope_conflict' })
+      throw Object.assign(new Error('egress container does not belong to this instance'), {
+        code: 'instance_scope_conflict',
+      })
     }
     const legacy = instanceId() ? expected : `kin-egress-${proxyKey(vm.proxy?.id)}`
     if (enabled) {
@@ -635,7 +647,10 @@ export async function releaseRemoteEgress(session, networkMode) {
   if (exit.egress) {
     const helper = await inspectContainerOrNull(session.docker, exit.egress)
     if (helper) {
-      assertInstanceOwner(helper.Config?.Labels, info.Labels?.['kin.egress.vm'] ? `slot-egress:${info.Labels['kin.egress.vm']}` : null)
+      assertInstanceOwner(
+        helper.Config?.Labels,
+        info.Labels?.['kin.egress.vm'] ? `slot-egress:${info.Labels['kin.egress.vm']}` : null,
+      )
       await removeContainer(session.docker, exit.egress)
     }
   }

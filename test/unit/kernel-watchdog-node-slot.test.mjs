@@ -4,7 +4,6 @@ import {
   createKernelWatchdog,
   watchdogProbeVm,
   NODE_SLOT_HEALTH_TIMEOUT_MS,
-  NODE_SLOT_FAILURES_BEFORE_RESTART,
 } from '../../src/lib/transport/kernel-watchdog.mjs'
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
 
@@ -189,7 +188,6 @@ test('intermittent node transport failures do not spend the kernel recovery budg
       now = at
       await wd.tick()
     }
-    assert.equal(NODE_SLOT_FAILURES_BEFORE_RESTART, 3)
     assert.deepEqual(ensured, [], 'transport loss cannot authorize a potentially destructive recovery preflight')
     assert.deepEqual(ensureHealthTimeouts, [])
     assert.equal(probes, 6)

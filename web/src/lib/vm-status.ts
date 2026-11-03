@@ -715,6 +715,17 @@ export function vmServiceStatus(
   if (pool.key === 'none') return { ...pool, text: '待导入凭证' }
   if (pool.key === 'off') return { ...pool, text: '人工暂停' }
   if (pool.key !== 'pool' && pool.key !== 'ok') return pool
+  if (
+    /^(stopped|dead|disabled|exited)$/.test(
+      String(vm.status || '').toLowerCase()
+    )
+  )
+    return {
+      key: 'runtime_off',
+      cls: 'off',
+      text: '服务未运行',
+      label: '在「运维」启动槽服务并确认健康。',
+    }
   const health = isCodexVm(vm)
     ? kernel?.codex_health
     : kernel?.rust_health || kernel?.go_health
@@ -790,9 +801,11 @@ export function claudeTier(vm: Vm | undefined): StatusTone {
     return { key: 'codex', label: plan, cls: 'codex', text: plan }
   }
   if (!vm?.has_token) return { key: 'none', label: '—', cls: 'none', text: '—' }
-  if (vm.usage_has_fable === false)
+  const raw = String(vm.account_tier || '')
+    .trim()
+    .toLowerCase()
+  if (raw === 'pro' || vm.usage_has_fable === false)
     return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
-  const raw = String(vm.account_tier || '').toLowerCase()
   const oi = vm.utilization_7d_oi
   const oiN =
     oi == null ? null : Number(oi) > 1.5 ? Number(oi) / 100 : Number(oi)

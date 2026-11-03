@@ -13,7 +13,8 @@ HTTP 200 empty or thinking-only generations are never automatically repeated.
 Their measured usage and attempt diagnostics are retained with the incomplete
 response error. Explicit request/auth/quota rejection remains eligible for the
 existing bounded repair/failover policy; timeouts and generic server failures
-do not. Local admission failures can use authoritative zero-dispatch evidence.
+do not. Measured generation usage also blocks replay, even if a late error is
+reported as 400 or 429. Local admission failures can use authoritative zero-dispatch evidence.
 
 Transport recovery remains bounded by the existing attempt, switch, delay and
 deadline controls. Setting either transport retry window to zero disables the

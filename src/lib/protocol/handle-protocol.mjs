@@ -1200,14 +1200,15 @@ export function createHandleProtocol(deps) {
         model: ctx.body?.model,
         cliVersion: OFFICIAL_CLI_VERSION,
       })
-    let personaHideTokens = apiPassthrough || requestContext
-      ? 0
-      : personaHideForUnofficial(personaIn, ctx.body, {
-          officialClient: officialPassthrough,
-          mode: personaMode,
-          hides: personaHidesUsageFromRoutingFile(routingConfigPath),
-          standing: standingUsageFromRoutingFile(routingConfigPath),
-        })
+    let personaHideTokens =
+      apiPassthrough || requestContext
+        ? 0
+        : personaHideForUnofficial(personaIn, ctx.body, {
+            officialClient: officialPassthrough,
+            mode: personaMode,
+            hides: personaHidesUsageFromRoutingFile(routingConfigPath),
+            standing: standingUsageFromRoutingFile(routingConfigPath),
+          })
 
     if (inferenceBackend === 'api') {
       // API 直连走平台端点，不经过槽位；门禁与 api-kernel hop 同位，勿提前于 credential/intercept 链

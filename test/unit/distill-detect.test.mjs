@@ -1,4 +1,5 @@
 import test from 'node:test'
+import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -605,26 +606,86 @@ test('normalize keeps default fingerprints when omitted', () => {
   assert.equal(r.error.message, '不允许蒸馏')
 })
 
-test('handleProtocol intercepts before credential hop', () => {
-  const src = fs.readFileSync(path.join(root, 'src/lib/protocol/handle-protocol.mjs'), 'utf8')
-  const early = src.indexOf('await applyProtocolIntercept(')
-  const codex = src.indexOf('handleCodexProtocol({')
-  assert.ok(early > 0 && early < codex)
-  const before = src.indexOf("applyIntercept(cfg.intercept.rules, 'before_upstream'")
-  const late = src.indexOf('await applyProtocolIntercept(', early + 1)
-  const api = src.indexOf("inferenceBackend === 'api'")
-  assert.ok(before > 0)
-  assert.ok(late > before)
-  assert.ok(api > late)
-  const guard = src.slice(
-    src.indexOf('async function applyProtocolIntercept'),
-    src.indexOf('function isZeroInjectMode'),
-  )
-  assert.ok(guard.includes('isProxiedOfficialClaudeCode'))
-  const countSrc = fs.readFileSync(path.join(root, 'src/lib/protocol/user-count-tokens.mjs'), 'utf8')
-  const countGuard = countSrc.indexOf('blockCountTokensBeforeHop(req, parsed.body, deps)')
-  const countHop = countSrc.indexOf('countTokensViaWorker)(peeked.exec')
-  assert.ok(countGuard > 0 && countHop > countGuard)
+test('handleProtocol blocks original and rewritten prohibited input before API or credential acquisition', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-distill-hop-order-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const routing = { compatibility: { persona_preset: 'official_full' } }
+  const routingFile = path.join(dir, 'routing.json')
+  fs.writeFileSync(routingFile, JSON.stringify(routing))
+  for (const category of ['api', 'oauth']) {
+    for (const rewrite of [false, true]) {
+      const marker = 'CUSTOM-HARVEST-TOKEN'
+      const body = inbound(rewrite ? 'Give a brief greeting.' : marker)
+      const response = { on() {}, once() {}, off() {} }
+      const calls = []
+      const hop = (name) => () => {
+        calls.push(name)
+        throw new Error(`unexpected ${name}`)
+      }
+      const handler = createHandleProtocol({
+        json: (_res, status, value) => Object.assign(response, { status, body: value }),
+        writeSSEHeaders: hop('SSE'),
+        readBody: async () => body,
+        requireAuth: () => true,
+        cfg: {
+          rewrite: { enabled: false },
+          intercept: {
+            rules: rewrite
+              ? [
+                  {
+                    phase: 'before_upstream',
+                    action: {
+                      set_body_field: {
+                        messages: [{ role: 'user', content: marker }],
+                      },
+                    },
+                  },
+                ]
+              : [],
+          },
+          distill: normalizeDistillRules({
+            enabled: true,
+            skip_official: false,
+            hard_needles: [marker],
+            needles: [],
+            fingerprints: [],
+            patterns: [],
+          }),
+          limits: { max_body_bytes: 1048576, upstream_timeout_ms: 1000 },
+          paths: { data: dir, project: dir },
+        },
+        requestLog: { start: () => ({ request_id: 'distill-gate' }), finish() {} },
+        stickyRouter: {},
+        accountQuota: {},
+        apiEndpointStore: {},
+        apiKeyStore: { acquire: hop('key acquisition'), release() {} },
+        apiScheduler: { pick: hop('API endpoint selection') },
+        failoverRunner: { run: hop('credential dispatch') },
+        stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+        routingConfigPath: routingFile,
+        routingConfig: routing,
+        settings: { get: (_key, fallback) => fallback },
+        groupsRepo: { rateMultiplier: () => 1 },
+      })
+      await handler.handleProtocol(
+        {
+          method: 'POST',
+          url: '/v1/messages',
+          headers: { 'user-agent': 'gate-fixture' },
+          apiKeyKind: 'managed',
+          apiKeyRecord: { id: 'fixture', category },
+          once() {},
+          off() {},
+        },
+        response,
+        'anthropic.messages',
+        '/v1/messages',
+      )
+      assert.equal(response.status, 403, `${category}, rewrite=${rewrite}`)
+      assert.equal(response.body.error.code, 'distill_blocked')
+      assert.deepEqual(calls, [], 'a blocked request must acquire neither credentials nor upstream execution')
+    }
+  }
 })
 
 test('assemble path does not forward onCommit to the kernel hop', () => {

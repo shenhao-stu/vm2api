@@ -34,6 +34,7 @@ x-api-key: sk-vm-…
 | 方法 | 路径 | 入站 | 出站给客户端 |
 |------|------|------|--------------|
 | `POST` | `/v1/messages` 或 `/messages` | Anthropic Messages | Anthropic Messages / SSE |
+| `POST` | `/v1/messages/count_tokens` 或 `/messages/count_tokens` | Anthropic Messages | Setup Token / Console API Key 的真实 `input_tokens`；OAuth 返回 `400 count_tokens_unsupported` |
 | `GET` | `/v1/usage` | — | 当前账户 5H/7D，Claude 与 GPT 均可（`unit=percent_used`） |
 | `POST` | `/v1/chat/completions` 或 `/chat/completions` | OpenAI Chat | OpenAI Chat / SSE |
 | `POST` | `/v1/completions` 或 `/completions` | OpenAI Completions | OpenAI Completions |
@@ -300,7 +301,7 @@ curl -sS http://127.0.0.1:8787/health
 | `kernel_unavailable` | 503 | CLI 正在恢复或恢复预算耗尽；换到可用 VM |
 | `upstream_timeout` | 504 | 上游或 job 静默超时 |
 
-上游 400/404、401/403、429、5xx 分别保留 `upstream_invalid_request`、`upstream_auth_error`、`upstream_rate_limit`、`upstream_error`（过载为 `upstream_overloaded` / 529）。一次 native job 只发一次上游请求；CLI 不做隐藏重试、换模型或流式转非流式，重放预算由 Node 统一计数。
+上游 400/404、401/403、429、5xx 分别保留 `upstream_invalid_request`、`upstream_auth_error`、`upstream_rate_limit`、`upstream_error`（过载为 `upstream_overloaded` / 529）。一次 native job 只发一次上游请求；CLI 不做隐藏重试、换模型或流式转非流式，重放资格与预算由 Node 统一判断；没有给客户端写字节不代表没有上游执行。
 
 客户端取消经内部鉴权的 `POST /internal/v1/cancel {"request_id":"单次 hop ID"}` 传到 CLI。每次执行使用不同 ID；提前到达的取消也阻止后续提交。HTTP 断开是第二条兜底路径。取消不会触发重试、账号处罚或重启；CLI 任务真正结束并返回匹配 `cancel_ack` 前，内核不复用该 slot。取消一个任务不阻塞其他 slot 或探活。
 
@@ -325,14 +326,14 @@ VM / 节点下线通知由「设置 → 通知」的 `notify.events.vm_down` 控
 {"error":{"type":"upstream_error","code":"incomplete_response","message":"Assistant hop ended without visible output or stop_reason"}}
 ```
 
-含义：请求已交给槽内 CLI，既没有明确的错误原因，也没有可见输出（text / tool_use / refusal）或 `stop_reason`。只有 thinking 也算。上一次执行已经结束且尚未向客户端写出时，网关先换到别的空闲 VM 重放，没有空位才回到同一 VM；同一请求在同一 VM 上最多实际执行 3 次（含传输层隐藏重试）。都用完仍不完整，才把这个 502 交回客户端。这一次请求不停调、不写账号冷却，也不因计数重启 CLI。一开始就没有可用账号时，返回 `pool_unavailable`。客户端主动断开是 `client_cancelled`，不是这个错误。诊断钉死在某一个槽时，停在该槽并返回这个错误。
+含义：请求已交给槽内 CLI，既没有明确的错误原因，也没有可见输出（text / tool_use / refusal）或 `stop_reason`。只有 thinking 也算。网关保留已观察到的 usage 并返回错误，不自动再次生成；执行已结束或尚未写出客户端内容，都不足以证明没有消耗上游额度。网络、超时、流中断等不明确结果只有在传输层明确报告 `upstreamExecutions=0` 且 `committed=false` 时才允许安全恢复。纯前置 400/429 拒绝可按既有策略修复或切换，但若已含生成用量证据则停止。客户端主动断开是 `client_cancelled`，不会重发或处罚账号。
 
 常见原因与处理：
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | 同一个槽的请求**全部**失败，网络 / 超时错误；面板代理探测却是绿的 | 槽容器到宿主机 `kin-egress` 网关被宿主机防火墙拦截（常见于 UFW 入站默认拒绝）。容器内 DNS 和出站 TCP 超时 | 放行 `keg*` 网卡到网关端口的入站，见 [DEPLOY.md「防火墙」](DEPLOY.md#防火墙ufw--firewalld) |
-| 偶发，重试后成功 | 上游流中断（新二进制报 `upstream_stream_interrupted`）或模型只返回了 thinking | 尚未提交的请求可重放；同一 VM 最多 3 次 |
+| 偶发，重试后成功 | 上游流中断（新二进制报 `upstream_stream_interrupted`）或模型只返回了 thinking | 返回真实错误并保留用量；仅明确零上游执行时可自动恢复 |
 | 某个槽持续失败 | slot 取消未结束或共享 CLI 不再响应 | 内核先隔离 slot / 重启 CLI；预算耗尽后 watchdog 才重启容器并最终告警，不需要每次手工重启 |
 
 面板代理探测是从宿主机本机连网关端口，不经过「容器 → 网关」这一跳，所以防火墙拦截时它仍显示正常。确认方法：
@@ -351,20 +352,21 @@ docker exec kin-<槽> curl -sS -o /dev/null -w '%{http_code}\n' --max-time 10 ht
 stateDiagram-v2
   [*] --> 选槽
   选槽 --> 上游SSE
-  上游SSE --> 可换号: 尚无业务事件
+  上游SSE --> 可换号: 明确零执行或纯前置拒绝
   上游SSE --> 已提交: 首个业务事件
-  可换号 --> 选槽: realtime 失败
+  可换号 --> 选槽: 恢复预算仍可用
   已提交 --> 结束: 只报错不换号
+  上游SSE --> 结束: 执行结果不明或不完整
   上游SSE --> 回放: verified 等到 message_stop
   回放 --> 结束
 ```
 
-- **realtime（默认）**：第一段业务 SSE 写出后不再换账号。
-- **verified**：收齐 `message_stop` 再给客户端；不完整则继续换号。
+- **realtime（默认）**：第一段业务 SSE 写出后不再换账号；写出之前也必须先满足安全重放资格。
+- **verified**：收齐 `message_stop` 再给客户端；不完整时返回错误并保留真实用量，不自动再次生成。
 - 席位（预调度）：出站占位的首要身份是 device id / machine id，其次才是 session id。一个 machine（`metadata.user_id.device_id`、`device_id`、`x-kin-device-id`）先占一台 VM。同一 machine 再来的 session 优先使用这台 VM 里还空着的槽；槽满了才等这台 VM，等不到才去别的 VM。每个 session 在请求进行中独占一个槽；这一轮结束且该 session 没有排在这台 VM 上的后续请求时，槽立刻释放。粘性 TTL 只记住用过的 VM，不占 `session_slots`。没有 device / machine 时，按 session id 占槽；再没有才用 `cache_control: ephemeral` 内容哈希，然后是客户端 IP + 归一化 UA + system + 首轮 user 内容哈希。API key 从不参与。同一 session 的并发请求共用这一个席位。每台 VM 的席位数是 `session_slots`（VM 覆盖 → `inference.session_slots`，上限 20）。额度 / 凭证 / 暂停等确定失效，或换 VM 重试，才立刻释放，到新 VM 再占一个槽。开新席位要求余量 `min(limit_5h − u5, limit_7d − u7) ≥ (已占 + 1) × seat_budget_reserve_pct`。都满时进全局 FIFO。有粘性 VM 的先在该 VM 等 `sticky_wait_timeout_ms`，再转全局等 `fallback_wait_timeout_ms`。超时返回 529。一次性短探测和诊断 pin 不占席位。分配原因：`device-affinity` 是这台 machine 已有的 VM，`sticky` 是这个 session 自己的绑定，`family-affinity` 是父会话所在 VM。
 - sticky：同一会话在终态成功后记住 VM；粘性 TTL 内这台 VM 是该 session 新开席位的首选。对话结束后不占席位。不可调度 / 错误会清掉这份记忆。
 - 5h/7d 闸（`routing.quota`）：用量进入闸线下 `critical_band`（默认 5 个百分点）起为「临近闸线」，一直到闸线上 `gate_overshoot`（默认 5 个百分点）。这一段里已入座的 device 留在原 VM：同账号一次只跑一个请求（额度读数滞后于在飞请求），第二个并发在原 VM 排队，不换 VM；新 device 优先开到其他正常 VM，用量已过闸线时不再开新席位。用量达到闸线 + `gate_overshoot` 才让出席位换 VM；上游 rejected / 100% / 429 冷却始终立即换。
-- 重试预算：每个 VM 每请求最多 3 次实际执行；准入竞争失败不算一次执行。`failover.max_total_attempts` / `max_account_switches` 用完后只再尝试本请求还没试过的 VM，直到 `total_retry_deadline_ms`。
+- 重试预算：仅在满足安全恢复资格时使用；每个 VM 每请求最多 3 次实际执行，准入竞争失败不算一次执行。`failover.max_total_attempts` / `max_account_switches` 用完后只再尝试本请求还没试过的 VM，直到 `total_retry_deadline_ms`。
 - 流空闲上限：上游流连续无事件超过 `failover.stream_idle_timeout_ms`（默认 180 秒，面板「重试与切号」可调，30 秒–60 分钟）即判超时。网关、槽内 kernel 的流空闲上限和 job 看门狗（kernel 读的是不带前缀的环境变量 `JOB_IDLE_SECS`，由 kernel 启动脚本从 `kernel.json` 读取并导出；`KIN_JOB_IDLE_SECS` 不生效）共用这个值。保存后立即热写入各槽 `kernel.json`；job 看门狗只在 kernel 启动时读取，所以值变化后各运行中的 Claude 槽会在没有任务时自动重启 kernel（有任务则等它结束，另每 15 秒复查一次）。不带 `eager_input_streaming` 时，上游会把大工具入参（如长 `Write` 内容）整段缓冲，期间可能静默数分钟。未配置时用环境变量 `KIN_STREAM_IDLE_TIMEOUT`。
 - 排队保活（仅 Claude `stream: true`）：选席、同会话串行、失败重试都发生在上游尝试开始之前，这段时间原先不下发任何字节。Cloudflare 约 100 秒收不到响应会回 524。`failover.queue_keepalive_delay_ms`（默认 60 秒，上限 90 秒，也可用 `KIN_QUEUE_KEEPALIVE_DELAY`）过后开始写 SSE `event: ping`，间隔与 `stream_keepalive_ms` 相同，并一直持续到首个内容事件。延迟之内失败仍是 HTTP 429/529/503。一旦写出 ping，状态码不能再改，后续失败改为 SSE `event: error`（例如 `overloaded_error`）。同会话排队另有 `failover.session_queue_timeout_ms`（默认 15 分钟；`0` 表示不限制），超时按 529 `overloaded_error` 返回，不会和仍在跑的上一轮并发。Codex / OpenAI 路径不变。
 - 工具参数流式下发：`failover.eager_tool_streaming`（默认开，面板「重试与切号」开关；显式 `false` 关闭）。开启后给所有自定义工具加 `eager_input_streaming: true`（服务端工具不动），上游边生成边下发大参数，不再长时间静默。这与官方 Claude Code 开启细粒度工具流式时的形态一致：官方只在直连官方 base URL 且服务端开关 `tengu_fgts` 打开，或设置 `CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1` 时给全部工具加这个字段，所以经中转的客户端默认不带。客户端自己带了这个布尔值时以客户端为准。参数在 `max_tokens` 截断时可能是不完整的 JSON。OpenAI chat/responses 入口的 function 工具在转成 Anthropic 后同样加这个字段。

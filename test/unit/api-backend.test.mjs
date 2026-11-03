@@ -1654,7 +1654,12 @@ unixTest('API Anthropic preserves UTF-8 split across transport chunks in JSON an
   })
   for (const clientStream of [false, true]) {
     let wire = ''
-    const res = { headersSent: false, write: (chunk) => { wire += String(chunk) } }
+    const res = {
+      headersSent: false,
+      write: (chunk) => {
+        wire += String(chunk)
+      },
+    }
     const result = await runApiInference({
       cfg: { paths: { data: root } },
       res,
@@ -1666,7 +1671,9 @@ unixTest('API Anthropic preserves UTF-8 split across transport chunks in JSON an
       converters: {
         createClaudeMessageAssembler,
         applyClaudeSSELineToMessage,
-        writeSSEHeaders: () => { res.headersSent = true },
+        writeSSEHeaders: () => {
+          res.headersSent = true
+        },
       },
       scheduler: {
         pick: () => ({

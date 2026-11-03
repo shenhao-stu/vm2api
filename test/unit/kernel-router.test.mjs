@@ -95,7 +95,7 @@ test('hop slot wait uses remaining wait-plan budget instead of a second 30s', ()
   assert.equal(resolveHopSlotWaitMs({}), 30_000)
 })
 
-test('waitForReadySlot with zero budget does an immediate check only', async () => {
+test('waitForReadySlot with zero budget returns immediately without probing', async () => {
   const started = Date.now()
   const result = await waitForReadySlot({ vmId: 'vm-zero-budget' }, 0, 50)
   assert.equal(result.ok, false)

@@ -3322,7 +3322,6 @@ test('a resting slot that cannot serve the model does not promise a Retry-After'
   assert.equal(selected.retry_after_ms, null)
 })
 
-
 test('final admission rejects a remote health failure observed after candidate selection', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -3337,7 +3336,11 @@ test('final admission rejects a remote health failure observed after candidate s
   vm.node_id = 'remote-test'
   fs.writeFileSync(file, JSON.stringify(vm))
   const cached = pool.healthCache.get(candidate.vmId)
-  pool.healthCache.set(candidate.vmId, { ...cached, at: Date.now(), value: { ok: false, error: 'health relay disconnected' } })
+  pool.healthCache.set(candidate.vmId, {
+    ...cached,
+    at: Date.now(),
+    value: { ok: false, error: 'health relay disconnected' },
+  })
   assert.equal(pool.reserve(candidate), null)
   assert.equal(pool.inflight.get(candidate.accountId) || 0, 0)
 })

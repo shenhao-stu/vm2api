@@ -82,3 +82,37 @@ test('resource ownership checks full instance and resource identities, not short
     slotContainerName('vm-01', hosted),
   )
 })
+
+test('native labels, remote host roots and gate names isolate the same VM on one login', async () => {
+  const { scopedRemoteHost, nativeServiceLabel, gateContainerName } = await import(
+    '../../src/lib/vm/instance-scope.mjs'
+  )
+  const { nativeLabels, nativeSlotPaths, assertNativeRuntimeScope } = await import(
+    '../../src/lib/cluster/native-slot.mjs'
+  )
+  const { nodeHostCommand } = await import('../../src/lib/cluster/node-host.mjs')
+  const host = { root: '/Users/u/.vm2api', home: '/Users/u', uid: 501, gid: 20, platform: 'darwin' }
+  assert.equal(scopedRemoteHost(host, {}), host)
+  assert.equal(nativeServiceLabel('vm-01', 'kernel', {}), 'com.vm2api.slot.vm-01.kernel')
+  assert.equal(gateContainerName({}), 'kin-slot-gate')
+  const a = scopedRemoteHost(host, hosted),
+    b = scopedRemoteHost(host, other)
+  assert.equal(a.root, '/Users/u/.vm2api/i/hosted')
+  assert.notEqual(a.root, b.root)
+  assert.notEqual(nativeLabels('vm-01', hosted).kernel, nativeLabels('vm-01', other).kernel)
+  assert.notEqual(gateContainerName(hosted), gateContainerName(other))
+  assert.notEqual(nativeServiceLabel('vm-01', 'telemetry', hosted), nativeServiceLabel('vm-01', 'telemetry', {}))
+  assert.match(nodeHostCommand('darwin', hosted), /\.vm2api\/i\/hosted\//)
+  const vm = { id: 'vm-01', runtime: { remote_dir: `${a.root}/vms/vm-01`, launchd: nativeLabels('vm-01', hosted) } }
+  assert.doesNotThrow(() => assertNativeRuntimeScope(vm, a, hosted))
+  assert.throws(() => assertNativeRuntimeScope(vm, b, other), { code: 'instance_scope_conflict' })
+  assert.throws(
+    () => assertNativeRuntimeScope({ id: 'vm-01', runtime: { remote_dir: `${host.root}/vms/vm-01` } }, a, hosted),
+    { code: 'instance_scope_conflict' },
+  )
+  assert.throws(() => nativeServiceLabel('../vm', 'kernel', hosted), { code: 'instance_scope_invalid' })
+  assert.throws(() => scopedRemoteHost({ root: '/u/../v' }, hosted), { code: 'instance_scope_invalid' })
+  const paths = nativeSlotPaths(a.root, vm.id, 'digest')
+  assert.match(paths.home, /\/i\/hosted\/vms\/vm-01\/cli-home$/)
+  assert.match(paths.payload, /\/i\/hosted\/native\/digest$/)
+})

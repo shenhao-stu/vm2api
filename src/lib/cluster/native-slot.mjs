@@ -23,6 +23,7 @@
  */
 
 import path from 'node:path'
+import { instanceId, nativeServiceLabel } from '../vm/instance-scope.mjs'
 import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
@@ -42,7 +43,6 @@ const LOG_ROTATE_BYTES = 8 * 1024 * 1024
 const BOOTOUT_WAIT_TRIES = 25
 // kickstart -k waits for the old process to exit (up to the job's ExitTimeOut) before it returns.
 const LAUNCHCTL_TIMEOUT_MS = 30_000
-const LABEL_PREFIX = 'com.vm2api.slot'
 export const LAUNCHD_GUI_REQUIRED =
   'SSH 用户没有登录 macOS 图形界面：launchd 槽位需要该用户保持登录（Mac mini 请开启自动登录）'
 
@@ -51,8 +51,8 @@ function failure(err, fallbackCode = 'native_slot_failed') {
   return { ok: false, code, error: String(err?.message || err).slice(0, 500) }
 }
 
-export function nativeLabels(vmId) {
-  return { kernel: `${LABEL_PREFIX}.${vmId}.kernel` }
+export function nativeLabels(vmId, env = process.env) {
+  return { kernel: nativeServiceLabel(vmId, 'kernel', env) }
 }
 
 /** Node-side paths of one slot; `payload` is the shared binaries directory of `digest`. */
@@ -296,9 +296,23 @@ function assertSocketPaths(p) {
   }
 }
 
+export function assertNativeRuntimeScope(vm, host, env = process.env) {
+  if (!instanceId(env)) return
+  const expected = nativeServiceLabel(vm.id, 'kernel', env)
+  if (
+    (vm.runtime?.remote_dir && vm.runtime.remote_dir !== `${host.root}/vms/${vm.id}`) ||
+    (vm.runtime?.launchd?.kernel && vm.runtime.launchd.kernel !== expected)
+  ) {
+    throw Object.assign(new Error('native slot runtime does not belong to this instance'), {
+      code: 'instance_scope_conflict',
+    })
+  }
+}
+
 async function nativeSession(vm) {
   const nodeId = vmNodeId(vm)
   const session = await nodeSession(nodeId)
+  assertNativeRuntimeScope(vm, session.host)
   if (session.host.platform !== 'darwin') {
     throw new ClusterError(409, 'node_platform_mismatch', `节点 ${nodeId} 不是 macOS，不能按原生方式管理槽位`)
   }
@@ -348,7 +362,7 @@ async function configureSlot(vm, projectRoot, routing) {
   assertSocketPaths(p)
   const domain = await launchdDomain(session)
   // Retire the precisely owned legacy job; never kill unrelated OAuth workers.
-  const legacyTelemetry = `${LABEL_PREFIX}.${vm.id}.telemetry`
+  const legacyTelemetry = nativeServiceLabel(vm.id, 'telemetry')
   await bootout(session, domain, legacyTelemetry)
   await runRemote(session.client, `rm -f ${shellQuote(`${p.launchd}/${legacyTelemetry}.plist`)}`)
   const slotDir = path.join(projectRoot, 'vms', vm.id)
@@ -403,7 +417,7 @@ export async function stopNativeSlot(vm) {
     const domain = await launchdDomain(session)
     const labels = nativeLabels(vm.id)
     const was = await nativeServiceStatus(session, domain, labels.kernel)
-    await bootout(session, domain, `${LABEL_PREFIX}.${vm.id}.telemetry`)
+    await bootout(session, domain, nativeServiceLabel(vm.id, 'telemetry'))
     await bootout(session, domain, labels.kernel)
     if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, stopped: true }
     return { ok: true, action: was.state === 'missing' ? 'absent' : 'stopped', runtime: vm.runtime || null }
@@ -419,7 +433,7 @@ export async function destroyNativeSlot(vm) {
     const domain = await launchdDomain(session)
     const labels = nativeLabels(vm.id)
     const was = await nativeServiceStatus(session, domain, labels.kernel)
-    await bootout(session, domain, `${LABEL_PREFIX}.${vm.id}.telemetry`)
+    await bootout(session, domain, nativeServiceLabel(vm.id, 'telemetry'))
     await bootout(session, domain, labels.kernel)
     await removeRemoteSlotDir(vm, session)
     await clusterManager().dropSlotRelays(vm.id)

@@ -458,3 +458,20 @@ test('reconnect, removal and another save during verification cannot resurrect s
     })
   }
 })
+
+test('remoteHost scopes before caching and editing verifies the same named root', async (t) => {
+  const before = process.env.VM2API_INSTANCE_ID
+  process.env.VM2API_INSTANCE_ID = 'hosted'
+  t.after(() => {
+    if (before === undefined) delete process.env.VM2API_INSTANCE_ID
+    else process.env.VM2API_INSTANCE_ID = before
+  })
+  const f = await fixture(t)
+  const host = await f.manager.remoteHost('node-a')
+  assert.equal(host.root, '/home/u/.vm2api/i/hosted')
+  assert.equal((await f.manager.remoteHost('node-a')).root, host.root)
+  assert.equal(f.manager.nodeHostFacts('node-a').root, host.root)
+  const result = await f.manager.update('node-a', f.patch({ password: 'new-password' }))
+  assert.ok(result)
+  assert.equal((await f.manager.remoteHost('node-a')).root, host.root)
+})

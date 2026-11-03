@@ -107,7 +107,6 @@ export function isKernelWatchdogTarget(vm, routing = {}) {
 }
 
 export { NODE_SLOT_HEALTH_TIMEOUT_MS } from './rust-kernel-client.mjs'
-export const NODE_SLOT_FAILURES_BEFORE_RESTART = 3
 
 function clusterRelayPaths(nodeId, vmId) {
   return clusterManager().slotRelayPaths(nodeId, vmId)
@@ -161,8 +160,6 @@ export function createKernelWatchdog({
   let inTick = false
   // vmId -> { attempts: [ms], nextAt }
   const restarts = new Map()
-  // Remote transport failures can be relay/gate jitter, not a dead kernel.
-  const nodeProbeFailures = new Map()
   // VMs under an operator power cycle: the watchdog must not restart them mid-cycle.
   const held = new Set()
   // vmId -> this tick's pending check/restart, so hold() can wait for it to settle.
@@ -244,13 +241,6 @@ export function createKernelWatchdog({
     }
     const current = await health(exec, { timeoutMs: rustKernelHealthTimeoutMs(vm) })
     if (held.has(vm.id)) return
-    if (vmNodeId(vm) && !rustKernelProcessUp(current) && current?.healthy !== false) {
-      const failures = (nodeProbeFailures.get(vm.id) || 0) + 1
-      nodeProbeFailures.set(vm.id, failures)
-      if (failures < NODE_SLOT_FAILURES_BEFORE_RESTART) return
-    } else {
-      nodeProbeFailures.delete(vm.id)
-    }
     // cc-node is the crag worker. Restarting a live kernel SIGKILLs it.
     if (dataplaneUsesCcNode(exec) && rustKernelProcessUp(current)) return
     if (!rustKernelNeedsRestart(current)) {
@@ -286,7 +276,6 @@ export function createKernelWatchdog({
     }
     const resultAt = now()
     if (result?.reason === 'already_up' || result?.reason === 'busy') {
-      nodeProbeFailures.delete(vm.id)
       const state = restarts.get(vm.id)
       if (state) state.nextAt = resultAt + config.interval_sec * 1000
       return

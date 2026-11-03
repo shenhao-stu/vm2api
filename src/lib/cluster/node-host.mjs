@@ -7,6 +7,7 @@
  * cluster page's disk column; it is optional so an odd `df` never hides the rest.
  */
 
+import { instanceId, scopedRemoteHost } from '../vm/instance-scope.mjs'
 import { shellQuote } from './remote-fs.mjs'
 
 export const NODE_HOST_TIMEOUT_MS = 5_000
@@ -41,8 +42,12 @@ const NODE_HOST_SCRIPT_DARWIN = [
 
 export const NODE_HOST_COMMAND_DARWIN = `sh -c ${shellQuote(NODE_HOST_SCRIPT_DARWIN)}`
 
-export function nodeHostCommand(platform) {
-  return platform === 'darwin' ? NODE_HOST_COMMAND_DARWIN : NODE_HOST_COMMAND
+export function nodeHostCommand(platform, env = process.env) {
+  if (platform !== 'darwin') return NODE_HOST_COMMAND
+  if (!instanceId(env)) return NODE_HOST_COMMAND_DARWIN
+  const root = scopedRemoteHost({ root: '/.vm2api' }, env).root
+  const script = NODE_HOST_SCRIPT_DARWIN.replace('$HOME/.vm2api/', `$HOME${root}/`)
+  return `sh -c ${shellQuote(script)}`
 }
 
 const num = (s) => {

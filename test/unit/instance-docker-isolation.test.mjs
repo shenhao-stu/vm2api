@@ -140,3 +140,33 @@ test('local slot stop and delete reject a conflicting name before Docker mutatio
   assert.throws(() => destroyVmRuntime(vm, { run }), { code: 'instance_scope_conflict' })
   assert.equal(seen.length, 2)
 })
+
+test('direct-link gate uses its scoped name and refuses foreign ownership before remote deletion', async (t) => {
+  scoped(t)
+  const { gateContainerName } = await import('../../src/lib/vm/instance-scope.mjs')
+  const { removeNodeGate, gateContainer } = await import('../../src/lib/cluster/direct-link.mjs')
+  const { connect, seen } = await docker(t)
+  const host = { root: '/home/u/.vm2api/i/hosted', uid: 1000, gid: 1000 }
+  let commands = 0
+  await assert.rejects(
+    removeNodeGate({
+      client: {
+        exec() {
+          commands++
+        },
+      },
+      host,
+      docker: connect,
+    }),
+    { code: 'instance_scope_conflict' },
+  )
+  assert.deepEqual(seen, [{ method: 'GET', path: `/containers/${gateContainerName()}/json` }])
+  assert.equal(commands, 0)
+  const { spec } = gateContainer({ host, imageRef: 'runner', body: '{}', binaryDigest: 'fixture' })
+  assert.deepEqual(spec.Labels['vm2api.instance'], 'hosted')
+  assert.deepEqual(spec.Labels['vm2api.resource'], 'gate')
+  assert.equal(
+    spec.HostConfig.Binds.every((mount) => mount.startsWith(`${host.root}/`)),
+    true,
+  )
+})

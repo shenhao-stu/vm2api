@@ -1,5 +1,6 @@
 import type { Vm } from '@/types/panel-vm'
 import { describe, expect, it } from 'vitest'
+import { tierVisual } from '@/lib/tier-visual'
 import {
   accountStatus,
   accountUsable,
@@ -230,8 +231,8 @@ describe('health probe must not paint a live ticket unavailable', () => {
   })
 })
 
-describe('claudeTier follows usage Fable presence', () => {
-  it('treats usage Fable as Max even when stored Pro and hop denied', () => {
+describe('claudeTier preserves explicit plans over stale usage', () => {
+  it('keeps explicit Pro when an old Fable probe is still present', () => {
     expect(
       claudeTier(
         liveVm({
@@ -240,10 +241,10 @@ describe('claudeTier follows usage Fable presence', () => {
           fable: { plan_denied: true, ok: false, status: 403 },
         })
       ).key
-    ).toBe('max')
+    ).toBe('pro')
   })
 
-  it('treats a real 7d_oi window as Max over stored Pro', () => {
+  it('keeps explicit Pro when a previous Max account window remains', () => {
     expect(
       claudeTier(
         liveVm({
@@ -252,7 +253,7 @@ describe('claudeTier follows usage Fable presence', () => {
           reset_7d_oi: '2026-08-24T00:00:00Z',
         })
       ).key
-    ).toBe('max')
+    ).toBe('pro')
   })
 
   it('keeps Pro when usage has no Fable evidence', () => {
@@ -270,6 +271,19 @@ describe('claudeTier follows usage Fable presence', () => {
     expect(claudeTier(liveVm({ account_tier: 'unknown' })).key).toBe('pro')
     expect(claudeTier(liveVm({})).key).toBe('pro')
     expect(claudeTier(liveVm({ account_tier: 'max' })).key).toBe('max')
+  })
+
+  it('keeps the badge and Fable usage row consistent after changing a Max slot to Pro', () => {
+    const vm = liveVm({
+      account_tier: ' Pro ',
+      usage_has_fable: true,
+      utilization_7d_oi: 0.21,
+      reset_7d_oi: '2026-08-24T00:00:00Z',
+      fable: { ok: true },
+    })
+    expect(claudeTier(vm).key).toBe('pro')
+    expect(tierVisual(vm).label).toBe('Pro')
+    expect(claudeTier(liveVm({ usage_has_fable: true })).key).toBe('max')
   })
 
   it('does not paint quota restriction as 调度关', () => {
@@ -798,6 +812,12 @@ describe('hosted operator readiness', () => {
   it('never presents remote unknown or unhealthy runtime as ready', () => {
     const vm = liveVm({ node_id: 'node-one', status: 'running' })
     expect(vmServiceStatus(vm).key).toBe('unknown')
+    expect(
+      vmServiceStatus(
+        { ...vm, status: 'stopped' },
+        { rust_health: { process_up: true, reachable: true } }
+      ).key
+    ).toBe('runtime_off')
     expect(
       vmServiceStatus(vm, { rust_health: { process_up: false } }).key
     ).toBe('unreachable')

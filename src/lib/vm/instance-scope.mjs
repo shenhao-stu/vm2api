@@ -118,3 +118,30 @@ export function egressIdentity(proxyId, env = process.env) {
     labels: instanceLabels(`proxy:${id}`, env),
   }
 }
+
+/** Remote host facts are scoped before entering the manager cache or edit verifier. */
+export function scopedRemoteHost(host, env = process.env) {
+  const scope = instanceId(env)
+  if (!scope) return host
+  const root = String(host?.root || '')
+  if (
+    !root.startsWith('/') ||
+    /[\x00-\x1f\x7f]/.test(root) ||
+    root.split('/').some((part) => part === '.' || part === '..')
+  )
+    throw invalid('invalid remote instance root')
+  return { ...host, root: `${root.replace(/\/+$/, '')}/i/${scope}` }
+}
+
+export function nativeServiceLabel(vmId, kind = 'kernel', env = process.env) {
+  const scope = instanceId(env)
+  const vm = String(vmId || '')
+  if (scope && !/^[a-zA-Z0-9_-]{1,96}$/.test(vm)) throw invalid('invalid native slot ID in named instance')
+  if (!['kernel', 'telemetry'].includes(kind)) throw invalid('invalid native service kind')
+  return `com.vm2api.slot.${scope ? `i${scope.length}-${scope}.` : ''}${vm}.${kind}`
+}
+
+export function gateContainerName(env = process.env) {
+  const scope = instanceId(env)
+  return scope ? `kin-slot-gate-i${scope.length}-${scope}` : 'kin-slot-gate'
+}

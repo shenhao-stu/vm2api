@@ -44,7 +44,12 @@ test('official reinitialization preserves deployment privacy in persisted CLI se
     path.join(home, '.claude.json'),
     JSON.stringify({ machineID: 'aa'.repeat(32), userID: 'bb'.repeat(32) }),
   )
-  const vm = { id: vmId, kernel: 'ubuntu-24.04', seed_policy: { telemetry_disabled: false }, fingerprint: { session_id: 'test-session' } }
+  const vm = {
+    id: vmId,
+    kernel: 'ubuntu-24.04',
+    seed_policy: { telemetry_disabled: false },
+    fingerprint: { session_id: 'test-session' },
+  }
   const vmPath = path.join(root, 'vms', `${vmId}.json`)
   fs.writeFileSync(vmPath, JSON.stringify(vm))
   const result = await finalizeOfficialCcTelemetry(root, vmId, {

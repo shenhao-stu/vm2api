@@ -724,7 +724,7 @@ export class ClusterManager {
   /**
    * SSH user facts for slot placement, cached per live SSH client (a
    * reconnect after `usermod -aG docker` or a key change re-reads them).
-   * `root` is where remote slot trees live: $HOME/.vm2api.
+   * `root` is scoped by readNodeHost before caching, including node edits and socket relays.
    */
   remoteHost(id) {
     const client = this.client(id)

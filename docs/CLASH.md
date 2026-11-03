@@ -26,7 +26,7 @@
 - `PATCH /api/panel/proxy-subscriptions/:id`：`{auto_refresh?,refresh_interval_minutes?}`。
 - `DELETE /api/panel/proxy-subscriptions/:id`：仅可删除没有绑定的订阅。
 
-保留旧 `/api/panel/proxies/clash`，GET 返回 `configured/sources`；POST 接受旧 `yaml` 名称及 `action=import|refresh|configure`、`source_id`，转发同一 manager。重复名称无法唯一选择订阅时必须提供 `source_id`。它使用相同管理员鉴权、字段验证、端口范围、固定出口与错误脱敏，不持有另一个 scheduler 或控制器。旧 source UUID 不会自动映射到新加密 registry 的 ID。
+保留旧 `/api/panel/proxies/clash`，GET 返回 `configured/sources`；POST 接受旧 `yaml` 名称及 `action=import|refresh|configure`、`source_id`，转发同一 manager；导入/刷新保留旧 `added/updated/unchanged/retained_disabled/skipped/source` 响应字段，统计由公开的前后状态派生，不二次应用配置。`retained_disabled` 为兼容字段名，表示保留旧绑定节点数量，本实现不静默禁用其原线路。重复名称无法唯一选择订阅时必须提供 `source_id`。它使用相同管理员鉴权、字段验证、端口范围、固定出口与错误脱敏，不持有另一个 scheduler 或控制器。旧 source UUID 不会自动映射到新加密 registry 的 ID。
 
 ## 从 Fwind 独立 sidecar 迁移
 

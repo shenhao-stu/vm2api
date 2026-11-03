@@ -10,6 +10,8 @@ VM2API_CONTAINER_NAME=vm2api-hosted
 VM2API_HOST_ROOT=/opt/vm2api-hosted
 HOST=127.0.0.1
 PORT=18888
+VM2API_PANEL_COOKIE_NAME=kin_hosted_panel_token
+VM2API_RELEASE_CHANNEL=hosted
 KIN_AUTO_SYNC_WRAP=0
 NODE_OPTIONS=--max-old-space-size=1024
 ```
@@ -17,6 +19,8 @@ NODE_OPTIONS=--max-old-space-size=1024
 实例名为 1–32 位小写字母、数字或连字符，首位必须是字母；不自动修剪、转小写或消除非法字符。具名实例未配置两个端口范围、端口越界、egress 范围不是完整偶/奇对、两个范围重叠时拒绝启动订阅管理器。为同宿主每个具名实例分配不同端口窗口；还应核验宿主其他服务实际监听。此例与旧订阅21000–22999、旧egress20000–35999不重叠。
 
 不要在已部署的数据目录随意更改实例名或端口范围。名字决定槽容器、egress网络、bridge、iptables链身份。订阅恢复会检查每个已保存listener是否仍在配置窗口内，窗口变化不匹配时拒绝加载，不静默换端口或重新绑定线路。
+
+构建前端时同时指定 `VITE_PANEL_COOKIE_NAME=kin_hosted_panel_token`，使同 IP 不同端口的其他实例登录 Cookie 保持独立。`VM2API_RELEASE_CHANNEL=hosted` 使更新页展示托管分支策略并阻止执行上游一键安装；托管版本通过已验证的 `dev/hosted` 镜像更新。
 
 ## 一份共享契约
 
@@ -29,6 +33,10 @@ NODE_OPTIONS=--max-old-space-size=1024
 - Docker列表及本地槽内存统计按实例过滤。具名控制面不能通过已知容器ID停止、重启、删除、执行命令或读取另一实例/旧服务日志；Docker低层操作在发出mutation前检查owner。
 - 具名实例的`runtime.container`必须等于由当前实例和槽ID派生的名字，不能直接信任从其他部署复制来的runtime指针。核心slot-exec、Rust supervisor和runtime均调用共享函数。
 - 本地透明egress与集群每槽egress仍保留原有拓扑；远端容器/网络应使用明确slot/slot-egress/slot-network/proxy资源标签，而非仅检查名字前缀。
+
+远端 SSH 用户目录在读取 host facts 时即隔离：具名实例使用 `$HOME/.vm2api/i/<instance>`，无名实例保持 `$HOME/.vm2api`。此 root 同时进入 ClusterManager 缓存、节点连接编辑校验、placement、凭据同步、payload 和 socket relay；不只修改某个槽位入口。macOS launchd 的 kernel/legacy telemetry 标签包含完整实例身份，具名实例拒绝来自其他实例的 runtime.remote_dir 或 launchd 标签。启停和清理不选择无名实例旧任务。长 HOME/实例名可能触及 macOS Unix socket 的103字节上限，原路径长度检查会明确拒绝，不能通过截断名字共享目录。
+
+集群直连 gate 也使用实例专属容器名、gate resource label、root 和证书。多个实例在同一节点启用 gate 时必须分别配置不同监听端口；没有自动换端口或接管其他 gate。Darwin 实例的槽进程内存统计仅匹配对应root；宿主CPU、可用内存等仍表示整个节点的实际容量。
 
 订阅profile个数不再固定限制为8；保留聚合512节点、每源解析限制、8MiB加密存储限制与listener窗口边界。第9个profile不会重新绑定已有节点、恢复禁用节点或改变原凭据。
 

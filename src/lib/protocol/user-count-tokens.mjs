@@ -309,16 +309,8 @@ export async function handleUserCountTokens(req, res, deps) {
   }
   const mode = credentialModeOfVm(peeked.vm)
   if (!canCountTokens(mode)) {
-    const { listed, source } = await resolveUsageWindows({
-      accountQuota: deps.accountQuota,
-      accountId: peeked.accountId,
-      vmId: peeked.vmId,
-      exec: peeked.exec,
-      vm: peeked.vm,
-      usageCache: deps.usageCache,
-      probe: deps.probeAccount,
-    })
-    return json(res, 200, buildUsageView(listed, source))
+    const error = countTokensUnsupportedError()
+    return json(res, error.status, error.body)
   }
   const hop = await (deps.countTokensViaWorker || countTokensViaWorker)(peeked.exec, {
     body: parsed.body,

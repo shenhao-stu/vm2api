@@ -17,6 +17,7 @@
  */
 
 import crypto from 'node:crypto'
+import { gateContainerName, instanceLabels, assertInstanceOwner, instanceId } from '../vm/instance-scope.mjs'
 import fs from 'node:fs'
 import net from 'node:net'
 import tls from 'node:tls'
@@ -30,7 +31,7 @@ import {
 import { openSftp, readRemoteFileNoFollow, runRemote, shellQuote, writeRemoteFile } from './remote-fs.mjs'
 import { ClusterError } from './ssh-link.mjs'
 
-export const GATE_CONTAINER = 'kin-slot-gate'
+export const GATE_CONTAINER = gateContainerName({})
 export const GATE_DEFAULT_PORT = 7790
 export const GATE_DIAL_TIMEOUT_MS = 3_000
 const GATE_MOUNT = '/etc/kin-slot-gate'
@@ -202,7 +203,7 @@ export function gateContainer({ host, imageRef, body, binaryDigest }) {
       User: user,
       Entrypoint: [`${GATE_MOUNT}/kin-slot-gate`],
       Cmd: ['-config', `${GATE_MOUNT}/gate.json`],
-      Labels: { 'kin.gate': '1', 'kin.gate.cfg': digest, 'vm2api.cluster': '1' },
+      Labels: { 'kin.gate': '1', 'kin.gate.cfg': digest, 'vm2api.cluster': '1', ...instanceLabels('gate') },
       HostConfig: {
         NetworkMode: 'host',
         Binds: [`${host.root}/gate:${GATE_MOUNT}:ro`, `${host.root}/gate/tls:${GATE_MOUNT}/tls`, `${vms}:${vms}:ro`],
@@ -245,7 +246,9 @@ export async function ensureNodeGate({ client, host, docker }, link, gateBin) {
   const body = gateConfigBody({ host, link })
   const binaryDigest = crypto.createHash('sha256').update(binary).digest('hex')
   const { digest, spec } = gateContainer({ host, imageRef, body, binaryDigest })
-  const existing = await inspectContainerOrNull(docker, GATE_CONTAINER)
+  const name = gateContainerName()
+  const existing = await inspectContainerOrNull(docker, name)
+  if (existing && instanceId()) assertInstanceOwner(existing.Config?.Labels, 'gate')
   let changed = false
   if (
     !(existing?.State?.Running && !existing.State.Restarting && existing.Config?.Labels?.['kin.gate.cfg'] === digest)
@@ -258,15 +261,18 @@ export async function ensureNodeGate({ client, host, docker }, link, gateBin) {
     const sftp = await openSftp(client)
     await writeRemoteFile(sftp, `${dir}/kin-slot-gate`, binary, { mode: 0o755 })
     await writeRemoteFile(sftp, `${dir}/gate.json`, body, { mode: 0o600 })
-    if (existing) await removeContainer(docker, GATE_CONTAINER)
-    await createContainerRaw(docker, GATE_CONTAINER, spec)
-    await containerAction(docker, GATE_CONTAINER, 'start')
+    if (existing) await removeContainer(docker, name)
+    await createContainerRaw(docker, name, spec)
+    await containerAction(docker, name, 'start')
     changed = true
   }
   return { changed, image: imageRef, certSha256: await readGateCert(client, host) }
 }
 
 export async function removeNodeGate({ client, host, docker }) {
-  if (await inspectContainerOrNull(docker, GATE_CONTAINER)) await removeContainer(docker, GATE_CONTAINER)
+  const name = gateContainerName()
+  const existing = await inspectContainerOrNull(docker, name)
+  if (existing && instanceId()) assertInstanceOwner(existing.Config?.Labels, 'gate')
+  if (existing) await removeContainer(docker, name)
   await runRemote(client, `rm -rf ${shellQuote(`${host.root}/gate`)}`)
 }

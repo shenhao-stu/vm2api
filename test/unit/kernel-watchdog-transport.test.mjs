@@ -4,7 +4,7 @@ import { createKernelWatchdog } from '../../src/lib/transport/kernel-watchdog.mj
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
 
 let sequence = 0
-function fixture({ remote = true, health, state = 'running', status = 'running' } = {}) {
+function fixture({ remote = true, health, state = 'running', status = 'running', observe } = {}) {
   const id = `transport-watchdog-${++sequence}`
   const vm = { id, status, runtime: { type: 'docker' }, ...(remote ? { node_id: 'node-fixture' } : {}) }
   let at = 0
@@ -15,7 +15,7 @@ function fixture({ remote = true, health, state = 'running', status = 'running' 
     listTargets: () => [vm],
     probeVm: (v) => v,
     health: async () => current,
-    observeRuntime: async () => ({ state }),
+    observeRuntime: observe || (async () => ({ state })),
     ensure: async () => {
       actions.push('ensure')
       return { ok: true }
@@ -126,6 +126,32 @@ test('local dead-kernel recovery is unchanged', async () => {
     await f.tick(10_000)
     assert.deepEqual(f.actions, ['ensure'])
   } finally {
+    f.wd.reset(f.id)
+  }
+})
+
+test('operator hold acquired during remote observation blocks revival and recovery accounting', async () => {
+  let observed
+  const f = fixture({
+    health: null,
+    observe: () =>
+      new Promise((resolve) => {
+        observed = resolve
+      }),
+  })
+  try {
+    const tick = f.tick(0)
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(typeof observed, 'function', 'runtime must be observed after the first lost health reply')
+    const held = f.wd.hold(f.id)
+    observed({ state: 'missing' })
+    await Promise.all([tick, held])
+    await f.tick(10_000)
+    assert.deepEqual(f.actions, [])
+    assert.equal(f.wd.restartsInWindow(f.id), 0)
+    assert.equal(kernelFaults.has(f.id), false)
+  } finally {
+    f.wd.release(f.id)
     f.wd.reset(f.id)
   }
 })

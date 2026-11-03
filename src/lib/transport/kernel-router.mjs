@@ -3,6 +3,7 @@
  * 公开仓只走 rust cli-hop（kernel → Claude Code）。Go HTTP 转发不再启用。
  * Credential import/ensure 仍可走 Go 客户端，但不参与推理 hop。
  */
+import { setTimeout as delay } from 'node:timers/promises'
 import { clientCancelledResult, isClientCancelledResult } from '../core/errors.mjs'
 import { ensureWorkerCredential } from './go-worker-client.mjs'
 import { ensureOfficialCredentialLink, slotUidGidFromHomeDir } from '../oauth/oauth-credentials.mjs'
@@ -68,24 +69,37 @@ export function rustShouldWaitForSlot(health, inflight = 0) {
   return rustKernelBusy(health) || Number(inflight) > 0
 }
 
-export async function waitForReadySlot(exec, timeoutMs = DEFAULT_SLOT_WAIT_MS, pollMs = DEFAULT_SLOT_POLL_MS) {
+function slotBudgetExhausted(health) {
+  return { ok: false, reason: 'slot_busy', health, error: 'rust kernel slot admission budget exhausted' }
+}
+
+export async function waitForReadySlot(
+  exec,
+  timeoutMs = DEFAULT_SLOT_WAIT_MS,
+  pollMs = DEFAULT_SLOT_POLL_MS,
+  { signal } = {},
+) {
   const parsed = Number(timeoutMs)
   const waitMs = Number.isFinite(parsed) ? Math.max(0, parsed) : DEFAULT_SLOT_WAIT_MS
   const deadline = Date.now() + waitMs
   const gap = Math.max(40, Number(pollMs) || DEFAULT_SLOT_POLL_MS)
-  const probe = () =>
-    rustKernelHealth(exec, {
+  let last
+  let first = true
+  while (Date.now() < deadline && !signal?.aborted) {
+    last = await rustKernelHealth(exec, {
       timeoutMs: Math.min(rustKernelHealthTimeoutMs(exec?.vm, 400), Math.max(1, deadline - Date.now())),
+      signal,
     })
-  let last = await probe()
-  if (rustKernelReachable(last)) return { ok: true, reason: 'already_up', health: last }
-  while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, Math.min(gap, deadline - Date.now())))
-    if (Date.now() >= deadline) break
-    last = await probe()
-    if (rustKernelReachable(last)) return { ok: true, reason: 'slot_ready', health: last }
+    if (signal?.aborted || Date.now() >= deadline) break
+    if (rustKernelReachable(last)) return { ok: true, reason: first ? 'already_up' : 'slot_ready', health: last }
+    first = false
+    try {
+      await delay(Math.min(gap, deadline - Date.now()), undefined, { signal })
+    } catch (error) {
+      if (!signal?.aborted) throw error
+    }
   }
-  return { ok: false, reason: 'slot_busy', health: last, error: 'rust kernel has no free slot' }
+  return signal?.aborted ? clientCancelledResult({ upstreamExecutions: 0 }) : slotBudgetExhausted(last)
 }
 
 export function clearRustHealthCache(vmId = null) {
@@ -108,6 +122,7 @@ export async function probeRustHealth(exec, { remainingBudgetMs, ...options } = 
   let at = Date.now()
   const budget = Number(remainingBudgetMs)
   const deadline = remainingBudgetMs != null && Number.isFinite(budget) ? at + Math.max(0, budget) : Infinity
+  if (at >= deadline) return { ok: false, status: 0, code: 'worker_timeout', error: 'health probe budget exhausted' }
   const initialOptions = Number.isFinite(deadline)
     ? { ...options, timeoutMs: Math.min(options.timeoutMs ?? 3000, Math.max(1, deadline - at)) }
     : options
@@ -236,22 +251,37 @@ async function prepareSlotCredentials(exec) {
 }
 
 async function prepareRust(exec, { ensure, routing, slotWaitMs, signal } = {}) {
+  const started = Date.now()
+  const budget =
+    slotWaitMs != null && slotWaitMs !== '' && Number.isFinite(Number(slotWaitMs))
+      ? Math.max(0, Number(slotWaitMs))
+      : Infinity
+  const expired = () => Date.now() - started >= budget
+  if (signal?.aborted) return clientCancelledResult({ upstreamExecutions: 0 })
+  if (expired()) return slotBudgetExhausted()
   await awaitWrapRecycle(exec)
+  if (signal?.aborted) return clientCancelledResult({ upstreamExecutions: 0 })
+  if (expired()) return slotBudgetExhausted()
   const fault = kernelFaults.get(cacheKey(exec))
   if (fault) return { ok: false, reason: 'kernel_unavailable', error: fault }
-  if (typeof ensure === 'function') return ensure(exec)
+  if (typeof ensure === 'function') {
+    const ready = await ensure(exec)
+    return expired() ? slotBudgetExhausted() : ready
+  }
   await prepareSlotCredentials(exec)
+  if (expired()) return slotBudgetExhausted()
   const ttl = rustHealthTtlMs(routing)
   const cached = peekRustHealth(exec, ttl)
   if (cached && rustKernelReachable(cached.health)) {
     return { ok: true, reason: 'health_cache', health: cached.health }
   }
-  const started = Date.now()
   const health = await probeRustHealth(exec, {
     timeoutMs: rustKernelHealthTimeoutMs(exec?.vm),
-    remainingBudgetMs: slotWaitMs,
+    remainingBudgetMs: Number.isFinite(budget) ? Math.max(0, budget - (Date.now() - started)) : undefined,
     signal,
   })
+  if (signal?.aborted) return clientCancelledResult({ upstreamExecutions: 0 })
+  if (expired()) return slotBudgetExhausted(health)
   if (rustKernelReachable(health)) {
     const ready = { ok: true, reason: 'already_up', health }
     return ready
@@ -270,7 +300,7 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs, signal } = {}) {
       0,
       resolveHopSlotWaitMs({ remainingBudgetMs: slotWaitMs, routing }) - (Date.now() - started),
     )
-    const waited = await waitForReadySlot(exec, waitMs)
+    const waited = await waitForReadySlot(exec, waitMs, DEFAULT_SLOT_POLL_MS, { signal })
     if (waited?.ok) {
       rememberRustHealth(exec, waited)
       return waited

@@ -49,7 +49,7 @@ test('buildUsageView converts Extra ratio to percent_used', () => {
   assert.equal(view.source, 'extra')
 })
 
-test('oauth count_tokens returns usage without hopping official count_tokens', async () => {
+test('oauth count_tokens rejects unsupported counting without any provider call', async () => {
   const cap = jsonCapture()
   let hopped = false
   const unified = {
@@ -77,6 +77,9 @@ test('oauth count_tokens returns usage without hopping official count_tokens', a
           exec: {},
         }),
       }),
+      probeAccount: async () => {
+        throw new Error('OAuth counting must not probe usage')
+      },
       countTokensViaWorker: async () => {
         hopped = true
         return { ok: true, body: { input_tokens: 9 } }
@@ -84,9 +87,8 @@ test('oauth count_tokens returns usage without hopping official count_tokens', a
     },
   )
   assert.equal(hopped, false)
-  assert.equal(cap.calls[0].status, 200)
-  assert.equal(cap.calls[0].body.unit, 'percent_used')
-  assert.equal(cap.calls[0].body.five_hour.utilization, 12)
+  assert.equal(cap.calls[0].status, 400)
+  assert.equal(cap.calls[0].body.error.code, 'count_tokens_unsupported')
   assert.equal(cap.calls[0].body.input_tokens, undefined)
 })
 

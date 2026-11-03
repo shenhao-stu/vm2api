@@ -1,3 +1,4 @@
+import { scopedRemoteHost } from '../vm/instance-scope.mjs'
 /** Node edits preserve placement identity and verify candidates without mutating either host. */
 import { inspectContainerOrNull, sshDocker } from './docker-remote.mjs'
 import { shellQuote } from './remote-fs.mjs'
@@ -92,14 +93,14 @@ export async function readNodeHost(client) {
   if (r.code !== 0 || !/^\d+$/.test(uid) || !/^\d+$/.test(gid) || !home.startsWith('/')) {
     throw new ClusterError(502, 'remote_host_unknown', '读取节点用户信息失败')
   }
-  return {
+  return scopedRemoteHost({
     uid: Number(uid),
     gid: Number(gid),
     home,
     root: `${home.replace(/\/+$/, '')}/.vm2api`,
     sudo: sudo === 'sudo',
     platform: nodePlatformOf(kernel),
-  }
+  })
 }
 
 function runtimeMismatch() {

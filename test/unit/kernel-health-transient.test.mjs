@@ -124,3 +124,38 @@ for (const remaining of [0, 20]) {
     assert.ok(performance.now() - start < 300)
   })
 }
+
+for (const hang of [false, true]) {
+  test(`client cancellation stops busy-slot ${hang ? 'health read' : 'poll delay'} without inference`, async (t) => {
+    const controller = new AbortController()
+    const f = await fixture(t, ({ count, reply }) => {
+      if (count <= 1 || !hang) reply(0, { ready_slots: 0 })
+      if (count === 2) setTimeout(() => controller.abort(), 20)
+    })
+    const start = performance.now()
+    const result = await f.send({ slotWaitMs: 700, signal: controller.signal })
+    assert.equal(result.status, 499)
+    assert.equal(f.counts().inferenceCalls, 0)
+    assert.ok(performance.now() - start < 250, 'cancelled request must release its admission wait promptly')
+    const count = f.counts().healthCalls
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.equal(f.counts().healthCalls, count, 'cancellation must leave no background health polls')
+  })
+}
+
+test('explicit zero admission budget cannot use a cached healthy kernel to dispatch', async (t) => {
+  const f = await fixture(t, ({ reply }) => reply())
+  assert.equal((await probeRustHealth(f.exec, { timeoutMs: 100 })).ok, true)
+  const before = f.counts()
+  const result = await f.send({ slotWaitMs: 0 })
+  assert.equal(result.ok, false)
+  assert.equal(result.upstreamExecutions, 0)
+  assert.deepEqual(f.counts(), before, 'exhausted budget must not probe or dispatch')
+})
+
+test('explicit zero health budget does not start a request', async (t) => {
+  const f = await fixture(t, ({ reply }) => reply())
+  const result = await probeRustHealth(f.exec, { remainingBudgetMs: 0 })
+  assert.equal(result.ok, false)
+  assert.deepEqual(f.counts(), { healthCalls: 0, inferenceCalls: 0 })
+})

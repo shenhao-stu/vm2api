@@ -43,7 +43,8 @@ that identity reliably. This phase does not change subscription import identity.
 
 The pool setting `routing.pool.egress_circuit_enabled` defaults to `true`.
 Setting it to the boolean `false` and reloading the existing routing configuration
-restores legacy selection and proxy-error cooldown behavior. Existing explicit
+restores legacy selection and proxy-error cooldown behavior. It does not disable
+the execution-safety checks or the fixed-egress guard. Existing explicit
 VM diagnostic pins bypass the egress gate; they do not clear an open circuit.
 This switch has no dedicated new UI control.
 
