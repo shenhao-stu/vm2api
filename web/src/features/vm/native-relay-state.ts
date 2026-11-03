@@ -9,6 +9,7 @@ export type NativeRelay = {
   usage?: {
     total_usd: number
     last_5h_usd: number
+    last_7d_usd?: number
     unpriced_requests: number
     first_at: string | null
   } | null

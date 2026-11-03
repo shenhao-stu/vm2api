@@ -93,7 +93,7 @@ claim of a fresh paid Fable generation or permanent authorization stability.
 Each Relay management configuration can select a read-only SQLite ledger with
 `usage_ledger: {"path": "/private/gateway/data/kin.db", "account_id": "ek_..."}`.
 Use the native backend account ID. Rotating an inbound API key retains the
-account's usage. The rolling five-hour and retained-history totals use
+account's usage. The rolling five-hour, seven-day and retained-history totals use
 `usage_logs.total_cost` in USD, including metered partial responses. The UI
 reports records without pricing separately. A missing ledger displays an
 unavailable state.

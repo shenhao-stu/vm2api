@@ -13,6 +13,8 @@ class RelayUsageTests(unittest.TestCase):
             with sqlite3.connect(path) as db:
                 db.execute('create table usage_logs(created_at, account_id, final_account_id, attempt_count, total_cost)')
                 db.executemany('insert into usage_logs values (?,?,?,?,?)', [
+                    ('2026-10-26T23:59:59.999Z', 'a', 'a', 1, 6),
+                    ('2026-10-27T00:00:00.000Z', 'a', 'a', 1, 1),
                     ('2026-11-02T18:59:59.999Z', 'a', 'a', 1, 3),
                     ('2026-11-02T19:00:00.000Z', 'b', 'a', 2, 2),
                     ('2026-11-02T23:01:00.000Z', 'a', None, 1, .5),
@@ -22,8 +24,8 @@ class RelayUsageTests(unittest.TestCase):
                 ])
             usage = relay_usage({'usage_ledger': {'path': str(path), 'account_id': 'a'}},
                                 datetime(2026, 11, 3, tzinfo=timezone.utc))
-            self.assertEqual((usage['total_usd'], usage['last_5h_usd'], usage['unpriced_requests']),
-                             (5.5, 2.5, 1))
+            self.assertEqual((usage['total_usd'], usage['last_5h_usd'], usage['last_7d_usd'], usage['unpriced_requests']),
+                             (12.5, 2.5, 6.5, 1))
 
     def test_unavailable_is_distinct_from_zero_and_does_not_create_database(self):
         with tempfile.TemporaryDirectory() as directory:

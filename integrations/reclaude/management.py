@@ -83,6 +83,7 @@ def relay_usage(config, now=None):
             row = db.execute("""
                 SELECT sum(total_cost),
                        sum(CASE WHEN created_at >= :since THEN total_cost ELSE 0 END),
+                       sum(CASE WHEN created_at >= :week THEN total_cost ELSE 0 END),
                        count(*), count(total_cost), min(created_at)
                 FROM usage_logs
                 WHERE created_at <= :now AND (
@@ -90,11 +91,11 @@ def relay_usage(config, now=None):
                     (final_account_id IS NULL AND account_id = :account AND attempt_count = 1)
                 )
             """, {"account": account_id, "since": stamp(now - timedelta(hours=5)),
-                  "now": stamp(now)}).fetchone()
+                  "week": stamp(now - timedelta(days=7)), "now": stamp(now)}).fetchone()
     except (KeyError, ValueError, TypeError, OSError, sqlite3.Error):
         return None
-    total, recent, count, priced, first = row
-    return {"total_usd": total or 0, "last_5h_usd": recent or 0,
+    total, recent, week, count, priced, first = row
+    return {"total_usd": total or 0, "last_5h_usd": recent or 0, "last_7d_usd": week or 0,
             "unpriced_requests": count - priced, "first_at": first}
 
 

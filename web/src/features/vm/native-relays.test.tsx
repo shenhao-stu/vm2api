@@ -66,13 +66,31 @@ describe('native Relay VM management', () => {
   it('separates Relay metering and the dated official quota', () => {
     const html = render(true, {
       ...relay,
-      usage: { total_usd: 12.5, last_5h_usd: 1.25, unpriced_requests: 1, first_at: null },
-      official_quota: { used_usd: 81, quota_usd: 80, observed_at_ms: 1000, resets_at_ms: 2000, stale: true },
+      usage: {
+        total_usd: 12.5,
+        last_5h_usd: 1.25,
+        last_7d_usd: 7.25,
+        unpriced_requests: 1,
+        first_at: null,
+      },
+      official_quota: {
+        used_usd: 81,
+        quota_usd: 80,
+        observed_at_ms: 1000,
+        resets_at_ms: 2000,
+        stale: true,
+      },
     })
-    for (const value of ['1.25', '12.5', '81', '80', '缺少计价', '上次记录（已过期）']) {
+    for (const value of ['1.25', '12.5', '81', '80', '缺少计价', '已过期']) {
       expect(html).toContain(value)
     }
-    expect(render(true)).toContain('等待此组织的官方额度数据')
+    const doc = new Window().document
+    doc.body.innerHTML = html
+    const meter = doc.querySelector('[role=meter]')
+    expect(meter?.getAttribute('aria-valuenow')).toBe('100')
+    expect(meter?.getAttribute('aria-valuetext')).toContain('101.25%')
+    expect(doc.body.textContent).toContain('$7.25')
+    expect(render(true)).toContain('等待官方额度')
   })
   it('does not show the administrative runtime to non-admins', () => {
     expect(render(false)).toBe('')
