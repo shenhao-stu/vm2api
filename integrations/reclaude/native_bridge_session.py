@@ -474,6 +474,9 @@ class Session:
                 "CLAUDE_CODE_MAX_RETRIES": "0",
                 "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "1",
                 "CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES": "0",
+                # Expired provider threads trigger a second POST; each relay grant
+                # permits one dispatch, so send the complete caller history.
+                "CLAUDE_CODE_TETHER_LIVE": "0",
                 "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
                 "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0",
                 "CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT": "360000",
