@@ -25,6 +25,7 @@ function money(n: number | undefined) {
 }
 
 export function RelayUsageCard({ relay }: { relay: NativeRelay }) {
+  const windows = relay.runtime.official_windows
   const q = relay.official_quota
   const usage = relay.usage
   const pct = q ? (100 * q.used_usd) / q.quota_usd : 0
@@ -40,48 +41,82 @@ export function RelayUsageCard({ relay }: { relay: NativeRelay }) {
         aria-label='ReClaude 官方套餐窗口'
         className='space-y-1.5 text-sm'
       >
-        <div className='flex items-baseline justify-between gap-2'>
-          <span className='text-muted-foreground'>套餐已用 / 总额</span>
-          <b
-            className='font-mono tabular-nums'
-            title={q ? `${q.used_usd} / ${q.quota_usd} USD` : undefined}
-          >
-            {q ? `${money(q.used_usd)} / ${money(q.quota_usd)}` : '—'}
-          </b>
-        </div>
-        {q ? (
+        {windows ? (
           <>
-            <div className='flex items-center gap-3'>
-              <div
-                role='meter'
-                aria-label='官方套餐已用比例'
-                aria-valuemin={0}
-                aria-valuemax={100}
-                aria-valuenow={fill}
-                aria-valuetext={`已用 ${percent.format(pct)}%`}
-                className='h-1.5 flex-1 overflow-hidden rounded-full bg-muted'
-              >
-                <div
-                  className={`h-full rounded-full ${q.stale ? 'bg-muted-foreground' : pct >= 100 ? 'bg-destructive' : 'bg-emerald-500'}`}
-                  style={{ width: `${fill}%` }}
+            <h4 className='text-xs text-muted-foreground'>套餐已用</h4>
+            {(
+              [
+                ['5H', windows.five_hour],
+                ['7D', windows.seven_day],
+              ] as const
+            ).map(([label, row]) => (
+              <div key={label} className='flex items-center gap-2 text-xs'>
+                <span>{label}</span>
+                <progress
+                  aria-label={label + ' 套餐已用'}
+                  className='h-1.5 flex-1 accent-emerald-500'
+                  max={100}
+                  value={Math.min(row.used_percent, 100)}
                 />
+                <b>{percent.format(row.used_percent)}%</b>
+                <span
+                  className='text-muted-foreground'
+                  title={exactTime(row.resets_at_ms)}
+                >
+                  {time.format(row.resets_at_ms)} 重置
+                </span>
               </div>
-              <span className='font-mono text-xs font-semibold'>
-                {percent.format(pct)}%
-              </span>
-            </div>
-            <div className='flex justify-between text-xs text-muted-foreground'>
-              <span title={q.resets_at_ms ? exactTime(q.resets_at_ms) : ''}>
-                重置{' '}
-                {q.resets_at_ms
-                  ? time.format(q.resets_at_ms) + ' 北京时间'
-                  : '待定'}
-              </span>
-              {q.stale && <span>已过期</span>}
-            </div>
+            ))}
+            {windows.stale && (
+              <span className='text-xs text-muted-foreground'>上次记录</span>
+            )}
           </>
         ) : (
-          <p className='text-xs text-muted-foreground'>等待官方额度</p>
+          <>
+            <div className='flex items-baseline justify-between gap-2'>
+              <span className='text-muted-foreground'>套餐已用 / 总额</span>
+              <b
+                className='font-mono tabular-nums'
+                title={q ? `${q.used_usd} / ${q.quota_usd} USD` : undefined}
+              >
+                {q ? `${money(q.used_usd)} / ${money(q.quota_usd)}` : '—'}
+              </b>
+            </div>
+            {q ? (
+              <>
+                <div className='flex items-center gap-3'>
+                  <div
+                    role='meter'
+                    aria-label='官方套餐已用比例'
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={fill}
+                    aria-valuetext={`已用 ${percent.format(pct)}%`}
+                    className='h-1.5 flex-1 overflow-hidden rounded-full bg-muted'
+                  >
+                    <div
+                      className={`h-full rounded-full ${q.stale ? 'bg-muted-foreground' : pct >= 100 ? 'bg-destructive' : 'bg-emerald-500'}`}
+                      style={{ width: `${fill}%` }}
+                    />
+                  </div>
+                  <span className='font-mono text-xs font-semibold'>
+                    {percent.format(pct)}%
+                  </span>
+                </div>
+                <div className='flex justify-between text-xs text-muted-foreground'>
+                  <span title={q.resets_at_ms ? exactTime(q.resets_at_ms) : ''}>
+                    重置{' '}
+                    {q.resets_at_ms
+                      ? time.format(q.resets_at_ms) + ' 北京时间'
+                      : '待定'}
+                  </span>
+                  {q.stale && <span>已过期</span>}
+                </div>
+              </>
+            ) : (
+              <p className='text-xs text-muted-foreground'>等待官方额度</p>
+            )}
+          </>
         )}
       </section>
       <section aria-label='本 Relay 已记用量' className='border-t pt-2 text-sm'>

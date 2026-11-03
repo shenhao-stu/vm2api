@@ -21,7 +21,9 @@ def rpc(bridge, number, method, params):
 
 
 @contextmanager
-def billing_tab(bridge, profile):
+def billing_tab(bridge, profile, app=APP):
+    if app not in (APP, "https://www.recode.cat/app"):
+        raise ValueError("invalid_billing_origin")
     def call(seq, name, **args):
         reply = rpc(bridge, seq, "tools/call", {"name": "browser_" + name, "arguments": args})
         if reply.get("isError"):
@@ -34,14 +36,33 @@ def billing_tab(bridge, profile):
     profiles = call(2, "profiles")["profiles"]
     if not any(p["id"] == profile and p["connected"] and not p["paused"] for p in profiles):
         raise RuntimeError("billing_profile_offline")
-    tab = call(3, "open", profileId=profile, url=APP, reuse="exact")
+    tab = call(3, "open", profileId=profile, url=app, reuse="exact")
     try:
-        if tab["expectedUrl"] != APP:
+        if tab["expectedUrl"] != app:
             raise RuntimeError("billing_login_required")
         yield lambda expression: call(4, "evaluate", profileId=profile, tabId=tab["id"],
-                                      expectedUrl=APP, expression=expression, timeoutMs=30000)["value"]
+                                      expectedUrl=app, expression=expression, timeoutMs=30000)["value"]
     finally:
         call(5, "release", profileId=profile, tabId=tab["id"], closeCreated=tab.get("created", False))
+
+
+ACCOUNT_WINDOWS = """(async () => {
+    const ids = IDS;
+    const options = { credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: AbortSignal.timeout(18000) };
+    const [orgs, devices] = await Promise.all(['/api/app/orgs/', '/api/app/devices?org_id=' + ids.org_id].map(async path => {
+        const response = await fetch(path, options);
+        return response.ok ? response.json() : null;
+    }));
+    const account = orgs?.items?.find(org => org.id === ids.org_id)?.current_account;
+    if (account?.id !== ids.account_id || !Array.isArray(devices) || !devices.some(d => d.org_id === ids.org_id && d.id === ids.binding && d.revoked_at === null)) return null;
+    const windows = {};
+    for (const key of ['five_hour', 'seven_day']) {
+        const w = account.usage_snapshot?.[key];
+        if (!w || !Number.isFinite(w.utilization) || w.utilization < 0 || !Number.isFinite(Date.parse(w.resets_at))) return null;
+        windows[key] = {used_percent:w.utilization, resets_at:w.resets_at};
+    }
+    return {ok:true, org:ids.org_id, account_id:ids.account_id, binding:ids.binding, source_updated:account.usage_updated_at, observed_at_ms:Date.now(), windows};
+})()"""
 
 
 def sync(config):
@@ -68,21 +89,30 @@ def sync(config):
       return {...expected, used_usd:Number(q.used_usd), quota_usd:Number(q.quota_usd),
         resets_at_ms:q.resets_at_ms ?? null, observed_at_ms:Date.now()};
     })()""".replace("IDS", json.dumps(ids))
+    kind = config.get("quota_kind", "carpool")
+    fields = {*ids, "used_usd", "quota_usd", "resets_at_ms", "observed_at_ms"}
+    if kind == "account_windows":
+        script = ACCOUNT_WINDOWS.replace("IDS", json.dumps(ids))
+        fields = {"ok", "org", "account_id", "binding", "source_updated", "observed_at_ms", "windows"}
+    elif kind != "carpool":
+        raise ValueError("invalid_quota_kind")
     with subprocess.Popen([sys.executable, str(Path.home()/".tmwd/runtime/bridge.py"), "mcp"],
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True) as bridge:
         try:
             rpc(bridge, 1, "initialize", {"protocolVersion": "2025-06-18",
                                          "clientInfo": {"name": "ReClaude billing reader", "version": "1"}, "capabilities": {}})
-            with billing_tab(bridge, config["profile"]) as read:
+            with billing_tab(bridge, config["profile"], config.get("app_url", APP)) as read:
                 observation = read(script)
         finally:
             bridge.stdin.close()
     if not isinstance(observation, dict) or "error" in observation:
         raise ValueError("official_billing_unavailable")
-    if set(observation) != {*ids, "used_usd", "quota_usd", "resets_at_ms", "observed_at_ms"}:
+    org_key = "org" if kind == "account_windows" else "org_id"
+    if (set(observation) != fields or observation.get(org_key) != ids["org_id"]
+            or observation.get("binding") != ids["binding"] or observation.get("account_id") != ids["account_id"]):
         raise ValueError("unexpected_billing_schema")
     subprocess.run(config["publish_command"], input=json.dumps(observation), text=True,
-                   check=True, timeout=30, stdout=subprocess.DEVNULL)
+                   check=True, timeout=75, stdout=subprocess.DEVNULL)
     print("official_quota_updated", int(time.time()))
 
 

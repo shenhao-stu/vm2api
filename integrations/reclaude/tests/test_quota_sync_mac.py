@@ -27,3 +27,10 @@ class BillingBrowserTests(unittest.TestCase):
         self.assertEqual([name for name, _ in calls].count('browser_evaluate'), 1)
         self.assertEqual(calls[-1][0], 'browser_release')
         self.assertTrue(calls[-1][1]['closeCreated'])
+
+    def test_portal_must_be_an_exact_allowed_origin(self):
+        with patch('quota_sync_mac.rpc') as bridge:
+            with self.assertRaisesRegex(ValueError, 'invalid_billing_origin'):
+                with billing_tab(None, 'profile', APP + '?other=1'):
+                    pass
+            bridge.assert_not_called()

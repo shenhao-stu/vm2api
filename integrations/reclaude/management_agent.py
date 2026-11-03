@@ -1,5 +1,7 @@
 """Fixed-target NAS agent. Stops only the HTTP worker; native OAuth stays alive."""
 import json
+import math
+from datetime import datetime
 import os
 from pathlib import Path
 import subprocess
@@ -26,13 +28,45 @@ def health(config):
         return {"ok": False}
 
 
+def account_windows(config):
+    source = config.get("account_windows")
+    if not source:
+        return None
+    try:
+        with Path(source["path"]).open() as stream:
+            data = json.loads(stream.read(2048))
+        if (data["binding"], data["org"], data["account_id"]) != (
+            config["binding"], source["org"], source["account_id"]
+        ):
+            return None
+        observed, updated = data["observed_at_ms"], data["source_updated"]
+        now = time.time() * 1000
+        if not 0 < updated <= observed <= now + 10000:
+            return None
+        result = {}
+        for key in ("five_hour", "seven_day"):
+            window = data["windows"][key]
+            used = window["used_percent"]
+            reset = datetime.fromisoformat(window["resets_at"].replace("Z", "+00:00"))
+            if type(used) not in (float, int) or not math.isfinite(used) or used < 0 or reset.tzinfo is None:
+                return None
+            result[key] = {"used_percent": used, "resets_at_ms": int(reset.timestamp() * 1000)}
+        result["observed_at_ms"] = observed
+        result["source_updated_ms"] = updated
+        result["stale"] = (now - observed > 900000 or now - updated > 7200000
+                           or any(result[key]["resets_at_ms"] <= now for key in ("five_hour", "seven_day")))
+        return result
+    except (OSError, KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
 def status(config):
     native = NativeHealth(config["home"], config["binding"])
     inspection = json.loads(run(["docker", "inspect", config["container"]]))[0]
     active = subprocess.run(["systemctl", "is-active", "--quiet", config["unit"]]).returncode == 0
     h = health(config) if active else {"ok": False, "active_requests": 0}
     state = native.state()
-    return {"ok": True, "container_running": inspection["State"]["Running"],
+    return {"ok": True, "official_windows": account_windows(config), "container_running": inspection["State"]["Running"],
             "container_started_at": inspection["State"]["StartedAt"],
             "memory_limit_bytes": inspection["HostConfig"]["Memory"],
             "daemon_pid": state.get("daemon", {}).get("pid"),

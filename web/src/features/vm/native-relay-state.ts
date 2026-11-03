@@ -20,6 +20,7 @@ export type NativeRelay = {
     observed_at_ms: number
     stale: boolean
   } | null
+  management_unavailable?: boolean
   observed_at: number
   authorization_latched: boolean
   guard: {
@@ -29,6 +30,13 @@ export type NativeRelay = {
     observed_ip?: string
   }
   runtime: {
+    official_windows?: {
+      five_hour: { used_percent: number; resets_at_ms: number }
+      seven_day: { used_percent: number; resets_at_ms: number }
+      observed_at_ms: number
+      source_updated_ms: number
+      stale: boolean
+    } | null
     container_running: boolean
     http_active: boolean
     http_ready: boolean
@@ -41,6 +49,7 @@ export type NativeRelay = {
 }
 
 export function relayState(relay: NativeRelay) {
+  if (relay.management_unavailable) return '管理连接待检查'
   if (
     relay.authorization_latched ||
     relay.runtime.revoked ||

@@ -463,6 +463,7 @@ def main():
     p.add_argument("--max-requests", type=int)
     p.add_argument("--session-budget-usd", type=float)
     p.add_argument("--idle-seconds", type=float, default=1800)
+    p.add_argument("--recognize-personal-max", action="store_true")
     p.add_argument("--allow-prewarm", action="store_true")
     p.add_argument("--allow-history-import", action="store_true")
     p.add_argument("--prepared-idle-seconds", type=float, default=120)
@@ -489,6 +490,8 @@ def main():
             body,
             timeout=limits.request_seconds,
             require_policy=True,
+            personal_max_profile=(args.home / ".rec/claude/accounts" / str(args.binding) / "config"
+                                  if args.recognize_personal_max else None),
             dispatch_proxy=args.dispatch_proxy,
             restore=True,
             session_budget_usd=args.session_budget_usd,

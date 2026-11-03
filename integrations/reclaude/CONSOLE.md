@@ -115,3 +115,13 @@ When Chrome is offline, its login expires, or the reported window resets,
 the card dates the last observation. The organization window can also include
 activity from other devices. Both views are admin-only and independent of Relay
 admission and lifecycle.
+
+### Multiple native accounts
+
+Repeat `--config` for each enrolled account on the same loopback management server. Give each configuration its own Relay ID, device binding, Sub2API account, state directory and fixed broker commands. All entries use the same panel authentication URL and browser origin. Each monitor refreshes its own account. A controller outage or device revocation is reported on that account's card. Start, stop and log requests carry the Relay ID in the path. Keep one native HOME, worker port, session directory, API key and usage ledger per account.
+
+Use the account's own verified model allowlist in Sub2API. During enrollment, test through a temporary group containing only that account and reconcile each terminal response with the native and Sub2API ledgers before admitting shared traffic. The per-Relay concurrency limit applies independently.
+
+The default native worker still waits for the organizational policy confirmation. For a personal Max binding, the worker supports `--recognize-personal-max`. It requires the genuine CLI initialization to report first-party Claude Max, the same current binding and matching native OAuth profile. Managed or ambiguous accounts retain the organizational policy check. Never share a policy cache or OAuth directory across devices.
+
+For account-window billing, set `quota_kind` to `account_windows` in the Chrome reader and set `account_windows` in the NAS agent config with its `path`, `org` and `account_id`. Use a separate installed reader and snapshot for each account. The existing `carpool` reader keeps the USD format. The optional `app_url` selects an allowlisted official portal with the login for that account. Percentage windows and dollar balances are displayed separately. When multiple devices use the same subscription, they share its official allowance.
