@@ -47,7 +47,8 @@ class ContinuationTests(unittest.TestCase):
         for body in [copy.deepcopy(self.follow), {**self.follow, "model": "different"}]:
             if body["model"] == "fixture":
                 body["messages"][0]["content"] = "not owned"
-            with self.assertRaisesRegex(ContractError, "history_prefix_mismatch"):
+            expected = "history_prefix_mismatch" if body["model"] == "fixture" else "session_configuration_changed"
+            with self.assertRaisesRegex(ContractError, expected):
                 Session(self.path, ["unused"], self.env, body, restore=True)
             self.assertEqual((self.path / "continuation.json").read_bytes(), saved)
 

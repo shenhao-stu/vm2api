@@ -356,6 +356,30 @@ class NativeHTTPTests(unittest.TestCase):
         self.assertNotEqual(self.created[0].directory, self.created[1].directory)
         self.assertEqual([r["attempts"] for r in self.audit(2)], [1, 1])
 
+    def test_structured_failure_audits_observed_usage_without_success(self):
+        def failure(session, body):
+            (session.directory / "dispatch" / (str(uuid.uuid4()) + ".consumed.json")).write_text("{}")
+            yield {"type": "message_start", "message": {
+                "id": "schema-fixture", "type": "message", "role": "assistant",
+                "model": body["model"], "content": [], "stop_reason": None,
+                "usage": {"input_tokens": 7, "output_tokens": 0},
+            }}
+            yield {"type": "message_delta", "delta": {}, "usage": {"input_tokens": 7, "output_tokens": 11}}
+            raise ContractError("native_structured_output_invalid_no_replay")
+        for index, stream in enumerate((False, True), 1):
+            self.identity = str(uuid.uuid4())
+            with patch.object(FixtureSession, "request", failure):
+                status, raw = self.request(self.body(stream=stream, output_config={"format": {"type": "json_schema", "schema": {"type": "object"}}}))
+            self.assertEqual(status, 200 if stream else 400)
+            expected = b"native_structured_output_invalid_no_replay" if stream else b"native_request_consumed_no_replay"
+            self.assertIn(expected, raw)
+            self.assertNotIn(b"message_stop", raw)
+            record = self.audit(index)[-1]
+            self.assertEqual(record["usage"], {"input_tokens": 7, "output_tokens": 11})
+            self.assertEqual(record["attempts"], 1)
+            self.assertFalse(record["complete"])
+            self.assertNotEqual(record["status"], 200)
+
     def test_sse_has_one_terminal(self):
         status, data = self.request(self.body(stream=True))
         self.assertEqual(status, 200)

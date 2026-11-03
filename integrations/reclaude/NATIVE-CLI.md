@@ -56,7 +56,35 @@ explicit `max_tokens`, output `effort` or supported thinking-display change is a
 original native conversation at its latest verified assistant checkpoint. These
 controls are never dropped merely to make a configuration comparison pass.
 Equivalent defaults, system text representations and cache annotations reuse
-the resident process. Structured `output_config.format` remains unsupported.
+the resident process.
+
+`output_config.format={"type":"json_schema","schema":{...}}` is supported
+through the unmodified CLI's `--json-schema` validator. The native CLI generates
+its own `StructuredOutput` tool; only that bare internal tool, followed by the
+matching native validated result, becomes the caller's JSON text response.
+Caller tools with the same name remain MCP namespaced and return normally.
+Schema mode buffers response content (up to 16 MiB) until validation; the initial
+message event is delivered immediately. A schema failure, plain-text answer,
+missing final result or overflow fails the request without a second dispatch
+grant. Observed usage is retained even when validation or the stream fails;
+missing usage remains unknown. The server's usual disconnect handling continues
+to drain the native turn and persist its usage audit.
+
+Schemas are passed unchanged to the native validator. The accepted envelope is
+an object schema of at most 64 KiB serialized JSON and depth 64; references must
+be local fragment references. External references, non-finite numbers and extra
+format-envelope fields are rejected before native dispatch. These resource
+checks do not claim to implement JSON Schema; the installed native CLI decides
+supported schema keywords and validates the result.
+
+A successfully projected structured turn writes a version-three checkpoint.
+Its next turn imports the verified caller-owned history into a new native
+segment and dispatches only the last new user message, because the caller's JSON
+text differs from the native internal tool transcript. Schema changes/removal
+are per-turn controls; model, system and exact history ownership stay protected.
+Ordinary sessions retain version-two checkpoints. A rollback to older code
+safely rejects version-three sessions rather than replaying or mis-resuming them;
+keep this compatibility change when rolling back active structured sessions.
 
 Adaptive thinking supports explicit `display: "summarized"` and `"omitted"`
 through the unmodified CLI's `--thinking adaptive --thinking-display` options.
