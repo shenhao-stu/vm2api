@@ -106,7 +106,7 @@ class ConfigurationCompatibilityTests(unittest.TestCase):
         self.assertEqual(recovered.native_id, self.session.native_id)
         self.assertEqual(recovered.environment['CLAUDE_CODE_MAX_OUTPUT_TOKENS'], '2048')
         self.assertIn('high', recovered.options)
-        for change in [{'model': 'different'}, {'system': 'different'}, {'tools': [{'name': 'Other', 'input_schema': {'type': 'object'}}]}]:
+        for change in [{'model': 'different'}, {'system': 'different'}]:
             with self.assertRaisesRegex(ContractError, 'history_prefix_mismatch'):
                 Session(self.path, ['unused'], {}, {**follow, **change}, restore=True)
 

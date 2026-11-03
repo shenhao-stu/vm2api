@@ -35,7 +35,8 @@ def memory_pressure(path, high_bytes):
 
 def idle(entry):
     return not entry.busy and (
-        entry.session.failed or not getattr(entry.session, "pending_ids", set())
+        entry.session.failed or getattr(entry.session, "suspended", False)
+        or not getattr(entry.session, "pending_ids", set())
     )
 
 
@@ -145,7 +146,9 @@ class SessionPool:
                     "busy": sum(e.busy for e in self.entries.values()),
                     "pending_tools_sessions": sum(
                         bool(getattr(e.session, "pending_ids", set()))
-                        and not e.session.failed for e in self.entries.values()),
+                        and not e.session.failed
+                        and not getattr(e.session, "suspended", False)
+                        for e in self.entries.values()),
                     "prepared": sum(bool(getattr(e.session, "prepared", False))
                                     for e in self.entries.values()),
                     "idle_seconds": self.idle_seconds,
