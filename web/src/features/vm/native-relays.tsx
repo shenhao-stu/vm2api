@@ -13,6 +13,7 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import { relayState, type NativeRelay } from './native-relay-state'
 
 const key = ['panel', 'native-relays'] as const
+const usd = new Intl.NumberFormat('en-US', { maximumFractionDigits: 8 })
 const endpoint = '/api/panel/native-relays'
 
 export function NativeRelays({ enabled }: { enabled: boolean }) {
@@ -166,6 +167,48 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
               </dd>
             </div>
           </dl>
+          <div className='space-y-1 text-sm'>
+            <h4 className='font-medium'>Relay 已记用量（USD）</h4>
+            {relay.usage ? (
+              <>
+                <p>
+                  最近 5 小时 {usd.format(relay.usage.last_5h_usd)} · 账本累计{' '}
+                  {usd.format(relay.usage.total_usd)}
+                </p>
+                <p className='text-xs text-muted-foreground'>
+                  按此 Relay 网关保留记录的模型原价统计。
+                  {relay.usage.first_at &&
+                    ` 最早记录 ${new Date(relay.usage.first_at).toLocaleString()}。`}
+                  {relay.usage.unpriced_requests > 0 &&
+                    ` 另有 ${relay.usage.unpriced_requests} 条记录缺少计价。`}
+                </p>
+              </>
+            ) : (
+              <p className='text-muted-foreground'>用量暂不可用</p>
+            )}
+          </div>
+          <div className='space-y-1 text-sm'>
+            <h4 className='font-medium'>ReClaude 官方套餐窗口（USD）</h4>
+            {relay.official_quota ? (
+              <>
+                <p>
+                  {relay.official_quota.stale ? '上次记录（已过期）' : '已用'}{' '}
+                  {usd.format(relay.official_quota.used_usd)} /{' '}
+                  {usd.format(relay.official_quota.quota_usd)}
+                  {' · 重置 '}
+                  {relay.official_quota.resets_at_ms
+                    ? new Date(relay.official_quota.resets_at_ms).toLocaleString()
+                    : '官方暂未给出时间'}
+                </p>
+                <p className='text-xs text-muted-foreground'>
+                  官方窗口包含其他设备的使用。读取于{' '}
+                  {new Date(relay.official_quota.observed_at_ms).toLocaleString()}。
+                </p>
+              </>
+            ) : (
+              <p className='text-muted-foreground'>等待此组织的官方额度数据</p>
+            )}
+          </div>
           <p className='text-sm break-words'>{relay.models.join(' · ')}</p>
           <p className='text-xs text-muted-foreground'>
             启停仅控制此 Relay

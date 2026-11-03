@@ -6,6 +6,19 @@ export type NativeRelay = {
   sub_account: number
   concurrency: number
   models: string[]
+  usage?: {
+    total_usd: number
+    last_5h_usd: number
+    unpriced_requests: number
+    first_at: string | null
+  } | null
+  official_quota?: {
+    used_usd: number
+    quota_usd: number
+    resets_at_ms: number | null
+    observed_at_ms: number
+    stale: boolean
+  } | null
   observed_at: number
   authorization_latched: boolean
   guard: {

@@ -87,3 +87,31 @@ Tests use local fixtures and a network-disabled genuine CLI, including Fable,
 default sampling, terminal SSE, authorization failure, drain and original-IP
 gates. This proves adapter compatibility without buying model calls; it is not a
 claim of a fresh paid Fable generation or permanent authorization stability.
+
+### Relay usage and official plan usage
+
+Each Relay management configuration can select a read-only SQLite ledger with
+`usage_ledger: {"path": "/private/gateway/data/kin.db", "account_id": "ek_..."}`.
+Use the native backend account ID. Rotating an inbound API key retains the
+account's usage. The rolling five-hour and retained-history totals use
+`usage_logs.total_cost` in USD, including metered partial responses. The UI
+reports records without pricing separately. A missing ledger displays an
+unavailable state.
+
+For the official quota, configure `official_quota` with a private snapshot
+`path`, the ReClaude `org_id` and the provider's numeric `account_id`. The
+snapshot is also scoped to the configured native device `binding`.
+`quota_sync_mac.py CONFIG` uses a selected, logged-in Chrome profile through
+the installed TMWD stdio bridge. It reads the first-party billing and device
+APIs inside the browser. Only the matching organization, account, device,
+amounts and timestamps leave Chrome. Its trusted local config names the
+`profile`, `binding`, `org_id`, `account_id` and fixed argv
+`publish_command`. Use an existing private operator transport to run
+`python3 publish_official_quota.py MANAGEMENT_CONFIG` with the observation
+on stdin. The publisher checks scope, recency and order before atomic replacement.
+
+A reader interval of five minutes fits the ten-minute freshness indicator.
+When Chrome is offline, its login expires, or the reported window resets,
+the card dates the last observation. The organization window can also include
+activity from other devices. Both views are admin-only and independent of Relay
+admission and lifecycle.
