@@ -59,6 +59,14 @@ class ManagementTests(unittest.TestCase):
     def action(self, action):
         return self.manager.action(action, str(uuid.uuid4()))
 
+    def test_profile_drift_rejects_start_before_starting_worker_but_allows_stop(self):
+        self.s["shared_policy_matches"] = False
+        with self.assertRaisesRegex(ManagementError, "shared_routing_profile_changed"):
+            self.action("start")
+        self.assertNotIn(("runtime", "start"), self.calls)
+        self.action("stop")
+        self.assertIn(("sub", "pause"), self.calls)
+
     def test_stop_pauses_before_stopping_and_never_calls_native_container_lifecycle(self):
         self.action("stop")
         mutations = [x for x in self.calls if x[1] != "status"]

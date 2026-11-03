@@ -141,6 +141,7 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
                     variant='outline'
                     disabled={
                       change.isPending ||
+                      relay.sub.shared_policy_matches === false ||
                       relay.authorization_latched ||
                       !relay.guard.ready ||
                       relay.runtime.revoked ||

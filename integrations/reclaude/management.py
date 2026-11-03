@@ -210,6 +210,8 @@ class Manager:
                 # Runtime refuses to stop until in-flight requests have drained.
                 self.runtime("stop")
             else:
+                if state["sub"].get("shared_policy_matches") is False:
+                    raise ManagementError("shared_routing_profile_changed")
                 r = state["runtime"]
                 if (state["authorization_latched"] or r.get("revoked") or r.get("auth_latched")
                         or r.get("failed_checks") or not state["guard"]["ready"]

@@ -45,7 +45,7 @@ export type NativeRelay = {
     auth_latched: boolean
     failed_checks: string[]
   }
-  sub: { schedulable: boolean }
+  sub: { schedulable: boolean; shared_policy_matches?: boolean }
 }
 
 export function relayState(relay: NativeRelay) {
@@ -56,6 +56,7 @@ export function relayState(relay: NativeRelay) {
     relay.runtime.auth_latched
   )
     return '授权锁存'
+  if (relay.sub.shared_policy_matches === false) return '调度配置待核对'
   if (!relay.guard.ready) return '出口待检查'
   if (relay.runtime.failed_checks.length) return '原生环境待检查'
   if (!relay.runtime.http_active || !relay.sub.schedulable) return '已暂停'
