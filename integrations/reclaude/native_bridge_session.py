@@ -26,6 +26,9 @@ from native_history import (HistoryError, active_efforts, import_plan, trailing_
                             validate_system_messages, write_transcript)
 
 
+STRUCTURED_RESPONSE_LIMIT = 16 * 1024 * 1024
+
+
 class ContractError(ValueError):
     pass
 
@@ -47,6 +50,40 @@ def thinking_configuration(body):
     ]:
         raise ContractError("unsupported_thinking_configuration")
     return copy.deepcopy(thinking)
+
+
+def schema_resources(value, depth=0):
+    """Bound local validation; schemas must not fetch external references."""
+    if depth > 64:
+        raise ContractError("unsupported_output_configuration")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"$ref", "$dynamicRef", "$recursiveRef"} and (
+                not isinstance(item, str) or not item.startswith("#")
+            ):
+                raise ContractError("unsupported_output_configuration")
+            schema_resources(item, depth + 1)
+    elif isinstance(value, list):
+        for item in value:
+            schema_resources(item, depth + 1)
+
+
+def output_format(body):
+    output = body.get("output_config", {})
+    if not isinstance(output, dict) or "format" not in output:
+        return None
+    fmt = output["format"]
+    if (not isinstance(fmt, dict) or set(fmt) != {"type", "schema"}
+            or fmt["type"] != "json_schema" or not isinstance(fmt["schema"], dict)):
+        raise ContractError("unsupported_output_configuration")
+    schema_resources(fmt["schema"])
+    try:
+        encoded = json.dumps(fmt["schema"], allow_nan=False).encode()
+    except (ValueError, TypeError, RecursionError):
+        raise ContractError("unsupported_output_configuration") from None
+    if len(encoded) > 65536:
+        raise ContractError("unsupported_output_configuration")
+    return copy.deepcopy(fmt)
 
 
 def native_options(body):
@@ -85,12 +122,13 @@ def native_options(body):
     output = body.get("output_config", {})
     if (
         not isinstance(output, dict)
-        or set(output) - {"effort"}
+        or set(output) - {"effort", "format"}
         or not isinstance(output.get("effort", "medium"), str)
         or output.get("effort", "medium")
         not in {"low", "medium", "high", "xhigh", "max"}
     ):
         raise ContractError("unsupported_output_configuration")
+    fmt = output_format(body)
     if type(body.get("stream", False)) is not bool:
         raise ContractError("invalid_stream")
     if not isinstance(body.get("metadata", {}), dict):
@@ -127,7 +165,7 @@ def native_options(body):
         "--effort",
         effective_effort(body),
     ] + (["--thinking", "adaptive", "--thinking-display", thinking["display"]]
-         if thinking else [])
+         if thinking else []) + (["--json-schema", json.dumps(fmt["schema"])] if fmt else [])
 
 
 def effective_effort(body, leading_only=False):
@@ -160,12 +198,14 @@ def legacy_configuration(body):
 def configuration(body):
     """The validated subset's effective native configuration, not JSON spelling."""
     thinking = thinking_configuration(body)
+    fmt = output_format(body)
     return {
         "model": body.get("model"),
         "system": caller_system(body.get("system", "")),
         "tools": tool_schema(body.get("tools", [])),
         "max_tokens": body.get("max_tokens"),
-        "output_config": {"effort": effective_effort(body)},
+        "output_config": {"effort": effective_effort(body),
+                          **({"format": fmt} if fmt else {})},
         **({"thinking": thinking} if thinking else {}),
     }
 
@@ -397,8 +437,12 @@ def initial_request(body, allow_history_import=False):
 class Turn:
     """Collect genuine native API events, changing only registered MCP tool names."""
 
-    def __init__(self, tools):
+    def __init__(self, tools, structured=False):
+        self.structured_indices = set()
+        self.structured = structured
         self.names = {"mcp__caller__" + name: name for name in tools}
+        if structured:
+            self.names["StructuredOutput"] = "StructuredOutput"
         self.message = None
         self.inputs = {}
 
@@ -410,6 +454,8 @@ class Turn:
         elif kind == "content_block_start":
             block = event["content_block"]
             if block["type"] == "tool_use":
+                if self.structured and block["name"] == "StructuredOutput":
+                    self.structured_indices.add(event["index"])
                 if block["name"] not in self.names:
                     raise ContractError("native_requested_an_unregistered_tool")
                 block["name"] = self.names[block["name"]]
@@ -522,6 +568,7 @@ class Session:
         self.prepared = False
         self.initialize_id = None
         self.initialize_response = None
+        self.structured_checkpoint = False
         self.control_ready = threading.Condition()
         if existed:
             self.restore(body)
@@ -535,7 +582,8 @@ class Session:
         except (OSError, ValueError):
             raise ContractError("native_session_recovery_unavailable") from None
         version = state.get("version")
-        if version == 2 and state.get("fixed_configuration") != self.fixed_signature:
+        self.structured_checkpoint = version == 3 and state.get("structured_output") is True
+        if version in (2, 3) and state.get("fixed_configuration") != self.fixed_signature:
             try:
                 old_tools = json.loads((self.directory / "tools.json").read_text())
             except (OSError, ValueError):
@@ -544,7 +592,7 @@ class Session:
         else:
             expected = self.fixed_signature
         matching = (state.get("configuration") == signature(legacy_configuration(body))
-                    if version == 1 else version == 2
+                    if version == 1 else (version == 2 or self.structured_checkpoint)
                     and state.get("fixed_configuration") in {expected, self.fixed_signature})
         if state["status"] == "prepared":
             if (
@@ -561,10 +609,9 @@ class Session:
         if state["status"] not in {"idle", "awaiting_tools"}:
             raise ContractError("native_session_incomplete_no_replay")
         history = body["messages"][: state["history_length"]]
-        if (
-            not matching
-            or signature(history_shape(history)) != state["history_sha256"]
-        ):
+        if not matching:
+            raise ContractError("session_configuration_changed")
+        if signature(history_shape(history)) != state["history_sha256"]:
             raise ContractError("history_prefix_mismatch")
         self.native_id = str(uuid.UUID(state["native_id"]))
         self.resume_uuid = str(uuid.UUID(state["assistant_uuid"]))
@@ -590,16 +637,19 @@ class Session:
         self.adopt_checkpoint_configuration(state)
 
     def adopt_checkpoint_configuration(self, state):
-        # Commit the verified boundary before tools.json changes. Keeping the
-        # existing version-two contract also makes a rollback able to resume.
-        updated = {**state, "version": 2, "configuration": self.body_signature,
+        # Commit the verified boundary before tools.json changes. Ordinary
+        # sessions retain v2; projected schema turns require v3-aware resume.
+        updated = {**state, "version": 3 if self.structured_checkpoint else 2, "configuration": self.body_signature,
                    "fixed_configuration": self.fixed_signature}
         if updated != state:
             self.write_checkpoint(updated)
         self.checkpoint_configuration = self.body_signature
 
     def checkpoint(self, status, request_sha256=None, message_id=None):
-        state = {"version": 2, "status": status, "native_id": self.native_id}
+        state = {"version": 3 if self.structured_checkpoint else 2,
+                 "status": status, "native_id": self.native_id}
+        if self.structured_checkpoint:
+            state["structured_output"] = True
         if status == "prepared":
             state.update({
                 "configuration": self.body_signature,
@@ -670,7 +720,7 @@ class Session:
         if history_shape(messages[:len(self.history)]) != history_shape(self.history):
             raise ContractError('history_prefix_mismatch')
         tail = [m for m in messages[len(self.history):] if m['role'] != 'system']
-        if len(tail) <= 1:
+        if len(tail) <= 1 and not self.structured_checkpoint:
             return None
         if self.history_profile is None:
             raise ContractError('unsupported_history_tail')
@@ -1031,6 +1081,7 @@ class Session:
                     self.native_id = str(uuid.uuid4())
                     self.resume_uuid = self.resume_message_id = None
                     self.pending_ids = set()
+                    self.structured_checkpoint = False
                 self.prepared = False
                 self.seen.add(request_signature)
                 self.history = copy.deepcopy(body["messages"])
@@ -1146,48 +1197,75 @@ class Session:
                     )
                     self.process.stdin.flush()
                 self.pending_ids = set()
-            turn = Turn([t["name"] for t in self.tools])
-            while True:
-                event = self.events.get(timeout=self.timeout)
-                if event is None or isinstance(event, Exception):
-                    self.failed = True
-                    self.close()
-                    raise ContractError("native_stream_incomplete")
-                converted = turn.event(event)
-                if event.get("type") == "message_stop":
-                    if not turn.message or not turn.message.get("stop_reason"):
+            structured = output_format(body) is not None
+            turn = Turn([t["name"] for t in self.tools], structured=structured)
+            buffered, buffer_bytes = [], 0
+            terminal_usage = None
+            try:
+                while True:
+                    event = self.events.get(timeout=self.timeout)
+                    if event is None or isinstance(event, Exception):
                         self.failed = True
                         self.close()
-                        raise ContractError("native_stop_without_terminal_reason")
-                    self.history.append(
-                        {"role": "assistant", "content": turn.message["content"]}
-                    )
-                    self.pending_ids = {
-                        b["id"]
-                        for b in turn.message["content"]
-                        if b.get("type") == "tool_use"
-                    }
-                    if self.pending_ids:
-                        self.tool_timer = threading.Timer(
-                            self.tool_wait_seconds, self.expire_tool_wait
+                        raise ContractError("native_stream_incomplete")
+                    if structured and event.get("type") != "message_start":
+                        buffer_bytes += len(json.dumps(event).encode())
+                        # Keep collecting real terminal usage after overflow, but
+                        # never accumulate more tool JSON or response text.
+                        if buffer_bytes > STRUCTURED_RESPONSE_LIMIT and event.get("type", "").startswith("content_block_"):
+                            continue
+                    converted = turn.event(event)
+                    if structured and event.get("type") == "message_delta":
+                        terminal_usage = copy.deepcopy(turn.message.get("usage", {}))
+                    if structured and event.get("type") != "message_start":
+                        if buffer_bytes <= STRUCTURED_RESPONSE_LIMIT:
+                            buffered.append(converted)
+                        if event.get("type") != "message_stop":
+                            continue
+                        converted_events = self.structured_events(turn, buffered, buffer_bytes)
+                    else:
+                        converted_events = [converted]
+                    if event.get("type") == "message_stop":
+                        if not turn.message or not turn.message.get("stop_reason"):
+                            self.failed = True
+                            self.close()
+                            raise ContractError("native_stop_without_terminal_reason")
+                        self.history.append(
+                            {"role": "assistant", "content": turn.message["content"]}
                         )
-                        self.tool_timer.daemon = True
-                        self.tool_timer.start()
-                    elif (
-                        turn.message["stop_reason"] != "end_turn"
-                        and self.dispatch_proxy
-                    ):
-                        # The CLI may autonomously recover from max_tokens. The
-                        # consumed network grant blocks it; do not reuse this turn.
-                        self.suspended = True
-                        self.close(graceful=True)
-                    self.checkpoint(
-                        "awaiting_tools" if self.pending_ids else "idle",
-                        request_signature, turn.message["id"],
-                    )
-                yield converted
-                if event.get("type") == "message_stop":
-                    return
+                        self.pending_ids = {
+                            b["id"]
+                            for b in turn.message["content"]
+                            if b.get("type") == "tool_use"
+                        }
+                        if self.pending_ids:
+                            self.tool_timer = threading.Timer(
+                                self.tool_wait_seconds, self.expire_tool_wait
+                            )
+                            self.tool_timer.daemon = True
+                            self.tool_timer.start()
+                        elif (
+                            turn.message["stop_reason"] != "end_turn"
+                            and self.dispatch_proxy
+                        ):
+                            # The CLI may autonomously recover from max_tokens. The
+                            # consumed network grant blocks it; do not reuse this turn.
+                            self.suspended = True
+                            self.close(graceful=True)
+                        self.checkpoint(
+                            "awaiting_tools" if self.pending_ids else "idle",
+                            request_signature, turn.message["id"],
+                        )
+                    yield from converted_events
+                    if event.get("type") == "message_stop":
+                        return
+            except Exception:
+                if structured and terminal_usage is not None:
+                    # An observed provider delta survives CLI validation errors,
+                    # truncated streams and timeouts. This is not a success or a
+                    # fabricated final receipt; the request still fails below.
+                    yield {"type": "message_delta", "delta": {}, "usage": terminal_usage}
+                raise
         except ContractError as exc:
             if not mutation_started:
                 raise RequestRejected(str(exc)) from None
@@ -1208,6 +1286,47 @@ class Session:
             raise ContractError("native_session_" + type(exc).__name__) from None
         finally:
             self.lock.release()
+
+    def structured_events(self, turn, events, buffer_bytes):
+        """Expose only a native-validated structured result, not its private tool."""
+        if buffer_bytes > STRUCTURED_RESPONSE_LIMIT:
+            raise ContractError("native_structured_output_too_large")
+        blocks = turn.message.get("content", [])
+        external = [b for i, b in enumerate(blocks)
+                    if b.get("type") == "tool_use" and i not in turn.structured_indices]
+        if not turn.structured_indices and external:
+            return events
+        if (len(turn.structured_indices) != 1 or external
+                or turn.message.get("stop_reason") != "tool_use"):
+            raise ContractError("native_structured_output_incomplete_no_replay")
+        with self.control_ready:
+            ready = self.control_ready.wait_for(
+                lambda: self.result_message_id == turn.message["id"]
+                or (self.process and self.process.poll() is not None),
+                timeout=min(self.timeout, 15),
+            )
+        result = self.result
+        value = blocks[next(iter(turn.structured_indices))].get("input")
+        if (not ready or self.result_message_id != turn.message["id"]
+                or not isinstance(result, dict) or result.get("is_error")
+                or "structured_output" not in result
+                or signature(result["structured_output"]) != signature(value)):
+            raise ContractError("native_structured_output_invalid_no_replay")
+        text = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+        turn.message["content"] = [{"type": "text", "text": text}]
+        turn.message["stop_reason"] = "end_turn"
+        self.structured_checkpoint = True
+        delta = next(e for e in reversed(events) if e.get("type") == "message_delta")
+        return [
+            {"type": "content_block_start", "index": 0,
+             "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "text_delta", "text": text}},
+            {"type": "content_block_stop", "index": 0},
+            {**delta, "delta": {**delta.get("delta", {}), "stop_reason": "end_turn"},
+             "usage": copy.deepcopy(turn.message.get("usage", {}))},
+            {"type": "message_stop"},
+        ]
 
     def expire_tool_wait(self):
         if not self.lock.acquire(blocking=False):

@@ -107,7 +107,7 @@ class ConfigurationCompatibilityTests(unittest.TestCase):
         self.assertEqual(recovered.environment['CLAUDE_CODE_MAX_OUTPUT_TOKENS'], '2048')
         self.assertIn('high', recovered.options)
         for change in [{'model': 'different'}, {'system': 'different'}]:
-            with self.assertRaisesRegex(ContractError, 'history_prefix_mismatch'):
+            with self.assertRaisesRegex(ContractError, 'session_configuration_changed'):
                 Session(self.path, ['unused'], {}, {**follow, **change}, restore=True)
 
     def test_pending_mixed_results_require_exact_ids_before_any_mutation(self):
@@ -129,7 +129,7 @@ class ConfigurationCompatibilityTests(unittest.TestCase):
         state.pop('message_id')
         (self.path / 'continuation.json').write_text(json.dumps(state))
         for change in [{'max_tokens': 2048}, {'system': [{'type': 'text', 'text': 'system'}]}]:
-            with self.assertRaisesRegex(ContractError, 'history_prefix_mismatch'):
+            with self.assertRaisesRegex(ContractError, 'session_configuration_changed'):
                 Session(self.path, ['unused'], {}, {**follow, **change}, restore=True)
         recovered = Session(self.path, ['unused'], {}, follow, restore=True)
         # A restored CLI can be prewarmed without having dispatched a model.
