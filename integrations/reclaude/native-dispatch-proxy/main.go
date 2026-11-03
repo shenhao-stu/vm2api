@@ -49,11 +49,17 @@ type Gate struct {
 	Requests       atomic.Int64
 	Normalized     atomic.Int64
 	Active         atomic.Int64
+	TraceFailures  atomic.Int64
 }
 
 var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$`)
 
 func (g *Gate) consume(body []byte) error {
+	_, err := g.consumeGrant(body)
+	return err
+}
+
+func (g *Gate) consumeGrant(body []byte) (string, error) {
 	var request struct {
 		Model    string `json:"model"`
 		Metadata struct {
@@ -65,23 +71,26 @@ func (g *Gate) consume(body []byte) error {
 	}
 	var grant Grant
 	if json.Unmarshal(body, &request) != nil || json.Unmarshal([]byte(request.Metadata.UserID), &identity) != nil || identity.Session != g.Session {
-		return errors.New("native_session_mismatch")
+		return "", errors.New("native_session_mismatch")
 	}
 	data, err := os.ReadFile(filepath.Join(g.Directory, "grant.json"))
 	if err != nil || json.Unmarshal(data, &grant) != nil || !uuidPattern.MatchString(grant.ID) ||
 		grant.Session != g.Session || grant.Model != request.Model || grant.Expires < time.Now().UnixMilli() || grant.Expires > time.Now().Add(2*time.Minute).UnixMilli() {
-		return errors.New("native_dispatch_not_authorized")
+		return "", errors.New("native_dispatch_not_authorized")
 	}
 	file, err := os.OpenFile(filepath.Join(g.Directory, grant.ID+".consumed.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
-		return errors.New("native_dispatch_already_consumed")
+		return "", errors.New("native_dispatch_already_consumed")
 	}
 	defer file.Close()
 	hash := sha256.Sum256(body)
 	if err = json.NewEncoder(file).Encode(map[string]any{"id": grant.ID, "session_id": g.Session, "model": request.Model, "at_ms": time.Now().UnixMilli(), "body_sha256": hex.EncodeToString(hash[:])}); err != nil {
-		return err
+		return "", err
 	}
-	return file.Sync()
+	if err = file.Sync(); err != nil {
+		return "", err
+	}
+	return grant.ID, nil
 }
 
 func reply(conn net.Conn, status int, code string) {
@@ -91,6 +100,7 @@ func reply(conn net.Conn, status int, code string) {
 }
 
 func (g *Gate) forward(conn net.Conn, reader *bufio.Reader) {
+	started := time.Now()
 	req, err := http.ReadRequest(reader)
 	if err != nil {
 		return
@@ -108,8 +118,10 @@ func (g *Gate) forward(conn net.Conn, reader *bufio.Reader) {
 		reply(conn, 413, "body_limit")
 		return
 	}
-	if req.Method == "POST" && req.URL.Path == "/v1/messages" {
-		if err = g.consume(body); err != nil {
+	modelRequest := req.Method == "POST" && req.URL.Path == "/v1/messages"
+	grantID := ""
+	if modelRequest {
+		if grantID, err = g.consumeGrant(body); err != nil {
 			g.Denied.Add(1)
 			reply(conn, 429, err.Error())
 			return
@@ -128,6 +140,9 @@ func (g *Gate) forward(conn net.Conn, reader *bufio.Reader) {
 	}
 	response, err := g.Transport.RoundTrip(req)
 	if err != nil {
+		if modelRequest {
+			g.recordTransport(grantID, body, started, 0, "response_headers", err, 0, 0)
+		}
 		reply(conn, 502, "native_transport_error")
 		return
 	}
@@ -145,13 +160,26 @@ func (g *Gate) forward(conn net.Conn, reader *bufio.Reader) {
 		response.Header.Del("Transfer-Encoding")
 		response.Header.Del("Content-Length")
 	}
-	_ = response.Write(conn)
+	provider := &transferReader{ReadCloser: response.Body}
+	response.Body = provider
+	downstream := &transferWriter{Writer: conn}
+	if err = response.Write(downstream); err != nil && modelRequest {
+		if provider.err != nil {
+			g.recordTransport(grantID, body, started, response.StatusCode, "provider_body", provider.err, provider.bytes, downstream.bytes)
+		}
+		if downstream.err != nil {
+			g.recordTransport(grantID, body, started, response.StatusCode, "downstream_write", downstream.err, provider.bytes, downstream.bytes)
+		}
+		if provider.err == nil && downstream.err == nil {
+			g.recordTransport(grantID, body, started, response.StatusCode, "response_framing", err, provider.bytes, downstream.bytes)
+		}
+	}
 }
 
 func (g *Gate) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method == "GET" && req.URL.Path == "/healthz" {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]int64{"upstream_attempts": g.Attempts.Load(), "denied": g.Denied.Load(), "requests": g.Requests.Load(), "normalized_304": g.Normalized.Load()})
+		_ = json.NewEncoder(w).Encode(map[string]int64{"upstream_attempts": g.Attempts.Load(), "denied": g.Denied.Load(), "requests": g.Requests.Load(), "normalized_304": g.Normalized.Load(), "transport_diagnostic_failures": g.TraceFailures.Load()})
 		return
 	}
 	active := g.Active.Add(1)
