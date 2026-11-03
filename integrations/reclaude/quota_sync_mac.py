@@ -1,6 +1,7 @@
 """Sync only allowlisted numbers through the existing local Chrome and SSH transports."""
 from contextlib import contextmanager
 import json
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -24,7 +25,11 @@ def billing_tab(bridge, profile):
     def call(seq, name, **args):
         reply = rpc(bridge, seq, "tools/call", {"name": "browser_" + name, "arguments": args})
         if reply.get("isError"):
-            raise RuntimeError("browser_" + name + "_failed")
+            details = json.loads(reply["content"][0]["text"])
+            code = str(details.get("code", "UNKNOWN"))
+            # Bridge descriptions may contain page content. Log only its short code.
+            safe_code = code if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) else "UNKNOWN"
+            raise RuntimeError(f"browser_{name}_{safe_code}")
         return json.loads(reply["content"][0]["text"])
     profiles = call(2, "profiles")["profiles"]
     if not any(p["id"] == profile and p["connected"] and not p["paused"] for p in profiles):
@@ -34,7 +39,7 @@ def billing_tab(bridge, profile):
         if tab["expectedUrl"] != APP:
             raise RuntimeError("billing_login_required")
         yield lambda expression: call(4, "evaluate", profileId=profile, tabId=tab["id"],
-                                      expectedUrl=APP, expression=expression)["value"]
+                                      expectedUrl=APP, expression=expression, timeoutMs=30000)["value"]
     finally:
         call(5, "release", profileId=profile, tabId=tab["id"], closeCreated=tab.get("created", False))
 
@@ -45,7 +50,7 @@ def sync(config):
         raise ValueError("invalid_binding_config")
     script = """(async () => {
       const expected = IDS;
-      const opts = {credentials:'same-origin', cache:'no-store', redirect:'error'};
+      const opts = {credentials:'same-origin', cache:'no-store', redirect:'error', signal:AbortSignal.timeout(20000)};
       const [qr, dr] = await Promise.all([
         fetch('/api/app/billing/carpool-quota?org_id=' + expected.org_id, opts),
         fetch('/api/app/devices?org_id=' + expected.org_id, opts)
