@@ -578,14 +578,15 @@ class Session:
                    and b.get("type") == "tool_use"]
             tail = [m for m in body["messages"][len(history):] if m.get("role") != "system"]
             results = [b.get("tool_use_id") for b in native_blocks(tail[0]["content"])
-                       if b.get("type") == "tool_result"] if len(tail) == 1 else []
-            if (not ids or len(tail) != 1 or tail[0].get("role") != "user"
+                       if b.get("type") == "tool_result"] if tail else []
+            if (not ids or not tail or tail[0].get("role") != "user"
                     or history[-1].get("role") != "assistant"
                     or len(set(ids)) != len(ids) or set(results) != set(ids)
                     or len(results) != len(ids)):
                 raise ContractError("native_session_incomplete_no_replay")
             self.pending_ids = set(ids)
             self.suspended = True
+        self.continuation_import(body)
         self.adopt_checkpoint_configuration(state)
 
     def adopt_checkpoint_configuration(self, state):
@@ -660,6 +661,20 @@ class Session:
         ):
             raise RequestRejected("session_configuration_changed")
         return signature(configuration(body)) != self.body_signature
+
+    def continuation_import(self, body):
+        """Validate context completed elsewhere after our exact paid boundary."""
+        if not self.history:
+            return None
+        messages = body['messages']
+        if history_shape(messages[:len(self.history)]) != history_shape(self.history):
+            raise ContractError('history_prefix_mismatch')
+        tail = [m for m in messages[len(self.history):] if m['role'] != 'system']
+        if len(tail) <= 1:
+            return None
+        if self.history_profile is None:
+            raise ContractError('unsupported_history_tail')
+        return initial_request(body, allow_history_import=True)
 
     def restart_for_request(self, body):
         """Resume at a verified assistant boundary; never replay a model turn."""
@@ -1004,11 +1019,18 @@ class Session:
             request_signature = signature(history_shape(body["messages"]))
             if request_signature in self.seen:
                 raise ContractError("request_already_consumed")
-            if not self.history:
-                imported, blocks = initial_request(body, self.history_profile is not None)
+            advanced = self.continuation_import(body)
+            if not self.history or advanced is not None:
+                imported, blocks = advanced or initial_request(body, self.history_profile is not None)
                 mutation_started = True
-                if changed:
+                if changed or advanced is not None:
                     self.restart_for_request(body)
+                if advanced is not None:
+                    # Preserve the old transcript. Import only caller-owned,
+                    # completed context; the sole new dispatch is the final user.
+                    self.native_id = str(uuid.uuid4())
+                    self.resume_uuid = self.resume_message_id = None
+                    self.pending_ids = set()
                 self.prepared = False
                 self.seen.add(request_signature)
                 self.history = copy.deepcopy(body["messages"])
