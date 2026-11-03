@@ -19,6 +19,7 @@ Configure administrator-owned JSON with these fields (no client-supplied paths):
 | `id`, `name`, `node` | Stable runtime ID and display labels |
 | `binding`, `sub_account`, `concurrency`, `models` | Accepted native device and dedicated account policy |
 | `guard_file`, `guard_revision`, `expected_ip` | Existing exit guard; read only |
+| `guard_source` | Optional `runtime`: validate the NAS agent's live guard snapshot against the same pin/revision; never fall back to a local shadow |
 | `state_dir` | Private management intents, audit and authorization latch |
 | `panel_me_url`, `origin` | Fixed main-panel authentication URL and public console origin |
 | `runtime_command` | Fixed argv invoking `management_agent.py CONFIG` over existing SSH |
@@ -35,6 +36,13 @@ accounts. Resume verifies the account's base URL, groups, model list and limit.
 The NAS agent config names its existing `home`, `binding`, `container`, `unit`,
 `expected_ip`, HTTP `state_dir`, `auth_latches` and private `health_url`.
 
+- **Shared-pool scheduling:** `pause_schedule` and `resume_schedule` change only
+  the dedicated Sub2API account's native `schedulable` flag. They preserve active
+  requests, waiting tool continuations, prewarmed CLI sessions and OAuth. Direct
+  Relay API access is unaffected. Resume requires the running worker, original
+  authorization and a fresh fixed-exit verification. It cannot restart a stopped
+  worker, clear an authorization/exit latch or remove a native quota cooldown.
+  Unknown outcomes must be read back, never automatically retried.
 - **Stop Relay:** pause its Sub2API account first, close new admission, wait for
   active requests and final usage, then stop only the HTTP worker. If draining
   takes too long, leave it paused and running; do not kill a charged request.

@@ -51,16 +51,16 @@ def read_tail(path, limit=50):
         return []
 
 
-def guard_status(config):
+def guard_status(config, snapshot=None):
     try:
-        g = json.loads(Path(config["guard_file"]).read_text())
+        g = snapshot if snapshot is not None else json.loads(Path(config["guard_file"]).read_text())
         age = time.time() - datetime.fromisoformat(g["checked_at"].replace("Z", "+00:00")).timestamp()
         ready = (g.get("ready") is True and g.get("latched") is False
                  and g.get("expected_ip") == g.get("observed_ip") == config["expected_ip"]
                  and g.get("revision") == config["guard_revision"] and 0 <= age < 180)
         return {"ready": ready, "latched": g.get("latched") is not False,
                 "expected_ip": config["expected_ip"], "observed_ip": g.get("observed_ip"),
-                "checked_at": g.get("checked_at")}
+                "checked_at": g.get("checked_at"), "revision": g.get("revision")}
     except (OSError, ValueError, KeyError, TypeError):
         return {"ready": False, "latched": True, "expected_ip": config["expected_ip"]}
 
@@ -165,11 +165,13 @@ class Manager:
                 with evidence.open("x") as file:
                     json.dump(data, file)
                 self.record("authorization_latched", **data)
+        guard = (guard_status(self.config, r.get("exit_guard") or {})
+                 if self.config.get("guard_source") == "runtime" else guard_status(self.config))
         result = {"id": self.config["id"], "name": self.config["name"],
                   "node": self.config["node"], "kind": "reclaude_native",
                   "binding": self.config["binding"], "sub_account": self.config["sub_account"],
                   "concurrency": self.config["concurrency"], "models": self.config["models"],
-                  "observed_at": time.time(), "runtime": r, "guard": guard_status(self.config),
+                  "observed_at": time.time(), "runtime": r, "guard": guard,
                   "usage": relay_usage(self.config), "official_quota": official_quota(self.config),
                   "sub": sub, "authorization_latched": (self.root / "authorization-latch.json").exists()}
         self.cached = result
@@ -184,8 +186,16 @@ class Manager:
         runtime = self.runtime("logs")
         return {"runtime": runtime.get("items", []), "management": read_tail(self.root / "audit.jsonl")}
 
+    def require_schedule_ready(self, state):
+        r = state["runtime"]
+        if (state["authorization_latched"] or r.get("revoked") or r.get("auth_latched")
+                or not state["guard"]["ready"] or state["sub"].get("shared_policy_matches") is False
+                or r.get("failed_checks") or r.get("management_paused")
+                or not all(r.get(k) for k in ("container_running", "http_active", "http_ready"))):
+            raise ManagementError("schedule_requires_healthy_running_relay")
+
     def action(self, action, operation_id):
-        if action not in ("start", "stop"):
+        if action not in ("start", "stop", "pause_schedule", "resume_schedule"):
             raise ManagementError("unknown_action", 404)
         try:
             if str(uuid.UUID(operation_id)) != operation_id:
@@ -202,14 +212,23 @@ class Manager:
             except FileExistsError:
                 raise ManagementError("operation_already_consumed") from None
             self.record("operation_started", action=action, operation_id=operation_id)
+            if action == "pause_schedule":
+                # The native scheduler is authoritative; never stop a paid turn.
+                if self.sub("pause").get("schedulable") is not False:
+                    raise ManagementError("sub_pause_unconfirmed", 503)
             state = self._refresh()
-            if action == "stop":
+            if action == "resume_schedule":
+                self.require_schedule_ready(state)
+                self.runtime("verify_exit")
+                self.require_schedule_ready(self._refresh())
+                self.sub("resume")
+            elif action == "stop":
                 paused = self.sub("pause")
                 if paused.get("schedulable") is not False:
                     raise ManagementError("sub_pause_unconfirmed", 503)
                 # Runtime refuses to stop until in-flight requests have drained.
                 self.runtime("stop")
-            else:
+            elif action == "start":
                 if state["sub"].get("shared_policy_matches") is False:
                     raise ManagementError("shared_routing_profile_changed")
                 r = state["runtime"]
@@ -226,7 +245,9 @@ class Manager:
                 self.sub("resume")
             self.cached = None
             result = self._refresh()
-            if action == "start" and not result["sub"].get("schedulable"):
+            if action == "pause_schedule" and result["sub"].get("schedulable") is not False:
+                raise ManagementError("sub_pause_unconfirmed", 503)
+            if action in ("start", "resume_schedule") and not result["sub"].get("schedulable"):
                 raise ManagementError("sub_resume_unconfirmed", 503)
             self.record("operation_completed", action=action, operation_id=operation_id)
             return result

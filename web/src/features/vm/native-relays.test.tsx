@@ -2,7 +2,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Window } from 'happy-dom'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
-import { relayState, type NativeRelay } from './native-relay-state'
+import {
+  canResumeSchedule,
+  scheduleLabel,
+  relayState,
+  type NativeRelay,
+} from './native-relay-state'
 import { NativeRelays } from './native-relays'
 
 const relay: NativeRelay = {
@@ -29,6 +34,60 @@ const relay: NativeRelay = {
 }
 
 describe('native Relay VM management', () => {
+  it('keeps scheduling separate from lifecycle and native cooldown', () => {
+    expect(canResumeSchedule(relay)).toBe(true)
+    expect(canResumeSchedule({ ...relay, authorization_latched: true })).toBe(
+      false
+    )
+    expect(
+      canResumeSchedule({
+        ...relay,
+        runtime: { ...relay.runtime, management_paused: true },
+      })
+    ).toBe(false)
+    expect(
+      canResumeSchedule({
+        ...relay,
+        runtime: { ...relay.runtime, http_active: false },
+      })
+    ).toBe(false)
+    const limited = {
+      ...relay,
+      sub: { schedulable: true, rate_limit_reset_at: '2099-01-01T00:00:00Z' },
+    }
+    expect(scheduleLabel(limited)).toBe('冷却中')
+    expect(
+      scheduleLabel({ ...limited, sub: { ...limited.sub, schedulable: false } })
+    ).toBe('已暂停')
+    expect(scheduleLabel({ ...relay, sub: { schedulable: null } })).toBe(
+      '状态未知'
+    )
+  })
+  it('renders one independent scheduling switch per account without hiding usage', () => {
+    const second = {
+      ...relay,
+      id: 'second',
+      name: 'Second',
+      sub_account: 43,
+      sub: { schedulable: false },
+    }
+    const doc = new Window().document
+    doc.body.innerHTML = render(true, relay, [second])
+    const switches = doc.querySelectorAll('button[role="switch"]')
+    expect(switches).toHaveLength(2)
+    expect(switches[0].getAttribute('aria-checked')).toBe('true')
+    expect(switches[1].getAttribute('aria-checked')).toBe('false')
+    expect(switches[0].id).not.toBe(switches[1].id)
+    const stopped = {
+      ...relay,
+      sub: { schedulable: false },
+      runtime: { ...relay.runtime, http_active: false },
+    }
+    doc.body.innerHTML = render(true, stopped)
+    expect(
+      doc.querySelector('button[role="switch"]')?.hasAttribute('disabled')
+    ).toBe(true)
+  })
   it('distinguishes runtime, scheduling, exit and authorization state', () => {
     expect(relayState(relay)).toBe('运行中')
     expect(relayState({ ...relay, sub: { schedulable: false } })).toBe('已暂停')

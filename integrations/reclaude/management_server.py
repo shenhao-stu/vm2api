@@ -60,7 +60,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             operation = parts[1]
             if self.command == "GET" and operation == "logs":
                 return self.send(200, {"ok": True, "data": manager.logs()})
-            if self.command == "POST" and operation in ("start", "stop"):
+            if self.command == "POST" and operation in ("start", "stop", "pause_schedule", "resume_schedule"):
                 if self.headers.get("Origin") != manager.config["origin"]:
                     raise ManagementError("origin_required", 403)
                 if self.headers.get("Content-Type", "").split(";")[0] != "application/json":

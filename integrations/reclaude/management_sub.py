@@ -70,7 +70,9 @@ def execute(config, action):
                    receipt="management-" + str(uuid.uuid4()) + ".private.json")
         value = account()
     return {"ok": True, "shared_policy_matches": matches, "id": value["id"], "status": value["status"],
-            "schedulable": value["schedulable"], "concurrency": value["concurrency"]}
+            "schedulable": value["schedulable"], "concurrency": value["concurrency"],
+            "rate_limit_reset_at": value.get("rate_limit_reset_at"),
+            "temp_unschedulable_until": value.get("temp_unschedulable_until")}
 
 
 if __name__ == "__main__":

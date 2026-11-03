@@ -40,12 +40,48 @@ export type NativeRelay = {
     container_running: boolean
     http_active: boolean
     http_ready: boolean
+    management_paused?: boolean
     active_requests: number | null
     revoked: boolean
     auth_latched: boolean
     failed_checks: string[]
   }
-  sub: { schedulable: boolean; shared_policy_matches?: boolean }
+  sub: {
+    schedulable: boolean | null
+    shared_policy_matches?: boolean
+    rate_limit_reset_at?: string | null
+    temp_unschedulable_until?: string | null
+  }
+}
+
+export function canResumeSchedule(relay: NativeRelay) {
+  const runtime = relay.runtime
+  return (
+    !relay.management_unavailable &&
+    !relay.authorization_latched &&
+    !runtime.revoked &&
+    !runtime.auth_latched &&
+    !runtime.management_paused &&
+    !runtime.failed_checks.length &&
+    runtime.container_running &&
+    runtime.http_active &&
+    runtime.http_ready &&
+    relay.guard.ready &&
+    !relay.guard.latched &&
+    relay.sub.shared_policy_matches !== false
+  )
+}
+
+export function scheduleLabel(relay: NativeRelay, now = Date.now()) {
+  if (relay.sub.schedulable == null) return '状态未知'
+  if (!relay.sub.schedulable) return '已暂停'
+  const limits = [
+    relay.sub.rate_limit_reset_at,
+    relay.sub.temp_unschedulable_until,
+  ]
+  return limits.some((value) => value && Date.parse(value) > now)
+    ? '冷却中'
+    : '已开启'
 }
 
 export function relayState(relay: NativeRelay) {
@@ -60,5 +96,6 @@ export function relayState(relay: NativeRelay) {
   if (!relay.guard.ready) return '出口待检查'
   if (relay.runtime.failed_checks.length) return '原生环境待检查'
   if (!relay.runtime.http_active || !relay.sub.schedulable) return '已暂停'
+  if (scheduleLabel(relay) === '冷却中') return '额度 / 冷却中'
   return relay.runtime.http_ready ? '运行中' : 'Relay 待检查'
 }

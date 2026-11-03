@@ -9,12 +9,24 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Switch } from '@/components/ui/switch'
 import { ConfirmDialog } from '@/components/confirm-dialog'
-import { relayState, type NativeRelay } from './native-relay-state'
+import {
+  canResumeSchedule,
+  scheduleLabel,
+  relayState,
+  type NativeRelay,
+} from './native-relay-state'
 import { RelayUsageCard, RelayUsageDetail } from './relay-usage-card'
 
 const key = ['panel', 'native-relays'] as const
 const endpoint = '/api/panel/native-relays'
+const successMessage = {
+  start: 'Relay 已启动并恢复调度',
+  stop: 'Relay 已停止，调度已暂停',
+  pause_schedule: '共享池调度已暂停，在途请求继续完成',
+  resume_schedule: '共享池调度已开启，额度与安全限制仍然有效',
+}
 
 export function NativeRelays({ enabled }: { enabled: boolean }) {
   const qc = useQueryClient()
@@ -53,7 +65,7 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
       verb,
     }: {
       relay: NativeRelay
-      verb: 'start' | 'stop'
+      verb: keyof typeof successMessage
     }) =>
       api(`${endpoint}/${encodeURIComponent(relay.id)}/${verb}`, {
         method: 'POST',
@@ -61,9 +73,7 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
       }),
     retry: false,
     onSuccess: (_data, { verb }) => {
-      toast.success(
-        verb === 'start' ? 'Relay 已启动并恢复调度' : 'Relay 已停止，调度已暂停'
-      )
+      toast.success(successMessage[verb])
       setAction(null)
     },
     onError: (error: Error) =>
@@ -115,6 +125,36 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
               </p>
             </header>
             <RelayUsageCard relay={relay} />
+            <div className='flex items-center justify-between gap-2 border-t pt-3'>
+              <div>
+                <label
+                  htmlFor={`schedule-${relay.id}`}
+                  className='text-sm font-medium'
+                >
+                  共享池调度
+                </label>
+                <p className='text-xs text-muted-foreground'>
+                  {scheduleLabel(relay)} · 在途请求不受影响
+                </p>
+              </div>
+              <Switch
+                id={`schedule-${relay.id}`}
+                aria-label={`${relay.name} · 共享池调度`}
+                checked={relay.sub.schedulable === true}
+                disabled={
+                  change.isPending ||
+                  relay.management_unavailable ||
+                  relay.sub.schedulable == null ||
+                  (!relay.sub.schedulable && !canResumeSchedule(relay))
+                }
+                onCheckedChange={(checked) =>
+                  change.mutate({
+                    relay,
+                    verb: checked ? 'resume_schedule' : 'pause_schedule',
+                  })
+                }
+              />
+            </div>
             <details className='border-t pt-2 text-sm'>
               <summary className='cursor-pointer text-muted-foreground'>
                 详情与控制
@@ -123,7 +163,7 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
                 <RelayUsageDetail relay={relay} />
                 <p className='text-xs text-muted-foreground'>
                   {relay.node} · 设备 {relay.binding} · Sub{relay.sub_account} ·
-                  调度{relay.sub.schedulable ? '开启' : '暂停'}
+                  调度{scheduleLabel(relay)}
                 </p>
                 <p className='text-xs break-words text-muted-foreground'>
                   {relay.models.join(' · ')}
