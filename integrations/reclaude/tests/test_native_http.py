@@ -11,7 +11,7 @@ from unittest.mock import patch
 import uuid
 
 from adapter import Limits
-from native_bridge_session import ContractError, RequestRejected
+from native_bridge_session import ContractError, NativeRateLimit, RequestRejected
 from native_http import NativeServer
 
 
@@ -479,6 +479,49 @@ class NativeHTTPTests(unittest.TestCase):
         rows = self.audit(4)
         self.assertEqual([row["attempts"] for row in rows], [1, 0, 1, 0])
         self.assertFalse(any(row["complete"] for row in rows))
+
+    def test_rate_limit_retains_reset_without_replay_or_global_pause(self):
+        self.server.pool.capacity = 10
+        original = FixtureSession.request
+
+        def rate_limited(session, body):
+            iterator = original(session, body)
+            next(iterator)  # Dispatch consumed, no downstream event committed.
+            iterator.close()
+            raise NativeRateLimit(body['model'], {
+                'status':'rejected', 'rateLimitType':'seven_day', 'resetsAt':1793815200})
+            yield
+
+        for stream in (False, True):
+            self.identity = str(uuid.uuid4())
+            with patch.object(FixtureSession, 'request', rate_limited):
+                status, data = self.request(self.body(stream=stream))
+            self.assertEqual(status, 400)
+            error = json.loads(data)['error']
+            self.assertEqual(error['code'], 'native_request_consumed_no_replay')
+            self.assertEqual(error['details'], {
+                'upstream_type':'rate_limit_error', 'model':self.body()['model'],
+                'rate_limit_type':'seven_day', 'reset_at':1793815200, 'no_replay':True})
+            self.assertEqual(self.request(self.body(stream=stream))[0], 400)
+        rows = self.audit(4)
+        self.assertEqual([row['attempts'] for row in rows], [1, 0, 1, 0])
+        self.assertEqual(rows[0]['native_error'], 'native_rate_limit')
+        self.assertEqual(rows[0]['upstream_error']['reset_at'], 1793815200)
+        self.assertFalse(self.server.latched)
+        self.identity = str(uuid.uuid4())
+        self.assertEqual(self.request(self.body(model='claude-fable-5-1'))[0], 200)
+
+    def test_native_limit_without_dispatch_does_not_claim_a_consumed_request(self):
+        def rejected(session, body):
+            raise NativeRateLimit(body['model'])
+            yield
+
+        with patch.object(FixtureSession, 'request', rejected):
+            status, data = self.request()
+        self.assertEqual(status, 429)
+        self.assertEqual(json.loads(data)['error']['code'], 'native_rate_limit')
+        self.assertEqual(self.audit()[0]['attempts'], 0)
+        self.assertNotIn(b'no_replay', data)
 
     def test_exhausted_canary_does_not_count_previous_dispatches(self):
         self.server.max_requests = 1

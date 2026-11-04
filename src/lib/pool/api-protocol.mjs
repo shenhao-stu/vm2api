@@ -206,22 +206,30 @@ export async function runApiInference({
 
   if (status >= 400) {
     const payload = await readApiJson(upstream).catch(() => ({}))
+    const passthroughError =
+      cfg.api_passthrough === true &&
+      payload?.error &&
+      typeof payload.error === 'object' &&
+      !Array.isArray(payload.error)
     const message = payload?.error?.message || payload?.message || `upstream ${status}`
     const upstreamCode = String(payload?.error?.code || payload?.code || '').trim()
     const contentCode = isContentPolicyErrorCode(upstreamCode) ? upstreamCode.toLowerCase() : ''
     return {
       ...resultBase,
       ok: false,
-      body: {
-        type: 'error',
-        error: {
-          ...(requestContext ? payload?.error : {}),
-          ...(requestContext && payload?.error?.code ? { upstream_code: payload.error.code } : {}),
-          ...(!requestContext && contentCode ? { code: contentCode } : {}),
-          type: requestContext ? payload?.error?.type || 'api_error' : 'api_error',
-          message: String(message).slice(0, 300),
-        },
-      },
+      passthroughError: !!passthroughError,
+      body: passthroughError
+        ? { type: 'error', error: payload.error }
+        : {
+            type: 'error',
+            error: {
+              ...(requestContext ? payload?.error : {}),
+              ...(requestContext && payload?.error?.code ? { upstream_code: payload.error.code } : {}),
+              ...(!requestContext && contentCode ? { code: contentCode } : {}),
+              type: requestContext ? payload?.error?.type || 'api_error' : 'api_error',
+              message: String(message).slice(0, 300),
+            },
+          },
       terminalState: 'rejected',
     }
   }

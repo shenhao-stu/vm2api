@@ -37,6 +37,21 @@ class RequestRejected(ContractError):
     """Invalid input rejected before changing a native conversation."""
 
 
+class NativeRateLimit(ContractError):
+    """The native CLI rejected this model; other model windows may remain usable."""
+
+    def __init__(self, model, info=None):
+        super().__init__("native_rate_limit")
+        self.details = {"upstream_type": "rate_limit_error", "model": model}
+        if not isinstance(info, dict) or info.get("status") != "rejected":
+            return
+        window, reset = info.get("rateLimitType"), info.get("resetsAt")
+        if isinstance(window, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", window):
+            self.details["rate_limit_type"] = window
+        if type(reset) is int and 0 < reset <= 253402300799:
+            self.details["reset_at"] = reset
+
+
 def thinking_configuration(body):
     """Keep legacy native defaults; carry only explicitly representable displays."""
     thinking = body.get("thinking")
@@ -1016,6 +1031,7 @@ class Session:
         raise ContractError("native_policy_not_ready_no_dispatch")
 
     def read_output(self):
+        rate_limit_info = None
         try:
             with self.process.stdout as stream, (
                 self.directory / "stdout.private.jsonl"
@@ -1032,10 +1048,15 @@ class Session:
                                 self.control_ready.notify_all()
                     elif event.get("type") == "stream_event":
                         self.events.put(event["event"])
+                    elif event.get("type") == "rate_limit_event":
+                        rate_limit_info = event.get("rate_limit_info")
                     elif event.get("type") == "assistant" and (
                         event.get("error") or event.get("is_api_error_message")
                     ):
-                        self.events.put(ContractError("native_api_error"))
+                        error = (NativeRateLimit(self.model, rate_limit_info)
+                                 if event.get("error") == "rate_limit"
+                                 else ContractError("native_api_error"))
+                        self.events.put(error)
                     elif event.get("type") == "assistant" and event.get("uuid"):
                         with self.assistant_ready:
                             self.last_native_message_id = event["message"]["id"]
@@ -1044,6 +1065,7 @@ class Session:
                                 self.assistants.pop(next(iter(self.assistants)))
                             self.assistant_ready.notify_all()
                     elif event.get("type") == "result":
+                        rate_limit_info = None
                         with self.control_ready:
                             self.result = event
                             self.result_message_id = self.last_native_message_id
@@ -1207,6 +1229,8 @@ class Session:
                     if event is None or isinstance(event, Exception):
                         self.failed = True
                         self.close()
+                        if isinstance(event, NativeRateLimit):
+                            raise event
                         raise ContractError("native_stream_incomplete")
                     if structured and event.get("type") != "message_start":
                         buffer_bytes += len(json.dumps(event).encode())

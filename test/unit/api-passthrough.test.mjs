@@ -134,16 +134,44 @@ const body = {
 
 test('a consumed native turn stays a non-retryable client error with no invented charge', async (t) => {
   const message = 'native_request_consumed_no_replay'
+  const details = {
+    no_replay: true,
+    upstream_type: 'rate_limit_error',
+    model: body.model,
+    rate_limit_type: 'seven_day',
+    reset_at: 1793815200,
+  }
   const { invoke, received, charges } = await fixture(t, true, {
     status: 400,
     type: 'application/json',
-    body: JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message } }),
+    body: JSON.stringify({ type: 'error', error: { type: 'api_error', code: message, message, details } }),
   })
   const response = await invoke(body)
   assert.equal(response.status, 400)
   assert.equal(response.body.error.message, message)
+  assert.equal(response.body.error.code, message)
+  assert.deepEqual(response.body.error.details, details)
   assert.equal(received.length, 1)
   assert.equal(charges.length, 0)
+})
+
+test('default API mode retains normalized errors and hides relay-only details', async (t) => {
+  const { invoke } = await fixture(t, false, {
+    status: 400,
+    type: 'application/json',
+    body: JSON.stringify({
+      error: {
+        type: 'api_error',
+        code: 'private-native-code',
+        message: 'bad input',
+        details: { reset_at: 1793815200 },
+      },
+    }),
+  })
+  const response = await invoke(body)
+  assert.equal(response.status, 400)
+  assert.equal(response.body.error.code, 'upstream_invalid_request')
+  assert.equal(response.body.error.details.reset_at, undefined)
 })
 
 test('isolated API passthrough preserves request/session/tool/cache fields and actual headers', async (t) => {
