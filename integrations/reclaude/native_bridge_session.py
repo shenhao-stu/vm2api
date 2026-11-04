@@ -37,6 +37,21 @@ class RequestRejected(ContractError):
     """Invalid input rejected before changing a native conversation."""
 
 
+class NativeRateLimit(ContractError):
+    """The native CLI rejected this model; other model windows may remain usable."""
+
+    def __init__(self, model, info=None):
+        super().__init__("native_rate_limit")
+        self.details = {"upstream_type": "rate_limit_error", "model": model}
+        if not isinstance(info, dict) or info.get("status") != "rejected":
+            return
+        window, reset = info.get("rateLimitType"), info.get("resetsAt")
+        if isinstance(window, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", window):
+            self.details["rate_limit_type"] = window
+        if type(reset) is int and 0 < reset <= 253402300799:
+            self.details["reset_at"] = reset
+
+
 def thinking_configuration(body):
     """Keep legacy native defaults; carry only explicitly representable displays."""
     thinking = body.get("thinking")
@@ -481,6 +496,25 @@ class Turn:
         return event
 
 
+def confirmed_personal_max(profile, initialized):
+    """Personal plans do not receive the Team/Enterprise server-settings marker."""
+    response = initialized.get("response") or {}
+    account = response.get("account") or {}
+    if (initialized.get("subtype") != "success" or account.get("apiProvider") != "firstParty"
+            or account.get("subscriptionType") != "Claude Max"):
+        return False
+    try:
+        if (profile.parents[2] / "current").read_text().strip() != profile.parent.name:
+            return False
+        if any((profile / name).exists() for name in ("policy-limits.json", "remote-settings.json")):
+            return False
+        oauth = json.loads((profile / ".credentials.json").read_text())["claudeAiOauth"]
+        return (oauth.get("subscriptionType") == "max"
+                and set(("user:inference", "user:profile")).issubset(oauth.get("scopes") or []))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 class Session:
     def __init__(
         self,
@@ -495,6 +529,7 @@ class Session:
         session_budget_usd=None,
         restore=False,
         history_profile=None,
+        personal_max_profile=None,
     ):
         native_env, self.options = native_options(body)
         self.budget_options = []
@@ -535,6 +570,8 @@ class Session:
         self.tool_timer = None
         self.timeout = timeout
         self.require_policy = require_policy
+        self.personal_max_profile = personal_max_profile
+        self.personal_max_confirmed = False
         self.dispatch_proxy = dispatch_proxy
         self.history_profile = Path(history_profile) if history_profile else None
         self.dispatch_process = None
@@ -834,6 +871,10 @@ class Session:
         if self.process is not None:
             if self.process.poll() is not None or self.failed:
                 raise ContractError("native_process_not_reusable")
+            if self.personal_max_confirmed and not confirmed_personal_max(
+                self.personal_max_profile, self.initialize_response or {}
+            ):
+                raise ContractError("native_account_scope_changed")
             return
         config = {
             "mcpServers": {
@@ -917,8 +958,15 @@ class Session:
             )
         self.reader = threading.Thread(target=self.read_output, daemon=True)
         self.reader.start()
+        self.personal_max_confirmed = False
         if self.require_policy:
-            self.await_native_policy()
+            if self.personal_max_profile is not None:
+                self.initialize_native()
+                self.personal_max_confirmed = confirmed_personal_max(
+                    self.personal_max_profile, self.initialize_response or {}
+                )
+            if not self.personal_max_confirmed:
+                self.await_native_policy()
 
     def start(self, blocks):
         self.prepare()
@@ -1016,6 +1064,7 @@ class Session:
         raise ContractError("native_policy_not_ready_no_dispatch")
 
     def read_output(self):
+        rate_limit_info = None
         try:
             with self.process.stdout as stream, (
                 self.directory / "stdout.private.jsonl"
@@ -1032,10 +1081,15 @@ class Session:
                                 self.control_ready.notify_all()
                     elif event.get("type") == "stream_event":
                         self.events.put(event["event"])
+                    elif event.get("type") == "rate_limit_event":
+                        rate_limit_info = event.get("rate_limit_info")
                     elif event.get("type") == "assistant" and (
                         event.get("error") or event.get("is_api_error_message")
                     ):
-                        self.events.put(ContractError("native_api_error"))
+                        error = (NativeRateLimit(self.model, rate_limit_info)
+                                 if event.get("error") == "rate_limit"
+                                 else ContractError("native_api_error"))
+                        self.events.put(error)
                     elif event.get("type") == "assistant" and event.get("uuid"):
                         with self.assistant_ready:
                             self.last_native_message_id = event["message"]["id"]
@@ -1044,6 +1098,7 @@ class Session:
                                 self.assistants.pop(next(iter(self.assistants)))
                             self.assistant_ready.notify_all()
                     elif event.get("type") == "result":
+                        rate_limit_info = None
                         with self.control_ready:
                             self.result = event
                             self.result_message_id = self.last_native_message_id
@@ -1207,6 +1262,8 @@ class Session:
                     if event is None or isinstance(event, Exception):
                         self.failed = True
                         self.close()
+                        if isinstance(event, NativeRateLimit):
+                            raise event
                         raise ContractError("native_stream_incomplete")
                     if structured and event.get("type") != "message_start":
                         buffer_bytes += len(json.dumps(event).encode())

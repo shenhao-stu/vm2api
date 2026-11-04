@@ -297,6 +297,9 @@ export function createHandleProtocol(deps) {
     if (Number(result?.retryAfterSec) > 0) {
       mapped.retryAfterSec = Math.max(1, Math.ceil(Number(result.retryAfterSec)))
     }
+    if (result?.passthroughError) {
+      return { ...mapped, status: result.status, body: result.body }
+    }
     return mapped
   }
 
