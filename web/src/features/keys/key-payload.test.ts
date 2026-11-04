@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import {
   keyLimitsDraft,
   keyLimitsPayload,
+  keyServiceLabel,
+  selectKeyService,
   type KeyLimitsDraft,
 } from './key-payload'
 
@@ -181,5 +183,128 @@ describe('API key limit payload', () => {
       keyLimitsPayload({ ...restored, category: 'oauth' }, 'edit')
         .openai_endpoint_id
     ).toBeNull()
+  })
+
+  it('creates separate Claude and GPT keys with concurrency one and no cross-service scope', () => {
+    const claude = {
+      ...keyLimitsDraft(null, true),
+      name: 'Claude pool',
+      allowed_vms: ['line01'],
+    }
+    expect(keyLimitsPayload(claude, 'create')).toMatchObject({
+      category: 'oauth',
+      group_type: 'anthropic',
+      allowed_vms: ['line01'],
+      max_concurrency: 1,
+    })
+    expect(keyLimitsPayload(claude, 'create')).not.toHaveProperty(
+      'openai_endpoint_id'
+    )
+    const gpt = {
+      ...keyLimitsDraft(null, true, 'gpt'),
+      name: 'GPT pool',
+      openai_endpoint_id: 'ep_0123456789ab',
+    }
+    expect(keyLimitsPayload(gpt, 'create')).toMatchObject({
+      category: 'hybrid',
+      group_type: 'openai',
+      allowed_vms: [],
+      vm_pool_id: null,
+      openai_endpoint_id: 'ep_0123456789ab',
+      max_concurrency: 1,
+    })
+    expect(keyServiceLabel(gpt)).toBe('GPT 托管池')
+    expect(keyServiceLabel(claude)).toBe('Claude 托管池')
+    expect(() =>
+      keyLimitsPayload({ ...gpt, allowed_vms: ['line01'] }, 'create')
+    ).toThrow('不绑定原生槽位')
+    expect(() =>
+      keyLimitsPayload({ ...gpt, vm_pool_id: 'pool_12345678' }, 'create')
+    ).toThrow('不绑定原生槽位')
+    expect(() => keyLimitsPayload(gpt, 'create', { isAdmin: false })).toThrow(
+      '管理员'
+    )
+  })
+
+  it('edits a GPT key without requiring native VMs or downgrading its gateway binding', () => {
+    const gpt = keyLimitsDraft(
+      {
+        id: 'key_gpt',
+        category: 'hybrid',
+        group_type: 'openai',
+        allowed_vms: [],
+        vm_pool_id: null,
+        openai_endpoint_id: 'ep_0123456789ab',
+        max_concurrency: 1,
+      },
+      true
+    )
+    expect(keyLimitsPayload(gpt, 'edit')).toMatchObject({
+      category: 'hybrid',
+      group_type: 'openai',
+      allowed_vms: [],
+      vm_pool_id: null,
+      openai_endpoint_id: 'ep_0123456789ab',
+    })
+    const tenant = keyLimitsPayload(gpt, 'edit', { isAdmin: false })
+    for (const field of [
+      'category',
+      'group_type',
+      'allowed_vms',
+      'vm_pool_id',
+      'openai_endpoint_id',
+    ])
+      expect(tenant).not.toHaveProperty(field)
+  })
+
+  it('explicit service changes reset incompatible routes; new mixed keys are rejected', () => {
+    const claude = {
+      ...keyLimitsDraft(null, true),
+      allowed_vms: ['line01'],
+      vm_pool_id: 'pool_12345678',
+    }
+    const gpt = selectKeyService(claude, 'gpt')
+    expect(gpt).toMatchObject({
+      category: 'hybrid',
+      group_type: 'openai',
+      allowed_vms: [],
+      vm_pool_id: '',
+      max_concurrency: 1,
+    })
+    const back = selectKeyService(
+      { ...gpt, openai_endpoint_id: 'ep_0123456789ab' },
+      'claude'
+    )
+    expect(back).toMatchObject({
+      category: 'oauth',
+      group_type: 'anthropic',
+      openai_endpoint_id: '',
+      allowed_vms: [],
+    })
+    expect(
+      keyLimitsPayload(
+        { ...back, group_type: 'pool', vm_pool_id: 'pool_12345678' },
+        'create'
+      )
+    ).toMatchObject({
+      category: 'oauth',
+      group_type: 'anthropic',
+      vm_pool_id: 'pool_12345678',
+    })
+    expect(() =>
+      keyLimitsPayload(
+        {
+          ...claude,
+          category: 'hybrid',
+          openai_endpoint_id: 'ep_0123456789ab',
+        },
+        'create'
+      )
+    ).toThrow('分别创建')
+    expect(selectKeyService(gpt, 'api')).toMatchObject({
+      category: 'api',
+      group_type: 'all',
+      openai_endpoint_id: '',
+    })
   })
 })

@@ -42,6 +42,7 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { summarizeCodexSlot } from '../vm/codex-slot.mjs'
 import { pickCodexSlots } from '../pool/codex-slot-pool.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
+import { hostedModelDenial } from './hosted-model-policy.mjs'
 import { resolveInboundIdentity } from '../identity/identity-rewrite.mjs'
 export function countTokensUnsupportedError() {
   return makeError({
@@ -281,6 +282,8 @@ export async function handleUserCountTokens(req, res, deps) {
   }
   const parsed = parseCountTokensBody(inbound)
   if (!parsed.ok) return json(res, parsed.error.status, parsed.error.body)
+  const denial = hostedModelDenial(req.apiKeyKind === 'managed' ? req.apiKeyRecord : null, parsed.body.model)
+  if (denial) return json(res, 403, { error: { type: 'permission_error', ...denial } })
   const routing = typeof deps.getRoutingConfig === 'function' ? deps.getRoutingConfig() : null
   if (
     claudeCodeOnlyFromRouting(routing) &&

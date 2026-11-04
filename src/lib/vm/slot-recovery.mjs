@@ -39,12 +39,15 @@ import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotDockerCpus } from './machine-spec.mjs'
 import { bindVmProxy, getVm, patchVmRecord, vmHasSchedulableCredential } from './vm-registry.mjs'
 import {
+  applyClearHold,
   applyClearUnschedulable,
   applyUnschedulable,
   deriveScheduleFields,
+  HOLD_PROXY,
   migrateScheduleRecord,
 } from '../pool/schedule-state.mjs'
 import { isCredentialRefreshFailed } from '../pool/availability.mjs'
+import { getProxyExitGuardState } from './proxy-exit-guard.mjs'
 
 const HEALTH_TIMEOUT_MS = 1500
 const BRIDGE_HEAL_MIN_MS = 60_000
@@ -373,7 +376,8 @@ export async function diagnoseSlotServices(
  * The POST /start boot: bind (or allocate) the exit, adopt its timezone, start
  * the container and its inference runtime, then record the running intent.
  * `by` is the action behind the boot: 'start' (operator /start) reopens 关机 and
- * a failed boot; 'recover_ok' (operator 恢复服务) reopens any 不可调度; null
+ * a failed boot; 'recover_ok' (operator 恢复服务) reopens 不可调度 except
+ * unrelated protection during proxy-hold recovery; null
  * (watchdog revive) only records whether a ticket is on disk.
  */
 export async function powerOnSlot({
@@ -387,6 +391,7 @@ export async function powerOnSlot({
 }) {
   let vm = getVm(projectRoot, id)
   if (!vm) return { ok: false, status: 404, code: 'vm_not_found', error: 'vm not found' }
+  const previousProxyId = vm.proxy?.id || null
   try {
     if (!isKvmRuntime(vm)) slotDockerCpus(vm)
   } catch (error) {
@@ -412,6 +417,8 @@ export async function powerOnSlot({
   }
   const hasCred = vmHasSchedulableCredential(vm, projectRoot)
   const runtime = boot.runtime || boot.docker?.runtime
+  const inference = boot.rust || boot.kernel
+  const runtimeReady = inference?.ok === true && inference.skipped !== true && boot.rust_ok !== false
   vm =
     patchVmRecord(projectRoot, id, (record) => {
       migrateScheduleRecord(record)
@@ -420,10 +427,32 @@ export async function powerOnSlot({
         delete record.schedule_off_reason
       }
       if (!hasCred) applyUnschedulable(record, 'no_credential')
-      else if (by === 'recover_ok') applyClearUnschedulable(record, { by })
-      else if (by === 'start' && record.unschedulable?.reason === 'runtime_start_failed') {
+      else if (by === 'recover_ok' && record.schedule_hold?.reason !== HOLD_PROXY) {
+        applyClearUnschedulable(record, { by })
+      } else if (['start', 'recover_ok'].includes(by) && record.unschedulable?.reason === 'runtime_start_failed') {
         applyClearUnschedulable(record, { by: 'operator' })
       } else applyClearUnschedulable(record, { by: 'credential_present' })
+      // Probes intentionally cannot reopen fixed-egress holds. An explicit boot
+      // may clear this proxy's old hold only after runtime readiness and a fresh
+      // guard verdict, without changing operator/credential scheduling state.
+      if (
+        ['start', 'recover_ok'].includes(by) &&
+        runtimeReady &&
+        previousProxyId === bound.id &&
+        record.proxy?.id === bound.id &&
+        isDeepStrictEqual(record.proxy, vm.proxy) &&
+        vmHasSchedulableCredential(record, projectRoot) &&
+        record.schedule_hold?.reason === HOLD_PROXY &&
+        record.schedule_hold.detail?.tag === bound.id
+      ) {
+        let guard = null
+        try {
+          guard = (ops.getProxyExitGuardState || getProxyExitGuardState)(projectRoot, bound.id)
+        } catch {
+          // Missing or invalid guard evidence leaves the existing hold intact.
+        }
+        if (guard?.required === true && guard.ready === true) applyClearHold(record, HOLD_PROXY, { tag: bound.id })
+      }
       deriveScheduleFields(record)
       const next = { status: 'running' }
       if (runtime) {

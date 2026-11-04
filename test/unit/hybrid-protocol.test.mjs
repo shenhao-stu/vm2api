@@ -46,7 +46,7 @@ async function upstream(t, handle) {
   })
   return `http://127.0.0.1:${server.address().port}`
 }
-function harness(t, origin, { requiredGuard = true } = {}) {
+function harness(t, origin, { requiredGuard = true, gatewayOnly = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hybrid-protocol-'))
   const db = openDatabase({ dbPath: path.join(root, 'kin.db') })
   t.after(() => {
@@ -66,8 +66,9 @@ function harness(t, origin, { requiredGuard = true } = {}) {
   const key = keys.create({
     category: 'hybrid',
     openai_endpoint_id: ep.id,
-    group_type: 'anthropic',
-    allowed_vms: ['vm-one'],
+    group_type: gatewayOnly ? 'openai' : 'anthropic',
+    allowed_vms: gatewayOnly ? [] : ['vm-one'],
+    vm_pool_id: null,
     max_concurrency: 1,
   })
   const scheduler = new ApiScheduler()
@@ -284,4 +285,92 @@ test('gateway 429 preserves Retry-After and cools only its configured credential
   assert.equal(second.statusCode, 503)
   assert.equal(calls, 1)
   assert.equal(h.nativeCalls.length, 0)
+})
+
+test('separate GPT and Claude keys reject cross-pool requests and each retain concurrency one', async (t) => {
+  let accepted
+  const entered = new Promise((resolve) => {
+    accepted = resolve
+  })
+  let finish
+  let calls = 0
+  const origin = await upstream(t, (req, res) => {
+    calls++
+    req.resume()
+    finish = () => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(
+        JSON.stringify({
+          status: 'completed',
+          model: gpt,
+          output: [{ type: 'message', content: [{ type: 'output_text', text: 'GPT answer' }] }],
+          usage: { input_tokens: 2, output_tokens: 3 },
+        }),
+      )
+    }
+    accepted()
+  })
+  const h = harness(t, origin, { gatewayOnly: true })
+  const claudeKey = h.keys.create({
+    category: 'oauth',
+    group_type: 'anthropic',
+    allowed_vms: ['vm-one'],
+    max_concurrency: 1,
+  })
+  const deniedClaude = await h.call(
+    { model: claude, messages: [{ role: 'user', content: 'hello' }] },
+    { protocol: 'anthropic.messages' },
+  ).done
+  assert.equal(deniedClaude.statusCode, 403)
+  assert.equal(deniedClaude.body.error.code, 'key_group_mismatch')
+  const deniedGpt = await h.call({ model: gpt, input: 'hello' }, { token: claudeKey.key }).done
+  assert.equal(deniedGpt.statusCode, 403)
+  assert.equal(deniedGpt.body.error.code, 'key_group_mismatch')
+  assert.equal(calls, 0)
+  assert.equal(h.nativeCalls.length, 0)
+  const first = h.call({ model: gpt, input: 'hello' })
+  await entered
+  assert.equal((await h.call({ model: gpt, input: 'hello' }).done).statusCode, 429)
+  const native = await h.call(
+    { model: claude, messages: [{ role: 'user', content: 'hello' }] },
+    { protocol: 'anthropic.messages', token: claudeKey.key },
+  ).done
+  assert.equal(native.statusCode, 200)
+  assert.equal(h.nativeCalls.length, 1)
+  assert.equal(h.keys.acquire(claudeKey).ok, true)
+  assert.equal(h.keys.acquire(claudeKey).ok, false)
+  h.keys.release(claudeKey)
+  finish()
+  assert.equal((await first.done).statusCode, 200)
+  assert.equal(calls, 1)
+  assert.equal(h.keys.getById(h.key.id).requests, 1)
+  assert.equal(h.keys.getById(claudeKey.id).requests, 1)
+})
+
+test('Fable names and case/prefix aliases are rejected before any gateway or native dispatch', async (t) => {
+  let calls = 0
+  const origin = await upstream(t, (_req, res) => {
+    calls++
+    res.end('{}')
+  })
+  const h = harness(t, origin, { gatewayOnly: true })
+  const claudeKey = h.keys.create({
+    category: 'oauth',
+    group_type: 'anthropic',
+    allowed_vms: ['vm-one'],
+    max_concurrency: 1,
+  })
+  for (const token of [h.key.key, claudeKey.key]) {
+    for (const model of ['fable', 'FABLE', 'provider/CLAUDE-FABLE-99', 'claude-fable-5-1[1m]', 'gpt-fable-hidden']) {
+      const reply = await h.call(
+        { model, messages: [{ role: 'user', content: 'hi' }] },
+        { protocol: 'anthropic.messages', token },
+      ).done
+      assert.equal(reply.statusCode, 403, model)
+      assert.equal(reply.body.error.code, 'model_disabled')
+    }
+  }
+  assert.equal(calls, 0)
+  assert.equal(h.nativeCalls.length, 0)
+  assert.ok(h.logs.every((log) => log.attempt_count === 0 && log.final_state === 'rejected'))
 })

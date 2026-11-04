@@ -22,8 +22,11 @@ import {
 } from '@/components/ui/select'
 import {
   keyLimitsDraft,
+  keyServiceOf,
+  selectKeyService,
   type KeyGroupType,
   type KeyLimitsDraft,
+  type KeyService,
 } from './key-payload'
 
 const CONC = [0, 1, 2, 4, 8, 16, 20, 32, 64]
@@ -100,6 +103,7 @@ export function KeyLimitsDialog({
   vms = [],
   pools,
   endpoints = [],
+  createService = 'claude',
 }: {
   mode: 'create' | 'edit'
   open: boolean
@@ -110,19 +114,25 @@ export function KeyLimitsDialog({
   vms?: Vm[]
   pools?: VmPool[]
   endpoints?: ApiEndpoint[]
+  createService?: 'claude' | 'gpt'
 }) {
   const withPools = pools !== undefined
   const [draft, setDraft] = useState<KeyLimitsDraft>(keyLimitsDraft())
 
   useEffect(() => {
     if (!open) return
-    setDraft(keyLimitsDraft(mode === 'edit' ? initial : null, withPools))
+    setDraft(
+      keyLimitsDraft(mode === 'edit' ? initial : null, withPools, createService)
+    )
     // pools is only the option list. Reloading it must not wipe an open form.
-  }, [open, mode, initial, withPools])
+  }, [open, mode, initial, withPools, createService])
 
   const quotaOpts = mode === 'edit' ? QUOTA_EDIT : QUOTA_CREATE
   const rpmOpts = mode === 'edit' ? RPM_EDIT : RPM_CREATE
   const hybrid = draft.category === 'hybrid'
+  const service = keyServiceOf(draft)
+  const gpt = service === 'gpt'
+  const claudeScope = service === 'claude' || service === 'legacy_hybrid'
   const scopeReadOnly = hybrid && pools === undefined && mode === 'edit'
   const gateways = endpoints.filter(
     (endpoint) => endpoint.kind === 'local_gateway'
@@ -131,8 +141,9 @@ export function KeyLimitsDialog({
     (endpoint) => endpoint.id === draft.openai_endpoint_id
   )
   const listed = vmsInGroup(vms || [], draft.group_type)
-  const scopeBlocked =
-    draft.group_type === 'pool'
+  const scopeBlocked = gpt
+    ? false
+    : draft.group_type === 'pool'
       ? !draft.vm_pool_id
       : draft.group_type !== 'all' && draft.allowed_vms.length === 0
 
@@ -167,32 +178,26 @@ export function KeyLimitsDialog({
             </Field>
           ) : null}
           {pools ? (
-            <Field label='分类'>
+            <Field label='托管服务'>
               <Select
-                value={draft.category}
+                value={service}
                 onValueChange={(v) =>
-                  setDraft((d) => ({
-                    ...d,
-                    category:
-                      v === 'hybrid' ? 'hybrid' : v === 'api' ? 'api' : 'oauth',
-                    ...(v === 'hybrid' && d.group_type !== 'pool'
-                      ? {
-                          group_type: 'anthropic',
-                          allowed_vms: d.allowed_vms.filter((id) =>
-                            vms.some((vm) => vm.id === id && !isCodexVm(vm))
-                          ),
-                        }
-                      : {}),
-                  }))
+                  setDraft((d) => selectKeyService(d, v as KeyService))
                 }
               >
-                <SelectTrigger>
+                <SelectTrigger aria-label='托管服务'>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value='oauth'>OAuth 槽位</SelectItem>
+                  <SelectItem value='claude'>Claude 托管池</SelectItem>
+                  <SelectItem value='gpt'>GPT 托管池</SelectItem>
+                  <SelectItem value='native'>OAuth 槽位</SelectItem>
                   <SelectItem value='api'>API 直连</SelectItem>
-                  <SelectItem value='hybrid'>统一 · Claude + GPT</SelectItem>
+                  {service === 'legacy_hybrid' ? (
+                    <SelectItem value='legacy_hybrid' disabled>
+                      历史 Claude + GPT（保留）
+                    </SelectItem>
+                  ) : null}
                 </SelectContent>
               </Select>
             </Field>
@@ -247,7 +252,9 @@ export function KeyLimitsDialog({
           {hybrid ? (
             <div className='space-y-2 sm:col-span-2'>
               <p className='text-xs text-muted-foreground'>
-                同一密钥：Claude 使用所选原生槽位，GPT 使用指定本机网关的模型。
+                {gpt
+                  ? '此密钥仅使用指定 GPT 网关，与 Claude 托管池分别限额和计并发。'
+                  : '历史混合密钥：Claude 使用所选原生槽位，GPT 使用指定本机网关的模型。新密钥按服务分别创建。'}
               </p>
               {pools ? (
                 <Field label='GPT 本机网关'>
@@ -277,7 +284,9 @@ export function KeyLimitsDialog({
                 </Field>
               ) : (
                 <p className='text-xs text-muted-foreground'>
-                  Claude 范围和 GPT 网关由管理员维护。
+                  {gpt
+                    ? 'GPT 网关由管理员维护。'
+                    : 'Claude 范围和 GPT 网关由管理员维护。'}
                 </p>
               )}
               {gateway ? (
@@ -298,9 +307,14 @@ export function KeyLimitsDialog({
               ) : null}
             </div>
           ) : null}
-          {!scopeReadOnly ? (
+          {service === 'claude' ? (
+            <p className='text-xs text-muted-foreground sm:col-span-2'>
+              此密钥仅使用所选 Claude 槽位，与 GPT 托管池分别限额和计并发。
+            </p>
+          ) : null}
+          {!scopeReadOnly && !gpt ? (
             <>
-              <Field label={hybrid ? 'Claude 范围' : '分组'}>
+              <Field label={claudeScope ? 'Claude 范围' : '分组'}>
                 <Select
                   value={draft.group_type}
                   onValueChange={(v) => {
@@ -328,16 +342,16 @@ export function KeyLimitsDialog({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {!hybrid ? (
+                    {!claudeScope ? (
                       <SelectItem value='all'>all · 全局可调度</SelectItem>
                     ) : null}
                     {pools ? (
                       <SelectItem value='pool'>账号池</SelectItem>
                     ) : null}
                     <SelectItem value='anthropic'>
-                      {hybrid ? 'Claude 原生槽位' : 'anthropic'}
+                      {claudeScope ? 'Claude 原生槽位' : 'anthropic'}
                     </SelectItem>
-                    {!hybrid ? (
+                    {!claudeScope ? (
                       <SelectItem value='openai'>openai</SelectItem>
                     ) : null}
                   </SelectContent>
@@ -370,7 +384,7 @@ export function KeyLimitsDialog({
                 </p>
               ) : (
                 <div className='sm:col-span-2'>
-                  <Field label={hybrid ? 'Claude 可用槽位' : '可用 VM'}>
+                  <Field label={claudeScope ? 'Claude 可用槽位' : '可用 VM'}>
                     <div className='max-h-40 space-y-1 overflow-y-auto rounded-md border p-2'>
                       {listed.length === 0 ? (
                         <p className='text-xs text-muted-foreground'>

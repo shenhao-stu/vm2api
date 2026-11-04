@@ -1,10 +1,12 @@
 import type { ApiKeyItem } from '@/types/panel-keys'
 
 export type KeyGroupType = 'all' | 'anthropic' | 'openai' | 'pool'
+export type KeyService = 'claude' | 'gpt' | 'native' | 'api' | 'legacy_hybrid'
 
 export type KeyLimitsDraft = {
   name: string
   category: 'oauth' | 'api' | 'hybrid'
+  service?: KeyService
   openai_endpoint_id?: string
   max_concurrency: number
   quota_requests: number
@@ -16,19 +18,70 @@ export type KeyLimitsDraft = {
   vm_pool_id?: string
 }
 
+export function keyServiceOf(value: {
+  service?: KeyService
+  category?: string
+  group_type?: string
+}): KeyService {
+  if (value.service) return value.service
+  if (value.category === 'api') return 'api'
+  if (value.category === 'hybrid')
+    return value.group_type === 'openai' ? 'gpt' : 'legacy_hybrid'
+  return value.group_type === 'anthropic' ? 'claude' : 'native'
+}
+
+export function keyServiceLabel(
+  value: Parameters<typeof keyServiceOf>[0]
+): string {
+  return {
+    claude: 'Claude 托管池',
+    gpt: 'GPT 托管池',
+    native: 'OAuth 槽位',
+    api: 'API 直连',
+    legacy_hybrid: '历史 Claude + GPT',
+  }[keyServiceOf(value)]
+}
+
+export function selectKeyService(
+  draft: KeyLimitsDraft,
+  service: KeyService
+): KeyLimitsDraft {
+  if (keyServiceOf(draft) === service) return draft
+  if (service === 'legacy_hybrid') throw new Error('历史混合密钥仅兼容已有配置')
+  return {
+    ...draft,
+    service,
+    category:
+      service === 'gpt' ? 'hybrid' : service === 'api' ? 'api' : 'oauth',
+    group_type:
+      service === 'gpt' ? 'openai' : service === 'claude' ? 'anthropic' : 'all',
+    allowed_vms: [],
+    vm_pool_id: '',
+    openai_endpoint_id: service === 'gpt' ? draft.openai_endpoint_id || '' : '',
+    ...(['gpt', 'claude'].includes(service) ? { max_concurrency: 1 } : {}),
+  }
+}
+
 export function keyLimitsDraft(
   initial?: ApiKeyItem | null,
-  withPools = false
+  withPools = false,
+  createService: 'claude' | 'gpt' = 'claude'
 ): KeyLimitsDraft {
   const group =
     withPools && initial?.vm_pool_id
       ? 'pool'
-      : groupTypeOf(initial?.group_type || 'all')
+      : groupTypeOf(
+          initial?.group_type ||
+            (initial ? 'all' : createService === 'gpt' ? 'openai' : 'anthropic')
+        )
   return {
     name: initial?.name || '',
-    category: initial?.category || 'oauth',
+    category:
+      initial?.category ||
+      (createService === 'gpt' && !initial ? 'hybrid' : 'oauth'),
+    service: initial ? keyServiceOf(initial) : createService,
     openai_endpoint_id: initial?.openai_endpoint_id || '',
-    max_concurrency: Number(initial?.max_concurrency ?? 20),
+    max_concurrency: Number(initial?.max_concurrency ?? (initial ? 20 : 1)),
     quota_requests: Number(initial?.quota_requests ?? 0),
     quota_usd: Number(initial?.quota_usd ?? 0),
     rpm: Number(initial?.rpm ?? 0),
@@ -58,11 +111,22 @@ export function keyLimitsPayload(
 ): Record<string, unknown> {
   const isAdmin = options.isAdmin ?? true
   const hybrid = draft.category === 'hybrid'
+  const gpt = hybrid && draft.group_type === 'openai'
+  const service = keyServiceOf(draft)
   if (hybrid && !isAdmin && mode === 'create') {
-    throw new Error('统一密钥由管理员创建')
+    throw new Error('GPT 托管密钥由管理员创建')
   }
-  if (hybrid && !['anthropic', 'pool'].includes(draft.group_type)) {
-    throw new Error('统一密钥必须选择 Claude 槽位或账号池')
+  if (hybrid && !['anthropic', 'pool', 'openai'].includes(draft.group_type)) {
+    throw new Error('历史混合密钥必须保留 Claude 范围')
+  }
+  if (hybrid && !gpt && mode === 'create') {
+    throw new Error('请分别创建 Claude 托管池和 GPT 托管池密钥')
+  }
+  if (
+    service === 'claude' &&
+    !['anthropic', 'pool'].includes(draft.group_type)
+  ) {
+    throw new Error('Claude 托管池必须选择 Claude 槽位或账号池')
   }
   const requests = nonNegative(draft.quota_requests, '请求额度')
   if (!Number.isInteger(requests)) throw new Error('请求额度必须是整数')
@@ -84,10 +148,16 @@ export function keyLimitsPayload(
   }
   // Tenant edits retain administrator-owned hybrid routing exactly.
   if (hybrid && !isAdmin && mode === 'edit') return body
-  if (isAdmin && draft.group_type === 'pool') {
+  if (gpt) {
+    if (draft.allowed_vms.length || draft.vm_pool_id)
+      throw new Error('GPT 托管池仅绑定本机网关，不绑定原生槽位')
+    body.group_type = 'openai'
+    body.allowed_vms = []
+    body.vm_pool_id = null
+  } else if (isAdmin && draft.group_type === 'pool') {
     const vm_pool_id = String(draft.vm_pool_id || '').trim()
     if (!vm_pool_id) throw new Error('选择一个账号池')
-    body.group_type = hybrid ? 'anthropic' : 'all'
+    body.group_type = hybrid || service === 'claude' ? 'anthropic' : 'all'
     body.allowed_vms = []
     body.vm_pool_id = vm_pool_id
   } else {

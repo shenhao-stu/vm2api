@@ -20,7 +20,12 @@ const initial: ApiKeyItem = {
   max_concurrency: 1,
 }
 
-async function mount(item = initial, admin = true, endpointPresent = true) {
+async function mount(
+  item = initial,
+  admin = true,
+  endpointPresent = true,
+  createService?: 'claude' | 'gpt'
+) {
   const container = document.createElement('div')
   document.body.append(container)
   const root = createRoot(container)
@@ -32,7 +37,8 @@ async function mount(item = initial, admin = true, endpointPresent = true) {
   await act(async () =>
     root.render(
       <KeyLimitsDialog
-        mode='edit'
+        mode={createService ? 'create' : 'edit'}
+        createService={createService}
         open
         initial={item}
         pending={false}
@@ -56,7 +62,7 @@ async function mount(item = initial, admin = true, endpointPresent = true) {
     )
   )
   const save = [...document.querySelectorAll('button')].find(
-    (b) => b.textContent === '保存'
+    (b) => b.textContent === (createService ? '生成' : '保存')
   )!
   return { save, submitted }
 }
@@ -109,4 +115,61 @@ it('tenant limit edits leave a pooled unified route under administrator control'
     'openai_endpoint_id',
   ])
     expect(payload).not.toHaveProperty(field)
+})
+
+it('GPT-only key editing has no native VM picker and preserves its independent gateway contract', async () => {
+  const ui = await mount({
+    ...initial,
+    name: 'GPT pool',
+    group_type: 'openai',
+    allowed_vms: [],
+    vm_pool_id: null,
+  })
+  expect(document.body.textContent).toContain('GPT 托管池')
+  expect(document.body.textContent).toContain(
+    '与 Claude 托管池分别限额和计并发'
+  )
+  expect(document.querySelectorAll('input[type="checkbox"]')).toHaveLength(0)
+  expect(ui.save.disabled).toBe(false)
+  await act(async () => ui.save.click())
+  expect(keyLimitsPayload(ui.submitted.mock.calls[0][0], 'edit')).toMatchObject(
+    {
+      category: 'hybrid',
+      group_type: 'openai',
+      allowed_vms: [],
+      vm_pool_id: null,
+      openai_endpoint_id: initial.openai_endpoint_id,
+      max_concurrency: 1,
+    }
+  )
+})
+
+it('Claude-only key editing does not offer a GPT gateway binding', async () => {
+  const ui = await mount({
+    ...initial,
+    category: 'oauth',
+    openai_endpoint_id: null,
+  })
+  expect(document.body.textContent).toContain('Claude 托管池')
+  expect(document.body.textContent).toContain('与 GPT 托管池分别限额和计并发')
+  expect(document.querySelector('[aria-label="GPT 本机网关"]')).toBeNull()
+  expect(ui.save.disabled).toBe(false)
+  await act(async () => ui.save.click())
+  expect(keyLimitsPayload(ui.submitted.mock.calls[0][0], 'edit')).toMatchObject(
+    {
+      category: 'oauth',
+      group_type: 'anthropic',
+      allowed_vms: ['line01'],
+      openai_endpoint_id: null,
+    }
+  )
+})
+
+it('the GPT create entry starts with a gateway-only form and waits for an explicit binding', async () => {
+  const ui = await mount(initial, true, true, 'gpt')
+  expect(document.body.textContent).toContain('GPT 托管池')
+  expect(document.querySelector('[aria-label="GPT 本机网关"]')).not.toBeNull()
+  expect(document.querySelectorAll('input[type="checkbox"]')).toHaveLength(0)
+  expect(ui.save.disabled).toBe(true)
+  expect(ui.submitted).not.toHaveBeenCalled()
 })

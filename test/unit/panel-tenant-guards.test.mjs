@@ -19,6 +19,7 @@ after(() => {
 const { createPanelHandler } = await import('../../src/lib/admin/panel-routes.mjs')
 const { authorizePanelRoute } = await import('../../src/lib/admin/panel-acl.mjs')
 const { ApiKeyStore } = await import('../../src/lib/admin/api-keys.mjs')
+const { ApiEndpointStore } = await import('../../src/lib/admin/api-endpoints.mjs')
 const { PanelUserStore } = await import('../../src/lib/admin/panel-users.mjs')
 const { parseAllowedVms } = await import('../../src/lib/admin/key-scope.mjs')
 const { createVmPool } = await import('../../src/lib/admin/vm-pools.mjs')
@@ -482,4 +483,48 @@ test('tenant test-models: own slot lists models, foreign slot 404s, refresh neve
   const admin = await makeHandler(root, ADMIN, null).call('GET', '/api/panel/test-models?vm_id=vm-other&refresh=1')
   assert.equal(admin.status, 200)
   assert.ok(dials > 0, 'admin refresh still goes live')
+})
+
+test('panel creates a GPT-only gateway key without VMs; tenant edits cannot widen its scope', async (t) => {
+  const { root, store } = keyFixture(t)
+  const endpoints = new ApiEndpointStore({ db: store.db })
+  const endpoint = endpoints.create({
+    kind: 'local_gateway',
+    protocol: 'openai',
+    base_url: 'http://127.0.0.1:8787',
+    models: [{ name: 'gpt-6.1-sol', alias: 'gpt-6.1-sol' }],
+    api_key_entries: [{ api_key: 'mock-gateway-key' }],
+  })
+  const body = {
+    category: 'hybrid',
+    openai_endpoint_id: endpoint.id,
+    group_type: 'openai',
+    allowed_vms: [],
+    vm_pool_id: null,
+    max_concurrency: 1,
+    user_id: 'u-1',
+  }
+  const denied = await makeHandler(root, TENANT, body, { apiKeyStore: store }).call('POST', '/api/panel/api-keys')
+  assert.equal(denied.status, 403)
+  const created = await makeHandler(root, ADMIN, body, { apiKeyStore: store }).call('POST', '/api/panel/api-keys')
+  assert.equal(created.status, 201, JSON.stringify(created.body))
+  assert.equal(created.body.item.group_type, 'openai')
+  assert.deepEqual(created.body.item.allowed_vms, [])
+  const id = created.body.item.id
+  const broaden = await makeHandler(
+    root,
+    TENANT,
+    { group_type: 'anthropic', allowed_vms: ['vm-mine'] },
+    { apiKeyStore: store },
+  ).call('PATCH', `/api/panel/api-keys/${id}`)
+  assert.equal(broaden.status, 403)
+  assert.equal(broaden.body.error.code, 'key_scope_forbidden')
+  assert.equal(store.getById(id).group_type, 'openai')
+  const limits = await makeHandler(root, TENANT, { max_concurrency: 1 }, { apiKeyStore: store }).call(
+    'PATCH',
+    `/api/panel/api-keys/${id}`,
+  )
+  assert.equal(limits.status, 200, JSON.stringify(limits.body))
+  assert.equal(store.getById(id).openai_endpoint_id, endpoint.id)
+  assert.deepEqual(parseAllowedVms(store.getById(id).allowed_vms), [])
 })

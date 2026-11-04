@@ -37,7 +37,11 @@ import {
   plaintextFromPayload,
 } from './key-format'
 import { KeyLimitsDialog } from './key-limits-dialog'
-import { keyLimitsPayload, type KeyLimitsDraft } from './key-payload'
+import {
+  keyLimitsPayload,
+  keyServiceLabel,
+  type KeyLimitsDraft,
+} from './key-payload'
 import { KeyRevealDialog, type RevealedKey } from './key-reveal-dialog'
 import { KeyStatsDialog } from './key-stats-dialog'
 import { VmPoolsCard, vmPoolsQueryOptions } from './vm-pools-card'
@@ -55,6 +59,7 @@ export function KeysPage() {
   const vms = useQuery(vmsListQueryOptions())
   const vmItems = vms.data?.items || []
   const [createOpen, setCreateOpen] = useState(false)
+  const [createService, setCreateService] = useState<'claude' | 'gpt'>('claude')
   const [editId, setEditId] = useState('')
   const [statsId, setStatsId] = useState('')
   const [rotateId, setRotateId] = useState('')
@@ -201,8 +206,30 @@ export function KeysPage() {
   return (
     <PageHeader
       title={VIEW_TITLES.keys}
-      description='发给客户端的 sk-vm- 密钥。请求走这张密钥，不要把主控密钥写进环境变量。'
-      extra={<Button onClick={() => setCreateOpen(true)}>生成</Button>}
+      description='Claude 与 GPT 分别使用独立 Key，托管池默认并发 1。请把对应服务的 Key 发给客户端。'
+      extra={
+        <div className='flex gap-2'>
+          <Button
+            onClick={() => {
+              setCreateService('claude')
+              setCreateOpen(true)
+            }}
+          >
+            生成 Claude Key
+          </Button>
+          {isAdmin ? (
+            <Button
+              variant='outline'
+              onClick={() => {
+                setCreateService('gpt')
+                setCreateOpen(true)
+              }}
+            >
+              生成 GPT Key
+            </Button>
+          ) : null}
+        </div>
+      }
     >
       {isAdmin ? <VmPoolsCard vms={vmItems} /> : null}
       <QueryGate
@@ -213,8 +240,11 @@ export function KeysPage() {
         {keys.length === 0 ? (
           <EmptyState
             reason='尚无密钥。协议密钥只能调 /v1。'
-            actionLabel='生成'
-            onAction={() => setCreateOpen(true)}
+            actionLabel='生成 Claude Key'
+            onAction={() => {
+              setCreateService('claude')
+              setCreateOpen(true)
+            }}
           />
         ) : (
           <Table>
@@ -262,6 +292,7 @@ export function KeysPage() {
       </QueryGate>
       <KeyLimitsDialog
         mode='create'
+        createService={createService}
         open={createOpen}
         onOpenChange={setCreateOpen}
         pending={create.isPending}
@@ -408,13 +439,7 @@ function KeyRow({
           )}
         </div>
       </TableCell>
-      <TableCell>
-        {item.category === 'hybrid'
-          ? 'Claude + GPT'
-          : item.category === 'api'
-            ? 'API'
-            : 'OAuth'}
-      </TableCell>
+      <TableCell>{keyServiceLabel(item)}</TableCell>
       <TableCell>
         <StatusMark tone={keyStatusTone(item)} />
       </TableCell>
@@ -457,6 +482,8 @@ function KeyRow({
 }
 
 function scopeText(item: ApiKeyItem): string {
+  if (item.category === 'hybrid' && item.group_type === 'openai')
+    return 'GPT 网关 · 独立 Key'
   if (item.vm_pool_id) return `账号池 · ${item.vm_pool_name || item.vm_pool_id}`
   if (item.group_type === 'anthropic')
     return `Anthropic · ${item.allowed_vms?.length || 0} 台`

@@ -28,7 +28,7 @@ export type ApiKeyItem = {
   last_used_at?: string
   requests?: number
   inflight?: number
-  /** all = 全局可调度。anthropic / openai 必须带 allowed_vms。 */
+  /** all = 全局可调度。原生分组需 allowed_vms；hybrid/openai 仅绑定网关且槽位为空。 */
   group_type?: 'all' | 'anthropic' | 'openai'
   allowed_vms?: string[]
   vm_pool_id?: string | null

@@ -2,6 +2,8 @@ import net from 'node:net'
 import { detectInboundPlatform } from '../protocol/platform-detect.mjs'
 import { slotAllowsModel } from './slot-model-gate.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
+import { parseAllowedVms } from '../admin/key-scope.mjs'
+import { isGatewayOnlyRecord, withoutFableModels, isFableModel } from '../protocol/hosted-model-policy.mjs'
 
 export function gatewayError(code, message, status = 400) {
   return Object.assign(new Error(message), { code, status })
@@ -59,7 +61,7 @@ export function assertLocalGatewayEndpoint(endpoint) {
   }
   for (const model of endpoint.models || []) {
     for (const id of [model.name || model.upstream_name, model.alias || model.name || model.upstream_name]) {
-      if (detectInboundPlatform(id).platform !== 'openai') {
+      if (detectInboundPlatform(id).platform !== 'openai' || isFableModel(id)) {
         throw gatewayError('invalid_gateway_model', 'Local gateway models must be explicit GPT chat models')
       }
     }
@@ -70,9 +72,11 @@ export function assertLocalGatewayEndpoint(endpoint) {
 
 export function assertHybridKeyScope(record) {
   if (record.category !== 'hybrid') return
-  if (record.group_type !== 'anthropic') {
+  if (!['anthropic', 'openai'].includes(record.group_type)) {
     throw gatewayError('hybrid_claude_scope_required', 'Hybrid keys must retain a scoped Anthropic slot selection')
   }
+  if (isGatewayOnlyRecord(record) && (parseAllowedVms(record.allowed_vms).length || record.vm_pool_id))
+    throw gatewayError('gateway_only_scope_required', 'GPT gateway keys cannot bind native slots or VM pools')
   if (!/^ep_[a-f0-9]{12}$/.test(String(record.openai_endpoint_id || ''))) {
     throw gatewayError('hybrid_endpoint_required', 'Select the GPT local gateway for this hybrid key')
   }
@@ -93,9 +97,10 @@ export function gatewayModels(endpoint) {
   return [...ids].map((id) => ({ id, object: 'model', owned_by: endpoint.name || 'local_gateway' }))
 }
 
-export function hybridModelCatalog(nativeCatalog, endpoint, { nativeVms = [] } = {}) {
+export function hybridModelCatalog(nativeCatalog, endpoint, { nativeVms = [], record = null } = {}) {
   const native = (nativeCatalog?.data || []).filter(
     (m) =>
+      !isGatewayOnlyRecord(record) &&
       detectInboundPlatform(m.id).platform === 'anthropic' &&
       nativeVms.some(
         (vm) =>
@@ -106,5 +111,9 @@ export function hybridModelCatalog(nativeCatalog, endpoint, { nativeVms = [] } =
           }).ok,
       ),
   )
-  return { object: 'list', data: [...native, ...gatewayModels(endpoint)], source: 'hybrid' }
+  return withoutFableModels({
+    object: 'list',
+    data: [...native, ...gatewayModels(endpoint)],
+    source: isGatewayOnlyRecord(record) ? 'local_gateway' : 'hybrid',
+  })
 }

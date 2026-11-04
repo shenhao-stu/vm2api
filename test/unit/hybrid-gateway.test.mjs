@@ -475,3 +475,37 @@ test('zero budget does not dispatch; an upstream that never responds consumes on
   assert.equal(calls, 1)
   assert.ok(Date.now() - began < 500)
 })
+
+test('GPT-only gateway key persists an empty native scope but cannot attach slots or a pool', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-only-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const keys = new ApiKeyStore({ dataDir: dir })
+  const endpoints = new ApiEndpointStore({ db: keys.db })
+  const ep = endpoints.create(endpoint())
+  const key = keys.create({
+    category: 'hybrid',
+    openai_endpoint_id: ep.id,
+    group_type: 'openai',
+    allowed_vms: [],
+    vm_pool_id: null,
+    max_concurrency: 1,
+  })
+  const saved = keys.authenticate(key.key).record
+  assert.equal(saved.group_type, 'openai')
+  assert.deepEqual(keys.list()[0].allowed_vms, [])
+  assert.equal(keys.update(key.id, { max_concurrency: 1 }).group_type, 'openai')
+  assert.throws(() => keys.update(key.id, { allowed_vms: ['vm-one'] }), { code: 'gateway_only_scope_required' })
+  assert.throws(() => keys.update(key.id, { vm_pool_id: 'pool_abcd1234' }), { code: 'gateway_only_scope_required' })
+  assert.throws(() => keys.create({ category: 'oauth', group_type: 'openai', allowed_vms: [] }), {
+    code: 'key_vms_required',
+  })
+  const catalog = hybridModelCatalog({ data: [{ id: 'claude-sonnet-4-6' }, { id: 'claude-fable-5' }] }, ep, {
+    record: saved,
+    nativeVms: [{ id: 'vm-one', platform: 'anthropic', account_tier: 'max' }],
+  })
+  assert.deepEqual(
+    catalog.data.map((entry) => entry.id),
+    [model],
+  )
+  assert.equal(catalog.source, 'local_gateway')
+})

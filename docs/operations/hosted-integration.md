@@ -38,8 +38,12 @@
 
 ## 统一 GPT / Claude 托管
 
-统一 Key 使用 `hybrid` 类别，绑定一个明确的 `local_gateway` GPT 端点及原生 Claude 槽范围。两种模型共享并发、额度、日志和撤销入口；GPT 账号仍由已部署的 GPT 后端管理，避免复制账号、刷新凭证和调度状态。端点只接受数字 loopback origin、明确 GPT 模型和 Bearer 认证；不接受代理、重定向或自定义头，不进入普通 API 调度。
+托管实例交付 GPT / Claude 两把独立 Key，统一控制台、API 入口和日志。GPT Key 使用内部 `hybrid` 网关能力与 `group_type=openai`，明确绑定一个 `local_gateway` 端点，不授权任何原生 Claude 槽；Claude Key 使用原生 `oauth` / `anthropic` 及明确槽范围。两把 Key 分别限制并发 1，并在派发前拒绝跨平台调用。旧混合 Key 的兼容读取仍保留，但此实例不再提供混合 Key。GPT 账号仍由已部署的 GPT 后端管理，避免复制账号、刷新凭证和调度状态。端点只接受数字 loopback origin、明确 GPT 模型和 Bearer 认证；不接受代理、重定向或自定义头，不进入普通 API 调度。
 
 GPT 上游统一使用 Responses；纯转换函数适配 Chat、Completions 与 Messages，原生 Responses 保留完整结构。JSON/SSE 校验终态、可见内容和真实终量；补齐 completed-only 文本时校验已发前缀，工具身份变化明确失败，不重复生成。GPT Messages 支持文本和标准工具，其他块明确拒绝并引导原生 Responses；Claude 保留原生完整链路。普通 Python/curl 可以通过部署的 `claude_code_only=false` 调用，网关沿原生 Claude Code 传输，无需客户端伪造 CLI 头。
 
 JEV 支持卡密文本/文件导入、去重预览和行号报错，临时邮箱字段不会混入 Key。401 退休、429 单 Key 冷却、529 站点冷却，遵守 Retry-After；整体审核受一个总超时和取消信号约束。无效/缺失评分不再当成零分封禁，实际提出的问题必须有合法评分；审核不可用时按 fail-open 配置处理。托管实例使用 fail-closed。
+
+所有 Fable 系列在托管入口禁止调用，大小写与别名解析后的模型均检查，目录也不暴露 Fable。模型测试仅使用允许的 Haiku 与 GPT 模型，不向 Fable 上游派发。
+
+固定出口保护在网关重启后要求显式确认原 IP。手动启动/恢复槽只有在同一代理绑定、最新出口验证和推理内核均健康时，才解除该代理留下的冷却标记；人工停调、凭据保护和其他原因的停用继续保留。后台探测不会替代此显式恢复。

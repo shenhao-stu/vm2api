@@ -62,6 +62,7 @@ import {
 import { resolveInferenceBackend, runApiInference } from '../pool/api-protocol.mjs'
 import { assertHybridKeyScope, isHybridKey } from '../pool/local-gateway-policy.mjs'
 import { runHostedGateway } from './hosted-gateway.mjs'
+import { hostedModelDenial } from './hosted-model-policy.mjs'
 import { classifyClaudeRequestPurpose, prepareClassifierBody, classifierRequestSummary } from './request-purpose.mjs'
 import { agentSummarySession } from './agent-summary.mjs'
 import { summarizeBody, redactHeaders, presentedApiKeyForLog } from '../admin/request-log.mjs'
@@ -317,6 +318,20 @@ export function createHandleProtocol(deps) {
         message: 'Hybrid keys support HTTP chat, Responses and Messages only',
       },
     })
+    return true
+  }
+
+  function rejectHostedModel(req, res, body, logBag) {
+    const denial = hostedModelDenial(req.apiKeyKind === 'managed' ? req.apiKeyRecord : null, body?.model)
+    if (!denial) return false
+    stats.errors++
+    Object.assign(logBag, {
+      attempt_count: 0,
+      final_state: 'rejected',
+      error_code: denial.code,
+      error_message: denial.message,
+    })
+    json(res, 403, { error: { type: 'permission_error', ...denial } })
     return true
   }
 
@@ -778,6 +793,7 @@ export function createHandleProtocol(deps) {
     logBag.has_tools = Array.isArray(inbound?.tools) && inbound.tools.length > 0
     logBag.session_id = sessionIdForLog(extractCallerSession({ inbound, headers: req.headers }))
     logBag.reasoning_effort = reasoningEffortOf(inbound)
+    if (rejectHostedModel(req, res, inbound, logBag)) return
 
     // Hybrid GPT never prepares a provider-facing slot: its explicit local gateway owns that boundary.
     if (
@@ -889,6 +905,7 @@ export function createHandleProtocol(deps) {
       autoCompactWindow,
     }
     ctx = applyIntercept(cfg.intercept.rules, 'before_convert', ctx)
+    if (rejectHostedModel(req, res, ctx.body, logBag)) return
     const bodyCheck = validateRequestBody(protocol, ctx.body)
     if (!bodyCheck.ok) {
       stats.errors++
@@ -920,6 +937,7 @@ export function createHandleProtocol(deps) {
       ctx = { ...ctx, body: modelRewrite.body }
       logBag.upstream_model = modelRewrite.upstreamModel || null
     }
+    if (rejectHostedModel(req, res, ctx.body, logBag)) return
     // Image models are listed in /v1/models but are not chat models: they run on the Images endpoint.
     const imageModel = canonicalImageToolModel(ctx.body?.model)
     const platform = imageModel ? { ok: true, platform: 'openai' } : detectInboundPlatform(ctx.body?.model)
@@ -1121,6 +1139,7 @@ export function createHandleProtocol(deps) {
     else stats.convert++
 
     ctx = applyIntercept(cfg.intercept.rules, 'before_upstream', { ...ctx, body: converted.claude })
+    if (rejectHostedModel(req, res, ctx.body, logBag)) return
     const officialTraffic = officialInbound
     const requestContext = apiPassthrough ? null : classifyClaudeRequestPurpose(inbound, { officialTraffic })
     if (requestContext) {
@@ -2147,6 +2166,7 @@ export function createHandleProtocol(deps) {
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeBody(body)
+    if (rejectHostedModel(req, res, body, logBag)) return
     if (rejectUnsupportedExitPath(body, res, logBag, { search: true })) return
     return runWithCodexKey(req, res, logBag, () =>
       handleCodexSearch({
@@ -2361,6 +2381,7 @@ export function createHandleProtocol(deps) {
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeImagesBody(body)
+    if (rejectHostedModel(req, res, body, logBag)) return
     return runWithCodexKey(req, res, logBag, () =>
       handleCodexImages({
         req,

@@ -2,6 +2,7 @@
  * CLIProxy-shaped picker: grouped round-robin by endpoint then key.
  * Same alias across endpoints shares a model id; prefix/alias pins an endpoint.
  */
+import { isFableModel } from '../protocol/hosted-model-policy.mjs'
 
 function norm(s) {
   return String(s || '').trim()
@@ -26,7 +27,7 @@ export function modelIdsForEndpoint(ep, { forcePrefix = false } = {}) {
   const seen = new Set()
   for (const m of ep.models || []) {
     const alias = norm(m.alias)
-    if (!alias) continue
+    if (!alias || isFableModel(alias) || isFableModel(m.name || m.upstream_name)) continue
     const key = ep.kind === 'local_gateway' ? alias : lower(alias)
     if (!forcePrefix || !prefix) {
       if (!seen.has(key)) {
@@ -53,7 +54,8 @@ export function resolveUpstreamPool(ep, requestedModel) {
   const seen = new Set()
   for (const m of ep.models || []) {
     if (lower(m.alias) !== want) continue
-    const name = norm(m.name) || norm(m.alias)
+    const name = norm(m.name) || norm(m.upstream_name) || norm(m.alias)
+    if (isFableModel(name) || isFableModel(m.alias)) continue
     const key = lower(name)
     if (seen.has(key)) continue
     seen.add(key)
@@ -114,6 +116,8 @@ export class ApiScheduler {
   }
 
   pick(requestedModel, now = Date.now(), { localGatewayId = null } = {}) {
+    if (isFableModel(requestedModel))
+      return { ok: false, code: 'model_disabled', message: 'Fable models are disabled on this hosted platform' }
     const parents = this.endpoints
       .filter((ep) =>
         localGatewayId ? ep.id === localGatewayId && ep.kind === 'local_gateway' : ep.kind !== 'local_gateway',
@@ -139,7 +143,7 @@ export class ApiScheduler {
       const pool = localGatewayId
         ? (ep.models || [])
             .filter((m) => requestedModel === m.alias || (ep.prefix && requestedModel === `${ep.prefix}/${m.alias}`))
-            .map((m) => m.name)
+            .map((m) => m.name || m.upstream_name)
         : resolveUpstreamPool(ep, requestedModel)
       const mk = `${ep.id}:${lower(requestedModel)}`
       const mi = this.modelCursor.get(mk) || 0
