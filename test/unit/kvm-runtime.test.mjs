@@ -354,4 +354,3 @@ test('slot-guest-bin unlinks staging temp when atomic replace fails', (t) => {
   assert.equal(fs.existsSync(tmp), false)
   assert.equal(fs.readFileSync(dest, 'utf8'), 'kernel-v1')
 })
-
