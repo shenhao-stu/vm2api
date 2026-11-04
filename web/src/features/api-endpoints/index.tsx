@@ -270,5 +270,6 @@ function summarize(items: ApiEndpoint[]) {
 function kindLabel(kind: ApiEndpoint['kind']): string {
   if (kind === 'claude') return 'Claude 官方'
   if (kind === 'openai') return 'OpenAI 官方'
+  if (kind === 'local_gateway') return '本机 GPT 网关'
   return '自定义'
 }

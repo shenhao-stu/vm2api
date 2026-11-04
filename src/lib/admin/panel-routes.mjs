@@ -865,6 +865,7 @@ export function createPanelHandler(ctx) {
       delete normalized.user_id
       delete normalized.group_id
       delete normalized.vm_pool_id
+      delete normalized.openai_endpoint_id
     }
     const hasRequestQuota = Object.prototype.hasOwnProperty.call(body, 'quota_requests')
     const hasLegacyQuota = Object.prototype.hasOwnProperty.call(body, 'quota')
@@ -1592,13 +1593,19 @@ export function createPanelHandler(ctx) {
             error: { code: 'key_pool_forbidden', message: '只有管理员可以设置账号池' },
           })
         }
+        if (ident.role !== 'admin' && (body?.category === 'hybrid' || body?.openai_endpoint_id != null)) {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'key_category_forbidden', message: '只有管理员可以配置 GPT 网关密钥' },
+          })
+        }
         const input = normalizePanelApiKeyInput(body, req)
         try {
           const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
-          const scope = normalizeKeyScope(scopeInput)
+          const scope = normalizeKeyScope(scopeInput, { gatewayOnly: body?.category === 'hybrid' })
           const pools = vmPoolsFor(apiKeyStore.db)
           if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
           else assertVmScope(keyScopeVms(req), scope)
@@ -1611,6 +1618,7 @@ export function createPanelHandler(ctx) {
             name: body?.name,
             key: body?.key || body?.custom_key || undefined,
             category: body?.category,
+            openai_endpoint_id: body?.openai_endpoint_id,
             user_id:
               panelIdentity(req).role === 'user' ? req.panelUserId || null : body?.user_id || req.panelUserId || null,
             group_id: input.group_id,
@@ -1655,14 +1663,36 @@ export function createPanelHandler(ctx) {
             error: { code: 'key_pool_forbidden', message: '只有管理员可以设置账号池' },
           })
         }
+        if (ident.role !== 'admin' && (body?.category === 'hybrid' || body?.openai_endpoint_id != null)) {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'key_category_forbidden', message: '只有管理员可以配置 GPT 网关密钥' },
+          })
+        }
         try {
           const input = normalizePanelApiKeyInput(body || {}, req)
           const currentRec = apiKeyStore.getById(id)
+          if (
+            ident.role !== 'admin' &&
+            currentRec?.category === 'hybrid' &&
+            ['group_type', 'allowed_vms', 'vm_pool_id', 'category', 'openai_endpoint_id'].some((key) =>
+              Object.prototype.hasOwnProperty.call(body || {}, key),
+            )
+          ) {
+            return json(res, 403, {
+              ok: false,
+              error: { code: 'key_scope_forbidden', message: '只有管理员可以修改 GPT 网关密钥范围' },
+            })
+          }
           const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
-          const scope = normalizeKeyScope(scopeInput, { partial: true, current: currentRec })
+          const scope = normalizeKeyScope(scopeInput, {
+            partial: true,
+            current: currentRec,
+            gatewayOnly: (body?.category ?? currentRec?.category) === 'hybrid',
+          })
           if (scope) {
             if (ident.role !== 'admin' && currentRec?.vm_pool_id) {
               scope.vm_pool_id = currentRec.vm_pool_id

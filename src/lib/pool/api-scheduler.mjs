@@ -27,16 +27,18 @@ export function modelIdsForEndpoint(ep, { forcePrefix = false } = {}) {
   for (const m of ep.models || []) {
     const alias = norm(m.alias)
     if (!alias) continue
+    const key = ep.kind === 'local_gateway' ? alias : lower(alias)
     if (!forcePrefix || !prefix) {
-      if (!seen.has(lower(alias))) {
-        seen.add(lower(alias))
+      if (!seen.has(key)) {
+        seen.add(key)
         ids.push(alias)
       }
     }
     if (prefix) {
       const pref = `${prefix}/${alias}`
-      if (!seen.has(lower(pref))) {
-        seen.add(lower(pref))
+      const prefKey = ep.kind === 'local_gateway' ? pref : lower(pref)
+      if (!seen.has(prefKey)) {
+        seen.add(prefKey)
         ids.push(pref)
       }
     }
@@ -51,7 +53,7 @@ export function resolveUpstreamPool(ep, requestedModel) {
   const seen = new Set()
   for (const m of ep.models || []) {
     if (lower(m.alias) !== want) continue
-    const name = norm(m.name) || norm(m.alias)
+    const name = norm(m.name) || norm(m.upstream_name) || norm(m.alias)
     const key = lower(name)
     if (seen.has(key)) continue
     seen.add(key)
@@ -94,7 +96,7 @@ export class ApiScheduler {
     const data = []
     const seen = new Set()
     for (const ep of this.endpoints) {
-      if (ep.disabled) continue
+      if (ep.disabled || ep.kind === 'local_gateway') continue
       for (const id of modelIdsForEndpoint(ep, { forcePrefix: this.forcePrefix })) {
         const k = lower(id)
         if (seen.has(k)) continue
@@ -111,9 +113,16 @@ export class ApiScheduler {
     return { object: 'list', data, source: 'api-endpoints' }
   }
 
-  pick(requestedModel, now = Date.now()) {
+  pick(requestedModel, now = Date.now(), { localGatewayId = null } = {}) {
     const parents = this.endpoints
-      .filter((ep) => endpointMatchesModel(ep, requestedModel))
+      .filter((ep) =>
+        localGatewayId ? ep.id === localGatewayId && ep.kind === 'local_gateway' : ep.kind !== 'local_gateway',
+      )
+      .filter((ep) =>
+        localGatewayId
+          ? !ep.disabled && modelIdsForEndpoint(ep).includes(requestedModel)
+          : endpointMatchesModel(ep, requestedModel),
+      )
       .sort((a, b) => (Number(b.priority) || 0) - (Number(a.priority) || 0))
     if (!parents.length) {
       return { ok: false, code: 'model_not_found', message: `no api endpoint serves ${requestedModel}` }
@@ -127,7 +136,11 @@ export class ApiScheduler {
       const key = keys[c % keys.length]
       this.childCursor.set(ep.id, c + 1)
       this.parentCursor = start + off + 1
-      const pool = resolveUpstreamPool(ep, requestedModel)
+      const pool = localGatewayId
+        ? (ep.models || [])
+            .filter((m) => requestedModel === m.alias || (ep.prefix && requestedModel === `${ep.prefix}/${m.alias}`))
+            .map((m) => m.name || m.upstream_name)
+        : resolveUpstreamPool(ep, requestedModel)
       const mk = `${ep.id}:${lower(requestedModel)}`
       const mi = this.modelCursor.get(mk) || 0
       const upstreamModel = pool[mi % pool.length] || requestedModel

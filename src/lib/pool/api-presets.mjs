@@ -1,3 +1,5 @@
+import { localGatewayOrigin } from './local-gateway-policy.mjs'
+
 export const CLAUDE_OFFICIAL_URL = 'https://api.anthropic.com'
 export const OPENAI_OFFICIAL_URL = 'https://api.openai.com'
 
@@ -5,6 +7,7 @@ export const API_ENDPOINT_PRESETS = [
   { kind: 'claude', label: 'Claude 官方', base_url: CLAUDE_OFFICIAL_URL, protocol: 'anthropic' },
   { kind: 'openai', label: 'OpenAI 官方', base_url: OPENAI_OFFICIAL_URL, protocol: 'openai' },
   { kind: 'custom', label: '自定义', base_url: '', protocol: 'anthropic' },
+  { kind: 'local_gateway', label: '本机 GPT 网关', base_url: '', protocol: 'openai' },
 ]
 
 export function trimBaseUrl(url) {
@@ -20,6 +23,7 @@ export function normalizeKind(kind, baseUrl = '') {
     .toLowerCase()
   if (k === 'claude' || k === 'anthropic') return 'claude'
   if (k === 'openai') return 'openai'
+  if (k === 'local_gateway') return k
   const u = trimBaseUrl(baseUrl)
   if (u === CLAUDE_OFFICIAL_URL) return 'claude'
   if (u === OPENAI_OFFICIAL_URL) return 'openai'
@@ -28,7 +32,7 @@ export function normalizeKind(kind, baseUrl = '') {
 
 export function normalizeProtocol(protocol, kind) {
   if (kind === 'claude') return 'anthropic'
-  if (kind === 'openai') return 'openai'
+  if (kind === 'openai' || kind === 'local_gateway') return 'openai'
   return String(protocol || '').toLowerCase() === 'openai' ? 'openai' : 'anthropic'
 }
 
@@ -36,7 +40,12 @@ export function resolvePreset(kind, input = {}) {
   const resolvedKind = normalizeKind(kind || input.kind, input.base_url)
   const preset = API_ENDPOINT_PRESETS.find((p) => p.kind === resolvedKind) || API_ENDPOINT_PRESETS[2]
   const protocol = normalizeProtocol(input.protocol, resolvedKind)
-  const base_url = resolvedKind === 'custom' ? trimBaseUrl(input.base_url) : preset.base_url
+  const base_url =
+    resolvedKind === 'local_gateway'
+      ? localGatewayOrigin(input.base_url)
+      : resolvedKind === 'custom'
+        ? trimBaseUrl(input.base_url)
+        : preset.base_url
   return {
     kind: resolvedKind,
     protocol,

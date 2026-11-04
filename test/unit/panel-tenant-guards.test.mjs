@@ -438,3 +438,44 @@ test('tenant test-models: own slot lists models, foreign slot 404s, refresh neve
   assert.equal(admin.status, 200)
   assert.ok(dials > 0, 'admin refresh still goes live')
 })
+
+test('admin can configure an explicit GPT gateway key while tenant cannot expand its scope', async (t) => {
+  const root = makeProject(t)
+  const db = createDatabase(':memory:')
+  t.after(() => db.close())
+  const apiKeyStore = new ApiKeyStore({ db })
+  const { ApiEndpointStore } = await import('../../src/lib/admin/api-endpoints.mjs')
+  const endpoint = new ApiEndpointStore({ db }).create({
+    kind: 'local_gateway',
+    protocol: 'openai',
+    base_url: 'http://127.0.0.1:12345',
+    models: [{ name: 'gpt-6.1-sol', alias: 'gpt-6.1-sol' }],
+  })
+  const body = {
+    name: 'gateway',
+    category: 'hybrid',
+    openai_endpoint_id: endpoint.id,
+    group_type: 'openai',
+    allowed_vms: [],
+    user_id: 'u-1',
+  }
+  const extra = { apiKeyStore }
+  const denied = await makeHandler(root, TENANT, body, extra).call('POST', '/api/panel/api-keys')
+  assert.equal(denied.status, 403)
+  const created = await makeHandler(root, ADMIN, body, extra).call('POST', '/api/panel/api-keys')
+  assert.equal(created.status, 201, JSON.stringify(created.body))
+  const id = created.body.item.id
+  assert.equal(apiKeyStore.getById(id).openai_endpoint_id, endpoint.id)
+  const edited = await makeHandler(root, ADMIN, { max_concurrency: 2 }, extra).call(
+    'PATCH',
+    `/api/panel/api-keys/${id}`,
+  )
+  assert.equal(edited.status, 200, JSON.stringify(edited.body))
+  assert.equal(edited.body.item.category, 'hybrid')
+  const expanded = await makeHandler(root, TENANT, { category: 'oauth', group_type: 'all' }, extra).call(
+    'PATCH',
+    `/api/panel/api-keys/${id}`,
+  )
+  assert.equal(expanded.status, 403)
+  assert.equal(apiKeyStore.getById(id).category, 'hybrid')
+})

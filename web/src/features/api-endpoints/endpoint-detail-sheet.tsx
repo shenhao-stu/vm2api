@@ -31,8 +31,13 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { apiEndpointsQueryOptions } from '@/features/api-endpoints/queries'
+import {
+  endpointPayload,
+  modelsFromEndpoint,
+  type ModelDraft,
+} from './endpoint-payload'
 
-type EndpointKind = 'claude' | 'openai' | 'custom'
+type EndpointKind = NonNullable<ApiEndpoint['kind']>
 type Protocol = 'anthropic' | 'openai'
 type EpAuthScheme = 'x_api_key' | 'authorization_bearer'
 
@@ -40,13 +45,7 @@ const KIND_FALLBACK_LABEL: Record<EndpointKind, string> = {
   claude: 'Claude 官方',
   openai: 'OpenAI 官方',
   custom: '自定义',
-}
-
-type ModelDraft = {
-  name: string
-  alias: string
-  image: boolean
-  thinking: string
+  local_gateway: '本机 GPT 网关',
 }
 
 export function EndpointDetailSheet({
@@ -118,6 +117,10 @@ function EndpointForm({
   const [newKey, setNewKey] = useState('')
   const [newProxy, setNewProxy] = useState('')
   const keys = endpoint?.api_key_entries || []
+  const localGateway = kind === 'local_gateway'
+  const kindOptions = (Object.keys(KIND_FALLBACK_LABEL) as EndpointKind[]).map(
+    (kind) => presetFor(presets, kind)
+  )
 
   const refresh = () =>
     qc.invalidateQueries({ queryKey: apiEndpointsQueryOptions().queryKey })
@@ -126,6 +129,11 @@ function EndpointForm({
     const nextPreset = presetFor(presets, nextKind)
     const prevPreset = presetFor(presets, kind)
     setKind(nextKind)
+    if (nextKind === 'local_gateway') {
+      setHeadersText('')
+      setNewProxy('')
+      setAuthScheme('authorization_bearer')
+    }
     if (nextKind !== 'custom') {
       setBaseUrl(nextPreset.base_url)
       setProtocol((nextPreset.protocol as Protocol) || 'anthropic')
@@ -143,6 +151,7 @@ function EndpointForm({
       fetched?: number
       item?: ApiEndpoint
     }> => {
+      if (localGateway) throw new Error('本机网关需要手工配置允许的 GPT 模型')
       if (!isEdit) {
         const key = newKey.trim()
         if (!key) throw new Error('先填上游 key')
@@ -216,7 +225,7 @@ function EndpointForm({
   })
 
   const addKey = useMutation({
-    mutationFn: (body: { api_key: string; proxy_url: string }) => {
+    mutationFn: (body: { api_key: string; proxy_url?: string }) => {
       if (!endpoint) throw new Error('地址不存在')
       return api(
         `/api/panel/api-endpoints/${encodeURIComponent(endpoint.id)}/keys`,
@@ -274,15 +283,7 @@ function EndpointForm({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {(presets.length
-                  ? presets
-                  : (['claude', 'openai', 'custom'] as EndpointKind[]).map(
-                      (k) => ({
-                        kind: k,
-                        label: KIND_FALLBACK_LABEL[k],
-                      })
-                    )
-                ).map((p) => (
+                {kindOptions.map((p) => (
                   <SelectItem key={p.kind} value={p.kind}>
                     {p.label}
                   </SelectItem>
@@ -297,12 +298,17 @@ function EndpointForm({
               placeholder='api'
             />
           </Field>
-          {kind === 'custom' ? (
-            <Field label='地址'>
+          {kind === 'custom' || localGateway ? (
+            <Field label={localGateway ? '本机网关地址' : '地址'}>
               <Input
                 value={baseUrl}
                 onChange={(e) => setBaseUrl(e.target.value)}
-                placeholder='https://api.example.com'
+                aria-label={localGateway ? '本机网关地址' : '地址'}
+                placeholder={
+                  localGateway
+                    ? 'http://127.0.0.1:8787'
+                    : 'https://api.example.com'
+                }
               />
             </Field>
           ) : null}
@@ -336,22 +342,29 @@ function EndpointForm({
               onChange={(e) => setPriority(e.target.value)}
             />
           </Field>
-          <Field label='上游认证'>
-            <Select
-              value={authScheme}
-              onValueChange={(value) => setAuthScheme(value as EpAuthScheme)}
-            >
-              <SelectTrigger className='w-full'>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value='x_api_key'>x-api-key</SelectItem>
-                <SelectItem value='authorization_bearer'>
-                  Authorization: Bearer
-                </SelectItem>
-              </SelectContent>
-            </Select>
-          </Field>
+          {!localGateway ? (
+            <Field label='上游认证'>
+              <Select
+                value={authScheme}
+                onValueChange={(value) => setAuthScheme(value as EpAuthScheme)}
+              >
+                <SelectTrigger className='w-full'>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value='x_api_key'>x-api-key</SelectItem>
+                  <SelectItem value='authorization_bearer'>
+                    Authorization: Bearer
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
+          ) : (
+            <p className='text-xs text-muted-foreground'>
+              仅连接本机回环地址，使用 OpenAI Responses 协议及 Bearer
+              认证。统一密钥只会调用这里明确配置的 GPT 模型。
+            </p>
+          )}
           <div className='flex items-center justify-between gap-3'>
             <Label htmlFor='disable_cooling'>关闭 429 冷却</Label>
             <Switch
@@ -360,15 +373,17 @@ function EndpointForm({
               onCheckedChange={setDisableCooling}
             />
           </div>
-          <Field label='Headers（JSON）'>
-            <Textarea
-              className='font-mono text-xs'
-              rows={4}
-              value={headersText}
-              onChange={(e) => setHeadersText(e.target.value)}
-              placeholder='{"anthropic-beta":"…"}'
-            />
-          </Field>
+          {!localGateway ? (
+            <Field label='Headers（JSON）'>
+              <Textarea
+                className='font-mono text-xs'
+                rows={4}
+                value={headersText}
+                onChange={(e) => setHeadersText(e.target.value)}
+                placeholder='{"anthropic-beta":"…"}'
+              />
+            </Field>
+          ) : null}
         </section>
 
         <section className='space-y-3'>
@@ -401,13 +416,15 @@ function EndpointForm({
                 placeholder='sk-…'
               />
             </Field>
-            <Field label='代理'>
-              <Input
-                value={newProxy}
-                onChange={(e) => setNewProxy(e.target.value)}
-                placeholder='socks5://… 可选'
-              />
-            </Field>
+            {!localGateway ? (
+              <Field label='代理'>
+                <Input
+                  value={newProxy}
+                  onChange={(e) => setNewProxy(e.target.value)}
+                  placeholder='socks5://… 可选'
+                />
+              </Field>
+            ) : null}
           </div>
           {isEdit ? (
             <Button
@@ -421,12 +438,15 @@ function EndpointForm({
                   toast.error('先填上游 key')
                   return
                 }
-                addKey.mutate({ api_key, proxy_url: newProxy.trim() })
+                addKey.mutate({
+                  api_key,
+                  ...(!localGateway ? { proxy_url: newProxy.trim() } : {}),
+                })
               }}
             >
               加 key
             </Button>
-          ) : (
+          ) : !localGateway ? (
             <Button
               type='button'
               size='sm'
@@ -437,14 +457,14 @@ function EndpointForm({
             >
               获取模型
             </Button>
-          )}
+          ) : null}
         </section>
 
         <section className='space-y-3'>
           <div className='flex items-center justify-between gap-2'>
             <h3 className='text-sm font-medium'>模型</h3>
             <div className='flex items-center gap-2'>
-              {isEdit ? (
+              {isEdit && !localGateway ? (
                 <Button
                   type='button'
                   size='sm'
@@ -471,12 +491,19 @@ function EndpointForm({
               </Button>
             </div>
           </div>
+          {localGateway ? (
+            <p className='text-xs text-muted-foreground'>
+              手工列出允许调用的 GPT
+              模型和客户端别名；保存不会自动拉取或扩大模型范围。
+            </p>
+          ) : null}
           {models.length ? (
             <div className='space-y-2'>
               {models.map((row, index) => (
                 <ModelRow
                   key={index}
                   row={row}
+                  localGateway={localGateway}
                   onChange={(next) =>
                     setModels((rows) =>
                       rows.map((item, i) =>
@@ -502,30 +529,31 @@ function EndpointForm({
           type='button'
           disabled={pending}
           onClick={() => {
-            const headers = parseHeadersJson(headersText)
-            if (!headers) {
-              toast.error('Headers 不是合法 JSON')
-              return
+            try {
+              save.mutate(
+                endpointPayload(
+                  {
+                    kind,
+                    protocol,
+                    name,
+                    baseUrl,
+                    prefix,
+                    priority,
+                    disableCooling,
+                    authScheme,
+                    headersText,
+                    models,
+                    newKey,
+                    newProxy,
+                  },
+                  isEdit
+                )
+              )
+            } catch (error) {
+              toast.error(
+                error instanceof Error ? error.message : '地址配置无效'
+              )
             }
-            const api_key = newKey.trim()
-            const body: Record<string, unknown> = {
-              kind,
-              protocol,
-              name: name.trim() || 'api',
-              base_url: baseUrl.trim(),
-              prefix: prefix.trim(),
-              priority: Number(priority || 0),
-              disable_cooling: disableCooling,
-              auth_scheme: authScheme,
-              headers,
-              models: collectModels(models),
-            }
-            if (!isEdit) {
-              body.api_key_entries = api_key
-                ? [{ api_key, proxy_url: newProxy.trim() }]
-                : []
-            }
-            save.mutate(body)
           }}
         >
           {isEdit ? '保存' : '添加'}
@@ -574,10 +602,12 @@ function KeyRow({
 
 function ModelRow({
   row,
+  localGateway = false,
   onChange,
   onRemove,
 }: {
   row: ModelDraft
+  localGateway?: boolean
   onChange: (next: Partial<ModelDraft>) => void
   onRemove: () => void
 }) {
@@ -585,23 +615,25 @@ function ModelRow({
     <div className='flex flex-wrap items-center gap-2'>
       <Input
         className='min-w-[8rem] flex-1'
-        placeholder='上游 name'
+        placeholder={localGateway ? '上游 GPT 模型名' : '上游 name'}
         value={row.name}
         onChange={(e) => onChange({ name: e.target.value })}
       />
       <Input
         className='min-w-[8rem] flex-1'
-        placeholder='alias'
+        placeholder={localGateway ? '客户端 GPT 别名' : 'alias'}
         value={row.alias}
         onChange={(e) => onChange({ alias: e.target.value })}
       />
-      <label className='flex items-center gap-1.5 text-sm'>
-        <Checkbox
-          checked={row.image}
-          onCheckedChange={(value) => onChange({ image: value === true })}
-        />
-        图
-      </label>
+      {!localGateway ? (
+        <label className='flex items-center gap-1.5 text-sm'>
+          <Checkbox
+            checked={row.image}
+            onCheckedChange={(value) => onChange({ image: value === true })}
+          />
+          图
+        </label>
+      ) : null}
       <Input
         className='min-w-[10rem] flex-1'
         placeholder='thinking levels'
@@ -637,6 +669,8 @@ function presetFor(
 ): { kind: string; label: string; base_url: string; protocol: string } {
   const found = presets.find((p) => p.kind === kind)
   if (found) return found
+  if (kind === 'local_gateway')
+    return { kind, label: '本机 GPT 网关', base_url: '', protocol: 'openai' }
   if (kind === 'custom')
     return {
       kind: 'custom',
@@ -656,46 +690,6 @@ function presetFor(
     label: 'Claude 官方',
     base_url: 'https://api.anthropic.com',
     protocol: 'anthropic',
-  }
-}
-
-function modelsFromEndpoint(endpoint: ApiEndpoint | null): ModelDraft[] {
-  const models = endpoint?.models || []
-  if (!models.length)
-    return [{ name: '', alias: '', image: false, thinking: '' }]
-  return models.map((model) => ({
-    name: model.name || '',
-    alias: model.alias || '',
-    image: !!model.image,
-    thinking: (model.thinking?.levels || []).join(','),
-  }))
-}
-
-function collectModels(rows: ModelDraft[]): ApiModelEntry[] {
-  const out: ApiModelEntry[] = []
-  for (const row of rows) {
-    const name = row.name.trim()
-    const alias = row.alias.trim() || name
-    if (!name || !alias) continue
-    const levels = row.thinking.split(/[,\s]+/).filter(Boolean)
-    const entry: ApiModelEntry = { name, alias }
-    if (row.image) entry.image = true
-    if (levels.length) entry.thinking = { levels }
-    out.push(entry)
-  }
-  return out
-}
-
-function parseHeadersJson(raw: string): Record<string, string> | null {
-  const text = raw.trim()
-  if (!text) return {}
-  try {
-    const parsed: unknown = JSON.parse(text)
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
-      return null
-    return parsed as Record<string, string>
-  } catch {
-    return null
   }
 }
 

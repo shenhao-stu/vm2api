@@ -14,7 +14,8 @@ export type ApiKeyItem = {
   key?: string
   revealable?: boolean
   status?: string
-  category?: 'oauth' | 'api'
+  category?: 'oauth' | 'api' | 'hybrid'
+  openai_endpoint_id?: string | null
   max_concurrency?: number
   quota_requests?: number
   quota_used?: number

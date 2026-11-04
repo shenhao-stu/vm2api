@@ -2,7 +2,8 @@ export type KeyGroupType = 'all' | 'anthropic' | 'openai' | 'pool'
 
 export type KeyLimitsDraft = {
   name: string
-  category: 'oauth' | 'api'
+  category: 'oauth' | 'api' | 'hybrid'
+  openai_endpoint_id?: string
   max_concurrency: number
   quota_requests: number
   quota_usd: number
@@ -39,7 +40,17 @@ export function keyLimitsPayload(
     quota_usd: nonNegative(draft.quota_usd, 'USD 额度'),
     rpm: nonNegative(draft.rpm, 'RPM'),
   }
-  if (isAdmin && draft.group_type === 'pool') {
+  if (draft.category === 'hybrid') {
+    if (!isAdmin) throw new Error('只有管理员可以配置 GPT 网关')
+    const endpoint = String(draft.openai_endpoint_id || '').trim()
+    if (!/^ep_[a-f0-9]{12}$/.test(endpoint)) throw new Error('选择 GPT 网关')
+    if (draft.allowed_vms.length || draft.vm_pool_id)
+      throw new Error('GPT 网关不能绑定 VM 或账号池')
+    body.group_type = 'openai'
+    body.allowed_vms = []
+    body.vm_pool_id = null
+    body.openai_endpoint_id = endpoint
+  } else if (isAdmin && draft.group_type === 'pool') {
     const vm_pool_id = String(draft.vm_pool_id || '').trim()
     if (!vm_pool_id) throw new Error('选择一个账号池')
     body.group_type = 'all'

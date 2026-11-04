@@ -201,6 +201,10 @@ export class ApiEndpointsRepo {
     )
   }
 
+  getKey(id) {
+    return rowKey(this._getKey.get(id))
+  }
+
   setKeyCooldown(id, untilIso) {
     this._cool.run(untilIso, id)
   }

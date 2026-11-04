@@ -38,7 +38,7 @@ export type ApiEndpoint = {
   priority?: number
   disabled?: boolean
   disable_cooling?: boolean
-  kind?: 'claude' | 'openai' | 'custom'
+  kind?: 'claude' | 'openai' | 'custom' | 'local_gateway'
   protocol?: 'anthropic' | 'openai'
   /** 上游认证方案，后端 `endpointAuthScheme()` 计算得出，openai 协议恒为 bearer。 */
   auth_scheme?: AuthScheme

@@ -99,3 +99,33 @@ describe('API key limit payload', () => {
     expect(tenantTampered.group_type).toBe('all')
   })
 })
+
+it('GPT gateway keys bind only an explicit endpoint with no VM or pool', () => {
+  const gateway: KeyLimitsDraft = {
+    ...draft,
+    category: 'hybrid',
+    openai_endpoint_id: 'ep_123456789abc',
+    group_type: 'openai',
+    allowed_vms: [],
+    vm_pool_id: '',
+  }
+  expect(keyLimitsPayload(gateway, 'create')).toMatchObject({
+    category: 'hybrid',
+    openai_endpoint_id: 'ep_123456789abc',
+    group_type: 'openai',
+    allowed_vms: [],
+    vm_pool_id: null,
+  })
+  expect(() => keyLimitsPayload(gateway, 'create', { isAdmin: false })).toThrow(
+    '管理员'
+  )
+  expect(() =>
+    keyLimitsPayload({ ...gateway, openai_endpoint_id: '' }, 'create')
+  ).toThrow('选择 GPT')
+  expect(() =>
+    keyLimitsPayload({ ...gateway, allowed_vms: ['vm-one'] }, 'create')
+  ).toThrow('不能绑定')
+  expect(() =>
+    keyLimitsPayload({ ...gateway, vm_pool_id: 'pool_one' }, 'create')
+  ).toThrow('不能绑定')
+})

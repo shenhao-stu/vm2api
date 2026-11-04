@@ -129,7 +129,7 @@ export function keyAllowsVm(scope, vm) {
  * A named pool replaces the copied allowlist. An explicit platform list
  * clears a previously bound pool. Does not check that the VM or pool exists.
  */
-export function normalizeKeyScope(input = {}, { partial = false, current = null } = {}) {
+export function normalizeKeyScope(input = {}, { partial = false, current = null, gatewayOnly = false } = {}) {
   const hasType = input.group_type != null && input.group_type !== ''
   const hasVms = input.allowed_vms != null
   const hasPool = Object.prototype.hasOwnProperty.call(input, 'vm_pool_id')
@@ -152,7 +152,7 @@ export function normalizeKeyScope(input = {}, { partial = false, current = null 
     return { group_type, allowed_vms: [], vm_pool_id }
   }
   if (group_type === 'all') allowed_vms = []
-  if (group_type !== 'all' && allowed_vms.length === 0) {
+  if (group_type !== 'all' && allowed_vms.length === 0 && !(gatewayOnly && group_type === 'openai')) {
     throw Object.assign(new Error('选择 anthropic 或 openai 时至少勾选一台 VM'), { code: 'key_vms_required' })
   }
   return { group_type, allowed_vms, vm_pool_id: null }

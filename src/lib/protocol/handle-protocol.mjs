@@ -54,6 +54,8 @@ import {
   healthUnavailableError,
 } from '../admin/health-probe.mjs'
 import { resolveInferenceBackend, runApiInference } from '../pool/api-protocol.mjs'
+import { assertHybridKeyScope, isHybridKey } from '../pool/local-gateway-policy.mjs'
+import { runHostedGateway } from './hosted-gateway.mjs'
 import { classifyClaudeRequestPurpose, prepareClassifierBody, classifierRequestSummary } from './request-purpose.mjs'
 import { summarizeBody, redactHeaders } from '../admin/request-log.mjs'
 import { reasoningEffortOf, sessionIdForLog } from './log-fields.mjs'
@@ -236,6 +238,110 @@ export function createHandleProtocol(deps) {
         officialCost: priced.total_cost,
       })
     } catch {}
+  }
+
+  async function serveHostedGateway(req, res, protocol, body, logBag) {
+    stats.requests++
+    stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
+    if (ownerScopeFromRequest(req, apiKeyStore?.users).type !== 'platform') {
+      logBag.attempt_count = 0
+      logBag.final_state = 'rejected'
+      return json(res, 403, {
+        error: { code: 'api_backend_forbidden', message: 'Tenant keys cannot use platform gateways' },
+      })
+    }
+    const managedKey = req.apiKeyRecord
+    const gate = apiKeyStore.acquire(managedKey)
+    if (!gate.ok) {
+      stats.errors++
+      logBag.error_code = gate.code
+      logBag.final_state = 'rejected'
+      return json(res, gate.status || 429, { error: { code: gate.code, message: gate.message } })
+    }
+    try {
+      const cancellation = bindClientAbort(req, res)
+      const endpoint = apiEndpointStore.getRaw(req.apiKeyRecord.openai_endpoint_id)
+      let result
+      try {
+        result = await runHostedGateway({
+          req,
+          res,
+          protocol,
+          body,
+          signal: cancellation.signal,
+          endpoint,
+          scheduler: apiScheduler,
+          timeoutMs: cfg.limits.upstream_timeout_ms,
+        })
+      } finally {
+        cancellation.settle()
+      }
+      if (result.status === 429 && result.accountId && !endpoint?.disable_cooling) {
+        const seconds = Math.max(1, Number(result.headers?.['retry-after']) || 30)
+        apiEndpointStore.setKeyCooldown(result.accountId, new Date(Date.now() + seconds * 1000).toISOString())
+        apiScheduler.reload(apiEndpointStore.listRaw())
+      }
+      Object.assign(logBag, {
+        via: 'local-gateway',
+        account_id: result.accountId,
+        final_account_id: result.accountId,
+        upstream_status: result.upstreamStatus ?? result.status,
+        upstream_model: result.upstreamModel || result.model,
+        usage: result.usage,
+        final_state: result.terminalState,
+        attempt_count: result.attemptCount,
+        error_code: result.errorCode || null,
+      })
+      if (
+        result.upstreamStatus >= 200 &&
+        result.upstreamStatus < 300 &&
+        result.terminal &&
+        !result.failed &&
+        result.usageVerified &&
+        result.attemptCount === 1
+      ) {
+        const model = result.upstreamModel || result.model || body.model
+        const priced = costColumnsFromUsage(result.usage, model)
+        Object.assign(logBag, priced)
+        if (priced.total_cost == null) {
+          Object.assign(result, { ok: false, status: 502, errorCode: 'gateway_usage_unpriced' })
+          logBag.final_state = 'billing_pending'
+          logBag.error_code = result.errorCode
+        } else {
+          apiKeyStore.recordUsage(managedKey, result.usage, {
+            model,
+            rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey.group_id ?? 1),
+            officialCost: priced.total_cost,
+          })
+        }
+      }
+      if (!result.ok && result.status !== 499) stats.errors++
+      if (result.status === 499) return finishClientCancel(res, result, logBag)
+      if (res.headersSent) {
+        if (!result.ok && !res.destroyed && !res.writableEnded) {
+          const error = {
+            type: 'api_error',
+            code: result.errorCode || 'gateway_stream_failed',
+            message: 'GPT gateway stream did not complete',
+          }
+          res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error })}\n\n`)
+        }
+        return res.end()
+      }
+      if (result.headers?.['retry-after']) res.setHeader('retry-after', result.headers['retry-after'])
+      if (result.body && (result.ok || (result.status >= 400 && result.terminalState === 'rejected'))) {
+        return json(res, result.status, result.body)
+      }
+      return json(res, result.status, {
+        error: {
+          type: 'api_error',
+          code: result.errorCode || 'gateway_unavailable',
+          message: 'GPT gateway request could not be completed',
+        },
+      })
+    } finally {
+      apiKeyStore.release(managedKey)
+    }
   }
 
   function finishClientCancel(res, result, logBag) {
@@ -604,7 +710,11 @@ export function createHandleProtocol(deps) {
     logBag.session_id = sessionIdForLog(extractCallerSession({ inbound, headers: req.headers }))
     logBag.reasoning_effort = reasoningEffortOf(inbound)
 
-    if (rejectUnsupportedExitPath(inbound, res, logBag)) return
+    if (
+      !(isHybridKey(req) && detectInboundPlatform(inbound?.model).platform === 'openai') &&
+      rejectUnsupportedExitPath(inbound, res, logBag)
+    )
+      return
 
     const fp = fingerprintRequest(req, inbound)
     // Before the health probe: its synthesized or fail-closed replies would otherwise answer
@@ -684,6 +794,16 @@ export function createHandleProtocol(deps) {
 
     const autoCompactWindow = callerAutoCompactWindow(inbound)
     const inferenceBackend = resolveInferenceBackend(req)
+    const hybrid = isHybridKey(req)
+    if (hybrid) {
+      try {
+        assertHybridKeyScope(req.apiKeyRecord)
+      } catch (error) {
+        logBag.attempt_count = 0
+        logBag.final_state = 'rejected'
+        return json(res, error.status || 403, { error: { code: error.code, message: error.message } })
+      }
+    }
     const apiPassthrough = inferenceBackend === 'api' && cfg.api_passthrough === true
     if (apiPassthrough && protocol !== 'anthropic.messages') {
       return json(res, 400, {
@@ -744,8 +864,9 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, errorResult.status, errorResult.body)
     }
+    const gatewayTurn = hybrid && platform.platform === 'openai'
     const keyScope = keyScopeFromRequest(req)
-    const poolDenial = vmPoolDenial(keyScope)
+    const poolDenial = gatewayTurn ? null : vmPoolDenial(keyScope)
     if (poolDenial) {
       stats.errors++
       const errorResult = makeError({
@@ -758,7 +879,7 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, 403, errorResult.body)
     }
-    if (keyScope.group_type !== 'all' && keyScope.group_type !== platform.platform) {
+    if (!gatewayTurn && keyScope.group_type !== 'all' && keyScope.group_type !== platform.platform) {
       stats.errors++
       const errorResult = makeError({
         type: ErrorType.PERMISSION,
@@ -798,6 +919,7 @@ export function createHandleProtocol(deps) {
     if (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res })) {
       return
     }
+    if (gatewayTurn) return serveHostedGateway(req, res, protocol, ctx.body, logBag)
     if (platform.platform === 'openai') {
       const routing = getRouting() || {}
       const codexSticky = {
@@ -1808,6 +1930,14 @@ export function createHandleProtocol(deps) {
       logBag.error_message = req.authError?.message || 'Invalid credentials'
       logBag.api_key_presented = req.presentedApiKey
       return
+    }
+    if (isHybridKey(req)) {
+      logBag.attempt_count = 0
+      logBag.final_state = 'rejected'
+      logBag.error_code = 'hybrid_protocol_unsupported'
+      return json(res, 400, {
+        error: { code: 'hybrid_protocol_unsupported', message: 'Use the configured GPT Responses gateway' },
+      })
     }
     let body
     try {
