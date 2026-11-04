@@ -247,6 +247,7 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
     repo: refusalRepo(deps),
     devices: deviceRepo(deps),
     account: deps.account || null,
+    signal: deps.signal,
   })
   let wait = false
   if (decision?.action !== 'block' && decision?.intercept) {

@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { keyLimitsPayload, type KeyLimitsDraft } from './key-payload'
+import {
+  keyLimitsDraft,
+  keyLimitsPayload,
+  type KeyLimitsDraft,
+} from './key-payload'
 
 const draft: KeyLimitsDraft = {
   name: ' ops ',
@@ -109,5 +113,73 @@ describe('API key limit payload', () => {
     })
     expect(tenantTampered).not.toHaveProperty('vm_pool_id')
     expect(tenantTampered.group_type).toBe('all')
+  })
+
+  it('editing a unified key preserves its native Claude scope and selected GPT gateway', () => {
+    const restored = keyLimitsDraft(
+      {
+        id: 'key_unified',
+        category: 'hybrid',
+        group_type: 'anthropic',
+        allowed_vms: ['line01', 'line02'],
+        openai_endpoint_id: 'ep_0123456789ab',
+        max_concurrency: 1,
+      },
+      true
+    )
+    expect(
+      keyLimitsPayload({ ...restored, quota_requests: 100 }, 'edit')
+    ).toMatchObject({
+      category: 'hybrid',
+      group_type: 'anthropic',
+      allowed_vms: ['line01', 'line02'],
+      openai_endpoint_id: 'ep_0123456789ab',
+      max_concurrency: 1,
+      quota_requests: 100,
+    })
+    expect(() =>
+      keyLimitsPayload({ ...restored, group_type: 'all' }, 'edit')
+    ).toThrow('Claude')
+    expect(() =>
+      keyLimitsPayload({ ...restored, openai_endpoint_id: '' }, 'edit')
+    ).toThrow('GPT')
+  })
+
+  it('keeps hybrid pools Anthropic-scoped and leaves admin routing untouched in tenant limit edits', () => {
+    const restored = keyLimitsDraft(
+      {
+        id: 'key_unified',
+        category: 'hybrid',
+        group_type: 'anthropic',
+        vm_pool_id: 'pool_12345678',
+        openai_endpoint_id: 'ep_0123456789ab',
+      },
+      true
+    )
+    expect(keyLimitsPayload(restored, 'edit')).toMatchObject({
+      group_type: 'anthropic',
+      allowed_vms: [],
+      vm_pool_id: 'pool_12345678',
+      category: 'hybrid',
+    })
+    const tenant = keyLimitsPayload(restored, 'edit', { isAdmin: false })
+    expect(() =>
+      keyLimitsPayload(restored, 'create', { isAdmin: false })
+    ).toThrow('管理员')
+    for (const field of [
+      'category',
+      'group_type',
+      'allowed_vms',
+      'vm_pool_id',
+      'openai_endpoint_id',
+    ]) {
+      expect(tenant).not.toHaveProperty(field)
+    }
+    expect(keyLimitsDraft().category).toBe('oauth')
+    expect(keyLimitsDraft({ id: 'api', category: 'api' }).category).toBe('api')
+    expect(
+      keyLimitsPayload({ ...restored, category: 'oauth' }, 'edit')
+        .openai_endpoint_id
+    ).toBeNull()
   })
 })

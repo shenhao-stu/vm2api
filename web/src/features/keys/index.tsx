@@ -23,6 +23,7 @@ import { PageHeader } from '@/components/page-header'
 import { TableSkeleton } from '@/components/page-skeletons'
 import { QueryGate } from '@/components/query-gate'
 import { StatusMark } from '@/components/status-mark'
+import { apiEndpointsQueryOptions } from '@/features/api-endpoints/queries'
 import { meQueryOptions } from '@/features/auth/queries'
 import { apiKeysQueryOptions } from '@/features/keys/queries'
 import { vmsListQueryOptions } from '@/features/vm/queries'
@@ -47,6 +48,10 @@ export function KeysPage() {
   const me = useQuery(meQueryOptions())
   const isAdmin = me.data?.role === 'admin'
   const pools = useQuery({ ...vmPoolsQueryOptions(), enabled: isAdmin })
+  const endpoints = useQuery({
+    ...apiEndpointsQueryOptions(),
+    enabled: isAdmin,
+  })
   const vms = useQuery(vmsListQueryOptions())
   const vmItems = vms.data?.items || []
   const [createOpen, setCreateOpen] = useState(false)
@@ -89,7 +94,7 @@ export function KeysPage() {
         body: JSON.stringify(keyLimitsPayload(draft, 'edit', { isAdmin })),
       }),
     onSuccess: async () => {
-      toast.success('并发已更新')
+      toast.success('密钥设置已更新')
       setEditId('')
       await refresh()
     },
@@ -262,6 +267,7 @@ export function KeysPage() {
         pending={create.isPending}
         vms={vmItems}
         pools={isAdmin ? pools.data?.pools || [] : undefined}
+        endpoints={endpoints.data?.items || []}
         onSubmit={(draft) => create.mutate(draft)}
       />
       <KeyLimitsDialog
@@ -273,6 +279,7 @@ export function KeysPage() {
         initial={editing}
         vms={vmItems}
         pools={isAdmin ? pools.data?.pools || [] : undefined}
+        endpoints={endpoints.data?.items || []}
         pending={edit.isPending}
         onSubmit={(draft) => {
           if (!editId) return
@@ -401,7 +408,13 @@ function KeyRow({
           )}
         </div>
       </TableCell>
-      <TableCell>{item.category === 'api' ? 'API' : 'OAuth'}</TableCell>
+      <TableCell>
+        {item.category === 'hybrid'
+          ? 'Claude + GPT'
+          : item.category === 'api'
+            ? 'API'
+            : 'OAuth'}
+      </TableCell>
       <TableCell>
         <StatusMark tone={keyStatusTone(item)} />
       </TableCell>

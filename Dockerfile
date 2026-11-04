@@ -9,6 +9,7 @@ ENV VITE_PANEL_COOKIE_NAME=$VITE_PANEL_COOKIE_NAME
 COPY web/package.json web/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY web/ ./
+COPY src/lib/protocol/jev-key-input.mjs src/lib/protocol/jev-key-input.d.mts /src/src/lib/protocol/
 RUN pnpm build
 
 FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS helpers

@@ -12,6 +12,11 @@ import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { SaveBar } from '@/features/settings/save-bar'
 import {
+  JEV_KEY_MAX as KEY_MAX,
+  parseJevKeyInput,
+  splitJevKeyLine,
+} from '../../../../src/lib/protocol/jev-key-input.mjs'
+import {
   FieldLine,
   Fold,
   FoldStack,
@@ -23,14 +28,6 @@ import {
 import { jevInterceptQueryOptions } from './queries'
 import { QuestionBank } from './question-bank'
 
-function linesOf(text: string) {
-  return text
-    .split('\n')
-    .map((s) => s.trim())
-    .filter(Boolean)
-}
-
-const KEY_MAX = 999
 const PROVIDERS = [
   {
     id: 'jev' as const,
@@ -96,6 +93,15 @@ export function ModelSettings({
   const [keysText, setKeysText] = useState('')
   const [clearKey, setClearKey] = useState(false)
   const [listed, setListed] = useState<string[]>([])
+  const keyImport = parseJevKeyInput(keysText.trim() ? keysText : apiKey)
+  const keyError =
+    apiKey.trim() && keysText.trim()
+      ? '请只填写单个 Key 或批量列表'
+      : keyImport.errors.length
+        ? `第 ${keyImport.errors.map((row) => row.line).join('、')} 行格式不正确，请修改后保存`
+        : keyImport.tooMany
+          ? `有效 Key 共 ${keyImport.keys.length} 把，最多 ${KEY_MAX} 把；请减少后保存`
+          : ''
 
   const load = (data: JevInterceptConfig) => {
     setDraft(data)
@@ -109,13 +115,14 @@ export function ModelSettings({
     !!q.data &&
     (ownedOf(draft) !== ownedOf(q.data) ||
       apiKey.trim().length > 0 ||
-      linesOf(keysText).length > 0 ||
+      keysText.trim().length > 0 ||
       clearKey)
   useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange])
 
   const save = useMutation({
     mutationFn: () => {
       if (!draft) throw new Error('没有可保存的配置')
+      if (keyError) throw new Error(keyError)
       const body: Record<string, unknown> = {
         enabled: draft.enabled,
         provider: draft.provider || 'jev',
@@ -130,19 +137,18 @@ export function ModelSettings({
         max_state_chars: Number(draft.max_state_chars ?? 16000),
         questions: draft.question_bank || [],
       }
-      const keys = linesOf(keysText).slice(0, KEY_MAX)
       if (clearKey) body.api_keys = []
-      else if (keys.length) body.api_keys = keys
-      else if (apiKey.trim()) body.api_key = apiKey.trim()
+      else if (keyImport.keys.length) body.api_keys = keyImport.keys
       return api<JevInterceptConfig>('/api/panel/jev-intercept', {
         method: 'PUT',
         body: JSON.stringify(body),
       })
     },
     onSuccess: (data) => {
-      toast.success('已保存决策模型关')
+      toast.success(`已保存审核配置，共 ${data.api_key_count} 把 Key`)
       load(data)
       qc.setQueryData(jevInterceptQueryOptions().queryKey, data)
+      void qc.invalidateQueries({ queryKey: ['panel', 'jev-usage'] })
     },
     onError: (error: Error) => toast.error(error.message),
   })
@@ -150,11 +156,13 @@ export function ModelSettings({
   const fetchModels = useMutation({
     mutationFn: () => {
       if (!draft?.base_url.trim()) throw new Error('先填模型地址')
+      if (keyError) throw new Error(keyError)
+      const target = splitJevKeyLine(keyImport.keys[0] || '')
       return api<{ models: string[] }>('/api/panel/jev-intercept/models', {
         method: 'POST',
         body: JSON.stringify({
-          base_url: draft.base_url.trim(),
-          api_key: apiKey.trim(),
+          base_url: target.baseUrl || draft.base_url.trim(),
+          api_key: target.apiKey,
           timeout_ms: Number(draft.timeout_ms) || 2000,
         }),
       })
@@ -244,7 +252,7 @@ export function ModelSettings({
         <ToggleList>
           <ToggleItem
             label='决策模型'
-            desc='三题各自打分，任一题低于阈值就拦。色情命中会封设备'
+            desc='按已启用的题目打分；色情命中会封禁设备'
           >
             <Switch
               checked={draft.enabled}
@@ -339,14 +347,18 @@ export function ModelSettings({
                   variant='outline'
                   className='shrink-0 cursor-pointer'
                   loading={fetchModels.isPending}
-                  disabled={fetchModels.isPending || !draft.base_url.trim()}
+                  disabled={
+                    fetchModels.isPending ||
+                    !draft.base_url.trim() ||
+                    !!keyError
+                  }
                   onClick={() => fetchModels.mutate()}
                 >
                   获取模型
                 </Button>
               </div>
             </FieldLine>
-            <FieldLine label='超时 ms' htmlFor='jev-timeout'>
+            <FieldLine label='整体超时 ms' htmlFor='jev-timeout'>
               <Input
                 id='jev-timeout'
                 type='number'
@@ -380,17 +392,18 @@ export function ModelSettings({
             </div>
           ) : (
             <p className='border-t pt-3 text-xs text-muted-foreground'>
-              获取模型会请求这个地址的 /v1/models。Key 留空时用已保存的第一把。
+              获取模型使用当前输入的第一把 Key；留空时使用已保存的第一把。
             </p>
           )}
         </div>
         <FoldStack>
           <Fold
             flush
-            title='多把 Key'
+            title='批量导入 Key'
+            defaultOpen
             meta={
               draft.api_key_count
-                ? `已存 ${draft.api_key_count} 把，401/429/529 不再调度`
+                ? `已存 ${draft.api_key_count} 把 · 可调度 ${draft.api_key_ready_count ?? draft.api_key_count} 把`
                 : `最多 ${KEY_MAX} 把`
             }
           >
@@ -400,12 +413,72 @@ export function ModelSettings({
                 rows={3}
                 className='font-mono text-xs'
                 value={keysText}
-                placeholder='一行一把。URL 空格 Key 打到该地址，否则用上面的模型地址'
+                placeholder='一行一把，支持 APIKEY:Key 导出格式（自动去除临时邮箱尾注）；也可填写 URL 空格 Key'
+                autoComplete='off'
+                spellCheck={false}
                 onChange={(e) => {
                   setKeysText(e.target.value)
                   if (e.target.value.trim()) setClearKey(false)
                 }}
               />
+              <div className='space-y-2 text-xs text-muted-foreground'>
+                <Label htmlFor='jev-key-file'>从文本文件导入</Label>
+                <Input
+                  id='jev-key-file'
+                  type='file'
+                  accept='.txt,text/plain'
+                  onChange={async (event) => {
+                    const file = event.target.files?.[0]
+                    event.target.value = ''
+                    if (!file) return
+                    if (file.size > 1024 * 1024) {
+                      toast.error('文件超过 1 MB，请拆分后导入')
+                      return
+                    }
+                    try {
+                      setKeysText(await file.text())
+                      setApiKey('')
+                      setClearKey(false)
+                    } catch {
+                      toast.error('无法读取文件，请重新选择')
+                    }
+                  }}
+                />
+                <p>保存后替换已存列表；留空不改。最多 {KEY_MAX} 把。</p>
+                {keyImport.total > 0 ? (
+                  <p role='status'>
+                    共 {keyImport.total} 行，识别 {keyImport.keys.length} 把有效
+                    Key
+                    {keyImport.duplicates.length
+                      ? `，重复 ${keyImport.duplicates.length} 行将合并`
+                      : ''}
+                    。
+                    {keyImport.errors.length
+                      ? `${keyImport.errors.length} 行无效，暂不能保存。`
+                      : ''}
+                  </p>
+                ) : null}
+                {keyError ? (
+                  <p role='alert' className='text-destructive'>
+                    {keyError}
+                  </p>
+                ) : null}
+                <p>
+                  401 鉴权失败后停用，重新保存 Key 可重试；429 限流、529
+                  服务过载会暂时冷却后自动恢复。
+                </p>
+                <p>
+                  一次审核最多尝试 4 把
+                  Key，共享整体超时；达到上限后按「失败放行」设置处理。
+                </p>
+                {!!draft.api_key_retired_count ||
+                !!draft.api_key_cooling_count ? (
+                  <p>
+                    当前停用 {draft.api_key_retired_count || 0} 把，冷却{' '}
+                    {draft.api_key_cooling_count || 0} 把；明细见使用记录。
+                  </p>
+                ) : null}
+              </div>
               <ToggleItem label='清除已存 Key' desc='留空且不勾选则保持原密钥'>
                 <Switch
                   checked={clearKey}
@@ -426,7 +499,7 @@ export function ModelSettings({
 
       <Group
         title='打分'
-        hint='高分表示安全。相同正文在去重窗口内不再打模型。阈值越低越不容易误伤。'
+        hint='高分表示安全。默认低于阈值时拦截；只有一项非色情评分略低于阈值（差距不超过 0.08）时容忍波动。相同正文在去重窗口内复用结果。'
         action={
           <button
             type='button'
@@ -515,6 +588,7 @@ export function ModelSettings({
 
       {dirty ? (
         <SaveBar
+          blockedReason={keyError}
           saving={save.isPending}
           onSave={() => save.mutate()}
           onDiscard={() => q.data && load(q.data)}

@@ -883,6 +883,7 @@ export function createPanelHandler(ctx) {
       delete normalized.user_id
       delete normalized.group_id
       delete normalized.vm_pool_id
+      delete normalized.openai_endpoint_id
     }
     const hasRequestQuota = Object.prototype.hasOwnProperty.call(body, 'quota_requests')
     const hasLegacyQuota = Object.prototype.hasOwnProperty.call(body, 'quota')
@@ -897,10 +898,10 @@ export function createPanelHandler(ctx) {
   }
 
   function isApiCategory(value) {
-    return (
+    return ['api', 'hybrid'].includes(
       String(value || '')
         .trim()
-        .toLowerCase() === 'api'
+        .toLowerCase(),
     )
   }
 
@@ -1647,7 +1648,7 @@ export function createPanelHandler(ctx) {
             error: { code: 'key_pool_forbidden', message: '只有管理员可以设置账号池' },
           })
         }
-        if (ident.role !== 'admin' && isApiCategory(body?.category)) {
+        if (ident.role !== 'admin' && (isApiCategory(body?.category) || body?.openai_endpoint_id != null)) {
           return json(res, 403, {
             ok: false,
             error: { code: 'key_category_forbidden', message: '只有管理员可以创建 API 直连密钥' },
@@ -1672,6 +1673,7 @@ export function createPanelHandler(ctx) {
             name: body?.name,
             key: body?.key || body?.custom_key || undefined,
             category: body?.category,
+            openai_endpoint_id: body?.openai_endpoint_id,
             user_id:
               panelIdentity(req).role === 'user' ? req.panelUserId || null : body?.user_id || req.panelUserId || null,
             group_id: input.group_id,
@@ -1716,7 +1718,7 @@ export function createPanelHandler(ctx) {
             error: { code: 'key_pool_forbidden', message: '只有管理员可以设置账号池' },
           })
         }
-        if (ident.role !== 'admin' && isApiCategory(body?.category)) {
+        if (ident.role !== 'admin' && (isApiCategory(body?.category) || body?.openai_endpoint_id != null)) {
           return json(res, 403, {
             ok: false,
             error: { code: 'key_category_forbidden', message: '只有管理员可以创建 API 直连密钥' },

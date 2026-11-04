@@ -35,3 +35,11 @@
 验证覆盖实际 Unix socket 上“收到 POST 后断开只执行一次”、取消等待、预算耗尽、并发 1 排队释放、跨实例 Docker owner 拒绝、订阅绑定线路刷新保护以及协议用量/鉴权。Linux ELF、`/proc` 和部署脚本必须在 Linux 上另验，macOS 无法执行不算通过。实际部署验收及测试结果以每次发布记录为准，本文不声明尚未执行的 CI 或镜像发布已成功。
 
 部署与后续账号验收见 [实例隔离](hosted-isolation.md)、[镜像构建](../DOCKER_IMAGE.md) 和 [订阅管理](../PROXY_SUBSCRIPTIONS.md)。没有 Cookie 的槽可以运行并验证网络，但不能宣称 Claude 推理已可用；导入账号后仍需检查实际套餐、模型权限、JSON/SSE 和用量，再解除人工停调。
+
+## 统一 GPT / Claude 托管
+
+统一 Key 使用 `hybrid` 类别，绑定一个明确的 `local_gateway` GPT 端点及原生 Claude 槽范围。两种模型共享并发、额度、日志和撤销入口；GPT 账号仍由已部署的 GPT 后端管理，避免复制账号、刷新凭证和调度状态。端点只接受数字 loopback origin、明确 GPT 模型和 Bearer 认证；不接受代理、重定向或自定义头，不进入普通 API 调度。
+
+GPT 上游统一使用 Responses；纯转换函数适配 Chat、Completions 与 Messages，原生 Responses 保留完整结构。JSON/SSE 校验终态、可见内容和真实终量；补齐 completed-only 文本时校验已发前缀，工具身份变化明确失败，不重复生成。GPT Messages 支持文本和标准工具，其他块明确拒绝并引导原生 Responses；Claude 保留原生完整链路。普通 Python/curl 可以通过部署的 `claude_code_only=false` 调用，网关沿原生 Claude Code 传输，无需客户端伪造 CLI 头。
+
+JEV 支持卡密文本/文件导入、去重预览和行号报错，临时邮箱字段不会混入 Key。401 退休、429 单 Key 冷却、529 站点冷却，遵守 Retry-After；整体审核受一个总超时和取消信号约束。无效/缺失评分不再当成零分封禁，实际提出的问题必须有合法评分；审核不可用时按 fail-open 配置处理。托管实例使用 fail-closed。

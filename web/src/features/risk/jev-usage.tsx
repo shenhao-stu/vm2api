@@ -32,6 +32,8 @@ type KeyUsage = {
   number: number
   key_fingerprint: string
   retired: boolean
+  cooldown_until?: number | null
+  cooldown_reason?: 'rate_limited' | 'overloaded' | null
   requests: number
   successful: number
   estimated_cost_nano_usd: number
@@ -183,6 +185,16 @@ export function JevUsagePanel({
                             ? ` · ${key.last_http_status}`
                             : ''}
                           {key.retired ? '（已暂停轮询）' : ''}
+                          {!key.retired && key.cooldown_until ? (
+                            <p>
+                              {key.cooldown_reason === 'overloaded'
+                                ? '服务过载'
+                                : '限流'}
+                              冷却至{' '}
+                              {time(new Date(key.cooldown_until).toISOString())}
+                              ，届时恢复调度
+                            </p>
+                          ) : null}
                         </td>
                         <td className='p-2'>
                           {tokens(key.requests)} / {tokens(key.successful)}

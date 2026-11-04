@@ -237,6 +237,29 @@ async function listenWithHandleProtocol(
 
 beforeEach(() => resetOpenAIAccountRuntime())
 
+test('hybrid keys reject WebSocket upgrades before native protocol dispatch', async () => {
+  let calls = 0
+  const live = await listen({
+    routing: ENABLED,
+    requireAuth(req) {
+      req.apiKeyKind = 'managed'
+      req.apiKeyRecord = { category: 'hybrid' }
+      return true
+    },
+    handleProtocol() {
+      calls++
+    },
+  })
+  try {
+    const result = await openWs(live.url)
+    assert.equal(result.status, 400)
+    assert.equal(result.body.error.code, 'hybrid_protocol_unsupported')
+    assert.equal(calls, 0)
+  } finally {
+    await live.close()
+  }
+})
+
 test('a terminal SSE event without a final newline reaches the WebSocket client', async () => {
   const live = await listen({
     routing: ENABLED,

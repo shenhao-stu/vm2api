@@ -60,6 +60,8 @@ import {
   healthUnavailableError,
 } from '../admin/health-probe.mjs'
 import { resolveInferenceBackend, runApiInference } from '../pool/api-protocol.mjs'
+import { assertHybridKeyScope, isHybridKey } from '../pool/local-gateway-policy.mjs'
+import { runHostedGateway } from './hosted-gateway.mjs'
 import { classifyClaudeRequestPurpose, prepareClassifierBody, classifierRequestSummary } from './request-purpose.mjs'
 import { agentSummarySession } from './agent-summary.mjs'
 import { summarizeBody, redactHeaders, presentedApiKeyForLog } from '../admin/request-log.mjs'
@@ -303,6 +305,92 @@ export function createHandleProtocol(deps) {
     }
   }
 
+  function rejectHybridProtocol(req, res, logBag) {
+    if (!isHybridKey(req)) return false
+    logBag.attempt_count = 0
+    logBag.final_state = 'rejected'
+    logBag.error_code = 'hybrid_protocol_unsupported'
+    json(res, 400, {
+      error: {
+        type: 'invalid_request_error',
+        code: logBag.error_code,
+        message: 'Hybrid keys support HTTP chat, Responses and Messages only',
+      },
+    })
+    return true
+  }
+
+  async function serveHostedGateway(req, res, protocol, body, logBag) {
+    stats.requests++
+    stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
+    if (ownerScopeFromRequest(req, apiKeyStore?.users).type !== 'platform') {
+      logBag.attempt_count = 0
+      logBag.final_state = 'rejected'
+      return json(res, 403, {
+        error: { code: 'api_backend_forbidden', message: 'Tenant keys cannot use platform gateways' },
+      })
+    }
+    return runWithCodexKey(req, res, logBag, async () => {
+      const cancellation = bindClientAbort(req, res)
+      const endpoint = apiEndpointStore.getRaw(req.apiKeyRecord.openai_endpoint_id)
+      let result
+      try {
+        result = await runHostedGateway({
+          req,
+          res,
+          protocol,
+          body,
+          signal: cancellation.signal,
+          endpoint,
+          scheduler: apiScheduler,
+          timeoutMs: cfg.limits.upstream_timeout_ms,
+        })
+      } finally {
+        cancellation.settle()
+      }
+      if (result.status === 429 && result.accountId && !endpoint?.disable_cooling) {
+        const seconds = Math.max(1, Number(result.headers?.['retry-after']) || 30)
+        apiEndpointStore.setKeyCooldown(result.accountId, new Date(Date.now() + seconds * 1000).toISOString())
+        apiScheduler.reload(apiEndpointStore.listRaw())
+      }
+      Object.assign(logBag, {
+        via: 'local-gateway',
+        account_id: result.accountId,
+        final_account_id: result.accountId,
+        upstream_status: result.status,
+        upstream_model: result.model,
+        usage: result.usage,
+        final_state: result.terminalState,
+        attempt_count: result.attemptCount,
+        error_code: result.errorCode || null,
+      })
+      if (!result.ok && result.status !== 499) stats.errors++
+      if (result.status === 499) return finishClientCancel(res, result, logBag)
+      if (res.headersSent) {
+        if (!result.ok && !res.destroyed && !res.writableEnded) {
+          const error = {
+            type: 'api_error',
+            code: result.errorCode || 'gateway_stream_failed',
+            message: 'GPT gateway stream did not complete',
+          }
+          res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error })}\n\n`)
+        }
+        return res.end()
+      }
+      if (result.headers?.['retry-after']) res.setHeader('retry-after', result.headers['retry-after'])
+      if (result.body && (result.ok || (result.status >= 400 && result.terminalState === 'rejected'))) {
+        return json(res, result.status, result.body)
+      }
+      return json(res, result.status, {
+        error: {
+          type: 'api_error',
+          code: result.errorCode || 'gateway_unavailable',
+          message: 'GPT gateway request could not be completed',
+        },
+      })
+    })
+  }
+
   function finishClientCancel(res, result, logBag) {
     // Client cancellation is a lifecycle terminal, not a request error. Keep
     // final_state for audit, but leave error fields empty so the cancelled turn
@@ -406,20 +494,27 @@ export function createHandleProtocol(deps) {
     } catch {
       jev = readJevConfig()
     }
-    const decision = await runProtocolIntercept({
-      inbound,
-      body,
-      headers: req.headers,
-      official,
-      zeroInject: isZeroInjectMode(),
-      distillRules: cfg.distill,
-      policy: refusalPolicy(),
-      jev,
-      repo: refusalRepo(),
-      devices: deviceRepo(),
-      requestId,
-      account,
-    })
+    const cancellation = bindClientAbort(req, res)
+    let decision
+    try {
+      decision = await runProtocolIntercept({
+        inbound,
+        body,
+        headers: req.headers,
+        official,
+        zeroInject: isZeroInjectMode(),
+        distillRules: cfg.distill,
+        policy: refusalPolicy(),
+        jev,
+        repo: refusalRepo(),
+        devices: deviceRepo(),
+        requestId,
+        account,
+        signal: cancellation.signal,
+      })
+    } finally {
+      cancellation.settle()
+    }
     if (!decision || decision.action !== 'block') {
       if (decision?.intercept) logBag.intercept = decision.intercept
       return false
@@ -684,7 +779,12 @@ export function createHandleProtocol(deps) {
     logBag.session_id = sessionIdForLog(extractCallerSession({ inbound, headers: req.headers }))
     logBag.reasoning_effort = reasoningEffortOf(inbound)
 
-    if (rejectUnsupportedExitPath(inbound, res, logBag)) return
+    // Hybrid GPT never prepares a provider-facing slot: its explicit local gateway owns that boundary.
+    if (
+      !(isHybridKey(req) && detectInboundPlatform(inbound?.model).platform === 'openai') &&
+      rejectUnsupportedExitPath(inbound, res, logBag)
+    )
+      return
 
     const fp = fingerprintRequest(req, inbound)
     // Before the health probe: its synthesized or fail-closed replies would otherwise answer
@@ -764,6 +864,16 @@ export function createHandleProtocol(deps) {
 
     const autoCompactWindow = callerAutoCompactWindow(inbound)
     const inferenceBackend = resolveInferenceBackend(req)
+    const hybrid = isHybridKey(req)
+    if (hybrid) {
+      try {
+        assertHybridKeyScope(req.apiKeyRecord)
+      } catch (error) {
+        logBag.attempt_count = 0
+        logBag.final_state = 'rejected'
+        return json(res, error.status || 403, { error: { code: error.code, message: error.message } })
+      }
+    }
     const apiPassthrough = inferenceBackend === 'api' && cfg.api_passthrough === true
     if (apiPassthrough && protocol !== 'anthropic.messages') {
       return json(res, 400, {
@@ -790,7 +900,9 @@ export function createHandleProtocol(deps) {
       return json(res, errorResult.status, errorResult.body)
     }
     let want1m = hasClaudeCode1mSuffix(inbound?.model) || hasClaudeCode1mSuffix(ctx.body?.model)
-    const modelRewrite = applyCodexInboundModelRewrite(ctx.body, getRouting() || {})
+    const modelRewrite = hybrid
+      ? { ok: true, mapped: false }
+      : applyCodexInboundModelRewrite(ctx.body, getRouting() || {})
     if (!modelRewrite.ok) {
       stats.errors++
       const errorResult = makeError({
@@ -826,8 +938,9 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, errorResult.status, errorResult.body)
     }
+    const gatewayTurn = hybrid && platform.platform === 'openai'
     const keyScope = keyScopeFromRequest(req)
-    const poolDenial = vmPoolDenial(keyScope)
+    const poolDenial = gatewayTurn ? null : vmPoolDenial(keyScope)
     if (poolDenial) {
       stats.errors++
       const errorResult = makeError({
@@ -840,7 +953,7 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, 403, errorResult.body)
     }
-    if (keyScope.group_type !== 'all' && keyScope.group_type !== platform.platform) {
+    if (!gatewayTurn && keyScope.group_type !== 'all' && keyScope.group_type !== platform.platform) {
       stats.errors++
       const errorResult = makeError({
         type: ErrorType.PERMISSION,
@@ -852,6 +965,7 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, 403, errorResult.body)
     }
+    if (imageModel && rejectHybridProtocol(req, res, logBag)) return
     if (imageModel) return serveImageModelTurn({ req, res, protocol, body: ctx.body, logBag })
     // Codex returns before conversion. Distill does not apply to OpenAI platform models; the rest
     // of the gate scans them only when jev.openai_platform_enabled is on.
@@ -881,6 +995,7 @@ export function createHandleProtocol(deps) {
     if (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res })) {
       return
     }
+    if (gatewayTurn) return serveHostedGateway(req, res, protocol, ctx.body, logBag)
     if (platform.platform === 'openai') {
       const routing = getRouting() || {}
       const codexSticky = {
@@ -2010,6 +2125,7 @@ export function createHandleProtocol(deps) {
       logBag.api_key_presented = req.presentedApiKey
       return
     }
+    if (rejectHybridProtocol(req, res, logBag)) return
     let body
     try {
       body = await readBody(req, inboundBodyLimit(getRouting(), cfg.limits.max_body_bytes))
@@ -2200,6 +2316,7 @@ export function createHandleProtocol(deps) {
       logBag.api_key_presented = presentedApiKeyForLog(req.presentedApiKey)
       return
     }
+    if (rejectHybridProtocol(req, res, logBag)) return
     let body
     try {
       const raw = await readRawBody(req, inboundBodyLimit(getRouting(), cfg.limits.max_body_bytes))

@@ -44,12 +44,14 @@ import { StickyRouter } from './lib/pool/sticky-router.mjs'
 import { AccountQuota } from './lib/pool/account-quota.mjs'
 import { normalizeTiers } from './lib/pool/quota-tiers.mjs'
 import { ApiKeyStore } from './lib/admin/api-keys.mjs'
-import { keyScopeFromRequest } from './lib/admin/key-scope.mjs'
+import { keyAllowsVm, keyScopeFromRequest } from './lib/admin/key-scope.mjs'
+import { ownerScopeFromRequest, vmMatchesOwnerScope } from './lib/admin/resource-owner.mjs'
 import { GroupsRepo } from './lib/db/repos/groups-repo.mjs'
 import { SettingsRepo } from './lib/db/repos/settings-repo.mjs'
 import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from './lib/pool/api-scheduler.mjs'
 import { resolveInferenceBackend } from './lib/pool/api-protocol.mjs'
+import { assertHybridKeyScope, hybridModelCatalog, isHybridKey } from './lib/pool/local-gateway-policy.mjs'
 import { bootApiKernel, apiKernelPaths, apiKernelSnapshot } from './lib/transport/api-kernel-client.mjs'
 import { PanelUserStore } from './lib/admin/panel-users.mjs'
 import { RequestLogStore } from './lib/admin/request-log.mjs'
@@ -1169,6 +1171,16 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, apiScheduler.catalog())
       }
       const result = await fetchWorkerModels({ groupType: keyScopeFromRequest(req).group_type })
+      if (isHybridKey(req)) {
+        assertHybridKeyScope(req.apiKeyRecord)
+        const scope = keyScopeFromRequest(req)
+        const owner = ownerScopeFromRequest(req, apiKeyStore.users)
+        const nativeVms = listVms(cfg.paths.project).filter(
+          (vm) => keyAllowsVm(scope, vm) && vmMatchesOwnerScope(vm, owner),
+        )
+        const endpoint = owner.type === 'platform' ? apiEndpointStore.getRaw(req.apiKeyRecord.openai_endpoint_id) : null
+        return json(res, 200, hybridModelCatalog(result, endpoint, { nativeVms }))
+      }
       return json(res, 200, result)
     }
     if (req.method === 'POST' && p === '/admin/models/refresh') {

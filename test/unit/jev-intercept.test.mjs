@@ -37,6 +37,10 @@ import { CRS_OFFICIAL_AGENT_PROMPT } from '../../src/lib/identity/official-cc-sy
 
 const DEVICE = 'device-12345678'
 
+function fullJevAnswers(scores = {}) {
+  return { usage_policy: { noul: 0.99 }, nsfw: { noul: 0.99 }, abuse: { noul: 0.99 }, ...scores }
+}
+
 function userBody(text, extra = {}) {
   return {
     model: 'claude-opus-5',
@@ -223,7 +227,10 @@ test('unsafe jev verdict blocks and bans the device without caching the prompt',
     assert.equal(sent.questions.jailbreak, undefined)
     return {
       ok: true,
-      json: async () => ({ model: 'jev-latest', answers: { usage_policy: { type: 'noul', noul: 0.1 } } }),
+      json: async () => ({
+        model: 'jev-latest',
+        answers: fullJevAnswers({ usage_policy: { type: 'noul', noul: 0.1 } }),
+      }),
     }
   }
   const repo = {
@@ -520,7 +527,7 @@ test('decision state keeps only the configured tail', async () => {
     },
     async (_url, init) => {
       sent = JSON.parse(init.body)
-      return { ok: true, json: async () => ({ answers: { nsfw: { noul: 0.1 } } }) }
+      return { ok: true, json: async () => ({ answers: fullJevAnswers({ nsfw: { noul: 0.1 } }) }) }
     },
   )
   assert.equal(sent.state.length, 12000)
@@ -544,7 +551,7 @@ test('replay of the same state blocks without a second model call', async () => 
   }
   const fetchImpl = async () => {
     fetches += 1
-    return { ok: true, json: async () => ({ answers: { usage_policy: { type: 'noul', noul: 0.1 } } }) }
+    return { ok: true, json: async () => ({ answers: fullJevAnswers({ usage_policy: { type: 'noul', noul: 0.1 } }) }) }
   }
   const text = 'replay-unique-harmful-prompt'
   const first = await classifyJev(text, cfg, fetchImpl, 1_000)
@@ -578,7 +585,7 @@ test('reminders are not scored and base64 text is', async () => {
     },
     async (_url, init) => {
       sent = JSON.parse(init.body)
-      return { ok: true, json: async () => ({ answers: { safety: { noul: 0.9 } } }) }
+      return { ok: true, json: async () => ({ answers: fullJevAnswers({ usage_policy: { noul: 0.9 } }) }) }
     },
   )
   assert.equal(sent.state.includes('system-reminder'), false)
@@ -648,7 +655,7 @@ test('an NSFW model hit bans the device even when the general switch is off', as
     policy: { enabled: true, similarity_enabled: false, device_block_enabled: false },
     jev: { enabled: true, hard_regex_enabled: false, base_url: 'http://127.0.0.1:9/v1', timeout_ms: 500 },
     devices: { block: (row) => banned.push(row), get: () => null },
-    fetchImpl: async () => ({ ok: true, json: async () => ({ answers: { nsfw: { noul: 0.1 } } }) }),
+    fetchImpl: async () => ({ ok: true, json: async () => ({ answers: fullJevAnswers({ nsfw: { noul: 0.1 } }) }) }),
     requestId: 'req-nsfw',
   })
   assert.equal(decision.reason, 'jev:nsfw')
@@ -882,7 +889,7 @@ test('a jev block stores the posted tail, not the sentence that fell out of the 
     },
     fetchImpl: async (_url, init) => {
       posted = JSON.parse(init.body).state
-      return { ok: true, json: async () => ({ answers: { abuse: { noul: 0.1 } } }) }
+      return { ok: true, json: async () => ({ answers: fullJevAnswers({ abuse: { noul: 0.1 } }) }) }
     },
   })
   assert.equal(decision.action, 'block')
@@ -952,7 +959,7 @@ test('a cached protocol block is not a refusal, so the model can pass the retry'
     devices: { get: () => null },
     fetchImpl: async () => {
       fetched += 1
-      return { ok: true, json: async () => ({ answers: { safety: { noul: 0.9 } } }) }
+      return { ok: true, json: async () => ({ answers: fullJevAnswers({ usage_policy: { noul: 0.9 } }) }) }
     },
   })
   assert.equal(decision.action, 'pass')
@@ -973,7 +980,7 @@ test('429 rotates to the next key', async () => {
     async (_url, init) => {
       seen.push(init.headers.authorization)
       if (seen.length === 1) return { ok: false, status: 429 }
-      return { ok: true, json: async () => ({ answers: { safety: { noul: 0.2 } } }) }
+      return { ok: true, json: async () => ({ answers: fullJevAnswers({ usage_policy: { noul: 0.2 } }) }) }
     },
   )
   assert.equal(seen.length, 2)
@@ -991,7 +998,7 @@ test('a replay outside the window calls the model again', async () => {
   }
   const fetchImpl = async () => {
     fetches += 1
-    return { ok: true, json: async () => ({ answers: { safety: { noul: 0.9 } } }) }
+    return { ok: true, json: async () => ({ answers: fullJevAnswers({ usage_policy: { noul: 0.9 } }) }) }
   }
   await classifyJev('window-unique-safe', cfg, fetchImpl, 10_000)
   const later = await classifyJev('window-unique-safe', cfg, fetchImpl, 80_000)
@@ -1029,7 +1036,7 @@ test('401 retires that key until the key list is saved again', async () => {
   const second = []
   const verdict = await classifyJev('retire-auth-2', cfg, async (_url, init) => {
     second.push(init.headers.authorization)
-    return { ok: true, json: async () => ({ answers: { safety: { noul: 0.9 } } }) }
+    return { ok: true, json: async () => ({ answers: fullJevAnswers({ usage_policy: { noul: 0.9 } }) }) }
   })
   assert.deepEqual(second, ['Bearer k-ok-retire'])
   assert.equal(verdict.reason, 'safe')
@@ -1084,7 +1091,7 @@ test('a network error does not retire the key and still tries the other host', a
     const verdict = await classifyJev(`failover-${i}`, both, async (url, init) => {
       seen.push(`${url} ${init.headers.authorization}`)
       if (String(url).includes('typesafe')) throw new Error('timeout')
-      return { ok: true, json: async () => ({ answers: { safety: { noul: 0.2 } } }) }
+      return { ok: true, json: async () => ({ answers: fullJevAnswers({ usage_policy: { noul: 0.2 } }) }) }
     })
     if (!String(seen[0]).includes('typesafe')) continue
     assert.equal(seen.filter((line) => line.includes('typesafe')).length, 1)

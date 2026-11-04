@@ -5,7 +5,7 @@
  * configured line blocks (0.5 unless the panel changes it). One score within
  * 0.08 under that line does not. The same state reuses that verdict for the
  * configured window. A dead model fails open unless fail_open is off.
- * 401 / 429 / 529 retires that key and tries the next. A network error or
+ * 401 retires the key; 429 cools the key and 529 cools its host. A network error or
  * other HTTP status skips the rest of that host for this call only.
  * A line may be `https://host[/v1/systemone] <key>`.
  */
@@ -16,6 +16,7 @@ import { hasAccessPresence } from '../oauth/oauth-credentials.mjs'
 import { prepareInterceptText, stripEnvironmentSection, stripReminders } from './jev-prepare.mjs'
 import { isOfficialTypeSafeUrl, jevKeyFingerprint, recordJevUsage } from './jev-usage.mjs'
 import { inferClaudeTier } from '../pool/claude-tier.mjs'
+import { JEV_KEY_MAX as KEY_MAX, parseJevKeyInput, splitJevKeyLine } from './jev-key-input.mjs'
 import {
   CRS_AGENT_EXPANSION,
   CRS_OFFICIAL_AGENT_IDENTITY,
@@ -453,8 +454,6 @@ function normalizeRules(raw) {
   return out.length ? out : null
 }
 
-const KEY_MAX = 999
-
 /** Trim, lowercase and dedupe one scope list; the panel sends what it shows. */
 function scopeList(raw) {
   if (!Array.isArray(raw)) return []
@@ -689,22 +688,7 @@ export function jevAccountInScope(jev, account) {
 }
 
 function normalizeKeys(raw) {
-  const list = []
-  const seen = new Set()
-  const add = (value) => {
-    const text = String(value || '')
-      .trim()
-      .slice(0, 500)
-    if (!text || seen.has(text) || list.length >= KEY_MAX) return
-    seen.add(text)
-    list.push(text)
-  }
-  if (Array.isArray(raw?.api_keys)) {
-    for (const item of raw.api_keys) add(item)
-    return list
-  }
-  add(raw?.api_key)
-  return list
+  return parseJevKeyInput(Array.isArray(raw?.api_keys) ? raw.api_keys : [raw?.api_key || '']).keys.slice(0, KEY_MAX)
 }
 
 export function normalizeJevConfig(raw) {
@@ -771,6 +755,7 @@ export function normalizeJevConfig(raw) {
 
 export function publicJevConfig(cfg) {
   const c = normalizeJevConfig(cfg)
+  const keys = publicJevKeys(c)
   return {
     enabled: c.enabled,
     hard_regex_enabled: c.hard_regex_enabled,
@@ -786,6 +771,9 @@ export function publicJevConfig(cfg) {
     timeout_ms: c.timeout_ms,
     api_key_set: c.api_keys.length > 0,
     api_key_count: c.api_keys.length,
+    api_key_ready_count: keys.filter((key) => !key.retired && !key.cooldown_until).length,
+    api_key_retired_count: keys.filter((key) => key.retired).length,
+    api_key_cooling_count: keys.filter((key) => !key.retired && key.cooldown_until).length,
     safety_instruction: c.safety_instruction,
     question_ids: [...c.question_ids],
     question_bank: c.questions.map((item) => ({ ...item })),
@@ -927,6 +915,17 @@ export function validateJevPatch(body = {}) {
   if (Object.hasOwn(body, 'api_keys')) {
     if (!Array.isArray(body.api_keys) || body.api_keys.length > KEY_MAX) problems.push(`api_keys 最多 ${KEY_MAX} 把`)
     else if (body.api_keys.some((item) => typeof item !== 'string')) problems.push('api_keys 必须是字符串数组')
+  }
+  const keyInput = Object.hasOwn(body, 'api_keys')
+    ? body.api_keys
+    : Object.hasOwn(body, 'api_key')
+      ? [body.api_key || '']
+      : null
+  if (Array.isArray(keyInput) && keyInput.length <= KEY_MAX && keyInput.every((item) => typeof item === 'string')) {
+    const parsed = parseJevKeyInput(keyInput)
+    if (parsed.errors.length) problems.push(`Key 第 ${parsed.errors.map((item) => item.line).join('、')} 行格式不正确`)
+    if (parsed.duplicates.length) problems.push(`Key 第 ${parsed.duplicates.join('、')} 行重复，请移除重复项`)
+    if (Object.hasOwn(body, 'api_keys') && keyInput.some((item) => !item.trim())) problems.push('api_keys 不能包含空行')
   }
   if (Object.hasOwn(body, 'questions')) {
     if (!Array.isArray(body.questions)) problems.push('questions 必须是数组')
@@ -1231,24 +1230,37 @@ function dropLoneNearMiss(hits, cfg) {
 export function parsePolicyDecision(payload, cfg = {}) {
   const answers = payload?.answers
   if (!answers || typeof answers !== 'object') return null
+  const strict = cfg.provider === 'jev'
   const asked = askedIds(cfg)
   const custom = storedSafetyInstruction(cfg.safety_instruction)
-  const ids = custom ? [...asked, 'custom'] : asked
+  const ids = strict ? Object.keys(questionsFor(cfg)) : custom ? [...asked, 'custom'] : asked
   const hits = []
   let saw = false
   for (const id of ids) {
-    const score = Number(answers[id]?.noul)
-    if (!Number.isFinite(score)) continue
+    if (!Object.hasOwn(answers, id)) {
+      if (strict) return null
+      continue
+    }
+    if (strict && typeof answers[id]?.noul !== 'number') return null
+    const score = policyScore(answers[id]?.noul)
+    if (score === null) return null
     saw = true
     if (scoreBlocks(score, cfg)) hits.push({ category: id, score })
   }
   if (!saw) {
-    const score = Number(answers.safety?.noul)
-    if (!Number.isFinite(score)) return null
+    if (strict) return null
+    const score = policyScore(answers.safety?.noul)
+    if (score === null) return null
     const hits = scoreBlocks(score, cfg) ? [{ category: 'safety', score }] : []
     return { hits: dropLoneNearMiss(hits, cfg) }
   }
   return { hits: dropLoneNearMiss(hits, cfg) }
+}
+
+function policyScore(value) {
+  if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return null
+  const score = Number(value)
+  return Number.isFinite(score) && score >= 0 && score <= 1 ? score : null
 }
 
 function noulQuestion(instructions) {
@@ -1371,42 +1383,65 @@ function unavailable(config, detail = '') {
 }
 
 const retiredJevKeys = new Set()
+const keyCooldowns = new Map()
+const hostCooldowns = new Map()
+const COOLDOWN_MAX_MS = 24 * 60 * 60 * 1000
+const MAX_DECISION_ATTEMPTS = 4
+
+function cooldownTarget(map, id, response, now) {
+  const failures = Math.min(6, (map.get(id)?.failures || 0) + 1)
+  const raw = response?.headers?.get?.('retry-after')
+  const retryMs = raw && /^\d+(\.\d+)?$/.test(raw.trim()) ? Number(raw) * 1000 : raw ? Date.parse(raw) - now : 0
+  const wait = Math.min(COOLDOWN_MAX_MS, Math.max(30_000 * 2 ** (failures - 1), Number.isFinite(retryMs) ? retryMs : 0))
+  map.set(id, { until: now + wait, failures, status: Number(response.status) })
+}
+
+function cooldownFor(target, now) {
+  return (
+    [keyCooldowns.get(target.id), hostCooldowns.get(target.origin)]
+      .filter((row) => row?.until > now)
+      .sort((a, b) => b.until - a.until)[0] || null
+  )
+}
 
 function jevKeyId(url, apiKey) {
   return `${url}\0${apiKey}`
-}
-
-/** Bare key uses the configured base. `https://host/... <key>` binds that host. */
-function splitKeyLine(line) {
-  const text = String(line || '').trim()
-  const match = text.match(/^(https?:\/\/\S+)\s+(\S+)$/)
-  if (!match) return { baseUrl: '', apiKey: text }
-  return { baseUrl: match[1], apiKey: match[2] }
 }
 
 function jevTargets(config) {
   const lines = config.api_keys.length ? config.api_keys : ['']
   const out = []
   for (const line of lines) {
-    const split = splitKeyLine(line)
+    const split = splitJevKeyLine(line)
     const url = decisionUrl(split.baseUrl || config.base_url)
     if (!url) continue
-    out.push({ url, apiKey: split.apiKey, id: jevKeyId(url, split.apiKey) })
+    try {
+      const parsed = new URL(url)
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') continue
+      out.push({ url, origin: parsed.origin, apiKey: split.apiKey, id: jevKeyId(url, split.apiKey) })
+    } catch {
+      // Invalid stored endpoints cannot become targets or break the public snapshot.
+    }
   }
   return out
 }
 
 /** Current configuration only; expose masked labels, never full credentials or URLs. */
-export function publicJevKeys(config) {
+export function publicJevKeys(config, now = Date.now()) {
   return jevTargets(normalizeJevConfig(config))
     .filter((target) => target.apiKey)
-    .map((target, index) => ({
-      number: index + 1,
-      masked_key:
-        target.apiKey.length >= 12 ? `${target.apiKey.slice(0, 4)}********${target.apiKey.slice(-4)}` : '********',
-      key_fingerprint: jevKeyFingerprint(target.apiKey),
-      retired: retiredJevKeys.has(target.id),
-    }))
+    .map((target, index) => {
+      const cooldown = cooldownFor(target, now)
+      return {
+        number: index + 1,
+        masked_key:
+          target.apiKey.length >= 12 ? `${target.apiKey.slice(0, 4)}********${target.apiKey.slice(-4)}` : '********',
+        key_fingerprint: jevKeyFingerprint(target.apiKey),
+        retired: retiredJevKeys.has(target.id),
+        cooldown_until: cooldown?.until || null,
+        cooldown_reason: cooldown ? (cooldown.status === 529 ? 'overloaded' : 'rate_limited') : null,
+      }
+    })
 }
 
 function rearmJevKeys(config) {
@@ -1423,6 +1458,9 @@ let keyCursor = 0
  */
 export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now = Date.now()) {
   const config = normalizeJevConfig(cfg)
+  const cancelled = () => unavailable({ ...config, fail_open: false }, '请求已取消')
+  if (cfg?.signal?.aborted) return cancelled()
+  const deadline = performance.now() + config.timeout_ms
   const document = prepareInterceptText(text, {
     stripReminders: config.strip_reminders,
     expandBase64: config.expand_base64,
@@ -1440,15 +1478,32 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
   const payload = { state: document, questions: questionsFor(config) }
   if (model) payload.model = model
   const all = jevTargets(config)
-  const targets = all.filter((target) => !retiredJevKeys.has(target.id))
-  if (!targets.length) return unavailable(config, all.some((target) => target.apiKey) ? '密钥失效' : '')
-  const start = keyCursor++
+  const targets = all.filter((target) => !retiredJevKeys.has(target.id) && !cooldownFor(target, now))
+  if (!targets.length)
+    return unavailable(
+      config,
+      all.some((target) => cooldownFor(target, now))
+        ? '上游限流或过载，等待冷却'
+        : all.some((target) => target.apiKey)
+          ? '密钥失效'
+          : '',
+    )
+  const start = keyCursor
+  let attempts = 0
   let network = false
   let http = ''
   const skipUrl = new Set()
   for (let i = 0; i < targets.length; i++) {
     const target = targets[(start + i) % targets.length]
-    if (skipUrl.has(target.url)) continue
+    if (skipUrl.has(target.url) || cooldownFor(target, now)) continue
+    if (cfg?.signal?.aborted) return cancelled()
+    const remainingMs = Math.floor(deadline - performance.now())
+    if (remainingMs <= 0) return unavailable(config, '审核超时')
+    if (attempts >= MAX_DECISION_ATTEMPTS) return unavailable(config, '上游多次失败，已达到本次尝试上限')
+    attempts += 1
+    keyCursor = start + i + 1
+    const timeoutSignal = AbortSignal.timeout(remainingMs)
+    const signal = cfg?.signal ? AbortSignal.any([cfg.signal, timeoutSignal]) : timeoutSignal
     // One row per real provider attempt; dedup replays return before this loop.
     const attemptStarted = Date.now()
     const attemptUsage = {
@@ -1468,25 +1523,46 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
           ...(target.apiKey ? { authorization: `Bearer ${target.apiKey}` } : {}),
         },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(config.timeout_ms),
+        signal,
       })
       attemptUsage.http_status = Number(response?.status) || null
       attemptUsage.outcome = response?.ok ? 'invalid_response' : 'http_error'
       if (!response?.ok) {
         const status = Number(response?.status) || 0
-        if (status === 401 || status === 429 || status === 529) {
+        if (status === 401) {
           if (target.apiKey) retiredJevKeys.add(target.id)
+          continue
+        }
+        if (status === 429 || status === 529) {
+          cooldownTarget(
+            status === 529 ? hostCooldowns : keyCooldowns,
+            status === 529 ? target.origin : target.id,
+            response,
+            now,
+          )
+          if (!http) http = status === 529 ? '上游暂时过载' : '上游限流'
           continue
         }
         skipUrl.add(target.url)
         if (!http) http = `上游 ${status || '失败'}`
         continue
       }
-      const responsePayload = await response.json()
+      let responsePayload
+      try {
+        responsePayload = await response.json()
+      } catch {
+        if (cfg?.signal?.aborted) return cancelled()
+        if (timeoutSignal.aborted) return unavailable(config, '审核超时')
+        return unavailable(config, '评分响应无效')
+      }
       attemptUsage.usage = responsePayload?.usage
       attemptUsage.response_model = responsePayload?.model
+      if (cfg?.signal?.aborted) return cancelled()
+      if (performance.now() >= deadline) return unavailable(config, '审核超时')
       const decision = parsePolicyDecision(responsePayload, config)
-      if (!decision) return { action: 'pass', reason: 'invalid', state: document }
+      if (!decision) return unavailable(config, '评分响应无效')
+      keyCooldowns.delete(target.id)
+      hostCooldowns.delete(target.origin)
       attemptUsage.outcome = 'success'
       const verdict = decision.hits.length
         ? {
@@ -1499,6 +1575,8 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
       if (windowMs > 0) verdictCache.set(key, { verdict, at: now })
       return verdict
     } catch {
+      if (cfg?.signal?.aborted) return cancelled()
+      if (timeoutSignal.aborted) return unavailable(config, '审核超时')
       // Host-level. Do not retire keys, and do not walk the rest of this host.
       skipUrl.add(target.url)
       network = true

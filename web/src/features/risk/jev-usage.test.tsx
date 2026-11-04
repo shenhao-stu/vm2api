@@ -13,7 +13,7 @@ const counts = {
   estimated_cost_nano_usd: 0,
   unknown_cost_requests: 1,
 }
-function markup(errors = 0, open = true) {
+function markup(errors = 0, open = true, cooldown = false) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: Infinity } },
   })
@@ -28,6 +28,8 @@ function markup(errors = 0, open = true) {
             masked_key: 'demo********1234',
             key_fingerprint: 'abcdef123456',
             retired: false,
+            cooldown_until: cooldown ? Date.UTC(2026, 10, 4, 12) : null,
+            cooldown_reason: cooldown ? 'overloaded' : null,
             requests: 1,
             successful: 0,
             estimated_cost_nano_usd: 0,
@@ -102,5 +104,11 @@ describe('JEV usage display', () => {
   })
   it('warns about storage failures instead of claiming complete totals', () => {
     expect(markup(2)).toContain('统计可能不完整')
+  })
+  it('distinguishes temporary overload cooldown from retired keys', () => {
+    const html = markup(0, true, true)
+    expect(html).toContain('服务过载冷却至')
+    expect(html).toContain('届时恢复调度')
+    expect(html).not.toContain('已暂停轮询')
   })
 })

@@ -23,6 +23,12 @@ import { ApiKeysRepo } from '../db/repos/api-keys-repo.mjs'
 import { maybeEncrypt, maybeDecrypt } from '../db/secure.mjs'
 import { calculateCost, normalizeUsage } from './pricing.mjs'
 import { UsersRepo } from '../db/repos/users-repo.mjs'
+import { ApiEndpointsRepo } from '../db/repos/api-endpoints-repo.mjs'
+import {
+  assertHybridKeyScope,
+  assertLocalGatewayEndpoint,
+  normalizeKeyCategory,
+} from '../pool/local-gateway-policy.mjs'
 
 const KEY_PREFIX = 'sk-vm-'
 const HASH_MARKER = 'hmac:'
@@ -106,7 +112,8 @@ export function publicKeyView(rec, { reveal = false } = {}) {
     requests: rec.requests || 0,
     tokens_in: rec.tokens_in || 0,
     tokens_out: rec.tokens_out || 0,
-    category: rec.category === 'api' ? 'api' : 'oauth',
+    category: normalizeKeyCategory(rec.category),
+    openai_endpoint_id: rec.openai_endpoint_id || null,
     ...keyScopeFromRecord(rec),
     inflight: undefined, // filled by store.snapshot
   }
@@ -244,7 +251,8 @@ export class ApiKeyStore {
       requests: 0,
       tokens_in: 0,
       tokens_out: 0,
-      category: String(input.category || 'oauth').toLowerCase() === 'api' ? 'api' : 'oauth',
+      category: normalizeKeyCategory(input.category),
+      openai_endpoint_id: input.openai_endpoint_id || null,
       ...storedKeyScope(
         normalizeKeyScope({
           group_type: input.group_type,
@@ -256,6 +264,7 @@ export class ApiKeyStore {
     if (rec.expires_at && Number.isNaN(Date.parse(rec.expires_at))) {
       throw Object.assign(new Error('invalid expires_at'), { code: 'invalid_expires_at' })
     }
+    this._validateGatewayBinding(rec)
     const stored = this.repo.insert(rec)
     return { ...stored, key, _plain_key: key }
   }
@@ -301,12 +310,24 @@ export class ApiKeyStore {
       rec.status = 'active'
     }
     if (patch.category != null) {
-      rec.category = String(patch.category).toLowerCase() === 'api' ? 'api' : 'oauth'
+      rec.category = normalizeKeyCategory(patch.category)
     }
+    if (Object.prototype.hasOwnProperty.call(patch, 'openai_endpoint_id'))
+      rec.openai_endpoint_id = patch.openai_endpoint_id || null
     const scope = normalizeKeyScope(patch, { partial: true, current: rec })
     if (scope) Object.assign(rec, storedKeyScope(scope))
+    this._validateGatewayBinding(rec)
     rec.updated_at = nowIso()
     return this.repo.update(rec)
+  }
+
+  _validateGatewayBinding(rec) {
+    if (rec.category !== 'hybrid') {
+      rec.openai_endpoint_id = null
+      return
+    }
+    assertHybridKeyScope(rec)
+    assertLocalGatewayEndpoint(new ApiEndpointsRepo(this.db).getHydrated(rec.openai_endpoint_id))
   }
 
   /**

@@ -181,6 +181,9 @@ export type JevInterceptConfig = {
   timeout_ms: number
   api_key_set: boolean
   api_key_count: number
+  api_key_ready_count?: number
+  api_key_retired_count?: number
+  api_key_cooling_count?: number
   safety_instruction: string
   question_ids: string[]
   question_bank?: PolicyQuestion[]

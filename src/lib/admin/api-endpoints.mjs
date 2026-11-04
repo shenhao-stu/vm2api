@@ -11,6 +11,7 @@ import {
 } from '../pool/api-presets.mjs'
 import { forwardApi, readApiJson } from '../transport/api-kernel-client.mjs'
 import { AUTH_SCHEME_X_API_KEY, resolveAuthScheme } from '../oauth/auth-scheme.mjs'
+import { assertLocalGatewayEndpoint, gatewayError } from '../pool/local-gateway-policy.mjs'
 
 function nowIso() {
   return new Date().toISOString()
@@ -139,6 +140,8 @@ export class ApiEndpointStore {
       created_at: nowIso(),
       updated_at: nowIso(),
     }
+    if (rec.kind === 'local_gateway')
+      assertLocalGatewayEndpoint({ ...rec, models: input.models, api_key_entries: input.api_key_entries })
     const stored = this.repo.insertEndpoint(rec)
     const models = Array.isArray(input.models) ? input.models : []
     if (models.length) this.replaceModels(stored.id, models)
@@ -173,6 +176,7 @@ export class ApiEndpointStore {
     if (patch.disable_cooling != null) rec.disable_cooling = !!patch.disable_cooling
     if (patch.priority != null) rec.priority = Number(patch.priority) || 0
     rec.updated_at = nowIso()
+    if (rec.kind === 'local_gateway') assertLocalGatewayEndpoint({ ...rec, models: patch.models ?? rec.models })
     this.repo.updateEndpoint(rec)
     if (Array.isArray(patch.models)) this.replaceModels(id, patch.models)
     return this.repo.getHydrated(id)
@@ -187,6 +191,7 @@ export class ApiEndpointStore {
     if (!ep) throw Object.assign(new Error('endpoint not found'), { code: 'endpoint_not_found' })
     const api_key = String(input.api_key || '').trim()
     if (api_key.length < 4) throw Object.assign(new Error('api_key too short'), { code: 'key_too_short' })
+    if (ep.kind === 'local_gateway') assertLocalGatewayEndpoint({ ...ep, api_key_entries: [input] })
     return this.repo.insertKey({
       id: nid('ek_'),
       endpoint_id: endpointId,
@@ -204,6 +209,9 @@ export class ApiEndpointStore {
   }
 
   updateKey(id, patch = {}) {
+    const key = this.repo.getKey(id)
+    const ep = key ? this.repo.getHydrated(key.endpoint_id) : null
+    if (ep?.kind === 'local_gateway') assertLocalGatewayEndpoint({ ...ep, api_key_entries: [{ ...key, ...patch }] })
     return this.repo.updateKey(id, patch)
   }
 
@@ -218,6 +226,8 @@ export class ApiEndpointStore {
         thinking: m.thinking,
       }))
       .filter((m) => m.name && m.alias)
+    const ep = this.repo.getHydrated(endpointId)
+    if (ep?.kind === 'local_gateway') assertLocalGatewayEndpoint({ ...ep, models: rows })
     return this.repo.replaceModels(endpointId, rows)
   }
 
@@ -246,6 +256,9 @@ export async function fetchUpstreamModels({
   forward = forwardApi,
 } = {}) {
   const preset = resolvePreset(kind, { protocol, base_url })
+  if (preset.kind === 'local_gateway') {
+    throw gatewayError('gateway_models_explicit', 'Configure the approved GPT models explicitly for a local gateway')
+  }
   const key = String(api_key || '').trim()
   if (key.length < 4) {
     throw Object.assign(new Error('需要上游 key 才能获取模型'), { code: 'key_required' })

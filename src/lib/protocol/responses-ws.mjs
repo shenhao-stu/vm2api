@@ -11,6 +11,7 @@ import { Readable } from 'node:stream'
 import { WebSocket, WebSocketServer } from 'ws'
 import { computedUpstreamTransport, inferenceWebsocketEnabled } from './codex-route.mjs'
 import { DEFAULT_MAX_REQUEST_BYTES, inboundBodyLimit } from '../core/config.mjs'
+import { isHybridKey } from '../pool/local-gateway-policy.mjs'
 
 export const RESPONSES_WS_QUEUE_LIMIT = 32
 export const RESPONSES_WS_REPLAY_MAX_ITEMS = 32
@@ -738,6 +739,18 @@ export function createResponsesWsHandler({
     if (rejectNewWs(socket, routing)) return true
     const res = handshakeRes(socket)
     if (typeof requireAuth === 'function' && !requireAuth(req, res)) return true
+    if (isHybridKey(req)) {
+      res.writeHead(400, { 'content-type': 'application/json' })
+      res.end(
+        JSON.stringify({
+          error: {
+            code: 'hybrid_protocol_unsupported',
+            message: 'Hybrid keys use HTTP Responses; WebSocket is not supported',
+          },
+        }),
+      )
+      return true
+    }
     wss.handleUpgrade(req, socket, head, (ws) => attach(ws, req))
     return true
   }

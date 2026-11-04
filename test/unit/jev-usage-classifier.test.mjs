@@ -23,7 +23,7 @@ const success = () =>
   new Response(
     JSON.stringify({
       model: 'jev-1.14.0',
-      answers: { safety: { noul: 0.99 } },
+      answers: { usage_policy: { noul: 0.99 }, nsfw: { noul: 0.99 }, abuse: { noul: 0.99 } },
       usage: { input_tokens: 123, output_tokens: 20 },
     }),
     { status: 200 },

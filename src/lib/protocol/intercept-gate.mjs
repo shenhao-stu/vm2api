@@ -133,6 +133,7 @@ export async function evaluateProtocolIntercept({
   requestId,
   account = null,
   fetchImpl,
+  signal,
 } = {}) {
   // GPT / Codex skips every layer unless the panel opts it in. Once a scope
   // is set, the slot decides GPT: a scope with no GPT pair and no named
@@ -268,7 +269,7 @@ export async function evaluateProtocolIntercept({
   }
 
   if (jev?.enabled) {
-    const verdict = await classifyJev(modelDocument, { ...jev, policy_request_id: requestId }, fetchImpl)
+    const verdict = await classifyJev(modelDocument, { ...jev, policy_request_id: requestId, signal }, fetchImpl)
     if (verdict.action === 'block') {
       const unavailable = verdict.reason === 'unavailable'
       const error = policyBlockError(requestId)
