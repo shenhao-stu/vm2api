@@ -1477,7 +1477,8 @@ export class PoolScheduler extends EventEmitter {
       if (quotaReservation) this.accountQuota?.release?.(candidate.accountId)
       return null
     }
-    this.inflight.set(candidate.accountId, requestInflight + 1)
+    // Admission hooks may release an earlier reservation.
+    this.inflight.set(candidate.accountId, (this.inflight.get(candidate.accountId) || 0) + 1)
     this.bumpFamily(candidate.accountId, family, 1)
     this.bumpVmInflight(candidate.vmId, 1)
     let released = false

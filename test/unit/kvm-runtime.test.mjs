@@ -321,3 +321,37 @@ test('writeKernelConfig uses guest socket path and runtime_kind kvm', () => {
   assert.equal(written.socketPath, path.join(root, 'vms', 'vm-02', 'run', 'kernel.sock'))
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+test('slot-guest-bin unlinks staging temp when atomic replace fails', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-guest-bin-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const deployBin = path.join(root, 'deploy-bin')
+  fs.mkdirSync(deployBin, { recursive: true })
+  const kernelBin = path.join(deployBin, 'kin-kernel')
+  fs.writeFileSync(kernelBin, 'kernel-v1', { mode: 0o755 })
+  const linkSync = fs.linkSync
+  const renameSync = fs.renameSync
+  t.after(() => {
+    fs.linkSync = linkSync
+    fs.renameSync = renameSync
+  })
+  // Copy path keeps staged inode separate from deploy-bin so content updates trigger replace.
+  fs.linkSync = () => {
+    throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' })
+  }
+  ensureSlotGuestBinDir(root, { kernelBin })
+  const stage = path.join(root, 'data', 'run', 'slot-guest-bin')
+  const dest = path.join(stage, 'kin-kernel')
+  const tmp = `${dest}.${process.pid}.tmp`
+  fs.renameSync = (from, to) => {
+    if (from === tmp) throw Object.assign(new Error('rename failed'), { code: 'EIO' })
+    return renameSync(from, to)
+  }
+  const next = `${kernelBin}.next`
+  fs.writeFileSync(next, 'kernel-v2', { mode: 0o755 })
+  renameSync(next, kernelBin)
+  assert.throws(() => ensureSlotGuestBinDir(root, { kernelBin }), /rename failed/)
+  assert.equal(fs.existsSync(tmp), false)
+  assert.equal(fs.readFileSync(dest, 'utf8'), 'kernel-v1')
+})
+
