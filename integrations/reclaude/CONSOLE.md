@@ -117,6 +117,21 @@ account's usage. The rolling five-hour, seven-day and retained-history totals us
 reports records without pricing separately. A missing ledger displays an
 unavailable state.
 
+The card labels these amounts **本 Relay / 近5H / 近7D**. Official percentage
+windows are labeled **官方 · 全员** because other members and devices using the
+same upstream account also consume them. The rolling local amounts and fixed
+official reset windows have different boundaries; do not subtract them to
+estimate another member's use. Dollar plan balances and percentage windows have
+independent freshness indicators. A passed reset retains the previous reading
+with a stale warning until a new official observation arrives.
+
+Quota-aware scheduling belongs to Sub2API's native account/model cooldowns,
+not the display. A consumed native rate-limit result may record the model's reset
+time for subsequent requests, but must retain `no_replay` for the request already
+dispatched. Do not convert that result into a retryable response. Carry full
+client history when switching between Relay and Pro; an upstream session ID alone
+cannot transfer context. Fable must never fall back to Pro accounts.
+
 For the official quota, configure `official_quota` with a private snapshot
 `path`, the ReClaude `org_id` and the provider's numeric `account_id`. The
 snapshot is also scoped to the configured native device `binding`.

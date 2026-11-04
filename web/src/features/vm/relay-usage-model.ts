@@ -24,20 +24,29 @@ export function relayUsageModel(relay: NativeRelay, now: number) {
     q && validAmount(q.used_usd) && validAmount(q.quota_usd) && q.quota_usd > 0
       ? q
       : null
-  const stale = Boolean(
-    source?.stale ||
-    quota?.stale ||
-    windows.some((w) => w.reset != null && w.reset <= now) ||
-    (quota?.resets_at_ms != null && quota.resets_at_ms <= now)
+  const windowsStale = Boolean(
+    source &&
+    (source.stale ||
+      now - source.observed_at_ms > 900_000 ||
+      now - source.source_updated_ms > 7_200_000 ||
+      windows.some((w) => w.reset != null && w.reset <= now))
+  )
+  const quotaStale = Boolean(
+    quota &&
+    (quota.stale ||
+      now - quota.observed_at_ms > 900_000 ||
+      (quota.resets_at_ms != null && quota.resets_at_ms <= now))
   )
   return {
     windows,
     quota,
-    stale,
+    windowsStale,
+    quotaStale,
+    stale: windowsStale || quotaStale,
     rows: (
       [
-        ['5H', relay.usage?.last_5h_usd],
-        ['7D', relay.usage?.last_7d_usd],
+        ['近5H', relay.usage?.last_5h_usd],
+        ['近7D', relay.usage?.last_7d_usd],
         ['总计', relay.usage?.total_usd],
       ] as const
     ).map(([label, value]) => ({

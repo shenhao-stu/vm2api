@@ -298,6 +298,37 @@ describe('native Relay VM management', () => {
     expect(model.quota).toBeNull()
     expect(model.rows.every((r) => r.value === undefined)).toBe(true)
   })
+  it('does not let an old dollar balance mark fresh percentage windows stale', () => {
+    const now = 1800000000000
+    const item = {
+      ...relay,
+      runtime: {
+        ...relay.runtime,
+        official_windows: {
+          five_hour: { used_percent: 28, resets_at_ms: now + 5000 },
+          seven_day: { used_percent: 5, resets_at_ms: now + 7000 },
+          observed_at_ms: now,
+          source_updated_ms: now,
+          stale: false,
+        },
+      },
+      official_quota: {
+        used_usd: 100,
+        quota_usd: 700,
+        observed_at_ms: now - 10000000,
+        resets_at_ms: null,
+        stale: true,
+      },
+    }
+    const model = relayUsageModel(item, now)
+    expect(model.windowsStale).toBe(false)
+    expect(model.quotaStale).toBe(true)
+    expect(model.rows.map((r) => r.label)).toEqual(['近5H', '近7D', '总计'])
+    const html = render(true, item)
+    expect(html).toContain('官方 · 全员')
+    expect(html).toContain('本 Relay')
+    expect(html).toContain('滚动统计')
+  })
   it('does not show the administrative runtime to non-admins', () => {
     expect(render(false)).toBe('')
   })

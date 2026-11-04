@@ -26,14 +26,21 @@ export function RelayUsageCard({
   relay: NativeRelay
   now: number
 }) {
-  const { windows, quota, stale, rows } = relayUsageModel(relay, now)
+  const { windows, quota, windowsStale, quotaStale, rows } = relayUsageModel(
+    relay,
+    now
+  )
   return (
     <>
       <section aria-label='ReClaude 官方套餐窗口' className='grid gap-1'>
         <h4 className='flex h-5 justify-between text-xs text-muted-foreground'>
-          <span>官方额度</span>
-          {stale && (
-            <span title='保留上次读数，重置后等待官方更新'>待更新</span>
+          <span title='同一账号在所有成员及设备上的消耗，不只来自 vm2api'>
+            官方 · 全员
+          </span>
+          {windowsStale && (
+            <span title='以下为上次官方读数，过重置时间不代表已确认恢复'>
+              待更新
+            </span>
           )}
         </h4>
         {windows.map((w) => (
@@ -43,7 +50,9 @@ export function RelayUsageCard({
           className='flex h-5 items-center justify-between gap-2 text-xs'
           title='官方套餐美元额度；与 5H / 7D 百分比及本 Relay 用量独立'
         >
-          <span className='text-muted-foreground'>套餐</span>
+          <span className='text-muted-foreground'>
+            套餐{quotaStale ? ' · 待更新' : ''}
+          </span>
           <span
             className='font-mono tabular-nums'
             title={quota ? undefined : '官方未提供美元总额'}
@@ -55,7 +64,12 @@ export function RelayUsageCard({
         </div>
       </section>
       <section aria-label='本 Relay 已记用量' className='hairline-t pt-2'>
-        <h4 className='mb-1 text-xs text-muted-foreground'>vm2api 用量</h4>
+        <h4 className='mb-1 flex justify-between text-xs text-muted-foreground'>
+          <span>本 Relay</span>
+          <span title='从现在向前统计，和官方套餐的固定重置窗口不同'>
+            滚动统计
+          </span>
+        </h4>
         <dl className='grid gap-1'>
           {rows.map(({ label, value }) => (
             <div
@@ -101,7 +115,13 @@ export function RelayUsageDetail({ relay }: { relay: NativeRelay }) {
           。同步 {exactTime(q.observed_at_ms)}（北京）
         </p>
       )}
-      <p>官方额度可能包含同组织其他设备；下方用量仅属于本 Relay。</p>
+      <p>
+        官方额度包含同账号其他成员及设备；本 Relay 只统计经它完成的已记价请求。
+      </p>
+      <p>
+        近5H / 近7D
+        是滚动用量，不能与官方重置窗口直接相减。模型专属额度以官方限流结果为准。
+      </p>
     </div>
   )
 }
