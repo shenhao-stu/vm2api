@@ -617,13 +617,13 @@ export function PoolPane({
         </button>
         <a
           className='inline-flex min-h-11 items-center gap-1 text-primary hover:underline'
-          href='/console/#/vm'
+          href='#/vm'
         >
           <Link2 className='size-3.5' aria-hidden /> 账号优先级 · VM 调度
         </a>
         <a
           className='inline-flex min-h-11 items-center gap-1 text-primary hover:underline'
-          href='/console/#/settings/sticky'
+          href='#/settings/sticky'
         >
           <Link2 className='size-3.5' aria-hidden /> 粘性设置
         </a>

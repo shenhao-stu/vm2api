@@ -10,6 +10,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 import { api } from '@/lib/api'
+import { panelWebSocketUrl } from '@/lib/base-path'
 import { captureLoginAuthUrl } from '@/lib/login-terminal'
 import { apiBase } from '@/lib/session'
 import {
@@ -237,9 +238,11 @@ export const WsTerminal = forwardRef<
     })
       .then(({ ticket }) => {
         if (disposed) return
-        const base = new URL(apiBase() || window.location.origin)
-        base.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:'
-        base.pathname = socketPath
+        const base = panelWebSocketUrl(
+          socketPath,
+          apiBase(),
+          window.location.origin
+        )
         base.search = new URLSearchParams({
           ticket,
           cols: String(term.cols),

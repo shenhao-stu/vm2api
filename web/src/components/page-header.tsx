@@ -18,16 +18,18 @@ export function PageHeader({
 }: PageHeaderProps) {
   return (
     <Main fluid={fluid}>
-      <div className='mb-4 flex flex-wrap items-end justify-between gap-2'>
+      <div className='mb-6 flex flex-wrap items-center justify-between gap-3'>
         <div className='max-w-full min-w-0'>
           <h2
-            className='truncate text-2xl font-bold tracking-tight'
+            className='truncate text-2xl font-semibold tracking-tight'
             title={title}
           >
             {title}
           </h2>
           {description ? (
-            <p className='mt-1 text-sm text-muted-foreground'>{description}</p>
+            <p className='mt-2 text-sm leading-relaxed text-muted-foreground'>
+              {description}
+            </p>
           ) : null}
         </div>
         {extra}

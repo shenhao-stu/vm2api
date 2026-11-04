@@ -31,6 +31,7 @@ import {
   HealthLegend,
 } from '@/features/overview/health-gauge'
 import { HostColumn } from '@/features/overview/host-column'
+import { HostedServices } from '@/features/overview/hosted-services'
 import { KpiCard } from '@/features/overview/kpi-card'
 import { OverviewSkeleton } from '@/features/overview/overview-skeleton'
 import { PoolQuota } from '@/features/overview/pool-quota'
@@ -147,6 +148,7 @@ export function OverviewPage() {
       title={VIEW_TITLES.overview}
       description={VIEW_DESCRIPTIONS.overview}
     >
+      <HostedServices />
       <QueryGate
         loading={dash.isLoading}
         error={dash.error || (d.error ? new Error(d.error) : null)}

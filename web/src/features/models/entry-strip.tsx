@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { ChevronDown } from 'lucide-react'
+import { publicApiBase } from '@/lib/base-path'
 import {
   Collapsible,
   CollapsibleContent,
@@ -13,10 +14,7 @@ import { dashboardQueryOptions } from '@/features/overview/queries'
 export function EntryStrip() {
   const dash = useQuery(dashboardQueryOptions())
   const models = useQuery(modelsQueryOptions())
-  const base = String(dash.data?.health?.base_url || location.origin).replace(
-    /\/$/,
-    ''
-  )
+  const base = publicApiBase(dash.data?.health?.base_url)
   const ids = (models.data?.items || []).map((m) => m.id)
 
   return (

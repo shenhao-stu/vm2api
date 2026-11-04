@@ -360,3 +360,27 @@
     opacity: 1;
   }
 }
+
+/* Shared workbench chrome; operational status colors retain their own semantics. */
+.workbench-brand {
+  background: linear-gradient(140deg, #5267e7, #7562d8);
+  box-shadow: 0 4px 12px rgb(79 91 213 / 16%);
+}
+.hosted-workbench [data-sidebar='group-label'] {
+  padding-inline: 0.75rem;
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+  letter-spacing: 0.04em;
+}
+.hosted-workbench [data-sidebar='menu-button'] {
+  min-height: 2.5rem;
+  border-radius: 0.75rem;
+}
+.hosted-workbench [data-sidebar='menu-button'][data-active='true'] {
+  background: var(--accent);
+  color: var(--accent-foreground);
+  font-weight: 600;
+}
+.hosted-workbench [data-sidebar='menu-button'] > svg {
+  stroke-width: 1.75;
+}

@@ -4,8 +4,10 @@ import { VIEW_TITLES } from '@/config/nav'
 import type { ApiKeyItem } from '@/types/panel-keys'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { publicApiBase } from '@/lib/base-path'
 import { copyText } from '@/lib/clipboard'
 import { fmtNum } from '@/lib/format'
+import { apiBase } from '@/lib/session'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
@@ -27,6 +29,7 @@ import { apiEndpointsQueryOptions } from '@/features/api-endpoints/queries'
 import { meQueryOptions } from '@/features/auth/queries'
 import { apiKeysQueryOptions } from '@/features/keys/queries'
 import { vmsListQueryOptions } from '@/features/vm/queries'
+import { KeyConnectionGuide } from './key-connection-guide'
 import {
   keyExpiryText,
   keyIsDead,
@@ -231,6 +234,7 @@ export function KeysPage() {
         </div>
       }
     >
+      <KeyConnectionGuide baseUrl={`${publicApiBase(apiBase())}/v1`} />
       {isAdmin ? <VmPoolsCard vms={vmItems} /> : null}
       <QueryGate
         loading={q.isLoading}
@@ -239,7 +243,7 @@ export function KeysPage() {
       >
         {keys.length === 0 ? (
           <EmptyState
-            reason='尚无密钥。协议密钥只能调 /v1。'
+            reason='尚无密钥。生成对应服务的 Key 后，使用上方 API 地址接入。'
             actionLabel='生成 Claude Key'
             onAction={() => {
               setCreateService('claude')

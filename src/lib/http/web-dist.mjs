@@ -1,5 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import { mountWebIndex } from './public-base-path.mjs'
 
 const MIME = {
   '.css': 'text/css; charset=utf-8',
@@ -58,7 +59,7 @@ function cacheControl(rel, ext) {
   return 'public, max-age=86400'
 }
 
-export function tryServeWebDist(res, projectRoot, pathname) {
+export function tryServeWebDist(res, projectRoot, pathname, { basePath = '' } = {}) {
   const root = distRoot(projectRoot)
   try {
     if (!fs.statSync(root).isDirectory()) return false
@@ -66,7 +67,7 @@ export function tryServeWebDist(res, projectRoot, pathname) {
     return false
   }
 
-  const rel = relativePath(pathname)
+  const rel = basePath && pathname === '/' ? 'index.html' : relativePath(pathname)
   if (!rel || rel.includes('\0') || rel.split(/[\\/]/).includes('..')) return false
 
   const file = safeFile(root, rel)
@@ -77,6 +78,7 @@ export function tryServeWebDist(res, projectRoot, pathname) {
     'content-type': MIME[ext] || 'application/octet-stream',
     'cache-control': cacheControl(rel, ext),
   })
-  res.end(fs.readFileSync(file))
+  const body = fs.readFileSync(file)
+  res.end(rel === 'index.html' ? mountWebIndex(body.toString('utf8'), basePath) : body)
   return true
 }

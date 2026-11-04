@@ -1,4 +1,5 @@
 import type { VmActiveHours, VmQuotaOverride } from '@/types/panel-vm'
+import { joinApiPath, publicBasePath } from '@/lib/base-path'
 import {
   apiBase,
   expirePanelSession,
@@ -115,7 +116,7 @@ export async function panelFetch(
   path: string,
   opts: RequestInit = {}
 ): Promise<Response> {
-  const url = `${apiBase() || ''}${path}`
+  const url = joinApiPath(apiBase(), path)
   const res = await fetch(url, {
     ...opts,
     credentials: 'include',
@@ -173,8 +174,8 @@ export async function loginRequest(input: {
   password: string
   base?: string
 }): Promise<{ token: string; user: string }> {
-  const base = input.base ?? apiBase()
-  const url = `${base || ''}/api/panel/login`
+  const base = publicBasePath() || (input.base ?? apiBase())
+  const url = joinApiPath(base, '/api/panel/login')
   let res: Response
   try {
     res = await fetch(url, {

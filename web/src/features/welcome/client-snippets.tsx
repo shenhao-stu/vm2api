@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { ArrowUpRight, Check } from 'lucide-react'
+import { publicApiBase } from '@/lib/base-path'
 import { cn } from '@/lib/utils'
 import { CopyButton, CopyChip } from '@/components/copy-chip'
 import { Reveal } from './reveal'
@@ -12,7 +13,7 @@ const NOTES = [
 ] as const
 
 export function WelcomeClientSnippets({ baseUrl }: { baseUrl: string }) {
-  const base = baseUrl.replace(/\/$/, '') || location.origin
+  const base = publicApiBase(baseUrl)
   const tabs = [
     {
       id: 'claude',

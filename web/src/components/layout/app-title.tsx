@@ -1,144 +1,84 @@
 import { Link } from '@tanstack/react-router'
 import { DOCS_URL, REPO_URL } from '@/config/repo'
-import { ArrowUpRight, BookOpen, Menu, X } from 'lucide-react'
+import { ArrowUpRight, BookOpen, PanelLeftClose } from 'lucide-react'
 import { IconGithub } from '@/assets/brand-icons'
 import { Logo } from '@/assets/logo'
-import { cn } from '@/lib/utils'
+import { Button } from '@/components/ui/button'
 import {
   SidebarMenu,
   SidebarMenuItem,
   useSidebar,
 } from '@/components/ui/sidebar'
-import { Button } from '../ui/button'
-
-const CHIP_CLASS =
-  'inline-flex h-8 min-w-0 items-center gap-1.5 rounded-lg border border-sidebar-foreground/15 bg-sidebar/70 px-2.5 text-[13px] font-medium text-sidebar-foreground shadow-xs outline-hidden transition-colors duration-200 focus-visible:ring-2 focus-visible:ring-sidebar-ring'
-
-const CHIP_LINK_CLASS =
-  'cursor-pointer hover:border-primary/45 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground'
-
-// 两枚链接按内容分一行且不折行：中文标签被压窄时会逐字竖排；空间不够先缩箭头，再省略文字。
-const CHIP_PAIR_CLASS = 'flex-auto justify-center whitespace-nowrap'
-const CHIP_PAIR_ARROW_CLASS = 'size-3.5 min-w-0 shrink-[100] opacity-60'
-
-// 版本号单独占一行且不截断：发布号可能带预发布/构建后缀，截断会丢失关键信息。
-const VERSION_CHIP_CLASS = 'h-auto min-h-10 gap-2 py-1.5 text-base'
 
 export function AppTitle({ version }: { version?: string }) {
-  const { setOpenMobile } = useSidebar()
+  const { setOpenMobile, toggleSidebar } = useSidebar()
   return (
     <SidebarMenu>
-      <SidebarMenuItem className='rounded-xl border border-primary/25 bg-gradient-to-br from-primary/12 via-primary/[0.03] to-transparent p-2.5 group-data-[collapsible=icon]:border-transparent group-data-[collapsible=icon]:bg-none group-data-[collapsible=icon]:p-0'>
+      <SidebarMenuItem className='px-1 py-2 group-data-[collapsible=icon]:px-0'>
         <div className='flex items-center gap-2'>
           <Link
             to='/overview'
             onClick={() => setOpenMobile(false)}
-            aria-label='vm2api 概览'
-            className='flex min-w-0 flex-1 items-center gap-2.5 rounded-lg outline-hidden focus-visible:ring-2 focus-visible:ring-sidebar-ring'
+            aria-label='Claude 工作台总览'
+            className='flex min-w-0 flex-1 items-center gap-3 rounded-xl'
           >
-            <span className='grid size-10 shrink-0 place-items-center rounded-xl bg-slate-950 text-white shadow-md ring-1 ring-cyan-500/35 group-data-[collapsible=icon]:size-8'>
+            <span className='workbench-brand grid size-10 shrink-0 place-items-center rounded-xl text-white group-data-[collapsible=icon]:size-8'>
               <Logo
                 aria-hidden
                 className='size-5 group-data-[collapsible=icon]:size-4'
               />
             </span>
-            <span className='grid min-w-0 leading-tight group-data-[collapsible=icon]:hidden'>
-              <span className='truncate text-base font-bold tracking-tight'>
-                vm2api
+            <span className='grid min-w-0 gap-1 leading-tight group-data-[collapsible=icon]:hidden'>
+              <span className='text-[17px] font-semibold tracking-tight'>
+                Claude
               </span>
-              <span className='truncate text-xs text-sidebar-foreground/60'>
-                管理台
+              <span className='text-[11px] text-muted-foreground'>
+                托管工作台
               </span>
             </span>
           </Link>
-          <ToggleSidebar className='group-data-[collapsible=icon]:hidden' />
+          <Button
+            variant='ghost'
+            size='icon'
+            className='size-7 text-muted-foreground group-data-[collapsible=icon]:hidden'
+            onClick={toggleSidebar}
+            aria-label='切换侧栏'
+          >
+            <PanelLeftClose className='size-4' />
+          </Button>
         </div>
-        <div className='mt-2.5 grid gap-1.5 group-data-[collapsible=icon]:hidden'>
-          <VersionChip version={version?.replace(/^v/i, '')} />
-          <div className='flex min-w-0 gap-1.5'>
+        <div className='mt-4 flex flex-wrap items-center gap-x-3 gap-y-2 text-[11px] text-muted-foreground group-data-[collapsible=icon]:hidden'>
+          <a
+            href={REPO_URL}
+            target='_blank'
+            rel='noreferrer'
+            className='inline-flex items-center gap-1 hover:text-foreground'
+          >
+            <IconGithub aria-hidden className='size-3.5' />
+            GitHub
+          </a>
+          <a
+            href={DOCS_URL}
+            target='_blank'
+            rel='noreferrer'
+            className='inline-flex items-center gap-1 hover:text-foreground'
+          >
+            <BookOpen aria-hidden className='size-3.5' />
+            文档
+          </a>
+          {version ? (
             <a
-              href={REPO_URL}
+              href={`${REPO_URL}/releases/tag/v${version.replace(/^v/i, '')}`}
               target='_blank'
               rel='noreferrer'
-              title='github.com/dofastted/vm2api'
-              className={cn(CHIP_CLASS, CHIP_LINK_CLASS, CHIP_PAIR_CLASS)}
+              className='ms-auto inline-flex min-w-0 items-center gap-1 font-mono break-all hover:text-foreground'
             >
-              <IconGithub aria-hidden className='size-4 shrink-0' />
-              <span className='truncate'>GitHub</span>
-              <ArrowUpRight aria-hidden className={CHIP_PAIR_ARROW_CLASS} />
+              v{version.replace(/^v/i, '')}
+              <ArrowUpRight aria-hidden className='size-3 shrink-0' />
             </a>
-            <a
-              href={DOCS_URL}
-              target='_blank'
-              rel='noreferrer'
-              title='项目入门'
-              className={cn(CHIP_CLASS, CHIP_LINK_CLASS, CHIP_PAIR_CLASS)}
-            >
-              <BookOpen aria-hidden className='size-4 shrink-0' />
-              <span className='truncate'>文档</span>
-              <ArrowUpRight aria-hidden className={CHIP_PAIR_ARROW_CLASS} />
-            </a>
-          </div>
+          ) : null}
         </div>
       </SidebarMenuItem>
     </SidebarMenu>
-  )
-}
-
-function VersionChip({ version }: { version?: string }) {
-  if (!version) {
-    return (
-      <span className={cn(CHIP_CLASS, VERSION_CHIP_CLASS)}>
-        <span className='size-2 shrink-0 rounded-full bg-sidebar-foreground/30' />
-        <span className='font-mono text-sidebar-foreground/60'>版本 —</span>
-      </span>
-    )
-  }
-  return (
-    <a
-      href={`${REPO_URL}/releases/tag/v${version}`}
-      target='_blank'
-      rel='noreferrer'
-      title={`v${version} 发布说明`}
-      className={cn(CHIP_CLASS, CHIP_LINK_CLASS, VERSION_CHIP_CLASS)}
-    >
-      <span className='size-2.5 shrink-0 rounded-full bg-primary shadow-[0_0_0_3px] shadow-primary/20' />
-      <span className='font-mono font-semibold break-all tabular-nums'>
-        v{version}
-      </span>
-      <ArrowUpRight
-        aria-hidden
-        className='ms-auto size-4 shrink-0 opacity-60'
-      />
-    </a>
-  )
-}
-
-function ToggleSidebar({
-  className,
-  onClick,
-  ...props
-}: React.ComponentProps<typeof Button>) {
-  const { toggleSidebar } = useSidebar()
-  return (
-    <Button
-      data-sidebar='trigger'
-      data-slot='sidebar-trigger'
-      variant='ghost'
-      size='icon'
-      className={cn(
-        'aspect-square size-8 shrink-0 cursor-pointer max-md:scale-125',
-        className
-      )}
-      onClick={(event) => {
-        onClick?.(event)
-        toggleSidebar()
-      }}
-      {...props}
-    >
-      <X className='md:hidden' />
-      <Menu className='max-md:hidden' />
-      <span className='sr-only'>切换侧栏</span>
-    </Button>
   )
 }

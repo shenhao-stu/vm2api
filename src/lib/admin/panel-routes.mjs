@@ -1366,7 +1366,7 @@ export function createPanelHandler(ctx) {
       }
       const token = createPanelSession(authed.username, { role: authed.role })
       const secure = panelCookieSecure(req)
-      res.setHeader('Set-Cookie', panelSessionCookie(token, { secure }))
+      res.setHeader('Set-Cookie', panelSessionCookie(token, { secure, req }))
       const me = { user: authed.username, role: authed.role }
       return json(res, 200, {
         ok: true,
@@ -1382,7 +1382,7 @@ export function createPanelHandler(ctx) {
       const tok = extractPanelToken(req)
       if (tok) revokePanelSession(tok)
       const secure = panelCookieSecure(req)
-      res.setHeader('Set-Cookie', clearPanelSessionCookie({ secure }))
+      res.setHeader('Set-Cookie', clearPanelSessionCookie({ secure, req }))
       return json(res, 200, { ok: true })
     }
 

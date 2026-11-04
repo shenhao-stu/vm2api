@@ -23,7 +23,11 @@ export function AuthenticatedLayout({
   return (
     <SearchProvider>
       <LayoutProvider>
-        <SidebarProvider defaultOpen={defaultOpen}>
+        <SidebarProvider
+          defaultOpen={defaultOpen}
+          className='hosted-workbench'
+          style={{ '--sidebar-width': '17rem' } as React.CSSProperties}
+        >
           <SkipToMain />
           <AppSidebar />
           <SidebarInset

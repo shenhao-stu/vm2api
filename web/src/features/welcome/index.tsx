@@ -8,6 +8,7 @@ import { useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useSearch } from '@tanstack/react-router'
 import { useAuthStore } from '@/stores/auth-store'
+import { publicApiBase } from '@/lib/base-path'
 import { meQueryOptions } from '@/features/auth/queries'
 import { WelcomeCapabilities } from './capabilities'
 import { WelcomeChecklist } from './checklist'
@@ -39,8 +40,7 @@ export function WelcomePage() {
     return () => window.clearTimeout(timer)
   }, [search.setup, onboarding.data])
 
-  const base =
-    (onboarding.data?.base_url || '').replace(/\/$/, '') || location.origin
+  const base = publicApiBase(onboarding.data?.base_url)
 
   return (
     <div className='welcome-theme min-h-svh overflow-x-hidden bg-background text-foreground'>

@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
+import { publicBasePath } from '../http/public-base-path.mjs'
 
 export function hashKey(key) {
   return crypto.createHash('sha256').update(String(key)).digest('hex')
@@ -235,7 +236,8 @@ function parseCookie(header) {
     if (i < 0) continue
     const k = part.slice(0, i).trim()
     const v = part.slice(i + 1).trim()
-    if (k) out[k] = decodeURIComponent(v)
+    // The browser orders the mounted Path before a same-name root cookie.
+    if (k && !Object.hasOwn(out, k)) out[k] = decodeURIComponent(v)
   }
   return out
 }
@@ -282,10 +284,10 @@ export function panelCookieSecure(req, env = process.env) {
 }
 
 /** Build Set-Cookie for panel session (7d) */
-export function panelSessionCookie(token, { secure = true, maxAgeSec = 7 * 24 * 3600, env = process.env } = {}) {
+export function panelSessionCookie(token, { secure = true, maxAgeSec = 7 * 24 * 3600, env = process.env, req } = {}) {
   const parts = [
     `${panelCookieName(env)}=${encodeURIComponent(token)}`,
-    'Path=/',
+    `Path=${publicBasePath(req, env) || '/'}`,
     `Max-Age=${maxAgeSec}`,
     'HttpOnly',
     'SameSite=Lax',
@@ -294,8 +296,14 @@ export function panelSessionCookie(token, { secure = true, maxAgeSec = 7 * 24 * 
   return parts.join('; ')
 }
 
-export function clearPanelSessionCookie({ secure = true, env = process.env } = {}) {
-  const parts = [`${panelCookieName(env)}=`, 'Path=/', 'Max-Age=0', 'HttpOnly', 'SameSite=Lax']
+export function clearPanelSessionCookie({ secure = true, env = process.env, req } = {}) {
+  const parts = [
+    `${panelCookieName(env)}=`,
+    `Path=${publicBasePath(req, env) || '/'}`,
+    'Max-Age=0',
+    'HttpOnly',
+    'SameSite=Lax',
+  ]
   if (secure) parts.push('Secure')
   return parts.join('; ')
 }

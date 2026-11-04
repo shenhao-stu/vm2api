@@ -113,6 +113,7 @@ import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
 import { corsHeadersForRequest } from './lib/http/cors.mjs'
 import { isConsoleEntry, tryServeWebDist } from './lib/http/web-dist.mjs'
+import { publicBasePath } from './lib/http/public-base-path.mjs'
 import { createRoutingRuntime } from './lib/admin/routing-runtime.mjs'
 import { createImportCommit } from './lib/oauth/import-commit.mjs'
 import { createHandleProtocol } from './lib/protocol/handle-protocol.mjs'
@@ -1112,7 +1113,7 @@ const server = http.createServer(async (req, res) => {
       if (handled !== false) return
     }
 
-    if (req.method === 'GET' && tryServeWebDist(res, cfg.paths.project, p)) return
+    if (req.method === 'GET' && tryServeWebDist(res, cfg.paths.project, p, { basePath: publicBasePath(req) })) return
     if (req.method === 'GET' && isConsoleEntry(p)) {
       return json(res, 404, { error: { message: 'console not found; run pnpm -C web build' } })
     }

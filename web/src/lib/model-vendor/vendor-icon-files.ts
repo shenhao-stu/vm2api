@@ -2,6 +2,7 @@
 // vendor-icon-map.json is a verbatim copy of claude-code-hub's map (itself the
 // cch-plus.com pricing-table icon map). Every referenced file is vendored under
 // web/public/model-icons so the panel never depends on a third-party host.
+import { publicPath } from '../base-path'
 import { resolveByDashPrefix } from './dash-prefix-lookup'
 import iconMap from './vendor-icon-map.json'
 
@@ -12,11 +13,11 @@ export interface VendorIconFileEntry {
 
 const ICONS = iconMap as Record<string, VendorIconFileEntry>
 
-export const MODEL_ICON_BASE_URL = `${import.meta.env.BASE_URL}model-icons/`
+export const MODEL_ICON_BASE_URL = '/model-icons/'
 
 /** 本地静态 SVG 地址；file 为映射表内的基名。 */
 export function modelIconUrl(file: string): string {
-  return `${MODEL_ICON_BASE_URL}${file}`
+  return publicPath(`${MODEL_ICON_BASE_URL}${file}`)
 }
 
 /** 精确命中 -> 最长前缀家族(alibaba-coding-plan-cn -> alibaba)回退；都没有返回 null */
