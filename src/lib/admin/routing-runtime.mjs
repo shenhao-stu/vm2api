@@ -519,6 +519,7 @@ export function createRoutingRuntime(ctx) {
     }
     fs.mkdirSync(path.dirname(ctx.routingConfigPath), { recursive: true })
     fs.writeFileSync(ctx.routingConfigPath, JSON.stringify(routingConfig, null, 2))
+    ctx.onRoutingChanged?.(routingConfig)
     ctx.stickyRouter.reloadConfig(routingConfig)
     ctx.accountQuota.reloadConfig(routingConfig)
     getPool()?.reloadConfig?.(poolSchedulerConfig())

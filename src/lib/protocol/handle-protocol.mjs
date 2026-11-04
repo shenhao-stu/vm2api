@@ -208,6 +208,9 @@ export function createHandleProtocol(deps) {
   const getFailoverRunner = () =>
     typeof deps.getFailoverRunner === 'function' ? deps.getFailoverRunner() : deps.failoverRunner
   const thinkingOwnerStore = deps.thinkingOwners || defaultThinkingOwners
+  function configureRouting(routing = getRouting()) {
+    if (routing?.compatibility?.preserve_pruned_tool_results !== true) toolPruneCache.clear()
+  }
   function responseClosed(res) {
     return !!(res?.destroyed || res?.writableEnded || res?.closed)
   }
@@ -716,6 +719,7 @@ export function createHandleProtocol(deps) {
   }
 
   async function handleProtocol(req, res, protocol, pathName) {
+    configureRouting()
     const logCtx = requestLog.start(req, { protocol, pathName })
     res._kinRequestId = logCtx.request_id
     // Registers its own 'finish' listener first so status/headers are final when finish() runs.
@@ -1228,7 +1232,11 @@ export function createHandleProtocol(deps) {
         ctx.body = toolPrune.attempt.body
         logBag.hop_meta = {
           ...logBag.hop_meta,
-          tool_result_prune: { restored: toolPrune.attempt.restored, reason: toolPrune.attempt.reason },
+          tool_result_prune: {
+            restored: toolPrune.attempt.restored,
+            restoredBytes: toolPrune.attempt.restoredBytes || 0,
+            reason: toolPrune.attempt.reason,
+          },
         }
       }
     }
@@ -2108,14 +2116,9 @@ export function createHandleProtocol(deps) {
         logBag.error_message = result?.body?.error?.message || 'Stream did not reach a verified terminal state'
         const closing = isRecoverableTruncation(result) && !res.writableEnded ? streamTracker?.closingEvents() : null
         if (closing) res.write(closing)
-        else if (
-          protocol === 'anthropic.messages' &&
-          !res.writableEnded &&
-          !streamTracker?.hasStarted() &&
-          !streamTracker?.isFinished()
-        ) {
-          // Headers already went out (queue ping or an in-attempt ping), so the
-          // status can no longer be 429/529/503. Close with the Anthropic event.
+        else if (protocol === 'anthropic.messages' && !res.writableEnded && !streamTracker?.isFinished()) {
+          // An open thinking block or a timeout cannot use a synthetic message
+          // ending. Preserve the failure instead of closing with a silent EOF.
           const mapped = mapProtocolClientError(result, logBag, logBag.error_code)
           res.write(buildAnthropicSseError(mapped.body?.error || {}))
         }
@@ -2447,6 +2450,8 @@ export function createHandleProtocol(deps) {
   }
 
   return {
+    configureRouting,
+    dispose: () => toolPruneCache.dispose(),
     handleProtocol,
     handleSearch,
     handleImages,

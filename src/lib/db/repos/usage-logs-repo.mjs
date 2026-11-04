@@ -87,6 +87,9 @@ const SUMMARY_COLUMNS = [
   'ip_address',
   'api_key_presented',
   'has_tools',
+  'tool_prune_reason',
+  'tool_prune_restored',
+  'tool_prune_restored_bytes',
   'via',
   'cache_read_tokens',
   'cache_creation_tokens',
@@ -1422,6 +1425,21 @@ export class UsageLogsRepo {
     const lastMinute = minuteRows.length ? minuteRows[minuteRows.length - 1] : null
 
     const ttftWhere = where ? `${where} AND first_token_ms IS NOT NULL` : 'WHERE first_token_ms IS NOT NULL'
+    const pruneWhere = where ? `${where} AND tool_prune_reason IS NOT NULL` : 'WHERE tool_prune_reason IS NOT NULL'
+    const toolPrune = this.db
+      .prepare(`
+      SELECT tool_prune_reason AS reason, COUNT(*) AS requests,
+             COALESCE(SUM(tool_prune_restored), 0) AS restored_results,
+             COALESCE(SUM(tool_prune_restored_bytes), 0) AS restored_bytes,
+             SUM(CASE WHEN ${SLA_ERROR_PRED} THEN 1 ELSE 0 END) AS errors,
+             COALESCE(SUM(${PROMPT_TOKENS_SQL}), 0) AS prompt_tokens,
+             COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+             COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+             CAST(AVG(first_token_ms) AS INTEGER) AS avg_first_token_ms,
+             CAST(AVG(duration_ms) AS INTEGER) AS avg_duration_ms
+      FROM usage_logs ${pruneWhere} GROUP BY tool_prune_reason ORDER BY tool_prune_reason
+    `)
+      .all(...allParams)
     const durWhere = where ? `${where} AND duration_ms IS NOT NULL` : 'WHERE duration_ms IS NOT NULL'
     const ttfts = this.db
       .prepare(`SELECT first_token_ms AS v FROM usage_logs ${ttftWhere}`)
@@ -1467,6 +1485,7 @@ export class UsageLogsRepo {
       prompt_tokens: cache.prompt_tokens,
       cache_hit_rate: cache.cache_hit_rate,
       sticky: this._stickyWindow({ since, until, owner_user_id }),
+      tool_result_prune: toolPrune,
       total_cost: Number(counts?.total_cost || 0),
       qps: {
         current: lastMinute ? Number(lastMinute.requests || 0) / 60 : 0,

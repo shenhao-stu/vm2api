@@ -148,6 +148,7 @@ function restore(previous, body) {
   }
   let messages = null
   let restored = 0
+  let restoredBytes = 0
   for (const saved of previous.records) {
     const message = (messages || body.messages)[saved.message]
     const block = message?.content?.[saved.part]
@@ -160,12 +161,13 @@ function restore(previous, body) {
     content[saved.part] = { ...block, content: original }
     messages[saved.message] = { ...message, content }
     restored++
+    restoredBytes += saved.raw.length - Buffer.byteLength(JSON.stringify(block.content))
   }
   if (!restored) return { body, restored: 0, reason: 'unchanged' }
   const candidate = { ...body, messages }
   // A marker in genuinely edited history is not permission to resurrect old text.
   return samePrefix(previous, candidate)
-    ? { body: candidate, restored, reason: 'restored' }
+    ? { body: candidate, restored, restoredBytes, reason: 'restored' }
     : { body, restored: 0, reason: 'history_changed' }
 }
 
@@ -225,6 +227,8 @@ export class ToolResultPruneCache {
     maxPending = 20,
     headroomTokens = 16384,
     clock = Date.now,
+    setTimer = setTimeout,
+    clearTimer = clearTimeout,
   } = {}) {
     Object.assign(this, {
       ttlMs,
@@ -235,11 +239,16 @@ export class ToolResultPruneCache {
       maxPending,
       headroomTokens,
       clock,
+      setTimer,
+      clearTimer,
     })
     this.entries = new Map()
     this.locks = new Set()
     this.bytes = 0
     this.pendingBytes = 0
+    this.pending = new Set()
+    this.expiryTimer = null
+    this.disposed = false
   }
 
   stats() {
@@ -254,10 +263,40 @@ export class ToolResultPruneCache {
   }
 
   sweep(now) {
-    for (const [key, entry] of this.entries) if (!this.locks.has(key) && now - entry.at >= this.ttlMs) this.remove(key)
+    for (const [key, entry] of this.entries) if (now - entry.at >= this.ttlMs) this.remove(key)
+  }
+
+  scheduleExpiry() {
+    if (this.expiryTimer !== null) this.clearTimer(this.expiryTimer)
+    this.expiryTimer = null
+    if (this.disposed || !this.entries.size) return
+    const deadline = Math.min(...[...this.entries.values()].map((entry) => entry.at + this.ttlMs))
+    this.expiryTimer = this.setTimer(
+      () => {
+        this.expiryTimer = null
+        this.sweep(this.clock())
+        this.scheduleExpiry()
+      },
+      Math.max(1, deadline - this.clock()),
+    )
+    this.expiryTimer?.unref?.()
+  }
+
+  clear() {
+    if (this.expiryTimer !== null) this.clearTimer(this.expiryTimer)
+    this.expiryTimer = null
+    for (const cancel of this.pending) cancel()
+    this.entries.clear()
+    this.bytes = 0
+  }
+
+  dispose() {
+    this.disposed = true
+    this.clear()
   }
 
   prepare({ scope, body, contextWindow, maxBodyBytes = 128 * 1024 * 1024 } = {}) {
+    if (this.disposed) return noop(body, 'disposed')
     if (
       typeof scope !== 'string' ||
       !scope.trim() ||
@@ -282,7 +321,7 @@ export class ToolResultPruneCache {
       else if (Buffer.byteLength(JSON.stringify(prepared.body)) > maxBodyBytes)
         prepared = { body, restored: 0, reason: 'body_budget' }
     }
-    const candidate = snapshot(prepared.body, this.maxTextBytes, this.maxEntryBytes)
+    let candidate = snapshot(prepared.body, this.maxTextBytes, this.maxEntryBytes)
     if (!candidate || candidate.bytes > this.maxEntryBytes) return noop(body, 'entry_budget')
     // Reservations count both the old baseline and the pending immutable snapshot.
     while (
@@ -300,16 +339,24 @@ export class ToolResultPruneCache {
     this.pendingBytes += candidate.bytes
     let settled = false
     const release = () => {
-      if (settled) return false
+      if (settled) return null
       settled = true
       this.locks.delete(key)
       this.pendingBytes -= candidate.bytes
-      return true
+      this.pending.delete(cancel)
+      const saved = candidate
+      candidate = null
+      return saved
     }
+    const cancel = () => {
+      release()
+    }
+    this.pending.add(cancel)
     return {
       ...prepared,
       commit: ({ verified, inputTokens, outputTokens = 0, attemptCount = 1 } = {}) => {
-        if (!release()) return
+        const saved = release()
+        if (!saved) return
         if (
           !verified ||
           attemptCount !== 1 ||
@@ -321,9 +368,11 @@ export class ToolResultPruneCache {
           return
         this.remove(key)
         // Empty snapshots invalidate older originals after genuine editing/compaction.
-        if (!candidate.records.length) return
-        this.entries.set(key, { ...candidate, at: this.clock(), inputTokens, outputTokens })
-        this.bytes += candidate.bytes
+        if (saved.records.length) {
+          this.entries.set(key, { ...saved, at: this.clock(), inputTokens, outputTokens })
+          this.bytes += saved.bytes
+        }
+        this.scheduleExpiry()
       },
       rollback: () => {
         release()

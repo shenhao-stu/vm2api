@@ -218,6 +218,13 @@ export function toUsageLogRow(row, names, chain = []) {
     via: row.via ?? null,
     stream: row.stream == null ? null : !!row.stream,
     hasTools: row.has_tools == null ? null : !!row.has_tools,
+    toolResultPrune: row.tool_prune_reason
+      ? {
+          reason: row.tool_prune_reason,
+          restored: num(row.tool_prune_restored),
+          restoredBytes: num(row.tool_prune_restored_bytes),
+        }
+      : null,
     serviceTier: row.service_tier ?? null,
     /** `response.service_tier` the upstream echoed; billing uses serviceTier (the sent tier). */
     upstreamServiceTier: row.upstream_service_tier ?? null,

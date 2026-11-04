@@ -1300,3 +1300,36 @@ test('repriceRange re-prices image usage from the stored JSON and keeps actual_c
   assert.ok(Math.abs(rows.log_img_only.total_cost - 0.0321) < 1e-9)
   assert.equal(rows.log_img_only.actual_cost, 5)
 })
+
+test('normal tool-prune metrics persist only whitelisted categories and counts', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  const secret = 'SYNTHETIC-PRIVATE-TOOL-TEXT'
+  store.finish(ctx, {
+    status: 200,
+    inbound_body: { messages: [{ role: 'user', content: secret }] },
+    hop_meta: {
+      tool_result_prune: { reason: 'restored', restored: 2, restoredBytes: 1234, raw: secret, session: secret },
+    },
+    usage: { input_tokens: 10, cache_read_input_tokens: 1000 },
+  })
+  const row = store.listNormal({ limit: 1 })[0]
+  assert.equal(row.tool_prune_reason, 'restored')
+  assert.equal(row.tool_prune_restored, 2)
+  assert.equal(row.tool_prune_restored_bytes, 1234)
+  assert.ok(!JSON.stringify(row).includes(secret))
+  assert.equal(store.listDebug({ limit: 5 }).length, 0)
+  const stats = store.windowStats().tool_result_prune
+  assert.equal(stats[0].restored_results, 2)
+  assert.equal(stats[0].cache_read_tokens, 1000)
+  const bad = store.start({ method: 'POST', headers: {}, socket: {} }, { pathName: '/v1/messages' })
+  const summary = store.finish(bad, {
+    status: 200,
+    hop_meta: { tool_result_prune: { reason: secret, restored: 1, restoredBytes: 42 } },
+  })
+  assert.equal(summary.tool_prune_reason, null)
+  assert.equal(summary.tool_prune_restored, null)
+})

@@ -143,7 +143,12 @@ async function fixture(t, { enabled = true, failSeed = false, finishDuringRespon
       },
     },
   })
+  t.after(() => handler.dispose())
   return {
+    configure(enabled) {
+      routing.compatibility.preserve_pruned_tool_results = enabled
+      handler.configureRouting(routing)
+    },
     posted,
     logged,
     async request(
@@ -190,7 +195,11 @@ for (const protocol of ['anthropic.messages', 'openai.chat']) {
     assert.equal(resultText(f.posted[0]), ORIGINAL)
     assert.equal(resultText(f.posted[1]), ORIGINAL)
     assert.deepEqual(request, before)
-    assert.deepEqual(f.logged[1].hop_meta.tool_result_prune, { restored: 1, reason: 'restored' })
+    assert.deepEqual(f.logged[1].hop_meta.tool_result_prune, {
+      restored: 1,
+      restoredBytes: Buffer.byteLength(JSON.stringify(ORIGINAL)) - Buffer.byteLength(JSON.stringify(PRUNED)),
+      reason: 'restored',
+    })
   })
 }
 
@@ -225,7 +234,11 @@ for (const earlyEvent of ['close', 'aborted']) {
     await f.request(payload('anthropic.messages', PRUNED, true), 'anthropic.messages', 'test-key', session)
     assert.equal(f.logged.length, 2)
     assert.equal(f.logged[0].hop_meta.tool_result_prune.reason, 'cold')
-    assert.deepEqual(f.logged[1].hop_meta.tool_result_prune, { restored: 1, reason: 'restored' })
+    assert.deepEqual(f.logged[1].hop_meta.tool_result_prune, {
+      restored: 1,
+      restoredBytes: Buffer.byteLength(JSON.stringify(ORIGINAL)) - Buffer.byteLength(JSON.stringify(PRUNED)),
+      reason: 'restored',
+    })
     assert.equal(resultText(f.posted.at(-1)), ORIGINAL)
   })
 }
@@ -241,3 +254,13 @@ for (const failSeed of [false, true]) {
     assert.equal(f.logged[1].final_state, 'verified')
   })
 }
+
+test('turning protection off clears history even if re-enabled before another request', async (t) => {
+  const f = await fixture(t)
+  await f.request(payload('anthropic.messages', ORIGINAL), 'anthropic.messages')
+  f.configure(false)
+  f.configure(true)
+  await f.request(payload('anthropic.messages', PRUNED, true), 'anthropic.messages')
+  assert.equal(resultText(f.posted[1]), PRUNED)
+  assert.equal(f.logged[1].hop_meta.tool_result_prune.reason, 'cold')
+})

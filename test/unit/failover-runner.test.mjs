@@ -1,3 +1,5 @@
+import { UnitCircuit } from '../../src/lib/pool/unit-circuit.mjs'
+import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
@@ -2271,3 +2273,58 @@ for (const content of [[], [{ type: 'thinking', thinking: 'partial generation', 
     assert.deepEqual(result.usage, { input_tokens: 9, output_tokens: 7 })
   })
 }
+
+test('repeated non-replayable slot failures open the circuit and a single healthy probe restores it', () => {
+  let now = 1000
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  scheduler.unitCircuit = new UnitCircuit({ failureThreshold: 3, openMs: 300000, now: () => now })
+  const runner = new FailoverRunner({ scheduler })
+  const failed = {
+    ok: false,
+    status: 502,
+    terminalState: 'incomplete',
+    body: { error: { code: 'upstream_network_error', message: 'Connection error.' } },
+  }
+  const policy = classifyUpstreamResult(failed)
+  assert.equal(policy.replayAllowed, false)
+  for (let i = 0; i < 3; i++) runner.noteUnitHealth(candidate(1), policy, failed)
+  assert.equal(scheduler.unitCircuit.inspect('account-1').reason, 'circuit_open')
+  assert.equal(scheduler.unitCircuit.inspect('account-2').ok, true)
+  now += 300001
+  assert.equal(scheduler.unitCircuit.admit('account-1').probe, true)
+  assert.equal(scheduler.unitCircuit.admit('account-1').reason, 'circuit_probe')
+  runner.noteUnitHealth(candidate(1), classifyUpstreamResult(success()), success())
+  assert.equal(scheduler.unitCircuit.inspect('account-1').state, 'closed')
+})
+
+test('successive failed requests quarantine the slot before the next allocation without replay', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  scheduler.unitCircuit = new UnitCircuit({ failureThreshold: 3, openMs: 300000 })
+  scheduler.selectAndReserve = function (options) {
+    const excluded = new Set(options.excluded)
+    for (const item of this.candidates) if (!this.unitCircuit.inspect(item.accountId).ok) excluded.add(item.accountId)
+    return Scheduler.prototype.selectAndReserve.call(this, { ...options, excluded })
+  }
+  const runner = new FailoverRunner({ scheduler })
+  const dispatched = []
+  for (let i = 0; i < 4; i++) {
+    const result = await runner.run({
+      requestId: `circuit-request-${i}`,
+      model: 'claude-haiku-4-5-20251001',
+      canonicalBody: { model: 'claude-haiku-4-5-20251001' },
+      callAttempt: async ({ candidate: selected }) => {
+        dispatched.push(selected.accountId)
+        return selected.accountId === 'account-1'
+          ? {
+              ok: false,
+              status: 502,
+              terminalState: 'incomplete',
+              body: { error: { code: 'upstream_network_error', message: 'Connection error.' } },
+            }
+          : success()
+      },
+    })
+    assert.equal(result.attemptCount, 1)
+  }
+  assert.deepEqual(dispatched, ['account-1', 'account-1', 'account-1', 'account-2'])
+})

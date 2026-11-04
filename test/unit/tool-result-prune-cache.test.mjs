@@ -629,6 +629,65 @@ test('stats expose counts without raw text, credentials, or session headers', ()
     assert.ok(!JSON.stringify(stats).includes(secret))
 })
 
+test('expiry removes idle originals without another request and unrefs its timer', () => {
+  let now = 1000
+  let alarm = null
+  let unrefs = 0
+  const cache = createCache({
+    ttlMs: 100,
+    clock: () => now,
+    setTimer(fn, delay) {
+      alarm = {
+        fn,
+        delay,
+        unref() {
+          unrefs++
+        },
+      }
+      return alarm
+    },
+    clearTimer() {
+      alarm = null
+    },
+  })
+  seed(cache, body())
+  assert.equal(alarm.delay, 100)
+  assert.equal(unrefs, 1)
+  now = 1100
+  alarm.fn()
+  assert.deepEqual(cache.stats(), { entries: 0, bytes: 0, pending: 0 })
+  cache.dispose()
+})
+
+test('clear invalidates pending snapshots without disturbing a new same-session transaction', () => {
+  const cache = createCache(),
+    original = body()
+  seed(cache, original)
+  const stale = prepare(cache, pruned(original))
+  cache.clear()
+  assert.deepEqual(cache.stats(), { entries: 0, bytes: 0, pending: 0 })
+  const fresh = prepare(cache, original)
+  stale.commit({ ...VERIFIED })
+  stale.rollback()
+  assert.equal(cache.stats().entries, 0)
+  assert.equal(cache.stats().pending, 1)
+  fresh.commit({ ...VERIFIED })
+  assertRestored(cache, original)
+  cache.dispose()
+})
+
+test('dispose clears pending and committed originals and cannot be repopulated', () => {
+  const cache = createCache(),
+    original = body()
+  seed(cache, original)
+  const pending = prepare(cache, original)
+  cache.dispose()
+  pending.commit({ ...VERIFIED })
+  prepare(cache, original).commit({ ...VERIFIED })
+  assert.deepEqual(cache.stats(), { entries: 0, bytes: 0, pending: 0 })
+  cache.dispose()
+})
+
 test('unknown successful usage or context window disables restoration', () => {
   const original = body()
   for (const usage of [

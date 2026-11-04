@@ -618,3 +618,28 @@ test('persistRoutingPatch replaces codex.model_mappings with the full table the 
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('routing change observers see the persisted off switch before the update returns', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-lifecycle-'))
+  const file = path.join(root, 'routing.json'),
+    seen = []
+  try {
+    const runtime = createRoutingRuntime({
+      cfg: { paths: { project: root } },
+      routingConfigPath: file,
+      routingConfig: { compatibility: { preserve_pruned_tool_results: true }, concurrency: {}, tiers: {} },
+      stickyRouter: { reloadConfig() {} },
+      accountQuota: { reloadConfig() {}, repo: { get: () => null } },
+      onRoutingChanged(routing) {
+        seen.push([
+          routing.compatibility.preserve_pruned_tool_results,
+          JSON.parse(fs.readFileSync(file, 'utf8')).compatibility.preserve_pruned_tool_results,
+        ])
+      },
+    })
+    await runtime.persistRoutingPatch({ compatibility: { preserve_pruned_tool_results: false } })
+    assert.deepEqual(seen, [[false, false]])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})

@@ -985,3 +985,36 @@ test('a late request or quota error with measured generation usage cannot author
     assert.equal(policy.decision.action, 'return')
   }
 })
+
+test('slot health failures count toward isolation even after output was committed', () => {
+  for (const code of [
+    'upstream_network_error',
+    'upstream_stream_interrupted',
+    'kernel_unavailable',
+    'kernel_error',
+    'cli_error',
+  ]) {
+    for (const committed of [false, true]) {
+      const p = classifyUpstreamResult({
+        ok: false,
+        status: 503,
+        committed,
+        body: { error: { code, message: 'runtime failure' } },
+        terminalState: 'incomplete',
+      })
+      assert.equal(p.circuit, true, `${code}/${committed}`)
+      if (committed) assert.equal(p.action, 'stop')
+    }
+  }
+})
+
+test('caller errors, cancellation, slot capacity and quota do not count as unhealthy slots', () => {
+  for (const result of [
+    { status: 400, body: { error: { message: 'invalid schema' } } },
+    { status: 429, body: { error: { message: 'rate limited' } } },
+    { status: 529, body: { error: { message: 'overloaded' } } },
+    { status: 503, body: { error: { code: 'slot_busy', message: 'slot_busy' } } },
+    { status: 499, body: { error: { code: 'client_cancelled', message: 'client cancelled' } } },
+  ])
+    assert.notEqual(classifyUpstreamResult(result).circuit, true)
+})

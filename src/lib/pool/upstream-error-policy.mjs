@@ -690,8 +690,45 @@ export function mayReplayUpstreamResult(result = {}, policy = {}) {
   return status >= 400 && status < 500 && status !== 408 && status !== 425 && result.terminalState !== 'incomplete'
 }
 
+const UNIT_FAILURE_REASONS = new Set([
+  'incomplete_assistant',
+  'empty_response',
+  'upstream_network_error',
+  'stream_interrupted',
+  'kernel_unavailable',
+  'kernel_error',
+  'cli_error',
+  'wrap_connection_error',
+  'worker_timeout',
+  'worker_transport_failure',
+  'provider_timeout',
+])
+
+const UNIT_FAILURE_CODES = new Set([
+  'upstream_transport_error',
+  'upstream_stream_incomplete',
+  'worker_timeout',
+  ErrorCode.UPSTREAM_TIMEOUT,
+  ErrorCode.UPSTREAM_NETWORK,
+  ErrorCode.UPSTREAM_STREAM_INTERRUPTED,
+  ErrorCode.UPSTREAM_EMPTY_STREAM,
+  ErrorCode.KERNEL_UNAVAILABLE,
+  ErrorCode.KERNEL_ERROR,
+  ErrorCode.CLI_ERROR,
+])
+
 export function classifyUpstreamResult(result, opts) {
   const policy = classifyUpstreamResultRaw(result, opts)
+  // Quarantine an unhealthy slot independently of whether this request may replay.
+  // Client, capacity, quota and credential failures keep their dedicated gates.
+  if (
+    UNIT_FAILURE_REASONS.has(policy.reason) ||
+    (policy.reason === 'downstream_committed_or_incomplete' &&
+      (UNIT_FAILURE_CODES.has(resultErrorCode(result)) ||
+        result.transportError === true ||
+        isTimeoutFailure(resultErrorCode(result), bodyMessage(result.body))))
+  )
+    policy.circuit = true
   const retry = policy.action === 'repair-and-retry' || shouldContinue(policy)
   return attachFailureDecision(
     retry && !mayReplayUpstreamResult(result, policy)

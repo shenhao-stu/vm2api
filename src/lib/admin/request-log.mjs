@@ -25,6 +25,7 @@ import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mj
 import { costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
 import { disjointOpenaiUsage } from '../protocol/openai-usage.mjs'
 import { REASONING_EFFORTS, sessionIdForLog } from '../protocol/log-fields.mjs'
+import { toolPruneMetrics } from '../protocol/tool-result-prune-metrics.mjs'
 
 /** Correlate failed authentication without persisting the supplied credential. */
 export function presentedApiKeyForLog(token) {
@@ -564,6 +565,7 @@ export class RequestLogStore {
       ip: ctx.ip,
       api_key_presented: extra.api_key_presented ? presentedApiKeyForLog(extra.api_key_presented) : null,
       has_tools: extra.has_tools ?? null,
+      ...toolPruneMetrics(extra.hop_meta?.tool_result_prune),
       via: extra.via || extra.hop_meta?.via || null,
       cache_read_tokens: extra.cache_read_tokens ?? usage.cache_read_tokens ?? usage.cache_read_input_tokens ?? null,
       cache_creation_tokens:

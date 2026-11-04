@@ -481,3 +481,47 @@ test('unpricedModels lists unpriced rows', () => {
     db.close()
   }
 })
+
+test('tool-prune effectiveness aggregates obey owner and time filters', () => {
+  const { repo, db, dir } = freshDb()
+  try {
+    seed(repo, [
+      {
+        created_at: '2026-01-02T00:00:00Z',
+        api_key_id: 'k1',
+        user_id: 'u1',
+        tool_prune_reason: 'restored',
+        tool_prune_restored: 2,
+        tool_prune_restored_bytes: 120,
+      },
+      {
+        created_at: '2026-01-02T00:00:00Z',
+        api_key_id: 'k2',
+        user_id: 'u2',
+        tool_prune_reason: 'restored',
+        tool_prune_restored: 99,
+        tool_prune_restored_bytes: 9999,
+      },
+      {
+        created_at: '2026-01-01T00:00:00Z',
+        api_key_id: 'k1',
+        user_id: 'u1',
+        tool_prune_reason: 'cold',
+        tool_prune_restored: 0,
+        tool_prune_restored_bytes: 0,
+      },
+    ])
+    const stats = repo.windowStats({
+      since: '2026-01-02T00:00:00Z',
+      until: '2026-01-03T00:00:00Z',
+      owner_user_id: 'u1',
+    }).tool_result_prune
+    assert.equal(stats.length, 1)
+    assert.equal(stats[0].requests, 1)
+    assert.equal(stats[0].restored_results, 2)
+    assert.equal(stats[0].restored_bytes, 120)
+  } finally {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})

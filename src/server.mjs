@@ -208,8 +208,10 @@ let attemptsRepo
 let poolScheduler
 let failoverRunner
 let groupsRepo
+let protocolRuntime
 
 const routingRt = createRoutingRuntime({
+  onRoutingChanged: (routing) => protocolRuntime?.configureRouting(routing),
   get routingConfig() {
     return routingConfig
   },
@@ -621,6 +623,7 @@ backupService.onRestored((db) => {
   apiScheduler.reload(apiEndpointStore.listRaw())
 
   routingConfig = loadRoutingConfig()
+  protocolRuntime?.configureRouting(routingConfig)
   migrateLegacyOpenAIPolicies(routingConfig)
   if (routingConfig.official_cc) {
     routingConfig.official_cc = normalizeOfficialCcConfig(routingConfig.official_cc)
@@ -879,7 +882,7 @@ const importCommit = createImportCommit({
 
 const { commitImportedOauth, requireSlotProxy, officialCcStatsHandler } = importCommit
 
-const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
+protocolRuntime = createHandleProtocol({
   json,
   writeSSEHeaders,
   readBody,
@@ -913,6 +916,8 @@ const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
     return groupsRepo
   },
 })
+
+const { handleProtocol, handleSearch, handleImages } = protocolRuntime
 
 const responsesWs = createResponsesWsHandler({
   handleProtocol,
@@ -1321,6 +1326,7 @@ let _shuttingDown = false
 async function shutdown(signal) {
   if (_shuttingDown) return
   _shuttingDown = true
+  protocolRuntime.dispose()
   installJevUsageRecorder(null)
   console.log(`[shutdown] ${signal} — closing`)
   try {
