@@ -8,8 +8,9 @@ import time
 import urllib.error
 import urllib.request
 
-from management import read_tail
+from management import guard_status, read_tail
 from native_health import NativeHealth
+from official_windows import normalize_windows
 
 
 def run(args, timeout=15):
@@ -26,13 +27,26 @@ def health(config):
         return {"ok": False}
 
 
+def account_windows(config):
+    source = config.get("account_windows")
+    if not source:
+        return None
+    try:
+        with Path(source["path"]).open() as stream:
+            data = json.loads(stream.read(2048))
+        return normalize_windows(config, data, time.time() * 1000)
+    except (OSError, KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
 def status(config):
     native = NativeHealth(config["home"], config["binding"])
     inspection = json.loads(run(["docker", "inspect", config["container"]]))[0]
     active = subprocess.run(["systemctl", "is-active", "--quiet", config["unit"]]).returncode == 0
     h = health(config) if active else {"ok": False, "active_requests": 0}
     state = native.state()
-    return {"ok": True, "container_running": inspection["State"]["Running"],
+    return {"ok": True, "exit_guard": guard_status(config) if config.get("guard_file") else None,
+            "official_windows": account_windows(config), "container_running": inspection["State"]["Running"],
             "container_started_at": inspection["State"]["StartedAt"],
             "memory_limit_bytes": inspection["HostConfig"]["Memory"],
             "daemon_pid": state.get("daemon", {}).get("pid"),

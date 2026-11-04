@@ -3,8 +3,11 @@
 Commands and paths come only from an administrator-owned local configuration.
 No HTTP input becomes a host, command, path, account ID or authorization change.
 """
-from datetime import datetime, timezone
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 import json
+import math
+import sqlite3
 from pathlib import Path
 import subprocess
 import threading
@@ -48,18 +51,78 @@ def read_tail(path, limit=50):
         return []
 
 
-def guard_status(config):
+def guard_status(config, snapshot=None):
     try:
-        g = json.loads(Path(config["guard_file"]).read_text())
+        g = snapshot if snapshot is not None else json.loads(Path(config["guard_file"]).read_text())
         age = time.time() - datetime.fromisoformat(g["checked_at"].replace("Z", "+00:00")).timestamp()
         ready = (g.get("ready") is True and g.get("latched") is False
                  and g.get("expected_ip") == g.get("observed_ip") == config["expected_ip"]
                  and g.get("revision") == config["guard_revision"] and 0 <= age < 180)
         return {"ready": ready, "latched": g.get("latched") is not False,
                 "expected_ip": config["expected_ip"], "observed_ip": g.get("observed_ip"),
-                "checked_at": g.get("checked_at")}
+                "checked_at": g.get("checked_at"), "revision": g.get("revision")}
     except (OSError, ValueError, KeyError, TypeError):
         return {"ready": False, "latched": True, "expected_ip": config["expected_ip"]}
+
+
+def relay_usage(config, now=None):
+    ledger = config.get("usage_ledger")
+    if not ledger:
+        return None
+    now = now or datetime.now(timezone.utc)
+    def stamp(value):
+        return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    try:
+        uri = Path(ledger["path"]).as_uri() + "?mode=ro"
+        account_id = ledger["account_id"]
+        if not isinstance(account_id, str) or not account_id:
+            return None
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.25)) as db:
+            # Final backend owns the logged cost. Older single-attempt rows
+            # may only identify it in account_id.
+            row = db.execute("""
+                SELECT sum(total_cost),
+                       sum(CASE WHEN created_at >= :since THEN total_cost ELSE 0 END),
+                       sum(CASE WHEN created_at >= :week THEN total_cost ELSE 0 END),
+                       count(*), count(total_cost), min(created_at)
+                FROM usage_logs
+                WHERE created_at <= :now AND (
+                    final_account_id = :account OR
+                    (final_account_id IS NULL AND account_id = :account AND attempt_count = 1)
+                )
+            """, {"account": account_id, "since": stamp(now - timedelta(hours=5)),
+                  "week": stamp(now - timedelta(days=7)), "now": stamp(now)}).fetchone()
+    except (KeyError, ValueError, TypeError, OSError, sqlite3.Error):
+        return None
+    total, recent, week, count, priced, first = row
+    return {"total_usd": total or 0, "last_5h_usd": recent or 0, "last_7d_usd": week or 0,
+            "unpriced_requests": count - priced, "first_at": first}
+
+
+def official_quota(config, now=None):
+    """A billing reader publishes a scoped snapshot, without web credentials."""
+    source = config.get("official_quota")
+    if not source:
+        return None
+    try:
+        with Path(source["path"]).open() as stream:
+            data = json.loads(stream.read(2048))
+        if (data["binding"], data["org_id"], data["account_id"]) != (
+                config["binding"], source["org_id"], source["account_id"]):
+            return None
+        used, limit = data["used_usd"], data["quota_usd"]
+        if any(type(n) not in (float, int) or not math.isfinite(n) for n in (used, limit)):
+            return None
+        observed, reset = data["observed_at_ms"], data["resets_at_ms"]
+        now_ms = int((now if now is not None else time.time()) * 1000)
+        if (type(observed) is not int or not 0 < observed <= now_ms or used < 0 or limit <= 0
+                or reset is not None and (type(reset) is not int or not 0 < reset < 8640000000000000)):
+            return None
+        stale = now_ms - observed > 600000 or (reset is not None and reset <= now_ms)
+        return {"used_usd": used, "quota_usd": limit, "resets_at_ms": reset,
+                "observed_at_ms": observed, "stale": stale}
+    except (KeyError, TypeError, ValueError, OSError, OverflowError):
+        return None
 
 
 class Manager:
@@ -102,11 +165,14 @@ class Manager:
                 with evidence.open("x") as file:
                     json.dump(data, file)
                 self.record("authorization_latched", **data)
+        guard = (guard_status(self.config, r.get("exit_guard") or {})
+                 if self.config.get("guard_source") == "runtime" else guard_status(self.config))
         result = {"id": self.config["id"], "name": self.config["name"],
                   "node": self.config["node"], "kind": "reclaude_native",
                   "binding": self.config["binding"], "sub_account": self.config["sub_account"],
                   "concurrency": self.config["concurrency"], "models": self.config["models"],
-                  "observed_at": time.time(), "runtime": r, "guard": guard_status(self.config),
+                  "observed_at": time.time(), "runtime": r, "guard": guard,
+                  "usage": relay_usage(self.config), "official_quota": official_quota(self.config),
                   "sub": sub, "authorization_latched": (self.root / "authorization-latch.json").exists()}
         self.cached = result
         return result
@@ -120,8 +186,16 @@ class Manager:
         runtime = self.runtime("logs")
         return {"runtime": runtime.get("items", []), "management": read_tail(self.root / "audit.jsonl")}
 
+    def require_schedule_ready(self, state):
+        r = state["runtime"]
+        if (state["authorization_latched"] or r.get("revoked") or r.get("auth_latched")
+                or not state["guard"]["ready"] or state["sub"].get("shared_policy_matches") is False
+                or r.get("failed_checks") or r.get("management_paused")
+                or not all(r.get(k) for k in ("container_running", "http_active", "http_ready"))):
+            raise ManagementError("schedule_requires_healthy_running_relay")
+
     def action(self, action, operation_id):
-        if action not in ("start", "stop"):
+        if action not in ("start", "stop", "pause_schedule", "resume_schedule"):
             raise ManagementError("unknown_action", 404)
         try:
             if str(uuid.UUID(operation_id)) != operation_id:
@@ -138,14 +212,25 @@ class Manager:
             except FileExistsError:
                 raise ManagementError("operation_already_consumed") from None
             self.record("operation_started", action=action, operation_id=operation_id)
+            if action == "pause_schedule":
+                # The native scheduler is authoritative; never stop a paid turn.
+                if self.sub("pause").get("schedulable") is not False:
+                    raise ManagementError("sub_pause_unconfirmed", 503)
             state = self._refresh()
-            if action == "stop":
+            if action == "resume_schedule":
+                self.require_schedule_ready(state)
+                self.runtime("verify_exit")
+                self.require_schedule_ready(self._refresh())
+                self.sub("resume")
+            elif action == "stop":
                 paused = self.sub("pause")
                 if paused.get("schedulable") is not False:
                     raise ManagementError("sub_pause_unconfirmed", 503)
                 # Runtime refuses to stop until in-flight requests have drained.
                 self.runtime("stop")
-            else:
+            elif action == "start":
+                if state["sub"].get("shared_policy_matches") is False:
+                    raise ManagementError("shared_routing_profile_changed")
                 r = state["runtime"]
                 if (state["authorization_latched"] or r.get("revoked") or r.get("auth_latched")
                         or r.get("failed_checks") or not state["guard"]["ready"]
@@ -160,7 +245,9 @@ class Manager:
                 self.sub("resume")
             self.cached = None
             result = self._refresh()
-            if action == "start" and not result["sub"].get("schedulable"):
+            if action == "pause_schedule" and result["sub"].get("schedulable") is not False:
+                raise ManagementError("sub_pause_unconfirmed", 503)
+            if action in ("start", "resume_schedule") and not result["sub"].get("schedulable"):
                 raise ManagementError("sub_resume_unconfirmed", 503)
             self.record("operation_completed", action=action, operation_id=operation_id)
             return result

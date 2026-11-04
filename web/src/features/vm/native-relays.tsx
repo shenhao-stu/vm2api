@@ -2,6 +2,8 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { api, isApiError } from '@/lib/api'
+import { resetCountdown, fmtResetClock } from '@/lib/fable-status'
+import { useNow } from '@/hooks/use-now'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -9,14 +11,29 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Switch } from '@/components/ui/switch'
 import { ConfirmDialog } from '@/components/confirm-dialog'
-import { relayState, type NativeRelay } from './native-relay-state'
+import {
+  canResumeSchedule,
+  scheduleLabel,
+  scheduleResetAt,
+  relayState,
+  type NativeRelay,
+} from './native-relay-state'
+import { RelayUsageCard, RelayUsageDetail } from './relay-usage-card'
 
 const key = ['panel', 'native-relays'] as const
 const endpoint = '/api/panel/native-relays'
+const successMessage = {
+  start: 'Relay 已启动并恢复调度',
+  stop: 'Relay 已停止，调度已暂停',
+  pause_schedule: '共享池调度已暂停，在途请求继续完成',
+  resume_schedule: '共享池调度已开启，额度与安全限制仍然有效',
+}
 
 export function NativeRelays({ enabled }: { enabled: boolean }) {
   const qc = useQueryClient()
+  const now = useNow()
   const [action, setAction] = useState<{
     relay: NativeRelay
     verb: 'start' | 'stop'
@@ -35,6 +52,7 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
     enabled,
     retry: false,
     refetchInterval: 30000,
+    refetchIntervalInBackground: true,
   })
   const logs = useQuery({
     queryKey: [...key, logTarget?.id, 'logs'],
@@ -51,7 +69,7 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
       verb,
     }: {
       relay: NativeRelay
-      verb: 'start' | 'stop'
+      verb: keyof typeof successMessage
     }) =>
       api(`${endpoint}/${encodeURIComponent(relay.id)}/${verb}`, {
         method: 'POST',
@@ -59,9 +77,7 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
       }),
     retry: false,
     onSuccess: (_data, { verb }) => {
-      toast.success(
-        verb === 'start' ? 'Relay 已启动并恢复调度' : 'Relay 已停止，调度已暂停'
-      )
+      toast.success(successMessage[verb])
       setAction(null)
     },
     onError: (error: Error) =>
@@ -92,88 +108,129 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
           刷新状态
         </Button>
       </div>
-      {query.data.items.map((relay) => (
-        <article key={relay.id} className='space-y-3 rounded-lg border p-4'>
-          <div className='flex flex-wrap items-center justify-between gap-3'>
-            <div>
-              <h3 className='font-medium'>{relay.name}</h3>
-              <p className='text-sm text-muted-foreground'>
-                {relay.node} · 原生 ReClaude · {relayState(relay)}
+      <div className='grid gap-3 md:grid-cols-2 xl:grid-cols-3'>
+        {query.data.items.map((relay) => (
+          <article
+            key={relay.id}
+            className='relative flex min-w-0 flex-col gap-2.5 rounded-[10px] bg-muted/50 p-3 ps-3.5 text-card-foreground shadow-[inset_0_0_0_1px_var(--hairline)]'
+          >
+            <header className='space-y-1.5'>
+              <div className='flex items-center justify-between gap-2'>
+                <h3
+                  className='truncate text-[13px] font-semibold'
+                  title={relay.name}
+                >
+                  {relay.name}
+                </h3>
+                <span className='shrink-0 rounded bg-muted px-1.5 py-0.5 text-xs'>
+                  {relayState(relay, now)}
+                </span>
+              </div>
+              <p className='flex items-center gap-2 text-xs text-muted-foreground'>
+                <span>{relay.node} · 原生</span>
+                <span className='font-mono tabular-nums' title='锁定的出口 IP'>
+                  {relay.guard.expected_ip}
+                </span>
               </p>
+            </header>
+            <RelayUsageCard relay={relay} now={now} />
+            <div className='hairline-t mt-auto flex min-h-9 items-center justify-between gap-2 pt-2'>
+              <span className='text-xs text-muted-foreground'>
+                席位{' '}
+                <b className='font-mono text-foreground tabular-nums'>
+                  {relay.runtime.active_requests ?? '—'}/{relay.concurrency}
+                </b>
+              </span>
+              <div className='flex items-center gap-2'>
+                <label
+                  htmlFor={`schedule-${relay.id}`}
+                  className='text-xs text-muted-foreground'
+                  title='共享池新请求调度；不会中断在途请求或解除额度冷却'
+                >
+                  共享调度
+                </label>
+                <Switch
+                  id={`schedule-${relay.id}`}
+                  aria-label={`${relay.name} · 共享池调度`}
+                  checked={relay.sub.schedulable === true}
+                  disabled={
+                    change.isPending ||
+                    relay.management_unavailable ||
+                    relay.sub.schedulable == null ||
+                    (!relay.sub.schedulable && !canResumeSchedule(relay))
+                  }
+                  onCheckedChange={(checked) =>
+                    change.mutate({
+                      relay,
+                      verb: checked ? 'resume_schedule' : 'pause_schedule',
+                    })
+                  }
+                />
+              </div>
             </div>
-            <div className='flex gap-2'>
-              <Button
-                size='sm'
-                variant='outline'
-                onClick={() => setLogTarget(relay)}
-              >
-                查看日志
-              </Button>
-              <Button
-                size='sm'
-                variant='outline'
-                disabled={
-                  change.isPending ||
-                  relay.authorization_latched ||
-                  !relay.guard.ready ||
-                  relay.runtime.revoked ||
-                  relay.runtime.auth_latched ||
-                  !!relay.runtime.failed_checks.length
-                }
-                onClick={() => setAction({ relay, verb: 'start' })}
-              >
-                启动 Relay
-              </Button>
-              <Button
-                size='sm'
-                variant='outline'
-                disabled={
-                  change.isPending ||
-                  (!relay.runtime.http_active && !relay.sub.schedulable)
-                }
-                onClick={() => setAction({ relay, verb: 'stop' })}
-              >
-                停止 Relay
-              </Button>
-            </div>
-          </div>
-          <dl className='grid gap-2 text-sm sm:grid-cols-2 lg:grid-cols-4'>
-            <div>
-              <dt className='text-muted-foreground'>固定出口</dt>
-              <dd>
-                {relay.guard.expected_ip} ·{' '}
-                {relay.guard.ready ? '已核验' : '未就绪'}
-              </dd>
-            </div>
-            <div>
-              <dt className='text-muted-foreground'>并发 / 在途</dt>
-              <dd>
-                {relay.concurrency} / {relay.runtime.active_requests ?? '未知'}
-              </dd>
-            </div>
-            <div>
-              <dt className='text-muted-foreground'>共享池调度</dt>
-              <dd>
-                Sub{relay.sub_account} ·{' '}
-                {relay.sub.schedulable ? '开启' : '暂停'}
-              </dd>
-            </div>
-            <div>
-              <dt className='text-muted-foreground'>设备 / 容器</dt>
-              <dd>
-                {relay.binding} ·{' '}
-                {relay.runtime.container_running ? '运行' : '停止'}
-              </dd>
-            </div>
-          </dl>
-          <p className='text-sm break-words'>{relay.models.join(' · ')}</p>
-          <p className='text-xs text-muted-foreground'>
-            启停仅控制此 Relay
-            的接单与工作进程，保留原生授权进程；不重新绑定或解除出口锁存。最近读取：
-            {new Date(relay.observed_at * 1000).toLocaleString()}
-          </p>
-        </article>
-      ))}
+            <p
+              className='text-xs text-muted-foreground'
+              title={fmtResetClock(scheduleResetAt(relay, now)) ?? undefined}
+            >
+              {scheduleLabel(relay, now)}
+              {relay.sub.schedulable && scheduleResetAt(relay, now)
+                ? ` · ${resetCountdown(scheduleResetAt(relay, now), now)} 后到期`
+                : ' · 在途请求不受影响'}
+            </p>
+            <details className='hairline-t pt-2 text-xs'>
+              <summary className='cursor-pointer text-muted-foreground'>
+                详情与控制
+              </summary>
+              <div className='mt-2 space-y-2'>
+                <RelayUsageDetail relay={relay} />
+                <p className='text-xs text-muted-foreground'>
+                  {relay.node} · 设备 {relay.binding} · Sub{relay.sub_account} ·
+                  调度{scheduleLabel(relay, now)}
+                </p>
+                <p className='text-xs break-words text-muted-foreground'>
+                  {relay.models.join(' · ')}
+                </p>
+                <div className='flex gap-2'>
+                  <Button
+                    size='sm'
+                    variant='outline'
+                    onClick={() => setLogTarget(relay)}
+                  >
+                    查看日志
+                  </Button>
+                  <Button
+                    size='sm'
+                    variant='outline'
+                    disabled={
+                      change.isPending ||
+                      relay.sub.shared_policy_matches === false ||
+                      relay.authorization_latched ||
+                      !relay.guard.ready ||
+                      relay.runtime.revoked ||
+                      relay.runtime.auth_latched ||
+                      !!relay.runtime.failed_checks.length
+                    }
+                    onClick={() => setAction({ relay, verb: 'start' })}
+                  >
+                    启动 Relay
+                  </Button>
+                  <Button
+                    size='sm'
+                    variant='outline'
+                    disabled={
+                      change.isPending ||
+                      (!relay.runtime.http_active && !relay.sub.schedulable)
+                    }
+                    onClick={() => setAction({ relay, verb: 'stop' })}
+                  >
+                    停止 Relay
+                  </Button>
+                </div>
+              </div>
+            </details>
+          </article>
+        ))}
+      </div>
       <ConfirmDialog
         open={!!action}
         onOpenChange={(open) => {

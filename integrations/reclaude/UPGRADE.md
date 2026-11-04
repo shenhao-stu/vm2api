@@ -49,3 +49,20 @@ dispatch, rather than relying on the upstream API to reject an invalid mixture.
 Successful canary responses establish compatibility for the tested cases, not
 permanent authorization stability or transparent support for every Messages
 parameter. Keep the supported subset and runtime version explicit.
+
+## Independent SSH transport recovery
+
+Verify the private HTTP listener as well as the native worker. A worker can be
+healthy while its SSH forwarding unit has exhausted systemd's start limit after
+a network interruption. For a persistent SSH transport with `Restart=on-failure`,
+install `http-tunnel-reconnect.conf` in that unit's drop-in directory. The
+30-second retry interval avoids a tight loop; removing the start-count limit
+allows recovery after a longer network outage. Enable the transport for boot.
+Keep its original loopback bind, destination, strict host-key checking and
+exit guard. This setting must not be applied to the OAuth or model worker.
+
+Before recovering a failed transport, verify the original exit and identity.
+Afterwards check the health endpoint, listener, effective systemd properties and
+unchanged daemon/container start times. Never clear an auth or exit latch to
+repair a tunnel. The reconnect policy is transport-only and cannot replay model
+requests.

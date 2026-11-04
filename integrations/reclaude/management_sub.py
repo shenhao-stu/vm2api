@@ -11,6 +11,29 @@ import sys
 import uuid
 
 
+def matches_shared_profile(account, profile):
+    """Compare only scheduling controls. Credentials and upstream addresses are per account."""
+    creds = account["credentials"]
+    if any(account.get(k) != value for k, value in profile["account"].items()):
+        return False
+    if not profile["groups"] or set(account.get("group_ids") or []) != set(profile["groups"]):
+        return False
+    extra = account.get("extra") or {}
+    if extra.get("affinity_tags") or any(extra.get(k) != v for k, v in profile["extra"].items()):
+        return False
+    if creds.get("model_mapping") != {model: model for model in profile["models"]}:
+        return False
+    if any(creds.get(k) != value for k, value in profile["credentials"].items()):
+        return False
+
+    def rules(entries):
+        # First-match order is significant. Keyword order and human labels are not.
+        return [(row.get("error_code"), row.get("scope"), row.get("duration_minutes"),
+                 sorted(row.get("keywords") or [])) for row in entries]
+
+    return rules(creds.get("temp_unschedulable_rules") or []) == rules(profile["cooldowns"])
+
+
 def execute(config, action):
     if action not in ("status", "pause", "resume"):
         raise ValueError("unknown_action")
@@ -25,7 +48,17 @@ def execute(config, action):
     value = account()
     if value["id"] != config["account_id"]:
         raise ValueError("account_mismatch")
+    profile_path = config.get("shared_routing_profile")
+    matches = True
+    if profile_path:
+        try:
+            matches = matches_shared_profile(value, json.loads(Path(profile_path).read_text()))
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            # Preserve stop and revocation handling even if the operator's file is unavailable.
+            matches = False
     if action == "resume":
+        if not matches:
+            raise ValueError("shared_routing_profile_changed")
         credentials = value["credentials"]
         if (value["concurrency"] != config["concurrency"] or value["status"] != "active"
                 or credentials.get("base_url") != config["base_url"]
@@ -36,8 +69,10 @@ def execute(config, action):
         native.api("sub", "POST", path + "/schedulable", {"schedulable": action == "resume"},
                    receipt="management-" + str(uuid.uuid4()) + ".private.json")
         value = account()
-    return {"ok": True, "id": value["id"], "status": value["status"],
-            "schedulable": value["schedulable"], "concurrency": value["concurrency"]}
+    return {"ok": True, "shared_policy_matches": matches, "id": value["id"], "status": value["status"],
+            "schedulable": value["schedulable"], "concurrency": value["concurrency"],
+            "rate_limit_reset_at": value.get("rate_limit_reset_at"),
+            "temp_unschedulable_until": value.get("temp_unschedulable_until")}
 
 
 if __name__ == "__main__":

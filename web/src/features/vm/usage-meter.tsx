@@ -46,12 +46,14 @@ export function riskFg(value: number): string {
  */
 export function UsageMeter({
   value,
+  label,
   size = 'md',
   ticks = size === 'md',
   className,
 }: {
   /** 已用百分比（0–100，越高越危险）。 */
   value: number
+  label?: string
   size?: 'sm' | 'md'
   ticks?: boolean
   className?: string
@@ -64,9 +66,10 @@ export function UsageMeter({
   return (
     <div
       role='meter'
+      aria-label={label}
       aria-valuemin={0}
       aria-valuemax={100}
-      aria-valuenow={Math.round(value)}
+      aria-valuenow={Math.min(100, Math.max(0, Math.round(value)))}
       className={cn(
         'relative w-full overflow-hidden rounded-full track-recessed',
         size === 'sm' ? 'h-[5px]' : 'h-2',

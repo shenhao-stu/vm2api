@@ -59,6 +59,92 @@ class ManagementTests(unittest.TestCase):
     def action(self, action):
         return self.manager.action(action, str(uuid.uuid4()))
 
+    def test_remote_guard_is_fresh_pinned_and_never_falls_back_to_local(self):
+        self.config["guard_source"] = "runtime"
+        self.r["exit_guard"] = dict(self.guard)
+        self.assertTrue(self.manager.refresh()["guard"]["ready"])
+        for bad in ({}, {**self.guard, "revision": "other"},
+                    {**self.guard, "expected_ip": "203.0.113.2"},
+                    {**self.guard, "checked_at": "2000-01-01T00:00:00Z"}):
+            self.r["exit_guard"] = bad
+            self.assertFalse(self.manager.refresh()["guard"]["ready"])
+            with self.assertRaises(ManagementError):
+                self.action("resume_schedule")
+        self.assertNotIn(("sub", "resume"), self.calls)
+
+    def test_schedule_pause_preserves_inflight_and_worker(self):
+        self.r.update(active_requests=3, pending_tools_sessions=2)
+        before = copy.deepcopy(self.r)
+        result = self.action("pause_schedule")
+        self.assertFalse(result["sub"]["schedulable"])
+        self.assertEqual(before, self.r)
+        self.assertEqual([x for x in self.calls if x[1] != "status"], [("sub", "pause")])
+
+    def test_schedule_pause_reaches_sub_even_if_runtime_is_unavailable(self):
+        self.fail = ("runtime", "status")
+        with self.assertRaises(ManagementError):
+            self.action("pause_schedule")
+        self.assertFalse(self.s["schedulable"])
+        self.assertNotIn(("runtime", "stop"), self.calls)
+
+    def test_schedule_resume_preserves_native_cooldown_and_warm_cli(self):
+        self.s.update(schedulable=False, rate_limit_reset_at="2099-01-01T00:00:00Z")
+        result = self.action("resume_schedule")
+        self.assertTrue(result["sub"]["schedulable"])
+        self.assertEqual(result["sub"]["rate_limit_reset_at"], "2099-01-01T00:00:00Z")
+        self.assertEqual([x for x in self.calls if x[1] != "status"],
+                         [("runtime", "verify_exit"), ("sub", "resume")])
+
+    def test_schedule_resume_cannot_restart_unhealthy_paused_or_revoked_worker(self):
+        for change in ({"http_active": False}, {"http_ready": False}, {"management_paused": True},
+                       {"container_running": False}, {"revoked": True}, {"failed_checks": ["bad"]}):
+            before = copy.deepcopy(self.r)
+            self.s["schedulable"] = False
+            self.r.update(change)
+            self.calls.clear()
+            with self.assertRaises(ManagementError):
+                self.action("resume_schedule")
+            self.assertFalse(self.s["schedulable"])
+            self.assertNotIn(("runtime", "start"), self.calls)
+            self.assertNotIn(("sub", "resume"), self.calls)
+            self.r = before
+
+    def test_schedule_resume_requires_original_exit_and_routing_profile(self):
+        self.s["schedulable"] = False
+        self.guard["observed_ip"] = "203.0.113.2"
+        self.save_guard()
+        with self.assertRaises(ManagementError):
+            self.action("resume_schedule")
+        self.guard["observed_ip"] = self.guard["expected_ip"]
+        self.save_guard()
+        self.s["shared_policy_matches"] = False
+        with self.assertRaises(ManagementError):
+            self.action("resume_schedule")
+        self.assertNotIn(("sub", "resume"), self.calls)
+
+    def test_schedule_resume_probe_failure_does_not_resume(self):
+        self.s["schedulable"] = False
+        self.fail = ("runtime", "verify_exit")
+        with self.assertRaises(ManagementError):
+            self.action("resume_schedule")
+        self.assertFalse(self.s["schedulable"])
+
+    def test_schedule_operation_is_once_only(self):
+        operation = str(uuid.uuid4())
+        self.manager.action("pause_schedule", operation)
+        self.calls.clear()
+        with self.assertRaisesRegex(ManagementError, "already_consumed"):
+            self.manager.action("resume_schedule", operation)
+        self.assertEqual(self.calls, [])
+
+    def test_profile_drift_rejects_start_before_starting_worker_but_allows_stop(self):
+        self.s["shared_policy_matches"] = False
+        with self.assertRaisesRegex(ManagementError, "shared_routing_profile_changed"):
+            self.action("start")
+        self.assertNotIn(("runtime", "start"), self.calls)
+        self.action("stop")
+        self.assertIn(("sub", "pause"), self.calls)
+
     def test_stop_pauses_before_stopping_and_never_calls_native_container_lifecycle(self):
         self.action("stop")
         mutations = [x for x in self.calls if x[1] != "status"]
@@ -175,6 +261,12 @@ class ManagementTests(unittest.TestCase):
             self.assertEqual(data["items"][0]["models"], ["claude-fable-5-1"])
             self.assertEqual(request(prefix + "/native-fixture/stop", "POST", origin=self.config["origin"], body=body)[0], 200)
             self.assertFalse(self.s["schedulable"])
+            self.r["http_active"] = self.r["http_ready"] = True
+            for operation in ("resume_schedule", "pause_schedule"):
+                fresh = {"operation_id": str(uuid.uuid4())}
+                self.assertEqual(request(prefix + "/native-fixture/" + operation, "POST",
+                                         origin=self.config["origin"], body=fresh)[0], 200)
+            self.assertTrue(self.r["http_active"])
         finally:
             server.shutdown()
             server.server_close()
