@@ -1731,14 +1731,9 @@ export function createHandleProtocol(deps) {
         logBag.error_message = result?.body?.error?.message || 'Stream did not reach a verified terminal state'
         const closing = isRecoverableTruncation(result) && !res.writableEnded ? streamTracker?.closingEvents() : null
         if (closing) res.write(closing)
-        else if (
-          protocol === 'anthropic.messages' &&
-          !res.writableEnded &&
-          !streamTracker?.hasStarted() &&
-          !streamTracker?.isFinished()
-        ) {
-          // Headers already went out (queue ping or an in-attempt ping), so the
-          // status can no longer be 429/529/503. Close with the Anthropic event.
+        else if (protocol === 'anthropic.messages' && !res.writableEnded && !streamTracker?.isFinished()) {
+          // An open thinking block or a timeout cannot use a synthetic message
+          // ending. Preserve the failure instead of closing with a silent EOF.
           const mapped = mapProtocolClientError(result, logBag, logBag.error_code)
           res.write(buildAnthropicSseError(mapped.body?.error || {}))
         }
