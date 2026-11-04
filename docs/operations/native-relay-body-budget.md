@@ -19,25 +19,43 @@ above the configured limit before reading, and verifies the actual read length.
 Chunked requests are buffered at nginx before forwarding. The HTTP API requires
 a complete JSON value, so disabling buffering does not remove JSON memory use.
 
-For the existing 512 MiB API gateways, use a separate native nginx admission
-budget for ReClaude. Requests of at least 1,000,000 bytes, or unknown length,
-share one large-request seat per Relay URI. Smaller requests retain their
-existing concurrency limit of 10. Do not attach this zone to Pro locations.
+For the existing 512 MiB API gateways, enforce both limits **before body
+parsing** at nginx: at most ten in-flight requests and one large request per
+Relay URI. The native CLI concurrency limit alone cannot constrain gateway
+memory: the gateway reads JSON before acquiring its managed-key seat.
 
-```nginx
-map "$request_method:$http_content_length" $reclaude_large_body {
-    default $uri;
-    ~^(GET|HEAD|OPTIONS): "";
-    "~^[A-Z]+:[0-9]{1,6}$" "";
-}
-limit_conn_zone $reclaude_large_body zone=reclaude_large_requests:1m;
-```
+Use the three fragments under `integrations/reclaude/nginx/`:
 
-In each exact ReClaude messages location, preserve its existing configuration
-and add `limit_conn reclaude_large_requests 1` and `limit_conn_status 429`.
-The URI identifies the Relay; caller-controlled IP headers cannot obtain an
-extra seat. The concurrency rejection happens before dispatch and differs from
-an upstream model limit or an already-consumed request.
+- `admission-http.conf` in the nginx `http` context defines the two zones.
+- `admission-location.conf` in each exact Relay messages location sets the
+  16 MiB limit, total-ten and large-one budgets. It also preserves the existing
+  `vm2api_clients_direct 20` limit: location-level limits override inheritance.
+- `capacity-server.conf` in that server returns local capacity failures as JSON
+  429 (`native_ingress_busy`) with `Retry-After: 1`.
+
+A known Content-Length below 1,000,000 bytes is small. All other requests,
+including unknown/chunked lengths and GET bodies, consume the large seat.
+The normalized URI identifies the Relay; query strings and client IP headers
+cannot obtain extra seats. Do not attach these limits to Pro locations.
+`proxy_intercept_errors off` preserves an upstream quota 429 and its reset
+headers. Capacity rejection occurs before forwarding or model dispatch.
+Sub2API currently applies its default five-second account backoff to such a
+429; the header does not guarantee a one-second or single-seat-only backoff.
+
+Verify the ingress boundary before relying on this memory budget. Current
+production uses Netcup's private Caddy listener 19878 → loopback SSH bridge
+19877 → HappySrv nginx 18888 → the two exact Relay messages locations.
+The SSH account permits only 127.0.0.1:18888, and both host-network gateway
+processes listen on 127.0.0.1 only. Other Relay paths return 404. Host-local
+administrative access remains trusted and can bypass nginx; do not route
+business traffic or load probes directly to the gateway ports.
+
+Run `python3 integrations/reclaude/tests/nginx_admission_probe.py` on a host
+with nginx installed. It starts a separate nginx on an ephemeral loopback port
+and a local fixture upstream, then removes both. It covers admission before
+body upload, ten-plus-one and large-plus-one rejection, unknown lengths,
+method/query/encoded-URI boundaries, independent Relays, retained Pro limits,
+JSON capacity errors and unchanged upstream quota responses.
 
 The isolated production-image probe with the existing 384 MiB Node heap and
 512 MiB cgroup, a retained 100 MiB baseline, one 16 MiB JSON request and nine
