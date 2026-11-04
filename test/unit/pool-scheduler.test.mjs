@@ -3065,3 +3065,35 @@ test('a resting slot that cannot serve the model does not promise a Retry-After'
   assert.equal(selected.ok, false)
   assert.equal(selected.retry_after_ms, null)
 })
+
+test('remote health transport failure is not admitted for a duplicate dispatch probe', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'vms/vm-01.json')
+  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file)), node_id: 'node-test' }))
+  const pool = scheduler(root, {
+    workerHealth: async (exec) =>
+      exec.vmId === 'vm-01'
+        ? { ok: false, status: 0, code: 'worker_timeout' }
+        : { ok: true, credential: { has_access: true } },
+  })
+  const selected = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.exec.vmId, 'vm-02')
+  selected.release()
+})
+
+test('a failed remote health probe cannot escape a single-VM key restriction', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'vms/vm-01.json')
+  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file)), node_id: 'node-test' }))
+  const pool = scheduler(root, { workerHealth: async () => ({ ok: false, status: 0, code: 'worker_timeout' }) })
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    allowWait: false,
+    keyScope: { group_type: 'anthropic', allowed_vms: ['vm-01'] },
+  })
+  assert.equal(selected.ok, false)
+  assert.equal(pool.inflight.size, 0)
+})

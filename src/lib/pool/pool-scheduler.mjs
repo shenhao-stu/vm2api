@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { vmNodeId } from '../cluster/placement.mjs'
 import { getVm, listVms, setVmSchedulable } from '../vm/vm-registry.mjs'
 import { vmCliHomePath, vmJsonPath } from '../vm/execution-context.mjs'
 import {
@@ -1172,6 +1173,9 @@ export class PoolScheduler extends EventEmitter {
     }
     // A sticky preference must not bypass exhausted kernel recovery.
     if (kernelFaults.has(vm.id)) return { ok: false, reason: 'kernel_faulted' }
+    // The admission probe already rechecked remote transport loss. Do not select
+    // it for another dispatch probe or treat a missed reply as a revoked account.
+    if (vmNodeId(vm) && workerStatus?.ok === false) return { ok: false, reason: 'worker_unhealthy' }
     if (rustKernelBusy(workerStatus)) {
       markWait('slot_busy')
     } else if (workerStatus && rustKernelProcessUp(workerStatus) && !rustKernelReachable(workerStatus)) {
