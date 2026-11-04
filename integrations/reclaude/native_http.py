@@ -243,6 +243,7 @@ class NativeHandler(RelayHandler):
             if "native_device_revoked" in failed:
                 self.server.latch()
             if failed or not self.server.proof():
+                record["readiness_failures"] = failed or ["official_proof_unavailable"]
                 raise Rejection(503, "native_not_ready")
             context = self.server.pool.lease(self.server.tenant, body)
             lease_started = time.monotonic()

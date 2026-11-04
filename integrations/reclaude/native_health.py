@@ -41,9 +41,9 @@ class NativeHealth:
                 return True
         return False
 
-    def authorization_revoked(self):
+    def authorization_revoked(self, state=None):
         try:
-            state = self.state()
+            state = self.state() if state is None else state
             error = str(state["identities"]["claude"].get("last_error") or "").lower()
             return any(
                 code in error
@@ -76,7 +76,7 @@ class NativeHealth:
                 failed.append("native_binding_mismatch")
             if self.control_authorization_revoked(state):
                 failed.append("native_control_authorization_revoked")
-            if self.authorization_revoked():
+            if self.authorization_revoked(state):
                 failed.append("native_device_revoked")
             elif identity.get("last_error"):
                 failed.append("native_identity_error")

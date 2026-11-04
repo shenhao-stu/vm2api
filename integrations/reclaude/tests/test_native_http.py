@@ -171,6 +171,24 @@ class NativeHTTPTests(unittest.TestCase):
         c.close()
         return result
 
+    def test_readiness_failure_is_audited_without_dispatch_or_losing_reason(self):
+        for i, failed in enumerate([["native_unavailable"], ["native_state_unavailable"]], 1):
+            with patch.object(self.health, "failed_health_checks", return_value=failed):
+                status, data = self.request()
+            self.assertEqual(status, 503)
+            self.assertIn("native_not_ready", data.decode())
+            row = self.audit(i)[-1]
+            self.assertEqual(row["readiness_failures"], failed)
+            self.assertEqual(row["attempts"], 0)
+            self.assertEqual(self.created, [])
+
+    def test_official_proof_failure_has_distinct_audit_reason(self):
+        self.server.proof = lambda: False
+        status, data = self.request()
+        self.assertEqual(status, 503)
+        self.assertEqual(self.audit()[0]["readiness_failures"], ["official_proof_unavailable"])
+        self.assertEqual(self.created, [])
+
     def test_explicit_sixteen_mib_budget_accepts_large_synthetic_context_once(self):
         self.server.limits = replace(self.server.limits, body_bytes=16 * 1024 * 1024)
         body = self.body(system='x' * 8596819)

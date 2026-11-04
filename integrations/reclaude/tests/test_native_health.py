@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+from copy import deepcopy
 
 from native_http import NativeHealth
 
@@ -41,6 +43,20 @@ class NativeHealthTests(unittest.TestCase):
 
     def write_state(self):
         (self.rec / "state.json").write_text(json.dumps(self.state))
+
+    def test_one_health_decision_uses_one_state_snapshot(self):
+        revoked = deepcopy(self.state)
+        revoked["identities"]["claude"]["last_error"] = "device_revoked"
+        with patch.object(self.health, "state", side_effect=[self.state, revoked]) as read:
+            self.assertEqual(self.health.failed_health_checks(), [])
+        self.assertEqual(read.call_count, 1)
+
+    def test_revocation_in_snapshot_cannot_be_lost_to_a_later_healthy_read(self):
+        revoked = deepcopy(self.state)
+        revoked["identities"]["claude"]["last_error"] = "device_revoked"
+        with patch.object(self.health, "state", side_effect=[revoked, self.state]) as read:
+            self.assertIn("native_device_revoked", self.health.failed_health_checks())
+        self.assertEqual(read.call_count, 1)
 
     def test_global_revocation_blocks_even_when_account_is_healthy(self):
         self.log.write_text(
