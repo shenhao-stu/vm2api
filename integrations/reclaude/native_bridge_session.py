@@ -496,6 +496,25 @@ class Turn:
         return event
 
 
+def confirmed_personal_max(profile, initialized):
+    """Personal plans do not receive the Team/Enterprise server-settings marker."""
+    response = initialized.get("response") or {}
+    account = response.get("account") or {}
+    if (initialized.get("subtype") != "success" or account.get("apiProvider") != "firstParty"
+            or account.get("subscriptionType") != "Claude Max"):
+        return False
+    try:
+        if (profile.parents[2] / "current").read_text().strip() != profile.parent.name:
+            return False
+        if any((profile / name).exists() for name in ("policy-limits.json", "remote-settings.json")):
+            return False
+        oauth = json.loads((profile / ".credentials.json").read_text())["claudeAiOauth"]
+        return (oauth.get("subscriptionType") == "max"
+                and set(("user:inference", "user:profile")).issubset(oauth.get("scopes") or []))
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 class Session:
     def __init__(
         self,
@@ -510,6 +529,7 @@ class Session:
         session_budget_usd=None,
         restore=False,
         history_profile=None,
+        personal_max_profile=None,
     ):
         native_env, self.options = native_options(body)
         self.budget_options = []
@@ -550,6 +570,8 @@ class Session:
         self.tool_timer = None
         self.timeout = timeout
         self.require_policy = require_policy
+        self.personal_max_profile = personal_max_profile
+        self.personal_max_confirmed = False
         self.dispatch_proxy = dispatch_proxy
         self.history_profile = Path(history_profile) if history_profile else None
         self.dispatch_process = None
@@ -849,6 +871,10 @@ class Session:
         if self.process is not None:
             if self.process.poll() is not None or self.failed:
                 raise ContractError("native_process_not_reusable")
+            if self.personal_max_confirmed and not confirmed_personal_max(
+                self.personal_max_profile, self.initialize_response or {}
+            ):
+                raise ContractError("native_account_scope_changed")
             return
         config = {
             "mcpServers": {
@@ -932,8 +958,15 @@ class Session:
             )
         self.reader = threading.Thread(target=self.read_output, daemon=True)
         self.reader.start()
+        self.personal_max_confirmed = False
         if self.require_policy:
-            self.await_native_policy()
+            if self.personal_max_profile is not None:
+                self.initialize_native()
+                self.personal_max_confirmed = confirmed_personal_max(
+                    self.personal_max_profile, self.initialize_response or {}
+                )
+            if not self.personal_max_confirmed:
+                self.await_native_policy()
 
     def start(self, blocks):
         self.prepare()
