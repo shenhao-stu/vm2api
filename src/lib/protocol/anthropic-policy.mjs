@@ -290,6 +290,18 @@ export function modelSupportsContextManagement(modelId = '') {
   return true
 }
 
+/** Remove only incompatible clear-thinking; leave other controls for existing validation. */
+export function stripUnsupportedClearThinkingEdits(body = {}) {
+  const context = body.context_management
+  if (!Array.isArray(context?.edits)) return body
+  if (modelSupportsContextManagement(body.model) && thinkingModeEnabled(body)) return body
+  const edits = context.edits.filter((edit) => edit?.type !== CLEAR_THINKING_EDIT.type)
+  if (edits.length === context.edits.length) return body
+  const out = { ...body, context_management: { ...context, edits } }
+  if (!edits.length && Object.keys(context).length === 1) delete out.context_management
+  return out
+}
+
 /**
  * Docs list: Fable 5 / 5.1, Mythos 5 / 5.1, Opus 5.5 / 5 / 4.8, Sonnet 5.5, Haiku 5.5.
  * Sonnet 5, Haiku 4.5 and other Claude 4.x reject mid-conversation `role=system` (400).

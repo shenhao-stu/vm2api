@@ -12,6 +12,7 @@ import {
   stripInvalidThinkingBlocks,
   alignSamplingWithThinking,
   modelSupportsMidConversationSystem,
+  stripUnsupportedClearThinkingEdits,
 } from './anthropic-policy.mjs'
 import { liftMidConversationSystemMessages } from './sanitize.mjs'
 import {
@@ -224,6 +225,7 @@ export function prepareCliHopBody(
   body = stripInvalidThinkingBlocks(body, { preserveThinkingBlocks })
   body = applyModelRequestRules(body)
   body = ensureOutputConfigSchema(body)
+  body = stripUnsupportedClearThinkingEdits(body)
   body = alignSamplingWithThinking(body)
   if (!preserveSystem) {
     body = stripIllegalCacheControlFields(body)
