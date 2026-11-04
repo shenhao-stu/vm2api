@@ -463,6 +463,7 @@ def main():
     p.add_argument("--model", action="append", required=True)
     p.add_argument("--port", type=int, default=18786)
     p.add_argument("--concurrency", type=int, default=1)
+    p.add_argument("--max-body-mib", type=int, choices=range(1, 33), default=8)
     p.add_argument("--reclaude", default="/opt/native/reclaude")
     p.add_argument("--private-host")
     p.add_argument("--proof-file", type=Path)
@@ -476,7 +477,8 @@ def main():
     p.add_argument("--memory-high-bytes", type=int, default=0)
     p.add_argument("--memory-current-file", type=Path, default=Path("/sys/fs/cgroup/memory.current"))
     args = p.parse_args()
-    limits = Limits(models=tuple(args.model), concurrency=args.concurrency)
+    limits = Limits(models=tuple(args.model), concurrency=args.concurrency,
+                    body_bytes=args.max_body_mib * 1024 * 1024)
     health = NativeHealth(args.home, args.binding)
     env = {
         "HOME": str(args.home),
@@ -550,6 +552,7 @@ def main():
                 "pid": os.getpid(),
                 "listen": server.server_address,
                 "concurrency": args.concurrency,
+                "max_body_bytes": limits.body_bytes,
                 "models": args.model,
                 "idle_seconds": args.idle_seconds,
                 "prepared_idle_seconds": server.pool.prepared_idle_seconds,

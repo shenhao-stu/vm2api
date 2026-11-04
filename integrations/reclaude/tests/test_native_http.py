@@ -1,5 +1,6 @@
 import http.client
 import json
+from dataclasses import replace
 from pathlib import Path
 import socket
 import struct
@@ -169,6 +170,33 @@ class NativeHTTPTests(unittest.TestCase):
         result = (r.status, r.read())
         c.close()
         return result
+
+    def test_explicit_sixteen_mib_budget_accepts_large_synthetic_context_once(self):
+        self.server.limits = replace(self.server.limits, body_bytes=16 * 1024 * 1024)
+        body = self.body(system='x' * 8596819)
+        self.assertGreater(len(json.dumps(body).encode()), 8 * 1024 * 1024)
+        status, raw = self.request(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)['content'][0]['text'], 'fixture')
+        self.assertEqual(self.server.accepted, 1)
+        self.assertEqual(len(self.created), 1)
+        self.assertEqual(len(list(self.created[0].directory.glob('dispatch/*.consumed.json'))), 1)
+
+    def test_oversize_content_length_rejects_without_reading_body_or_creating_session(self):
+        for limit in [8 * 1024 * 1024, 16 * 1024 * 1024]:
+            self.server.limits = replace(self.server.limits, body_bytes=limit)
+            connection = http.client.HTTPConnection(*self.server.server_address, timeout=3)
+            connection.putrequest('POST', '/v1/messages')
+            connection.putheader('Authorization', 'Bearer ' + 'k' * 40)
+            connection.putheader('Content-Type', 'application/json')
+            connection.putheader('Content-Length', str(limit + 1))
+            connection.endheaders()
+            response = connection.getresponse()
+            self.assertEqual(response.status, 413)
+            self.assertEqual(json.loads(response.read())['error']['code'], 'request_body_too_large')
+            connection.close()
+        self.assertEqual(self.server.accepted, 0)
+        self.assertEqual(self.created, [])
 
     def test_optional_prewarm_is_authenticated_and_never_dispatches(self):
         path = "/v1/messages/prepare"
