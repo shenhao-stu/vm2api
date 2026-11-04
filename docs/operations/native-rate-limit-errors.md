@@ -23,8 +23,10 @@ No token count, charge or successful completion is inferred from this error.
 The consumed request remains consumed. If the native rejection occurs before
 any dispatch, it can return 429 without claiming a consumed request.
 
-The optional API passthrough mode preserves upstream HTTP status and structured
-error fields. Default gateway normalization remains unchanged. A downstream
+The optional API passthrough mode preserves only the known native no-replay and
+rate-limit codes, their constant messages, and validated quota fields above.
+It never copies arbitrary upstream error objects, URLs, debug data or nested
+extras. Other errors and default gateway normalization remain unchanged. A downstream
 scheduler may use a fresh, validated reset to cool the **specified model** on
 that account; it must not replay the rejected request, clear an exit guard, or
 pause unrelated model windows. In particular, a Sonnet weekly limit is not

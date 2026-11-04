@@ -7,6 +7,7 @@ import path from 'node:path'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { anthropicClientHeaders } from '../../src/lib/pool/api-protocol.mjs'
 import { telemetryIngressResponse, isTelemetryPath } from '../../src/lib/identity/telemetry-rewrite.mjs'
+import { safeNativeRelayError } from '../../src/lib/protocol/native-relay-error.mjs'
 
 const events = [
   {
@@ -172,6 +173,98 @@ test('default API mode retains normalized errors and hides relay-only details', 
   assert.equal(response.status, 400)
   assert.equal(response.body.error.code, 'upstream_invalid_request')
   assert.equal(response.body.error.details.reset_at, undefined)
+})
+
+test('native relay errors expose only validated quota fields, never upstream debug data', async (t) => {
+  const code = 'native_request_consumed_no_replay'
+  const secret = 'sk-upstream-secret-fixture'
+  const source = `https://origin.private.invalid/path?token=${secret}`
+  const { invoke } = await fixture(t, true, {
+    status: 400,
+    type: 'application/json',
+    body: JSON.stringify({
+      error: {
+        type: source,
+        code,
+        message: `Bearer ${secret} at ${source}`,
+        status: 200,
+        source_url: source,
+        authorization: secret,
+        details: {
+          no_replay: true,
+          upstream_type: 'rate_limit_error',
+          model: body.model,
+          rate_limit_type: 'seven_day',
+          reset_at: 1793815200,
+          debug: [{ source_url: source, authorization: secret }],
+          token: secret,
+        },
+      },
+    }),
+  })
+  const response = await invoke(body)
+  assert.equal(response.status, 400)
+  assert.deepEqual(response.body.error, {
+    type: 'api_error',
+    code,
+    message: code,
+    details: {
+      no_replay: true,
+      upstream_type: 'rate_limit_error',
+      model: body.model,
+      rate_limit_type: 'seven_day',
+      reset_at: 1793815200,
+    },
+  })
+  assert.ok(!JSON.stringify(response.body).includes(secret))
+  assert.ok(!JSON.stringify(response.body).includes('origin.private.invalid'))
+})
+
+test('unrelated passthrough errors retain the existing bounded normalization', async (t) => {
+  const { invoke } = await fixture(t, true, {
+    status: 400,
+    type: 'application/json',
+    body: JSON.stringify({
+      error: {
+        type: 'api_error',
+        code: 'unrelated_error',
+        message: 'bad input',
+        source_url: 'https://origin.private.invalid',
+        details: { token: 'secret-fixture' },
+      },
+    }),
+  })
+  const response = await invoke(body)
+  assert.equal(response.status, 400)
+  assert.equal(response.body.error.code, 'upstream_invalid_request')
+  assert.equal(response.body.error.message, 'bad input')
+  assert.ok(!JSON.stringify(response.body).includes('secret-fixture'))
+  assert.ok(!JSON.stringify(response.body).includes('origin.private.invalid'))
+})
+
+test('native quota metadata cannot redirect cooldown to another model or inject untyped values', () => {
+  const code = 'native_request_consumed_no_replay'
+  const details = {
+    upstream_type: 'rate_limit_error',
+    model: body.model,
+    rate_limit_type: 'https://origin.private.invalid',
+    reset_at: 'secret-fixture',
+  }
+  const result = safeNativeRelayError(400, { code, details }, body.model)
+  assert.deepEqual(result.details, { no_replay: true, upstream_type: 'rate_limit_error', model: body.model })
+  assert.deepEqual(safeNativeRelayError(400, { code, details }, 'other-model').details, { no_replay: true })
+  for (const reset_at of [true, -1, 0, 1.5, NaN, Infinity, 253402300800]) {
+    assert.equal(
+      safeNativeRelayError(400, { code, details: { ...details, reset_at } }, body.model).details.reset_at,
+      undefined,
+    )
+  }
+  assert.equal(safeNativeRelayError(502, { code, details }, body.model), null)
+  assert.equal(safeNativeRelayError(400, { code: 'native_rate_limit', details }, body.model), null)
+  assert.equal(
+    safeNativeRelayError(429, { code: 'native_rate_limit', details }, body.model).details.no_replay,
+    undefined,
+  )
 })
 
 test('isolated API passthrough preserves request/session/tool/cache fields and actual headers', async (t) => {

@@ -1,5 +1,6 @@
 import { officialMessagesBody } from '../protocol/anthropic-messages.mjs'
 import { prepareClassifierBody } from '../protocol/request-purpose.mjs'
+import { safeNativeRelayError } from '../protocol/native-relay-error.mjs'
 import { consumeClaudeSSEData } from '../protocol/convert.mjs'
 import { isCompleteAssistantMessage, mapUpstreamError } from '../core/errors.mjs'
 import { isContentPolicyErrorCode } from '../core/refusal-guard.mjs'
@@ -208,10 +209,7 @@ export async function runApiInference({
   if (status >= 400) {
     const payload = await readApiJson(upstream).catch(() => ({}))
     const passthroughError =
-      cfg.api_passthrough === true &&
-      payload?.error &&
-      typeof payload.error === 'object' &&
-      !Array.isArray(payload.error)
+      cfg.api_passthrough === true ? safeNativeRelayError(status, payload?.error, picked.upstream_model) : null
     const message = payload?.error?.message || payload?.message || `upstream ${status}`
     const upstreamCode = String(payload?.error?.code || payload?.code || '').trim()
     const contentCode = isContentPolicyErrorCode(upstreamCode) ? upstreamCode.toLowerCase() : ''
@@ -220,7 +218,7 @@ export async function runApiInference({
       ok: false,
       passthroughError: !!passthroughError,
       body: passthroughError
-        ? { type: 'error', error: payload.error }
+        ? { type: 'error', error: passthroughError }
         : {
             type: 'error',
             error: {
