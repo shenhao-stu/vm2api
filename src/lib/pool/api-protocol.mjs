@@ -1,5 +1,6 @@
 import { officialMessagesBody } from '../protocol/anthropic-messages.mjs'
 import { prepareClassifierBody } from '../protocol/request-purpose.mjs'
+import { safeNativeRelayError } from '../protocol/native-relay-error.mjs'
 import { consumeClaudeSSEData } from '../protocol/convert.mjs'
 import { isCompleteAssistantMessage, mapUpstreamError } from '../core/errors.mjs'
 import { isContentPolicyErrorCode } from '../core/refusal-guard.mjs'
@@ -59,9 +60,10 @@ export function anthropicClientHeaders(headers) {
 }
 
 async function readLines(stream, onLine) {
+  stream.setEncoding('utf8')
   let buf = ''
   for await (const chunk of stream) {
-    buf += chunk.toString('utf8')
+    buf += chunk
     let idx
     while ((idx = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, idx)
@@ -206,22 +208,27 @@ export async function runApiInference({
 
   if (status >= 400) {
     const payload = await readApiJson(upstream).catch(() => ({}))
+    const passthroughError =
+      cfg.api_passthrough === true ? safeNativeRelayError(status, payload?.error, picked.upstream_model) : null
     const message = payload?.error?.message || payload?.message || `upstream ${status}`
     const upstreamCode = String(payload?.error?.code || payload?.code || '').trim()
     const contentCode = isContentPolicyErrorCode(upstreamCode) ? upstreamCode.toLowerCase() : ''
     return {
       ...resultBase,
       ok: false,
-      body: {
-        type: 'error',
-        error: {
-          ...(requestContext ? payload?.error : {}),
-          ...(requestContext && payload?.error?.code ? { upstream_code: payload.error.code } : {}),
-          ...(!requestContext && contentCode ? { code: contentCode } : {}),
-          type: requestContext ? payload?.error?.type || 'api_error' : 'api_error',
-          message: String(message).slice(0, 300),
-        },
-      },
+      passthroughError: !!passthroughError,
+      body: passthroughError
+        ? { type: 'error', error: passthroughError }
+        : {
+            type: 'error',
+            error: {
+              ...(requestContext ? payload?.error : {}),
+              ...(requestContext && payload?.error?.code ? { upstream_code: payload.error.code } : {}),
+              ...(!requestContext && contentCode ? { code: contentCode } : {}),
+              type: requestContext ? payload?.error?.type || 'api_error' : 'api_error',
+              message: String(message).slice(0, 300),
+            },
+          },
       terminalState: 'rejected',
     }
   }

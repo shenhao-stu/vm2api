@@ -593,8 +593,11 @@ class RelayHandler(BaseHTTPRequestHandler):
             finally:
                 self.server.inference.release()
 
-    def send_error_json(self, status, code):
-        self.send_json(status, {"type": "error", "error": {"type": "api_error", "code": code, "message": code}})
+    def send_error_json(self, status, code, details=None):
+        error = {"type": "api_error", "code": code, "message": code}
+        if details:
+            error["details"] = details
+        self.send_json(status, {"type": "error", "error": error})
 
     def send_json(self, status, value):
         payload = json.dumps(value, separators=(",", ":")).encode()

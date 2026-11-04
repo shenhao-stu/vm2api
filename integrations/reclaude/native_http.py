@@ -16,7 +16,7 @@ import time
 from urllib.parse import urlsplit
 
 from adapter import Limits, Rejection, RelayHandler, RelayServer, load_relay_key, request_trace
-from native_bridge_session import ContractError, RequestRejected, Session, Turn
+from native_bridge_session import ContractError, NativeRateLimit, RequestRejected, Session, Turn
 from native_session_pool import SessionPool, memory_pressure
 from native_health import NativeHealth, validate_official
 
@@ -350,6 +350,9 @@ class NativeHandler(RelayHandler):
             )
             if expired.is_set():
                 code = "native_request_deadline"
+            error_details = dict(exc.details) if isinstance(exc, NativeRateLimit) else None
+            if error_details:
+                record["upstream_error"] = error_details
             if code == "unsupported_thinking_configuration" and isinstance(body, dict):
                 record["thinking"] = safe_thinking_summary(body.get("thinking"))
             status = (
@@ -357,7 +360,7 @@ class NativeHandler(RelayHandler):
                 if isinstance(exc, Rejection)
                 else (
                     429
-                    if code in {"session_busy", "native_session_capacity", "native_memory_pressure"}
+                    if code in {"session_busy", "native_session_capacity", "native_memory_pressure", "native_rate_limit"}
                     else (
                         400
                         if code
@@ -393,13 +396,15 @@ class NativeHandler(RelayHandler):
                 record["native_error"] = code
                 status, code = 400, "native_request_consumed_no_replay"
                 record['no_replay'] = True
+                if error_details:
+                    error_details = {**error_details, "no_replay": True}
                 if self.server.relay.authorization_revoked():
                     self.server.latch()
                     code = 'device_revoked'
             record.update({"error": code, "status": 499 if disconnected else status})
             if not committed:
                 try:
-                    self.send_error_json(status, code)
+                    self.send_error_json(status, code, error_details)
                 except OSError:
                     record["status"] = 499
             elif not disconnected and not record["complete"]:
@@ -410,7 +415,8 @@ class NativeHandler(RelayHandler):
                             + json.dumps(
                                 {
                                     "type": "error",
-                                    "error": {"type": "api_error", "message": code},
+                                    "error": {"type": "api_error", "message": code,
+                                              **({"details": error_details} if error_details else {})},
                                 }
                             )
                             + "\n\n"
@@ -457,6 +463,7 @@ def main():
     p.add_argument("--model", action="append", required=True)
     p.add_argument("--port", type=int, default=18786)
     p.add_argument("--concurrency", type=int, default=1)
+    p.add_argument("--max-body-mib", type=int, choices=range(1, 33), default=8)
     p.add_argument("--reclaude", default="/opt/native/reclaude")
     p.add_argument("--private-host")
     p.add_argument("--proof-file", type=Path)
@@ -470,7 +477,8 @@ def main():
     p.add_argument("--memory-high-bytes", type=int, default=0)
     p.add_argument("--memory-current-file", type=Path, default=Path("/sys/fs/cgroup/memory.current"))
     args = p.parse_args()
-    limits = Limits(models=tuple(args.model), concurrency=args.concurrency)
+    limits = Limits(models=tuple(args.model), concurrency=args.concurrency,
+                    body_bytes=args.max_body_mib * 1024 * 1024)
     health = NativeHealth(args.home, args.binding)
     env = {
         "HOME": str(args.home),
@@ -544,6 +552,7 @@ def main():
                 "pid": os.getpid(),
                 "listen": server.server_address,
                 "concurrency": args.concurrency,
+                "max_body_bytes": limits.body_bytes,
                 "models": args.model,
                 "idle_seconds": args.idle_seconds,
                 "prepared_idle_seconds": server.pool.prepared_idle_seconds,
