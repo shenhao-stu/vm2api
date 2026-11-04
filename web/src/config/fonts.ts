@@ -1,1 +1,1 @@
-export const fonts = ['inter', 'manrope', 'system'] as const
+export const fonts = ['system', 'inter', 'manrope'] as const

@@ -1,26 +1,19 @@
 import { GPT_CONSOLE_URL } from '@/config/hosted'
-import { ArrowUpRight, Sparkles } from 'lucide-react'
-import { Logo } from '@/assets/logo'
+import { ArrowUpRight } from 'lucide-react'
 
 export function WorkspaceSwitcher() {
   return (
     <nav
       aria-label='托管工作台'
-      className='grid grid-cols-2 gap-1 rounded-xl border border-sidebar-border bg-background p-1 group-data-[collapsible=icon]:hidden'
+      className='flex flex-wrap items-center gap-2 px-2 py-1 text-[11px] text-muted-foreground group-data-[collapsible=icon]:hidden'
     >
-      <span
-        aria-current='page'
-        className='flex items-center justify-center gap-1.5 rounded-lg bg-primary/10 px-2 py-2 text-xs font-semibold text-primary'
-      >
-        <Logo aria-hidden className='size-3.5' />
-        Claude
-      </span>
+      <span aria-current='page'>Claude 工作台</span>
+      <span aria-hidden>·</span>
       <a
         href={GPT_CONSOLE_URL}
-        className='flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground'
+        className='inline-flex items-center gap-1 hover:text-primary'
       >
-        <Sparkles aria-hidden className='size-3.5' />
-        GPT
+        GPT 控制台
         <ArrowUpRight aria-hidden className='size-3' />
       </a>
     </nav>

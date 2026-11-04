@@ -361,26 +361,57 @@
   }
 }
 
-/* Shared workbench chrome; operational status colors retain their own semantics. */
+/* Metrics shared with the production GPT workbench. */
+.font-system {
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
 .workbench-brand {
-  background: linear-gradient(140deg, #5267e7, #7562d8);
-  box-shadow: 0 4px 12px rgb(79 91 213 / 16%);
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: #3454bf;
+  color: #fff;
+}
+.hosted-workbench [data-sidebar='content'] {
+  gap: 16px;
+  padding: 12px 4px;
 }
 .hosted-workbench [data-sidebar='group-label'] {
-  padding-inline: 0.75rem;
-  color: var(--muted-foreground);
-  font-size: 0.6875rem;
+  font-size: 11px;
+  font-weight: 500;
   letter-spacing: 0.04em;
 }
-.hosted-workbench [data-sidebar='menu-button'] {
-  min-height: 2.5rem;
-  border-radius: 0.75rem;
+.workbench-topbar > div {
+  padding: 10px 16px;
 }
-.hosted-workbench [data-sidebar='menu-button'][data-active='true'] {
-  background: var(--accent);
-  color: var(--accent-foreground);
-  font-weight: 600;
+.workbench-login-aside {
+  color: #233765;
+  background: #edf1fc;
 }
-.hosted-workbench [data-sidebar='menu-button'] > svg {
-  stroke-width: 1.75;
+.dark .workbench-login-aside {
+  color: #d1deff;
+  background: #192642;
+}
+.workbench-login-grid {
+  display: grid;
+  width: min(1040px, 100%);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--card);
+  box-shadow: 0 16px 60px #17295408;
+}
+@media (width <= 767px) {
+  .workbench-login-grid {
+    max-width: 420px;
+    grid-template-columns: minmax(0, 1fr);
+  }
 }

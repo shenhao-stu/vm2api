@@ -1,3 +1,4 @@
+import { DOCS_URL, REPO_URL } from '@/config/repo'
 import { useAuthStore } from '@/stores/auth-store'
 import { useLayout } from '@/context/layout-provider'
 import {
@@ -24,16 +25,44 @@ export function AppSidebar() {
       variant={variant}
       className='workbench-sidebar'
     >
-      <SidebarHeader className='gap-3 px-4 pt-4 pb-3 group-data-[collapsible=icon]:px-2'>
-        <AppTitle version={me?.version} />
-        <WorkspaceSwitcher />
+      <SidebarHeader className='border-b p-0'>
+        <AppTitle />
       </SidebarHeader>
-      <SidebarContent className='px-2 group-data-[collapsible=icon]:px-0'>
+      <SidebarContent>
         {groups.map((group) => (
           <NavGroup key={group.title} {...group} />
         ))}
       </SidebarContent>
-      <SidebarFooter>
+      <SidebarFooter className='border-t'>
+        <WorkspaceSwitcher />
+        <div className='flex flex-wrap items-center gap-x-3 gap-y-1 px-2 py-1 text-[11px] text-muted-foreground group-data-[collapsible=icon]:hidden'>
+          <a
+            href={REPO_URL}
+            target='_blank'
+            rel='noreferrer'
+            className='hover:text-primary'
+          >
+            GitHub
+          </a>
+          <a
+            href={DOCS_URL}
+            target='_blank'
+            rel='noreferrer'
+            className='hover:text-primary'
+          >
+            文档
+          </a>
+          {me?.version ? (
+            <a
+              href={`${REPO_URL}/releases/tag/v${me.version.replace(/^v/i, '')}`}
+              target='_blank'
+              rel='noreferrer'
+              className='min-w-0 font-mono break-all hover:text-primary'
+            >
+              v{me.version.replace(/^v/i, '')}
+            </a>
+          ) : null}
+        </div>
         <NavUser
           user={{
             name: userName,

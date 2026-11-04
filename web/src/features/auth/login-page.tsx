@@ -3,16 +3,8 @@ import { useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate, useSearch } from '@tanstack/react-router'
 import { GPT_CONSOLE_URL } from '@/config/hosted'
 import { DOCS_URL } from '@/config/repo'
-import {
-  ArrowUpRight,
-  Eye,
-  EyeOff,
-  KeyRound,
-  LogIn,
-  ShieldCheck,
-} from 'lucide-react'
+import { ArrowUpRight, Eye, EyeOff, LogIn, Layers } from 'lucide-react'
 import { toast } from 'sonner'
-import { Logo } from '@/assets/logo'
 import { useAuthStore } from '@/stores/auth-store'
 import { loginRequest } from '@/lib/api'
 import { apiBase, sameOriginPanel, setApiBase } from '@/lib/session'
@@ -78,16 +70,17 @@ export function LoginPage() {
   }
 
   return (
-    <div className='flex min-h-svh flex-col bg-background text-foreground'>
-      <header className='mx-auto flex h-20 w-full max-w-6xl items-center justify-between px-5 sm:px-8'>
-        <Link to='/welcome' className='flex items-center gap-2.5 rounded-xl'>
-          <span className='workbench-brand grid size-9 place-items-center rounded-xl text-white'>
-            <Logo aria-hidden className='size-4' />
+    <div className='welcome-theme flex min-h-svh flex-col bg-background text-foreground'>
+      <header className='flex h-16 items-center justify-between border-b border-border/60 bg-card px-5 md:px-8'>
+        <Link
+          to='/welcome'
+          className='flex items-center gap-2.5 rounded-md focus-visible:ring-2 focus-visible:ring-ring'
+        >
+          <span className='workbench-brand'>
+            <Layers aria-hidden className='size-[18px]' />
           </span>
-          <span className='text-sm font-semibold tracking-tight'>
-            Claude{' '}
-            <span className='font-normal text-muted-foreground'>/ 工作台</span>
-          </span>
+          <span className='text-lg font-bold tracking-tight'>Claude</span>
+          <span className='text-xs text-muted-foreground'>工作台</span>
         </Link>
         <div className='flex items-center gap-3'>
           <a
@@ -100,66 +93,49 @@ export function LoginPage() {
           <ThemeSwitch />
         </div>
       </header>
-      <main className='flex flex-1 items-center justify-center px-5 pt-6 pb-16 sm:px-8'>
-        <div className='grid w-full max-w-[1040px] overflow-hidden rounded-[20px] border bg-card shadow-[0_16px_60px_#17295408] md:grid-cols-2'>
-          <aside className='hidden flex-col justify-between bg-accent/70 p-7 md:flex md:p-10 lg:p-12'>
+      <main className='flex flex-1 items-center justify-center px-4 py-10 md:px-8'>
+        <div className='workbench-login-grid'>
+          <aside className='workbench-login-aside hidden min-h-[520px] flex-col justify-between p-10 md:flex'>
             <div>
-              <div className='mb-6 flex items-center gap-2 text-xs font-medium text-primary'>
-                <span className='h-px w-6 bg-primary/50' />
-                HOSTED WORKSPACE
-              </div>
-              <h2 className='text-2xl leading-snug font-semibold tracking-tight md:text-3xl'>
+              <span className='workbench-brand mb-8'>
+                <Layers aria-hidden className='size-7' />
+              </span>
+              <p className='text-xs font-semibold tracking-[0.2em] uppercase opacity-65'>
+                CLAUDE WORKSPACE
+              </p>
+              <h2 className='mt-4 text-3xl leading-tight font-semibold tracking-tight'>
                 Claude 与 GPT，
                 <br />
                 统一托管工作台。
               </h2>
-              <p className='mt-4 max-w-sm text-sm leading-7 text-muted-foreground'>
-                在一个工作台查看 Claude
-                账号、出口线路和使用情况，按服务管理独立的 Claude 与 GPT Key。
+              <p className='mt-5 max-w-sm text-sm leading-7 opacity-75'>
+                查看账号健康、请求记录、调度状态与接入配置，按服务管理独立的
+                Claude 与 GPT Key。
               </p>
             </div>
-            <div className='mt-8 hidden space-y-5 md:block'>
-              <div className='flex gap-3'>
-                <KeyRound
-                  aria-hidden
-                  className='mt-0.5 size-4 shrink-0 text-primary'
-                />
-                <div>
-                  <p className='text-sm font-medium'>两池分开，边界清楚</p>
-                  <p className='mt-1 text-xs leading-6 text-muted-foreground'>
-                    各自授权、各自计并发，新建 Key 默认并发 1。
-                  </p>
-                </div>
-              </div>
-              <div className='flex gap-3'>
-                <ShieldCheck
-                  aria-hidden
-                  className='mt-0.5 size-4 shrink-0 text-primary'
-                />
-                <div>
-                  <p className='text-sm font-medium'>
-                    运行与可服务状态分开呈现
-                  </p>
-                  <p className='mt-1 text-xs leading-6 text-muted-foreground'>
-                    凭据、线路和风险审核共同决定账号是否可用。
-                  </p>
-                </div>
-              </div>
+            <div className='flex items-center gap-3 border-t border-current/10 pt-5 text-xs opacity-70'>
+              <span className='size-2 rounded-full bg-primary' />
+              独立登录 · 凭据分开管理
             </div>
           </aside>
-          <div className='p-7 md:p-10 lg:p-12'>
-            <h1 className='text-xl font-semibold tracking-tight'>
-              登录 Claude 工作台
-            </h1>
-            <p className='mt-2 text-sm leading-6 text-muted-foreground'>
-              使用管理员分配的面板账号继续。
-            </p>
-            <form className='mt-7 space-y-5' onSubmit={onSubmit}>
+          <section className='flex min-h-[520px] flex-col justify-center px-6 py-10 sm:px-10'>
+            <div className='mb-8'>
+              <p className='mb-2 text-xs font-medium tracking-wide text-primary'>
+                欢迎回来
+              </p>
+              <h1 className='text-2xl font-semibold tracking-tight md:text-[28px]'>
+                登录 Claude 工作台
+              </h1>
+              <p className='mt-2 text-sm text-muted-foreground'>
+                使用管理员分配的面板账号继续。
+              </p>
+            </div>
+            <form className='space-y-4' onSubmit={onSubmit}>
               <div className='space-y-2'>
                 <Label htmlFor='login-username'>用户名</Label>
                 <Input
                   id='login-username'
-                  className='h-11 rounded-xl bg-background/50'
+                  className='h-10 rounded-lg'
                   autoComplete='username'
                   placeholder='输入面板用户名'
                   value={username}
@@ -172,7 +148,7 @@ export function LoginPage() {
                   <Input
                     id='login-password'
                     type={showPassword ? 'text' : 'password'}
-                    className='h-11 rounded-xl bg-background/50 pe-10'
+                    className='h-10 rounded-lg pe-10'
                     autoComplete='current-password'
                     placeholder='输入密码'
                     autoFocus
@@ -195,11 +171,11 @@ export function LoginPage() {
               </div>
               {hideBase ? null : (
                 <div className='space-y-2'>
-                  <Label htmlFor='login-api-base'>API Base</Label>
+                  <Label htmlFor='login-api-base'>连接地址（可选）</Label>
                   <Input
                     id='login-api-base'
-                    placeholder='http://127.0.0.1:8787'
-                    className='h-11 rounded-xl bg-background/50'
+                    placeholder='留空时使用当前服务器'
+                    className='h-10 rounded-lg'
                     value={base}
                     onChange={(e) => setBase(e.target.value)}
                   />
@@ -211,7 +187,7 @@ export function LoginPage() {
                 </p>
               ) : null}
               <Button
-                className='mt-2 h-11 w-full rounded-xl font-medium'
+                className='h-10 w-full rounded-lg font-medium'
                 type='submit'
                 disabled={pending}
               >
@@ -219,25 +195,27 @@ export function LoginPage() {
                 {pending ? '登录中…' : '登录'}
               </Button>
             </form>
-            <div className='mt-6 flex flex-wrap gap-x-4 gap-y-2 text-xs text-muted-foreground'>
-              <Link to='/welcome' className='hover:text-primary'>
-                使用指南
+            <p className='mt-8 text-xs text-muted-foreground'>
+              首次使用？
+              <Link
+                to='/welcome'
+                className='font-medium text-primary hover:underline'
+              >
+                查看使用指南
               </Link>
+              <span className='mx-2'>·</span>
               <a
                 href={`${DOCS_URL}guide/install`}
                 target='_blank'
                 rel='noreferrer'
-                className='hover:text-primary'
+                className='hover:underline'
               >
                 部署文档
               </a>
-            </div>
-          </div>
+            </p>
+          </section>
         </div>
       </main>
-      <footer className='px-5 pb-6 text-center text-[11px] text-muted-foreground'>
-        Claude 与 GPT 源控制台分别管理登录和凭据。
-      </footer>
     </div>
   )
 }

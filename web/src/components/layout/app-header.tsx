@@ -18,16 +18,14 @@ export function AppHeader({ actions }: AppHeaderProps) {
   return (
     <Header
       fixed
-      className='h-auto min-h-16 border-b bg-card/90 backdrop-blur-xl xl:h-16 [&>div]:flex-wrap xl:[&>div]:flex-nowrap'
+      className='workbench-topbar h-auto min-h-14 border-b bg-card xl:h-14 [&>div]:flex-wrap xl:[&>div]:flex-nowrap'
     >
-      <div className='hidden shrink-0 items-center gap-2 text-xs text-muted-foreground md:flex'>
-        <span>Claude 工作台</span>
+      <div className='hidden items-center gap-2 text-xs whitespace-nowrap text-muted-foreground lg:flex'>
+        <span>工作台</span>
         <ChevronRight aria-hidden className='size-3' />
         <span className='font-medium text-foreground'>{title}</span>
       </div>
-      <div className='min-w-0 md:ms-3'>
-        <Search placeholder='搜索页面…' />
-      </div>
+      <Search placeholder='搜索页面…' />
       <div className='ms-auto flex min-w-0 flex-wrap items-center justify-end gap-2 [&>div]:flex-wrap'>
         {actions}
         <ConfigDrawer />

@@ -26,7 +26,12 @@ export function AuthenticatedLayout({
         <SidebarProvider
           defaultOpen={defaultOpen}
           className='hosted-workbench'
-          style={{ '--sidebar-width': '17rem' } as React.CSSProperties}
+          style={
+            {
+              '--sidebar-width': '15rem',
+              '--sidebar-width-icon': '4rem',
+            } as React.CSSProperties
+          }
         >
           <SkipToMain />
           <AppSidebar />
