@@ -37,11 +37,28 @@ export function RelayUsageCard({
           <span title='同一账号在所有成员及设备上的消耗，不只来自 vm2api'>
             官方 · 全员
           </span>
-          {windowsStale && (
+          {windowsStale ? (
             <span title='以下为上次官方读数，过重置时间不代表已确认恢复'>
               待更新
             </span>
-          )}
+          ) : relay.runtime.official_windows ? (
+            <time
+              dateTime={new Date(
+                relay.runtime.official_windows.source_updated_ms
+              ).toISOString()}
+              title={`官方更新 ${exactTime(relay.runtime.official_windows.source_updated_ms)}（北京）`}
+            >
+              {new Date(
+                relay.runtime.official_windows.source_updated_ms
+              ).toLocaleTimeString('zh-CN', {
+                timeZone: 'Asia/Shanghai',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: false,
+              })}{' '}
+              更新
+            </time>
+          ) : null}
         </h4>
         {windows.map((w) => (
           <QuotaWindowRow key={w.label} w={w} now={now} hasToken quiet />
@@ -107,7 +124,12 @@ export function RelayUsageDetail({ relay }: { relay: NativeRelay }) {
   return (
     <div className='space-y-1 text-xs text-muted-foreground'>
       {!windows && <p>官方未提供 5H / 7D 百分比，显示为 —。</p>}
-      {windows && <p>窗口同步 {exactTime(windows.observed_at_ms)}（北京）</p>}
+      {windows && (
+        <p>
+          官方更新 {exactTime(windows.source_updated_ms)}；读取{' '}
+          {exactTime(windows.observed_at_ms)}（北京）
+        </p>
+      )}
       {q && (
         <p>
           套餐已用 {money(q.used_usd)} / {money(q.quota_usd)}，
