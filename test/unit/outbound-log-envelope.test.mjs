@@ -7,6 +7,8 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { ThinkingOwnerStore } from '../../src/lib/pool/thinking-owner.mjs'
+import { claudeCodeInboundBody } from '../../src/lib/protocol/claude-code-inbound.mjs'
+import { isOfficialClaudeCodeTraffic } from '../../src/lib/identity/crs-persona.mjs'
 
 // Unix socket 在 Windows 上不可用，和 go-worker-client.test.mjs 的 unixTest 保持一致。
 const unixTest = process.platform === 'win32' ? test.skip : test
@@ -120,6 +122,7 @@ function fakeResponse() {
 unixTest('debug log uses final CLI headers, hides internal events and never substitutes envelope headers', async () => {
   const kernel = await fakeKernel()
   const finished = []
+  const routingConfig = { compatibility: {}, failover: {} }
   const handler = createHandleProtocol({
     json: (res, status) => {
       res.statusCode = status
@@ -148,7 +151,7 @@ unixTest('debug log uses final CLI headers, hides internal events and never subs
     apiEndpointStore: {},
     stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
     routingConfigPath: path.join(kernel.root, 'routing.json'),
-    routingConfig: { compatibility: {}, failover: {} },
+    routingConfig,
     groupsRepo: { rateMultiplier: () => 1 },
     thinkingOwners: new ThinkingOwnerStore({ db: new DatabaseSync(':memory:') }),
     failoverRunner: {
@@ -194,18 +197,45 @@ unixTest('debug log uses final CLI headers, hides internal events and never subs
       assert.equal(res.writes.join('').includes('kin_outbound_headers'), false)
       assert.equal(res.writes.join('').includes('must-not-be-logged'), false)
     }
+    // Replay only the safe model/thinking/context fields from the captured
+    // official 2.1.304 request, through both the rewrite and passthrough modes.
+    for (const passthrough of [false, true]) {
+      routingConfig.compatibility.official_cc_passthrough = passthrough
+      const body = claudeCodeInboundBody({
+        model: 'claude-haiku-4-5-20251001',
+        maxTokens: 32000,
+        stream: true,
+        sessionId: '11111111-1111-4111-8111-111111111111',
+        thinking: { budget_tokens: 31999, type: 'enabled', display: 'omitted' },
+        messages: [{ role: 'user', content: 'Return exactly HOSTED_CLAUDE_CODE_OK' }],
+      })
+      delete body.temperature
+      body.context_management = { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] }
+      const req = request(body)
+      assert.equal(isOfficialClaudeCodeTraffic(req.headers, body), true)
+      const res = fakeResponse()
+      await handler.handleProtocol(req, res, 'anthropic.messages', '/v1/messages')
+      res.finish()
+      assert.equal(res.statusCode, 200)
+      assert.equal(
+        kernel.posted.at(-1).body.context_management,
+        undefined,
+        `clear-thinking must not reach the native CLI when passthrough=${passthrough}`,
+      )
+    }
     assert.equal(
       kernel.posted.length,
-      4,
+      6,
       JSON.stringify(finished.map((f) => [f.status, f.error_code, f.error_message])),
     )
-    assert.equal(finished.length, 4)
+    assert.equal(finished.length, 6)
     for (const [i, extra] of finished.entries()) {
       const sent = kernel.posted[i]
       assert.deepEqual(JSON.parse(JSON.stringify(extra.outbound_body)), sent.body)
       // cli-hop 在传输层才补的字段：betas 与 cch 占位；billing 由 cli-hop 末段补上。
       assert.ok(Array.isArray(extra.outbound_body.betas))
-      assert.match(extra.outbound_body.system[0].text, /^x-anthropic-billing-header: .*\bcch=00000;/)
+      if (i < 4) assert.match(extra.outbound_body.system[0].text, /^x-anthropic-billing-header: .*\bcch=00000;/)
+      else assert.equal(extra.outbound_body.context_management, undefined)
       assert.deepEqual(extra.worker_envelope_headers, sent.headers)
       if (i < 2) {
         assert.deepEqual(extra.outbound_headers, {

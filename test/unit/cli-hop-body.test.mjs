@@ -294,7 +294,7 @@ test('prepareCliHopBody repaired does not refill thinking after signature downgr
   ])
 })
 
-test('prepareCliHopBody leaves Haiku thinking and context management untouched', () => {
+test('prepareCliHopBody preserves explicit Haiku thinking but removes unsupported clear-thinking', () => {
   const body = prepareCliHopBody({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 512,
@@ -303,7 +303,7 @@ test('prepareCliHopBody leaves Haiku thinking and context management untouched',
     messages: [{ role: 'user', content: 'hi' }],
   })
   assert.equal(body.thinking.type, 'adaptive')
-  assert.deepEqual(body.context_management, { edits: [{ type: 'clear_thinking_20251015' }] })
+  assert.equal(body.context_management, undefined)
   assert.equal(body.output_config, undefined)
 })
 
@@ -550,4 +550,72 @@ test('cli-hop leaves Opus model policy for cli-node', () => {
   assert.deepEqual(body.tool_choice, { type: 'tool', name: 'get_weather' })
   assert.equal(body.tools.find((tool) => tool.name === 'get_weather').strict, undefined)
   assert.equal(body.tools.find((tool) => tool.name === 'computer').type, 'computer_20251124')
+})
+
+test('native CLI hop removes captured Haiku clear-thinking before native policy disables thinking', () => {
+  const inbound = {
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 32000,
+    thinking: { budget_tokens: 31999, type: 'enabled', display: 'omitted' },
+    context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },
+    messages: [{ role: 'user', content: 'Return exactly HOSTED_CLAUDE_CODE_OK' }],
+  }
+  const before = structuredClone(inbound)
+  const body = prepareCliHopBody(inbound, {
+    preserveSystem: true,
+    routing: { compatibility: { thinking_display: 'passthrough' } },
+  })
+  // The native Haiku policy may subsequently disable thinking. No incompatible
+  // clearing edit may survive that boundary, even though caller thinking is enabled.
+  assert.equal(body.context_management, undefined)
+  assert.deepEqual(body.thinking, inbound.thinking)
+  assert.deepEqual(inbound, before)
+})
+
+test('native clear-thinking repair preserves tool clearing and explicit unsupported controls', () => {
+  const tool = { type: 'clear_tool_uses_20250919', keep: { type: 'tool_uses', value: 3 } }
+  const unknown = { type: 'unknown_strategy_for_validation' }
+  for (const [model, thinking] of [
+    ['claude-haiku-4-5-20251001', { type: 'enabled', budget_tokens: 31999 }],
+    ['claude-haiku-4-5-20251001', { type: 'adaptive' }],
+    ['claude-sonnet-4-6', { type: 'disabled' }],
+    ['claude-sonnet-4-6', undefined],
+  ]) {
+    const body = prepareCliHopBody({
+      model,
+      thinking,
+      max_tokens: 32000,
+      context_management: { edits: [{ type: 'clear_thinking_20251015' }, tool, unknown] },
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    assert.deepEqual(body.context_management.edits, [tool, unknown])
+    assert.equal(body.thinking?.type, thinking?.type)
+  }
+})
+
+test('native clear-thinking cleanup preserves valid supported thinking and malformed caller validation', () => {
+  for (const thinking of [{ type: 'enabled', budget_tokens: 2048 }, { type: 'adaptive' }]) {
+    const context_management = { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] }
+    const body = prepareCliHopBody({
+      model: 'claude-sonnet-4-6',
+      thinking,
+      context_management,
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    assert.deepEqual(body.context_management, context_management)
+  }
+  for (const context_management of [
+    { edits: 'invalid' },
+    { edits: [{ type: 'unknown_strategy' }] },
+    { edits: [{ type: 'clear_tool_uses_20250919' }] },
+  ]) {
+    const body = prepareCliHopBody({
+      model: 'claude-haiku-4-5-20251001',
+      thinking: { type: 'adaptive' },
+      context_management,
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    assert.deepEqual(body.context_management, context_management)
+    assert.equal(body.thinking.type, 'adaptive')
+  }
 })

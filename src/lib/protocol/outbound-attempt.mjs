@@ -12,6 +12,7 @@ import {
   stripInvalidThinkingBlocks,
   alignSamplingWithThinking,
   modelSupportsMidConversationSystem,
+  stripUnsupportedClearThinkingEdits,
 } from './anthropic-policy.mjs'
 import { liftMidConversationSystemMessages, promoteContentToBlocks } from './sanitize.mjs'
 import { applyThinkingDisplay, thinkingDisplayMode } from './thinking.mjs'
@@ -371,6 +372,7 @@ export function prepareCliHopBody(
   body = stripSubagentBilling(body)
   body = stripInvalidThinkingBlocks(body, { preserveThinkingBlocks })
   body = ensureOutputConfigSchema(body)
+  body = stripUnsupportedClearThinkingEdits(body)
 
   if (preparedZero && !lean && !preserveSystem && !requestContext && body.cache_control != null) {
     body = materializeAutomaticCache(body)
