@@ -6,7 +6,8 @@ import { attemptDiagnostic } from './attempt-diagnostic.mjs'
 import { applyIntercept } from '../core/intercept.mjs'
 import { resolveStreamIdleTimeoutMs, inboundBodyLimit, queueKeepaliveDelayMs } from '../core/config.mjs'
 import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
-import { validateToolChoice } from './model-policy.mjs'
+import { validateBetweenToolsThinking, validateToolChoice, getCapabilities } from './model-policy.mjs'
+import { ToolResultPruneCache, dshPruneScope } from './tool-result-prune-cache.mjs'
 import {
   inboundRefusalDeviceId,
   isRefusalGuardEnabled,
@@ -199,6 +200,7 @@ export function createHandleProtocol(deps) {
   const apiScheduler = deps.apiScheduler
   const apiEndpointStore = deps.apiEndpointStore
   const stats = deps.stats
+  const toolPruneCache = new ToolResultPruneCache()
   const routingConfigPath = deps.routingConfigPath
   const getRouting = () => (typeof deps.getRoutingConfig === 'function' ? deps.getRoutingConfig() : deps.routingConfig)
   const getHealthMonitor = () =>
@@ -684,12 +686,13 @@ export function createHandleProtocol(deps) {
     return acceptAssistantHop(workerResult)
   }
 
-  function bindRequestLog(req, res, logCtx, logBag) {
+  function bindRequestLog(req, res, logCtx, logBag, onSettled) {
     let settled = false
     let recorded = false
     const finish = () => {
       if (!settled || recorded) return
       recorded = true
+      onSettled?.()
       try {
         const groupId = req.apiKeyRecord?.group_id ?? 1
         requestLog.finish(logCtx, {
@@ -750,15 +753,34 @@ export function createHandleProtocol(deps) {
       reasoning_effort: null,
       outbound_session_id: null,
     }
-    const settleLog = bindRequestLog(req, res, logCtx, logBag)
+    const toolPrune = { attempt: null, closed: false }
+    const discardToolPrune = () => {
+      if (res.writableFinished) return
+      toolPrune.closed = true
+      toolPrune.attempt?.rollback()
+    }
+    res.once('close', discardToolPrune)
+    req.once('aborted', discardToolPrune)
+    const settleLog = bindRequestLog(req, res, logCtx, logBag, () => {
+      const usage = logBag.usage || {}
+      toolPrune.attempt?.commit({
+        verified: !toolPrune.closed && res.statusCode === 200 && logBag.final_state === 'verified',
+        attemptCount: logBag.attempt_count,
+        inputTokens:
+          Number(usage.input_tokens || 0) +
+          Number(usage.cache_read_tokens ?? usage.cache_read_input_tokens ?? 0) +
+          Number(usage.cache_creation_tokens ?? usage.cache_creation_input_tokens ?? 0),
+        outputTokens: Number(usage.output_tokens || 0),
+      })
+    })
     try {
-      return await runProtocol(req, res, protocol, pathName, logCtx, logBag)
+      return await runProtocol(req, res, protocol, pathName, logCtx, logBag, toolPrune)
     } finally {
       settleLog()
     }
   }
 
-  async function runProtocol(req, res, protocol, pathName, logCtx, logBag) {
+  async function runProtocol(req, res, protocol, pathName, logCtx, logBag, toolPrune) {
     if (!requireAuth(req, res)) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
       logBag.error_message = req.authError?.message || 'Invalid credentials'
@@ -1165,6 +1187,7 @@ export function createHandleProtocol(deps) {
       inboundToolReverse = standard.reverse
     }
     try {
+      validateBetweenToolsThinking(ctx.body)
       validateToolChoice(ctx.body)
     } catch (error) {
       if (!error.body?.error) throw error
@@ -1185,6 +1208,30 @@ export function createHandleProtocol(deps) {
       }
     }
 
+    if (
+      !toolPrune.closed &&
+      !req.aborted &&
+      !responseClosed(res) &&
+      !requestContext &&
+      !apiPassthrough &&
+      inferenceBackend !== 'api' &&
+      getRouting()?.compatibility?.preserve_pruned_tool_results === true
+    ) {
+      const scope = dshPruneScope({ headers: req.headers, apiKey: req.presentedApiKey })
+      if (scope) {
+        toolPrune.attempt = toolPruneCache.prepare({
+          scope,
+          body: ctx.body,
+          contextWindow: Number(getCapabilities(ctx.body.model)?.context_window),
+          maxBodyBytes: inboundBodyLimit(getRouting(), cfg.limits.max_body_bytes),
+        })
+        ctx.body = toolPrune.attempt.body
+        logBag.hop_meta = {
+          ...logBag.hop_meta,
+          tool_result_prune: { restored: toolPrune.attempt.restored, reason: toolPrune.attempt.reason },
+        }
+      }
+    }
     if (
       !apiPassthrough &&
       (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res }))
