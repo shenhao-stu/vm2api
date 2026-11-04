@@ -12,6 +12,7 @@ import { ApiEndpointStore } from '../../src/lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from '../../src/lib/pool/api-scheduler.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { keyAllowsVm } from '../../src/lib/admin/key-scope.mjs'
+import { RequestLogStore } from '../../src/lib/admin/request-log.mjs'
 
 const gpt = 'gpt-6.1-sol'
 const claude = 'claude-sonnet-4-6'
@@ -46,7 +47,7 @@ async function upstream(t, handle) {
   })
   return `http://127.0.0.1:${server.address().port}`
 }
-function harness(t, origin, { requiredGuard = true, gatewayOnly = false } = {}) {
+function harness(t, origin, { requiredGuard = true, gatewayOnly = false, persistentLogs = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hybrid-protocol-'))
   const db = openDatabase({ dbPath: path.join(root, 'kin.db') })
   t.after(() => {
@@ -78,6 +79,7 @@ function harness(t, origin, { requiredGuard = true, gatewayOnly = false } = {}) 
   fs.writeFileSync(routingConfigPath, JSON.stringify(routingConfig))
   const nativeCalls = []
   const logs = []
+  const logStore = persistentLogs ? new RequestLogStore({ db, dataDir: root, jsonlMirror: false }) : null
   const json = (res, status, body) => {
     res.statusCode = status
     res.body = body
@@ -110,7 +112,9 @@ function harness(t, origin, { requiredGuard = true, gatewayOnly = false } = {}) 
       limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 1500, stream_idle_timeout_ms: 1500 },
       paths: { data: root, project: root },
     },
-    requestLog: { start: () => ({ request_id: 'hybrid-test', t0: Date.now() }), finish: (_ctx, log) => logs.push(log) },
+    requestLog: logStore
+      ? { start: (...args) => logStore.start(...args), finish: (ctx, log) => logs.push(logStore.finish(ctx, log)) }
+      : { start: () => ({ request_id: 'hybrid-test', t0: Date.now() }), finish: (_ctx, log) => logs.push(log) },
     stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
     accountQuota: {},
     apiKeyStore: keys,
@@ -160,7 +164,7 @@ function harness(t, origin, { requiredGuard = true, gatewayOnly = false } = {}) 
           : handlers.handleProtocol(req, res, protocol, '/v1/responses')
     return { req, res, done: promise.then(() => res) }
   }
-  return { call, key, keys, ep, endpoints, scheduler, nativeCalls, logs }
+  return { call, key, keys, ep, endpoints, scheduler, nativeCalls, logs, logStore, db }
 }
 
 test('full handler authenticates and routes only configured GPT to a local gateway with required guard intact', async (t) => {
@@ -481,4 +485,185 @@ test('different managed keys cannot collide through caller-supplied session head
   for (const entry of received) for (const key of Object.keys(headers)) assert.equal(entry[key], undefined)
   assert.equal(h.keys.getById(h.key.id).requests, 1)
   assert.equal(h.keys.getById(second.id).requests, 1)
+})
+
+for (const protocol of ['openai.responses', 'openai.chat', 'anthropic.messages']) {
+  for (const [label, usage, serviceTier, expectedInput] of [
+    ['missing usage', undefined, undefined, null],
+    ['partial usage', { input_tokens: 14, input_tokens_details: { cached_tokens: 4 } }, undefined, 10],
+    ['unpriced usage', { input_tokens: 14, output_tokens: 2 }, 'unknown-tier', 14],
+  ]) {
+    test(`gateway holds success terminal and preserves pending SQLite billing: ${protocol} / ${label}`, async (t) => {
+      let calls = 0
+      const prefix =
+        'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"hello"}\n\n'
+      const origin = await upstream(t, (req, res) => {
+        calls++
+        req.resume()
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        const terminal = `event: response.completed\ndata: ${JSON.stringify({
+          type: 'response.completed',
+          response: {
+            id: 'resp_offline_billing',
+            status: 'completed',
+            model: gpt,
+            service_tier: serviceTier,
+            output: [{ type: 'message', content: [{ type: 'output_text', text: 'hello' }] }],
+            usage,
+          },
+        })}\n\n`
+        // A TCP chunk boundary is not an SSE event boundary.
+        res.write(prefix + terminal.slice(0, 35))
+        res.end(terminal.slice(35) + 'data: [DONE]\n\n')
+      })
+      const h = harness(t, origin, { gatewayOnly: true, persistentLogs: true })
+      const reply = await h.call(
+        { model: gpt, input: 'hello', messages: [{ role: 'user', content: 'hello' }], stream: true },
+        { protocol },
+      ).done
+      const wire = reply.chunks.join('')
+      if (protocol === 'openai.responses') assert.ok(wire.startsWith(prefix), 'nonterminal raw frames are preserved')
+      assert.equal(wire.includes('response.completed'), false)
+      assert.equal(wire.includes('[DONE]'), false)
+      assert.equal(wire.includes('"type":"message_stop"'), false)
+      assert.equal(wire.includes('"finish_reason":"stop"'), false)
+      assert.equal(calls, 1)
+      assert.equal(h.keys.getById(h.key.id).requests, 0)
+      const saved = h.db.prepare('SELECT * FROM usage_logs').get()
+      assert.equal(saved.final_state, 'billing_pending')
+      assert.equal(saved.total_cost, null)
+      assert.equal(saved.actual_cost, null)
+      assert.equal(saved.input_tokens, expectedInput)
+      assert.equal(saved.output_tokens, usage?.output_tokens ?? null)
+      assert.equal(saved.attempt_count, 1)
+    })
+  }
+}
+
+test('cancelled dispatched gateway turn leaves unknown SQLite usage pending, without retry', async (t) => {
+  let entered
+  const accepted = new Promise((resolve) => {
+    entered = resolve
+  })
+  let calls = 0
+  const origin = await upstream(t, (req, res) => {
+    calls++
+    req.resume()
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.write(': accepted\n\n')
+    entered()
+  })
+  const h = harness(t, origin, { gatewayOnly: true, persistentLogs: true })
+  const request = h.call({ model: gpt, input: 'hello', stream: true })
+  await accepted
+  request.res.destroyed = true
+  request.res.emit('close')
+  await request.done
+  const saved = h.db.prepare('SELECT * FROM usage_logs').get()
+  assert.equal(saved.final_state, 'billing_pending')
+  assert.equal(saved.input_tokens, null)
+  assert.equal(saved.output_tokens, null)
+  assert.equal(saved.total_cost, null)
+  assert.equal(saved.actual_cost, null)
+  assert.equal(calls, 1)
+  assert.equal(h.keys.getById(h.key.id).requests, 0)
+  assert.equal(h.keys.inflight.get(h.key.id) || 0, 0)
+})
+
+for (const protocol of ['openai.responses', 'openai.chat', 'anthropic.messages']) {
+  test(`verified gateway stream produces one priced SQLite receipt: ${protocol}`, async (t) => {
+    let calls = 0
+    const origin = await upstream(t, (req, res) => {
+      calls++
+      req.resume()
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(
+        `data: ${JSON.stringify({
+          type: 'response.completed',
+          response: {
+            id: 'resp_single_charge',
+            status: 'completed',
+            model: gpt,
+            output: [{ type: 'message', content: [{ type: 'output_text', text: 'hello' }] }],
+            usage: { input_tokens: 14, output_tokens: 2, input_tokens_details: { cached_tokens: 4 } },
+          },
+        })}\n\ndata: [DONE]\n\n`,
+      )
+    })
+    const h = harness(t, origin, { gatewayOnly: true, persistentLogs: true })
+    await h.call(
+      { model: gpt, input: 'hello', messages: [{ role: 'user', content: 'hello' }], stream: true },
+      { protocol },
+    ).done
+    const rows = h.db.prepare('SELECT * FROM usage_logs').all()
+    const key = h.keys.getById(h.key.id)
+    assert.equal(calls, 1)
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].final_state, 'verified')
+    assert.equal(rows[0].input_tokens, 10)
+    assert.equal(rows[0].cache_read_tokens, 4)
+    assert.equal(rows[0].output_tokens, 2)
+    assert.ok(rows[0].actual_cost > 0)
+    assert.equal(rows[0].actual_cost, key.quota_used)
+    assert.equal(key.requests, 1)
+  })
+}
+
+test('raw Responses streams complete nonterminal frames before EOF and preserves UTF-8/comment bytes', async (t) => {
+  const prefix =
+    ': keepalive\r\n\r\nevent: response.output_text.delta\r\ndata: {"type":"response.output_text.delta","delta":"你好"}\r\n\r\n'
+  const tail = `event: response.completed\r\ndata: ${JSON.stringify({
+    type: 'response.completed',
+    response: {
+      id: 'resp_utf8',
+      status: 'completed',
+      model: gpt,
+      output: [{ type: 'message', content: [{ type: 'output_text', text: '你好' }] }],
+      usage: { input_tokens: 2, output_tokens: 1 },
+    },
+  })}\r\n\r\ndata: [DONE]\r\n\r\n`
+  let finish
+  const origin = await upstream(t, (req, res) => {
+    req.resume()
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    const bytes = Buffer.from(prefix)
+    const split = bytes.indexOf(Buffer.from('你好')) + 1
+    res.write(bytes.subarray(0, split))
+    setImmediate(() => res.write(bytes.subarray(split)))
+    finish = () => res.end(tail)
+  })
+  const h = harness(t, origin, { gatewayOnly: true, persistentLogs: true })
+  const request = h.call({ model: gpt, input: 'hello', stream: true })
+  let prefixDelivered
+  const delivered = new Promise((resolve) => {
+    prefixDelivered = resolve
+  })
+  const write = request.res.write
+  request.res.write = function (chunk) {
+    const result = write.call(this, chunk)
+    if (this.chunks.join('').includes('你好')) prefixDelivered()
+    return result
+  }
+  await delivered
+  assert.equal(request.res.writableEnded, undefined)
+  assert.equal(request.res.chunks.join(''), prefix)
+  finish()
+  await request.done
+  assert.equal(request.res.chunks.join(''), prefix + tail)
+  assert.equal(h.keys.getById(h.key.id).requests, 1)
+})
+
+test('pending local gateway token handling does not change native Claude log normalization', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'native-log-normalization-'))
+  const db = openDatabase({ dbPath: path.join(root, 'kin.db') })
+  t.after(() => {
+    closeDatabase()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const logger = new RequestLogStore({ db, dataDir: root, jsonlMirror: false })
+  const context = { request_id: 'native-normalization', t0: Date.now(), mode: 'normal', protocol: 'anthropic.messages' }
+  logger.finish(context, { via: 'go-worker-pool', model: claude, final_state: 'billing_pending', usage: null })
+  const row = db.prepare('SELECT input_tokens,output_tokens FROM usage_logs WHERE request_id=?').get(context.request_id)
+  assert.equal(row.input_tokens, 0)
+  assert.equal(row.output_tokens, 0)
 })

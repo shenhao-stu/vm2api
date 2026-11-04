@@ -315,8 +315,25 @@ export function createHandleProtocol(deps) {
           })
         }
       }
+      // A dispatched turn without an authoritative terminal can already have cost.
+      // Explicit null pricing prevents the log store from turning missing usage into $0.
+      if (
+        result.attemptCount === 1 &&
+        !(result.upstreamStatus >= 400 && result.terminalState === 'rejected') &&
+        !(result.terminal && !result.failed && result.usageVerified)
+      ) {
+        Object.assign(logBag, costColumnsFromUsage(null, null), { final_state: 'billing_pending' })
+      }
       if (!result.ok && result.status !== 499) stats.errors++
-      if (result.status === 499) return finishClientCancel(res, result, logBag)
+      if (result.status === 499) {
+        const pendingBilling = logBag.final_state === 'billing_pending'
+        const reply = finishClientCancel(res, result, logBag)
+        if (pendingBilling) {
+          logBag.final_state = 'billing_pending'
+          logBag.error_code = result.errorCode || 'gateway_usage_missing'
+        }
+        return reply
+      }
       if (res.headersSent) {
         if (!result.ok && !res.destroyed && !res.writableEnded) {
           const error = {

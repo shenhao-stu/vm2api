@@ -138,8 +138,10 @@ function toRow(rec) {
       c === 'cache_creation_5m_tokens' ||
       c === 'cache_creation_1h_tokens' ||
       c === 'web_search_requests'
-    )
+    ) {
+      if (rec.via === 'local-gateway' && rec.final_state === 'billing_pending' && rec[c] == null) return null
       return Number(rec[c]) || 0
+    }
     return rec[c] ?? null
   })
 }

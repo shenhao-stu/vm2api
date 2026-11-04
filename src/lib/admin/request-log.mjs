@@ -503,7 +503,12 @@ export class RequestLogStore {
   finish(ctx, extra = {}) {
     if (!ctx || ctx.mode === 'off') return null
     const duration_ms = Math.max(0, Date.now() - (ctx.t0 || Date.now()))
-    const usage = normalizeUsage(disjointOpenaiUsage(extra.usage || {}) || {})
+    // The local gateway supplies disjoint observations; pending billing must keep
+    // absent counters unknown. Other backends retain their existing normalization.
+    const usage =
+      extra.via === 'local-gateway' && extra.final_state === 'billing_pending'
+        ? extra.usage || {}
+        : normalizeUsage(disjointOpenaiUsage(extra.usage || {}) || {})
     const breakdown = cacheCreationBreakdown(usage)
     const webSearch = extra.web_search_requests ?? webSearchRequestsOf(usage)
     const billedUsage = {

@@ -441,7 +441,7 @@ test('tenant test-models: own slot lists models, foreign slot 404s, refresh neve
 
 test('admin can configure an explicit GPT gateway key while tenant cannot expand its scope', async (t) => {
   const root = makeProject(t)
-  const db = createDatabase(':memory:')
+  const db = createDatabase({ dbPath: ':memory:' })
   t.after(() => db.close())
   const apiKeyStore = new ApiKeyStore({ db })
   const { ApiEndpointStore } = await import('../../src/lib/admin/api-endpoints.mjs')

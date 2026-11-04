@@ -239,7 +239,7 @@ test('SSE bytes including split UTF-8 survive while final usage and terminal evi
   assert.deepEqual(Buffer.concat(res.chunks), bytes)
   assert.equal(result.usage.output_tokens, 3)
   assert.equal(result.attemptCount, 1)
-  assert.ok(res.chunks.length >= 2)
+  assert.equal(Buffer.concat(res.chunks).toString('utf8').includes('\uFFFD'), false)
 })
 
 test('redirects are refused without credential delivery to the destination', async (t) => {

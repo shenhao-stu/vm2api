@@ -74,8 +74,15 @@ function evidence(protocol) {
     },
     snapshot: () => {
       const tokens = extractOpenaiUsage(finalUsage)
+      const observed = extractOpenaiUsage(usage)
+      const measured = usage
+        ? { ...disjointOpenaiUsage(usage), ...(serviceTier ? { service_tier: serviceTier } : {}) }
+        : null
+      // Partial wire usage is evidence, not an authoritative zero for absent fields.
+      if (measured && observed?.input_tokens == null) delete measured.input_tokens
+      if (measured && observed?.output_tokens == null) delete measured.output_tokens
       return {
-        usage: usage ? { ...disjointOpenaiUsage(usage), ...(serviceTier ? { service_tier: serviceTier } : {}) } : null,
+        usage: measured,
         usageVerified: tokens?.input_tokens != null && tokens?.output_tokens != null,
         terminal,
         failed,
@@ -129,6 +136,12 @@ export async function runHostedGateway({ req, res, endpoint, scheduler, body, pr
     const chunks = []
     let bytes = 0
     const convertFrame = createHostedResponseStream(protocol, body.model)
+    const terminalReady = (snapshot) =>
+      snapshot.terminal &&
+      snapshot.visible &&
+      !snapshot.failed &&
+      snapshot.usageVerified &&
+      calculateCost(snapshot.usage, snapshot.upstreamModel || picked.upstream_model).known
     const observeDelivered = (frames) => {
       for (const line of frames.split(/\r?\n/)) {
         if (!line.startsWith('data:')) continue
@@ -142,6 +155,7 @@ export async function runHostedGateway({ req, res, endpoint, scheduler, body, pr
       let output = ''
       while ((match = /\r?\n\r?\n/.exec(pending))) {
         const frame = pending.slice(0, match.index)
+        const rawFrame = frame + match[0]
         pending = pending.slice(match.index + match[0].length)
         if (Buffer.byteLength(frame) > MAX_FRAME)
           throw gatewayError('gateway_frame_too_large', 'GPT gateway event exceeded its size limit', 502)
@@ -150,23 +164,27 @@ export async function runHostedGateway({ req, res, endpoint, scheduler, body, pr
           .filter((line) => line.startsWith('data:'))
           .map((line) => line.slice(5).trimStart())
           .join('\n')
-        if (data === '[DONE]') observed.done()
-        else if (data) {
+        if (data === '[DONE]') {
+          observed.done()
+          if (!converted && terminalReady(observed.snapshot())) output += rawFrame
+        } else if (data) {
           try {
             const event = JSON.parse(data)
             observed.observe(event)
-            if (converted) {
-              const snapshot = observed.snapshot()
-              output += convertFrame(
-                event,
-                snapshot.terminal && snapshot.visible && !snapshot.failed && snapshot.usageVerified,
-              )
+            const ready = terminalReady(observed.snapshot())
+            if (converted) output += convertFrame(event, ready)
+            else {
+              const completionFrame =
+                event.type === 'response.completed' ||
+                event.status === 'completed' ||
+                frame.split(/\r?\n/).some((line) => /^event:\s*response\.completed\s*$/.test(line))
+              if (!completionFrame || ready) output += rawFrame
             }
           } catch (error) {
             if (error.code) throw error
             throw gatewayError('gateway_invalid_sse', 'Invalid GPT gateway event', 502)
           }
-        }
+        } else if (!converted) output += rawFrame
       }
       if (Buffer.byteLength(pending) > MAX_FRAME)
         throw gatewayError('gateway_frame_too_large', 'GPT gateway event exceeded its size limit', 502)
@@ -185,7 +203,7 @@ export async function runHostedGateway({ req, res, endpoint, scheduler, body, pr
       if (stream) {
         pending += decoder.write(chunk)
         const output = parseFrames()
-        await write(converted ? output : chunk)
+        await write(output)
       } else {
         bytes += chunk.length
         if (bytes > MAX_JSON)
@@ -197,7 +215,7 @@ export async function runHostedGateway({ req, res, endpoint, scheduler, body, pr
     if (stream) {
       pending += decoder.end()
       const output = parseFrames()
-      if (converted) await write(output)
+      await write(output)
       if (pending.trim()) throw gatewayError('gateway_incomplete_sse', 'GPT gateway ended inside an event', 502)
     } else {
       try {
@@ -214,6 +232,8 @@ export async function runHostedGateway({ req, res, endpoint, scheduler, body, pr
     const snapshot = observed.snapshot()
     const doneRequired = stream && (protocol === 'openai.chat' || protocol === 'openai.completions')
     const output = converted ? delivered.snapshot() : snapshot
+    const priceKnown =
+      snapshot.usageVerified && calculateCost(snapshot.usage, snapshot.upstreamModel || picked.upstream_model).known
     const ok =
       status >= 200 &&
       status < 300 &&
@@ -221,6 +241,7 @@ export async function runHostedGateway({ req, res, endpoint, scheduler, body, pr
       snapshot.visible &&
       !snapshot.failed &&
       snapshot.usageVerified &&
+      priceKnown &&
       output.visible &&
       output.terminal &&
       !output.failed &&
@@ -237,7 +258,9 @@ export async function runHostedGateway({ req, res, endpoint, scheduler, body, pr
           ? null
           : snapshot.terminal && snapshot.visible && !snapshot.usageVerified
             ? 'gateway_usage_missing'
-            : 'gateway_incomplete_response',
+            : snapshot.usageVerified && !priceKnown
+              ? 'gateway_usage_unpriced'
+              : 'gateway_incomplete_response',
       terminalState: ok ? 'verified' : status >= 400 ? 'rejected' : 'incomplete',
       committed,
       attemptCount: dispatched ? 1 : 0,
