@@ -576,6 +576,7 @@ class Session:
         self.history_profile = Path(history_profile) if history_profile else None
         self.dispatch_process = None
         self.dispatch_address = None
+        self.dispatch_close_observation = None
         self.last_grant_id = None
         self.model = body["model"]
         self.tools = tool_schema(body.get("tools", []))
@@ -819,6 +820,7 @@ class Session:
         """Prepare one caller's CLI without a prompt or model dispatch grant."""
         if not self.lock.acquire(blocking=False):
             raise RequestRejected("session_busy")
+        initialization_boundary = None
         try:
             changed = self.validate_configuration(body)
             if not self.history:
@@ -835,6 +837,7 @@ class Session:
             if not self.history:
                 self.prepared = True
                 self.checkpoint("prepared")
+            initialization_boundary = self.initialization_boundary()
             reused = self.process is not None
             self.prepare()
             if not self.history:
@@ -842,7 +845,9 @@ class Session:
             return {"ready": True, "reused": reused, "model_dispatches": 0}
         except RequestRejected:
             raise
-        except Exception:
+        except Exception as exc:
+            if self.preserve_initialization_boundary(exc, initialization_boundary):
+                raise RequestRejected(str(exc)) from None
             self.failed = True
             self.close()
             raise
@@ -970,6 +975,9 @@ class Session:
 
     def start(self, blocks):
         self.prepare()
+        self.dispatch_user_input(blocks)
+
+    def dispatch_user_input(self, blocks):
         self.process_has_turn = True
         self.authorize_dispatch()
         self.process.stdin.write(
@@ -1113,10 +1121,83 @@ class Session:
             with self.control_ready:
                 self.control_ready.notify_all()
 
+    def initialization_boundary(self):
+        if not self.dispatch_proxy or self.failed:
+            return None
+        try:
+            if not self.history:
+                if (self.seen or self.pending_ids or self.resume_uuid
+                        or self.process_has_turn or self.last_grant_id is not None):
+                    return None
+                self.checkpoint("prepared")
+            raw = (self.directory / "continuation.json").read_bytes()
+            state = json.loads(raw)
+            if self.history:
+                if (state.get("status") != ("awaiting_tools" if self.pending_ids else "idle")
+                        or state.get("native_id") != self.native_id
+                        or state.get("assistant_uuid") != self.resume_uuid
+                        or state.get("message_id") != self.resume_message_id
+                        or state.get("configuration") != self.checkpoint_configuration
+                        or state.get("history_length") != len(self.history)
+                        or state.get("history_sha256") != signature(history_shape(self.history))):
+                    return None
+            elif state.get("status") != "prepared":
+                return None
+            directory = self.directory / "dispatch"
+            consumed = {p.name: p.read_bytes() for p in directory.glob("*.consumed.json")}
+            grant = (directory / "grant.json").read_bytes() if (directory / "grant.json").exists() else None
+            if not self.history and (consumed or grant is not None):
+                return None
+            return {"checkpoint": raw, "consumed": consumed, "grant": grant,
+                    "last_grant": self.last_grant_id, "tools": (self.directory / "tools.json").read_bytes(),
+                    "native_id": self.native_id, "resume_uuid": self.resume_uuid,
+                    "resume_message_id": self.resume_message_id, "pending_ids": self.pending_ids.copy(),
+                    "structured_checkpoint": self.structured_checkpoint}
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def preserve_initialization_boundary(self, exc, boundary):
+        if (boundary is None or str(exc) != "native_initialize_not_ready_no_dispatch"
+                or self.failed or self.process_has_turn
+                or self.last_grant_id != boundary["last_grant"]):
+            return False
+        # Stop both producers, then require a fresh observation from this proxy.
+        self.close()
+        stats = self.dispatch_close_observation
+        if (self.failed or not self.process or self.process.poll() is None
+                or not self.dispatch_process or self.dispatch_process.poll() is None
+                or self.reader and self.reader.is_alive()
+                or not isinstance(stats, dict)
+                or any(type(stats.get(k)) is not int or stats[k] != 0
+                       for k in ("upstream_attempts", "denied"))):
+            return False
+        directory = self.directory / "dispatch"
+        try:
+            ready = json.loads((directory / "ready.safe.json").read_text())
+            consumed = {p.name: p.read_bytes() for p in directory.glob("*.consumed.json")}
+            grant = (directory / "grant.json").read_bytes() if (directory / "grant.json").exists() else None
+            if (ready.get("session_id") != self.native_id
+                    or self.dispatch_address != "http://" + ready.get("listen", "")
+                    or consumed != boundary["consumed"] or grant != boundary["grant"]
+                    or any(directory.glob("*.tmp"))
+                    or (self.directory / "continuation.json").read_bytes() != boundary["checkpoint"]
+                    or (self.directory / "tools.json").read_bytes() != boundary["tools"]):
+                return False
+        except (OSError, ValueError, TypeError):
+            return False
+        # The verified checkpoint was never replaced with in_flight. Retire this
+        # CLI; only the next customer request may resume that same safe boundary.
+        for name in ("native_id", "resume_uuid", "resume_message_id", "pending_ids", "structured_checkpoint"):
+            setattr(self, name, boundary[name])
+        self.prepared = not self.history
+        self.suspended = True
+        return True
+
     def request(self, body):
         if not self.lock.acquire(blocking=False):
             raise RequestRejected("session_busy")
         mutation_started = False
+        initialization_boundary = None
         try:
             if self.failed:
                 raise ContractError("session_failed_no_replay")
@@ -1130,6 +1211,7 @@ class Session:
                 mutation_started = True
                 if changed or advanced is not None:
                     self.restart_for_request(body)
+                initialization_boundary = self.initialization_boundary()
                 if advanced is not None:
                     # Preserve the old transcript. Import only caller-owned,
                     # completed context; the sole new dispatch is the final user.
@@ -1137,10 +1219,6 @@ class Session:
                     self.resume_uuid = self.resume_message_id = None
                     self.pending_ids = set()
                     self.structured_checkpoint = False
-                self.prepared = False
-                self.seen.add(request_signature)
-                self.history = copy.deepcopy(body["messages"])
-                self.checkpoint("in_flight")
                 if imported:
                     # A new caller-owned transcript; no other native session is read.
                     self.close()
@@ -1157,7 +1235,12 @@ class Session:
                 (self.directory / 'context.pending.json').write_text(
                     json.dumps(trailing_system_text(history_shape(body['messages'])))
                 )
-                self.start(dispatch_blocks(blocks))
+                self.prepare()
+                self.prepared = False
+                self.seen.add(request_signature)
+                self.history = copy.deepcopy(body["messages"])
+                self.checkpoint("in_flight")
+                self.dispatch_user_input(dispatch_blocks(blocks))
             else:
                 messages = body["messages"]
                 tail = messages[len(self.history) :]
@@ -1222,10 +1305,11 @@ class Session:
                 )
                 if changed or resume_tools or self.suspended:
                     self.restart_for_request(body)
+                initialization_boundary = self.initialization_boundary()
+                self.prepare()
                 self.seen.add(request_signature)
                 self.history = copy.deepcopy(messages)
                 self.checkpoint("in_flight")
-                self.prepare()
                 if self.tool_timer:
                     self.tool_timer.cancel()
                     self.tool_timer = None
@@ -1324,6 +1408,8 @@ class Session:
                     yield {"type": "message_delta", "delta": {}, "usage": terminal_usage}
                 raise
         except ContractError as exc:
+            if self.preserve_initialization_boundary(exc, initialization_boundary):
+                raise RequestRejected(str(exc)) from None
             if not mutation_started:
                 raise RequestRejected(str(exc)) from None
             self.failed = True
@@ -1403,6 +1489,7 @@ class Session:
             self._close(graceful)
 
     def _close(self, graceful=False):
+        self.dispatch_close_observation = None
         if self.tool_timer:
             self.tool_timer.cancel()
             self.tool_timer = None
@@ -1440,10 +1527,10 @@ class Session:
                     with opener.open(
                         self.dispatch_address + "/healthz", timeout=2
                     ) as response:
-                        (self.directory / "dispatch/final.safe.json").write_bytes(
-                            response.read(4096)
-                        )
-                except OSError:
+                        raw = response.read(4096)
+                        (self.directory / "dispatch/final.safe.json").write_bytes(raw)
+                        self.dispatch_close_observation = json.loads(raw)
+                except (OSError, ValueError):
                     pass
             if self.dispatch_process.poll() is None:
                 self.dispatch_process.terminate()

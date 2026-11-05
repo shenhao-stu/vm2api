@@ -41,7 +41,10 @@ def idle(entry):
 
 
 def session_identity(body):
-    value = body.get("metadata", {}).get("user_id")
+    metadata = body.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise ContractError("caller_session_required")
+    value = metadata.get("user_id")
     if not isinstance(value, str):
         raise ContractError("caller_session_required")
     try:
@@ -60,6 +63,10 @@ def session_identity(body):
     if identifier != value:
         raise ContractError("invalid_caller_session")
     return identifier
+
+
+def session_key(tenant, body):
+    return hashlib.sha256((tenant + "\0" + session_identity(body)).encode()).hexdigest()
 
 
 @dataclass
@@ -164,8 +171,7 @@ class SessionPool:
     @contextmanager
     def lease(self, tenant, body):
         native_options(body)
-        identity = session_identity(body)
-        key = hashlib.sha256((tenant + "\0" + identity).encode()).hexdigest()
+        key = session_key(tenant, body)
         # The reaper handles expiry; hot requests need not wait for other CLIs.
         while True:
             retiring = None

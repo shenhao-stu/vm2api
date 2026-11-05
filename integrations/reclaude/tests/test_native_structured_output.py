@@ -56,6 +56,7 @@ class StructuredFailureTests(unittest.TestCase):
             if ending != "timeout":
                 events.append(None if ending == "eof" else {"type": "message_stop"})
             def start(_):
+                self.assertEqual(json.loads((session.directory / "continuation.json").read_text())["status"], "in_flight")
                 session.authorize_dispatch()
                 for e in events:
                     session.events.put(e)
@@ -65,7 +66,7 @@ class StructuredFailureTests(unittest.TestCase):
             def observe(turn, event):
                 tracked.append(event)
                 return original_event(turn, event)
-            with patch.object(session, "start", side_effect=start), patch.object(session, "authorize_dispatch") as grant, patch("native_bridge_session.STRUCTURED_RESPONSE_LIMIT", 2048), patch.object(Turn, "event", observe):
+            with patch.object(session, "prepare"), patch.object(session, "dispatch_user_input", side_effect=start), patch.object(session, "authorize_dispatch") as grant, patch("native_bridge_session.STRUCTURED_RESPONSE_LIMIT", 2048), patch.object(Turn, "event", observe):
                 with self.assertRaises(ContractError):
                     for event in session.request(body):
                         actual.append(event)

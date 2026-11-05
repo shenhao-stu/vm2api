@@ -171,6 +171,31 @@ class NativeHTTPTests(unittest.TestCase):
         c.close()
         return result
 
+    def test_failure_audit_links_scoped_pool_without_storing_caller_metadata(self):
+        from native_session_pool import session_key
+        body = self.body()
+        with patch.object(self.health, "failed_health_checks", return_value=["native_unavailable"]):
+            status, _ = self.request(body)
+        self.assertEqual(status, 503)
+        row = self.audit()[0]
+        self.assertEqual(row["session_pool_key"], session_key(self.server.tenant, body))
+        self.assertNotEqual(row["session_pool_key"], session_key("other-tenant", body))
+        self.assertNotIn(self.identity, json.dumps(row))
+
+    def test_only_canonical_uuid_request_id_is_added_to_audit(self):
+        for index, value in enumerate([str(uuid.uuid4()), "sk-not-a-request-id", "x" * 200], 1):
+            c = http.client.HTTPConnection(*self.server.server_address, timeout=5)
+            with patch.object(self.health, "failed_health_checks", return_value=["native_unavailable"]):
+                c.request("POST", "/v1/messages", json.dumps(self.body()), {
+                    "Authorization": "Bearer " + "k" * 40, "Content-Type": "application/json",
+                    "X-Request-ID": value})
+                response = c.getresponse()
+                self.assertEqual(response.status, 503)
+                response.read()
+            c.close()
+            row = self.audit(index)[-1]
+            self.assertEqual(row.get("gateway_request_id"), value if index == 1 else None)
+
     def test_readiness_failure_is_audited_without_dispatch_or_losing_reason(self):
         for i, failed in enumerate([["native_unavailable"], ["native_state_unavailable"]], 1):
             with patch.object(self.health, "failed_health_checks", return_value=failed):

@@ -9,6 +9,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import threading
@@ -17,7 +18,7 @@ from urllib.parse import urlsplit
 
 from adapter import Limits, Rejection, RelayHandler, RelayServer, load_relay_key, request_trace
 from native_bridge_session import ContractError, NativeRateLimit, RequestRejected, Session, Turn
-from native_session_pool import SessionPool, memory_pressure
+from native_session_pool import SessionPool, memory_pressure, session_key
 from native_health import NativeHealth, validate_official
 
 
@@ -203,6 +204,9 @@ class NativeHandler(RelayHandler):
             "response_bytes": 0,
             "operation": "prepare" if prewarm else "messages",
         }
+        request_id = self.headers.get("X-Request-ID", "")
+        if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", request_id):
+            record["gateway_request_id"] = request_id
         started = time.monotonic()
         committed = False
         disconnected = False
@@ -232,6 +236,7 @@ class NativeHandler(RelayHandler):
             raw, body = self.read_message()
             self.request_body_read = True
             record.update(request_trace(body, len(raw)))
+            record["session_pool_key"] = session_key(self.server.tenant, body)
             record.update(
                 {
                     "model": body["model"],
