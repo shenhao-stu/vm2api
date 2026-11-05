@@ -431,3 +431,14 @@ test('quota refresh quarantines only explicit rejected grants, preserving manual
     assert.equal(JSON.stringify(result).includes('private-value'), false)
   }
 })
+
+test('fresh official snapshot clears an absent secondary window from older headers', () => {
+  const old = { codex_secondary_used_percent: 0, codex_secondary_window_minutes: 0, codex_secondary_reset_at: '2026-01-01T00:00:00Z' }
+  const fresh = extraFromRateLimit({ primary_window: { used_percent: 14, limit_window_seconds: 604800 } })
+  const merged = { ...old, ...fresh }
+  assert.equal(merged.codex_secondary_used_percent, null)
+  assert.equal(merged.codex_secondary_window_minutes, null)
+  assert.equal(merged.codex_secondary_reset_at, null)
+  assert.equal(merged.codex_5h_used_percent, null)
+  assert.equal(merged.codex_7d_used_percent, 14)
+})
