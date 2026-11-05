@@ -56,14 +56,15 @@ type ExitGuardProbe struct {
 }
 
 type exitGuard struct {
-	cfg      ExitGuardConfig
-	mu       sync.Mutex
-	probeMu  sync.Mutex
-	state    ExitGuardState
-	conns    map[*guardConn]struct{}
-	client   *http.Client
-	canceled context.Context
-	cancel   context.CancelFunc
+	cfg             ExitGuardConfig
+	mu              sync.Mutex
+	probeMu         sync.Mutex
+	probeFinishedAt time.Time // protected by probeMu
+	state           ExitGuardState
+	conns           map[*guardConn]struct{}
+	client          *http.Client
+	canceled        context.Context
+	cancel          context.CancelFunc
 }
 
 func newExitGuard(cfg ExitGuardConfig, dial func(context.Context, string, string) (net.Conn, error)) (*exitGuard, error) {
@@ -185,10 +186,23 @@ func (g *exitGuard) blockLocked(reason, observed string) {
 }
 
 func (g *exitGuard) verify(ctx context.Context) error {
+	return g.verifyAfter(ctx, time.Now())
+}
+
+func (g *exitGuard) verifyAfter(ctx context.Context, requestedAt time.Time) error {
 	g.probeMu.Lock()
 	defer g.probeMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// Overlapping callers may use proof completed after they arrived. Later
+	// callers still probe afresh; no TTL cache or previous success is reused.
+	if !g.probeFinishedAt.Before(requestedAt) {
+		state := g.snapshot()
+		if state.Ready && !state.Latched {
+			return ctx.Err()
+		}
+		return errors.New(state.Reason)
 	}
 	g.mu.Lock()
 	if g.state.Latched {
@@ -197,6 +211,7 @@ func (g *exitGuard) verify(ctx context.Context) error {
 		return errors.New(reason)
 	}
 	g.mu.Unlock()
+	defer func() { g.probeFinishedAt = time.Now() }()
 
 	// A canceled business request is not evidence that the shared exit failed.
 	// Independent verification has one total deadline, including all retries.
