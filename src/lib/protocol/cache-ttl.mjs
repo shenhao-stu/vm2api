@@ -81,6 +81,39 @@ export function resolveCacheTtl({ headers = {}, body, routing, routingFile } = {
   return cacheTtlFromRoutingFile(routingFile)
 }
 
+/** Native CLI 2.1.296 composes one TTL; never silently flatten caller mixtures. */
+export function resolveNativeCacheTtl(body) {
+  const ttls = new Set()
+  const reject = (code) => {
+    const error = new Error(code)
+    error.status = 400
+    error.body = { type: 'error', error: { type: 'invalid_request_error', code, message: code } }
+    throw error
+  }
+  const collect = (node) => {
+    if (!node || !Object.hasOwn(node, 'cache_control')) return
+    const control = node.cache_control
+    const ttl = control && Object.hasOwn(control, 'ttl') ? control.ttl : DEFAULT_CACHE_TTL
+    if (!control || control.type !== 'ephemeral' || !['5m', '1h'].includes(ttl)) {
+      reject('invalid_cache_control')
+    }
+    ttls.add(ttl)
+  }
+  const blocks = (content) => {
+    for (const block of Array.isArray(content) ? content : []) {
+      collect(block)
+      if (block?.type === 'tool_result' || block?.type === 'search_result') blocks(block.content)
+      if (block?.type === 'tool_addition' && block.tool?.type === 'tool_definition') collect(block.tool.definition)
+    }
+  }
+  collect(body)
+  blocks(body?.tools)
+  blocks(body?.system)
+  for (const message of body?.messages || []) blocks(message?.content)
+  if (ttls.size > 1) reject('cache_ttl_mixed_unsupported')
+  return ttls.values().next().value || DEFAULT_CACHE_TTL
+}
+
 /** Native passthrough validates caller markers; it never repairs their budget or TTL. */
 export function validateCacheBreakpoints(body) {
   let count = 0
@@ -113,7 +146,7 @@ export function validateCacheBreakpoints(body) {
   check(body)
 }
 
-/** Only call for a rewritten native body: every surviving marker is Node-owned. */
+/** Fill existing ephemeral markers only; preserve explicit TTLs and placement. */
 export function fillMissingCacheTtl(body, ttl = DEFAULT_CACHE_TTL) {
   const target = normalizeCacheTtl(ttl)
   return walkCacheNodes(body, (node) => {
@@ -283,17 +316,28 @@ function downgradePinnedHourToFive() {
 }
 
 function walkCacheNodes(body, mapFn) {
+  const mapBlock = (block) => {
+    let node = mapFn(block)
+    if ((node?.type === 'tool_result' || node?.type === 'search_result') && Array.isArray(node.content)) {
+      const content = node.content.map(mapBlock)
+      if (content.some((child, i) => child !== node.content[i])) node = { ...node, content }
+    }
+    const tool = node?.tool
+    if (node?.type !== 'tool_addition' || tool?.type !== 'tool_definition' || !tool.definition) return node
+    const definition = mapFn(tool.definition)
+    return definition === tool.definition ? node : { ...node, tool: { ...tool, definition } }
+  }
   const out = { ...body }
   if (out.cache_control) {
     const mapped = mapFn({ cache_control: out.cache_control })
     out.cache_control = mapped?.cache_control
   }
-  if (Array.isArray(out.tools)) out.tools = out.tools.map(mapFn)
-  if (Array.isArray(out.system)) out.system = out.system.map(mapFn)
+  if (Array.isArray(out.tools)) out.tools = out.tools.map(mapBlock)
+  if (Array.isArray(out.system)) out.system = out.system.map(mapBlock)
   if (Array.isArray(out.messages)) {
     out.messages = out.messages.map((message) => {
       if (!Array.isArray(message?.content)) return message
-      const content = message.content.map(mapFn)
+      const content = message.content.map(mapBlock)
       return content.some((block, i) => block !== message.content[i]) ? { ...message, content } : message
     })
   }
