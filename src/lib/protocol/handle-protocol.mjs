@@ -1288,15 +1288,6 @@ export function createHandleProtocol(deps) {
       )
     }
     const isProbe = isParentSessionCompanion(inbound) || isParentSessionCompanion(ctx.body)
-    // One-shot test calls (sub2api account test, new-api channel test) keep their
-    // sticky identity but never hold a session seat the main conversation needs.
-    const seatless = isProbe || isShortProbeRequest(inbound)
-    // Seat = this client session. Same device, other session = other slot.
-    const seatKey = seatless
-      ? null
-      : summarySession
-        ? `seat:sess:${summarySession}`
-        : resolveSeatIdentity({ inbound, body: ctx.body, headers: req.headers, clientIp: clientIp(req) }).key
     // Summary forks retain parent affinity, but must not migrate/bind its
     // aliases or join its serialization queue while the parent is streaming.
     const sessionKeys = summarySession
@@ -1326,6 +1317,14 @@ export function createHandleProtocol(deps) {
     const familyVmId = familyKey ? stickyRouter?.resolve?.(familyKey)?.vmId || null : null
     const stickyBound =
       stickyKey && typeof stickyRouter?.resolve === 'function' ? stickyRouter.resolve(stickyKey) : null
+    // A short continuation of a known conversation keeps its account and seat.
+    // Fresh one-shot probes and parent companions stay seatless.
+    const seatless = isProbe || (!stickyBound && isShortProbeRequest(inbound))
+    const seatKey = seatless
+      ? null
+      : summarySession
+        ? `seat:sess:${summarySession}`
+        : resolveSeatIdentity({ inbound, body: ctx.body, headers: req.headers, clientIp: clientIp(req) }).key
     const outboundSessionId = resolveOutboundSessionId(executionSession, {
       ...sessionContext,
       accountId: stickyBound?.accountId || '',

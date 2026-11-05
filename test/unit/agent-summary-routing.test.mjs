@@ -300,3 +300,54 @@ test('cancelling a queued summary removes its ticket without releasing the paren
     h.close()
   }
 })
+
+test('a short continuation of a bound session waits for its account instead of borrowing another', async () => {
+  const h = harness({ capacity: 1 })
+  h.pool.eligibleCandidates = async ({ model, excluded }) =>
+    [1, 2]
+      .filter((n) => !excluded.has(`account-${n}`))
+      .map((n) => {
+        const vm = { id: `vm-0${n}`, fingerprint: {}, claude: { account_tier: 'pro' } }
+        const inflight = h.pool.inflight.get(`account-${n}`) || 0
+        return {
+          ok: true,
+          vmId: vm.id,
+          accountId: `account-${n}`,
+          vm,
+          model,
+          exec: { vmId: vm.id, vm },
+          seatCap: 10,
+          maxConcurrency: 1,
+          headroom: null,
+          inflight,
+          priority: 1,
+          weight: 1,
+          loadRatio: inflight,
+          lastUsedAt: 0,
+          busy: inflight >= 1,
+          waitReason: inflight >= 1 ? 'concurrency_limit' : null,
+        }
+      })
+  const stickyKey = h.sticky.canonicalSessionKey('short-bound-session')
+  h.sticky.bind(stickyKey, { accountId: 'account-1', vmId: 'vm-01', sessionId: 'de97c53d-565c-4a54-9795-69f01d1d2996' })
+  const held = await h.pool.selectAndReserve({ model: 'claude-haiku-4-5', seatKey: 'foreign', deviceVmId: 'vm-01' })
+  const short = h.invoke('short-followup', {
+    model: 'claude-haiku-4-5',
+    max_tokens: 128,
+    metadata: { user_id: JSON.stringify({ session_id: 'short-bound-session' }) },
+    messages: [{ role: 'user', content: 'continue' }],
+  })
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(h.calls.length, 0, 'the bound short continuation must queue on its busy account')
+    held.release()
+    const response = await short
+    assert.equal(response.statusCode, 200)
+    assert.equal(h.calls[0].candidate.vmId, 'vm-01')
+    assert.equal(h.sticky.resolve(stickyKey).vmId, 'vm-01')
+  } finally {
+    held.release()
+    await short
+    h.close()
+  }
+})
