@@ -316,17 +316,24 @@ function downgradePinnedHourToFive() {
 }
 
 function walkCacheNodes(body, mapFn) {
+  const mapBlock = (block) => {
+    const node = mapFn(block)
+    const tool = node?.tool
+    if (node?.type !== 'tool_addition' || tool?.type !== 'tool_definition' || !tool.definition) return node
+    const definition = mapFn(tool.definition)
+    return definition === tool.definition ? node : { ...node, tool: { ...tool, definition } }
+  }
   const out = { ...body }
   if (out.cache_control) {
     const mapped = mapFn({ cache_control: out.cache_control })
     out.cache_control = mapped?.cache_control
   }
-  if (Array.isArray(out.tools)) out.tools = out.tools.map(mapFn)
-  if (Array.isArray(out.system)) out.system = out.system.map(mapFn)
+  if (Array.isArray(out.tools)) out.tools = out.tools.map(mapBlock)
+  if (Array.isArray(out.system)) out.system = out.system.map(mapBlock)
   if (Array.isArray(out.messages)) {
     out.messages = out.messages.map((message) => {
       if (!Array.isArray(message?.content)) return message
-      const content = message.content.map(mapFn)
+      const content = message.content.map(mapBlock)
       return content.some((block, i) => block !== message.content[i]) ? { ...message, content } : message
     })
   }

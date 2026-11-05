@@ -1,7 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
-import { resolveNativeCacheTtl } from '../../src/lib/protocol/cache-ttl.mjs'
+import {
+  resolveNativeCacheTtl,
+  fillMissingCacheTtl,
+  forceEphemeralCacheTtl,
+} from '../../src/lib/protocol/cache-ttl.mjs'
 
 test('native passthrough fills omitted TTL without changing homogeneous layout', () => {
   const body = {
@@ -56,4 +60,39 @@ test('native TTL accepts homogeneous controls and rejects mixtures without mutat
       (e) => e.status === 400 && e.body.error.code === 'invalid_cache_control',
     )
   }
+})
+
+test('native completion reaches a typed tool definition without traversing schema data', () => {
+  const body = {
+    messages: [
+      {
+        role: 'system',
+        content: [
+          {
+            type: 'tool_addition',
+            tool: {
+              type: 'tool_definition',
+              definition: {
+                name: 'caller',
+                cache_control: { type: 'ephemeral' },
+                input_schema: {
+                  properties: { cache_control: { type: 'ephemeral', ttl: 'business-data' } },
+                },
+              },
+            },
+          },
+        ],
+      },
+    ],
+  }
+  const original = structuredClone(body)
+  for (const transform of [fillMissingCacheTtl, forceEphemeralCacheTtl]) {
+    const output = transform(body, '1h')
+    assert.equal(output.messages[0].content[0].tool.definition.cache_control.ttl, '1h')
+    assert.deepEqual(
+      output.messages[0].content[0].tool.definition.input_schema,
+      body.messages[0].content[0].tool.definition.input_schema,
+    )
+  }
+  assert.deepEqual(body, original)
 })
