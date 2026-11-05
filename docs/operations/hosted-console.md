@@ -20,6 +20,14 @@ and overwrites `X-Forwarded-Prefix` with `/claude`. Set
 only when it exactly matches this configuration. Direct IP access clears the
 header and retains the existing `/console` and `/v1` endpoints.
 
+Set `proxy_request_buffering off` with `proxy_http_version 1.1` on both hosted
+locations (the domain prefix and dedicated IP). This streams uploaded bodies
+to the gateway, including chunked uploads, without depending on Nginx's body
+temporary directory. `proxy_buffering off` controls responses only. Keep the
+128 MiB body limit and the gateway's existing admission checks. Do not apply
+this change to the original GPT locations. The isolated Linux/root regression
+check is `python3 test/ops/hosted-nginx-body.py`; it makes no provider calls.
+
 HTML assets, API calls, event streams, terminal WebSockets, and generated client
 examples use the same runtime mount. A relative Vite build serves both mounted
 and legacy entries. Hash navigation preserves the document path. Panel storage

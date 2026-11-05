@@ -1,0 +1,19 @@
+{
+  "concurrency": {
+    "default_max_per_account": 1,
+    "default_key_concurrency": 1,
+    "default_max_rpm": 0
+  },
+  "tiers": {
+    "default": { "max_concurrency": 1, "max_rpm": 0 },
+    "pro": { "max_concurrency": 1, "max_rpm": 0 },
+    "max": { "max_concurrency": 1, "max_rpm": 0 }
+  },
+  "inference": { "session_slots": 10 },
+  "pool": { "strategy": "balanced", "queue_max": 50 },
+  "failover": {
+    "max_total_attempts": 2,
+    "max_account_switches": 1,
+    "max_same_account_retries": 0
+  }
+}
