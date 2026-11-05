@@ -675,3 +675,20 @@ test('cache creation above the TTL split bills the remainder (#678)', () => {
   const as1h = calculateCost({ ...usage, cache_creation_1h_tokens: 14890 }, 'claude-opus-5-5')
   assert.equal(pinned.cache_creation_cost, as1h.cache_creation_cost)
 })
+
+test('GPT-6.1 Terra standard, Flex/Fast and long prompts have native prices', () => {
+  const standard = calculateCost({ input_tokens: 100, output_tokens: 20 }, 'gpt-6.1-terra')
+  assert.equal(standard.known, true)
+  assert.equal(standard.total_cost, 0.0002)
+  assert.equal(
+    calculateCost({ input_tokens: 100, output_tokens: 20, service_tier: 'flex' }, 'gpt-6.1-terra').total_cost,
+    0.0001,
+  )
+  assert.equal(
+    calculateCost({ input_tokens: 100, output_tokens: 20, service_tier: 'priority' }, 'gpt-6.1-terra').total_cost,
+    0.0004,
+  )
+  const long = calculateCost({ input_tokens: 300_000, output_tokens: 100_000 }, 'gpt-6.1-terra')
+  assert.equal(long.long_context, true)
+  assert.equal(long.total_cost, 1.35)
+})

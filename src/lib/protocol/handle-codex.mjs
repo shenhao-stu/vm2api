@@ -9,7 +9,7 @@ import { isProtocolWarmup } from './responses-ws.mjs'
 import { semanticStatusForStreamError } from './stream-error-status.mjs'
 import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { isClientStream, fromClaudeToOpenAIChat, fromClaudeToOpenAICompletions } from './convert.mjs'
-import { getVm, listVms, markUnschedulable, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
+import { getVm, listVms, markUnschedulable, persistCodexUsage, persistCodexImageUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { isValidVmId, listVmRecordFiles, readJsonCached } from '../vm/vm-file.mjs'
 import { isCodexProtocolAllowed, isCodexVm, normalizeCodexRouting } from './codex-route.mjs'
 import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
@@ -1546,10 +1546,18 @@ export async function handleCodexImages({
   }
   const excluded = new Set()
   let usable = 0
+  let imageLimited = 0
   for (const item of listVms(projectRoot)) {
     if (!isCodexVm(item)) continue
-    if (isFreePlanSlot(projectRoot, getVm(projectRoot, item.id) || item)) excluded.add(item.id)
-    else usable += 1
+    const vm = getVm(projectRoot, item.id) || item
+    if (isFreePlanSlot(projectRoot, vm)) excluded.add(item.id)
+    else {
+      usable += 1
+      if (Date.parse(vm.codex?.image_usage?.limited_until || '') > Date.now()) {
+        excluded.add(item.id)
+        imageLimited += 1
+      }
+    }
   }
   if (!usable && excluded.size) {
     return reject(
@@ -1558,6 +1566,9 @@ export async function handleCodexImages({
       'image_generation_unavailable',
       'Image generation is not available on Free-plan GPT slots',
     )
+  }
+  if (usable && imageLimited === usable) {
+    return reject(429, 'rate_limit_error', 'image_quota_exhausted', 'Image quota is temporarily exhausted')
   }
   const turnMetadata = headerString(req.headers, 'x-codex-turn-metadata')
   const imageTurnId = headerString(req.headers, 'x-codex-image-turn-id')
@@ -1605,7 +1616,7 @@ export async function handleCodexImages({
           refresh: ops.refresh,
         })
         logBag.upstream_status = last.status || null
-        ingestCodexHop(projectRoot, vm.id, {
+        persistCodexImageUsage(projectRoot, vm.id, {
           ok: last.status >= 200 && last.status < 300,
           status: last.status,
           headers: last.headers || {},

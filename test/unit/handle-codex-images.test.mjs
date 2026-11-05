@@ -407,3 +407,42 @@ for (const status of [0, 500, 502, 504]) {
     assert.equal(res.statusCode, status || 502)
   })
 }
+
+test('daily image quota cannot overwrite text windows or park text dispatch', async () => {
+  writeGptVm('vm-a')
+  const file = path.join(root, 'vms', 'vm-a.json')
+  const original = JSON.parse(fs.readFileSync(file))
+  const extra = {
+    codex_primary_used_percent: 36,
+    codex_primary_window_minutes: 10080,
+    codex_primary_reset_at: new Date(Date.now() + 86400_000).toISOString(),
+  }
+  original.codex = { extra }
+  fs.writeFileSync(file, JSON.stringify(original))
+  let calls = 0
+  const ops = {
+    postCodexJson: async () => {
+      calls++
+      return {
+        status: 429,
+        headers: {
+          'x-codex-primary-used-percent': '100',
+          'x-codex-primary-window-minutes': '1440',
+          'x-codex-primary-reset-after-seconds': '3600',
+          'x-codex-secondary-used-percent': '0',
+          'x-codex-secondary-window-minutes': '0',
+        },
+        text: JSON.stringify({ error: { code: 'usage_limit_reached' } }),
+      }
+    },
+  }
+  await images({ ops })
+  const saved = JSON.parse(fs.readFileSync(file))
+  assert.deepEqual(saved.codex.extra, extra)
+  assert.equal(saved.schedulable, true)
+  assert.equal(saved.codex.image_usage.extra.codex_primary_window_minutes, 1440)
+  assert.ok(Date.parse(saved.codex.image_usage.limited_until) > Date.now())
+  const again = await images({ ops })
+  assert.equal(again.res.statusCode, 429)
+  assert.equal(calls, 1)
+})

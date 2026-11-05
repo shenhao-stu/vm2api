@@ -112,6 +112,17 @@ const OPENAI = {
       long_fast: [40, 150, 4],
     },
   ),
+  // Official standard/long-context and Flex/Fast rates, checked 2026-11-06.
+  'gpt-6.1-terra': openaiFrom(
+    { input: 1, output: 5, cache_read: 0.05, cache_write: 1.25 },
+    {
+      flex: [0.5, 2.5, 0.025],
+      fast: [2, 10, 0.1],
+      long_standard: [2, 7.5, 0.1],
+      long_flex: [1, 3.75, 0.05],
+      long_fast: [4, 15, 0.2],
+    },
+  ),
   'gpt-6.1-sol': openaiFrom(
     { input: 2, output: 10, cache_read: 0.1, cache_write: 2.5 },
     {

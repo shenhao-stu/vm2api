@@ -42,6 +42,7 @@ import {
   codexCreditsFromHeaders,
   codexQuotaPark,
   hasSpendableCodexCredits,
+  mergeCodexImageQuota,
 } from '../protocol/codex-usage.mjs'
 
 import { summarizeCodexSlot } from './codex-slot.mjs'
@@ -213,6 +214,21 @@ export function persistAccountTier(projectRoot, vmId, tier, { source = null } = 
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm, { mode: 0o600 })
   return vm
+}
+
+export function persistCodexImageUsage(projectRoot, vmId, { headers, status, now = Date.now() } = {}) {
+  const file = path.join(projectRoot, 'vms', `${vmId}.json`)
+  const vm = getVm(projectRoot, vmId)
+  if (!vm || !isCodexVm(vm)) return null
+  const imageUsage = mergeCodexImageQuota(vm.codex?.image_usage, headers, status, now)
+  if (!imageUsage) return vm
+  const updated = {
+    ...vm,
+    codex: { ...(vm.codex || {}), image_usage: imageUsage },
+    updated_at: new Date(now).toISOString(),
+  }
+  atomicWriteJson(file, updated, { mode: 0o600 })
+  return updated
 }
 
 /**

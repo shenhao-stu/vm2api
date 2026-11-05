@@ -99,3 +99,19 @@ test('elapsed reset on a leftover 100% window is not parked', () => {
   )
   assert.equal(park.limited, false)
 })
+
+test('image quota cools only until its native reset and refreshes without model calls', async () => {
+  const { mergeCodexImageQuota } = await import('../../src/lib/protocol/codex-usage.mjs')
+  const now = Date.now()
+  const headers = {
+    'x-codex-primary-used-percent': '100',
+    'x-codex-primary-window-minutes': '1440',
+    'x-codex-primary-reset-after-seconds': '10',
+  }
+  const full = mergeCodexImageQuota({}, headers, 429, now)
+  assert.equal(Date.parse(full.limited_until), now + 10_000)
+  const refreshed = mergeCodexImageQuota(full, { ...headers, 'x-codex-primary-used-percent': '2' }, 200, now + 5000)
+  assert.equal(refreshed.limited_until, null)
+  assert.equal(full.extra.codex_primary_used_percent, 100)
+  assert.equal(mergeCodexImageQuota({}, {}, 429, now).limited_until, new Date(now + 60_000).toISOString())
+})

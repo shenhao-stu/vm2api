@@ -306,3 +306,24 @@ export function buildCodexUsageView(extraOrSnapshot = {}) {
     ],
   }
 }
+
+/** Image endpoints have their own (often daily) budget, never text 5H/7D. */
+export function mergeCodexImageQuota(previous = {}, headers = {}, status = 200, now = Date.now()) {
+  const fresh = extraFromCodexHeaders(headers, now)
+  if (!fresh && status !== 429) return null
+  const extra = { ...(previous.extra || {}), ...(fresh || {}) }
+  const resets = []
+  for (const role of ['primary', 'secondary']) {
+    if (!(Number(extra[`codex_${role}_window_minutes`]) > 0) || !(Number(extra[`codex_${role}_used_percent`]) >= 100))
+      continue
+    const reset = Date.parse(extra[`codex_${role}_reset_at`] || '')
+    if (Number.isFinite(reset) && reset <= now) continue
+    resets.push(Number.isFinite(reset) ? reset : now + CODEX_DEFAULT_PARK_MS)
+  }
+  if (status === 429 && !resets.length) resets.push(now + CODEX_DEFAULT_PARK_MS)
+  return {
+    extra,
+    limited_until: resets.length ? new Date(Math.min(...resets)).toISOString() : null,
+    updated_at: new Date(now).toISOString(),
+  }
+}
