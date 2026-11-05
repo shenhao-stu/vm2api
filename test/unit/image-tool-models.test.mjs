@@ -6,10 +6,12 @@ import {
   imageGenerationTools,
 } from '../../src/lib/protocol/image-tool-models.mjs'
 import { detectInboundPlatform } from '../../src/lib/protocol/platform-detect.mjs'
-test('ships Image 2 and 2.5 models with Flare as default', () => {
+test('ships Image 2, 2.5 and 2.6 without changing the default', () => {
   assert.deepEqual(
     IMAGE_TOOL_MODELS.map((m) => [m.id, m.upstream_default]),
     [
+      ['gpt-image-2.6-flare', false],
+      ['gpt-image-2.6-sunburst', false],
       ['gpt-image-2.5-flare', true],
       ['gpt-image-2.5-sunburst', false],
       ['gpt-image-2', false],

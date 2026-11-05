@@ -5,6 +5,20 @@
 
 export const IMAGE_TOOL_MODELS = Object.freeze([
   Object.freeze({
+    id: 'gpt-image-2.6-flare',
+    display_name: 'GPT Image 2.6 Flare',
+    snapshots: Object.freeze([]),
+    upstream_default: false,
+    sort: 1,
+  }),
+  Object.freeze({
+    id: 'gpt-image-2.6-sunburst',
+    display_name: 'GPT Image 2.6 Sunburst',
+    snapshots: Object.freeze([]),
+    upstream_default: false,
+    sort: 2,
+  }),
+  Object.freeze({
     id: 'gpt-image-2.5-flare',
     display_name: 'GPT Image 2.5 Flare',
     snapshots: Object.freeze(['gpt-image-2.5-flare-2026-09-08']),

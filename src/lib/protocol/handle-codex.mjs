@@ -1614,7 +1614,8 @@ export async function handleCodexImages({
         if (last.status >= 200 && last.status < 300 && stickyRouter?.bind) {
           for (const key of admitted.picked.stickyKeys || []) stickyRouter.bind(key, { accountId: vm.id, vmId: vm.id })
         }
-        if (!isSearchFailover(last)) break
+        // A transport/5xx result can already be billed; only definitive rejections may move slots.
+        if (![401, 402, 403, 429].includes(last.status)) break
       } finally {
         admitted.lease.release()
       }

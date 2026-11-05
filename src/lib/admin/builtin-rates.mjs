@@ -95,7 +95,7 @@ const ANTHROPIC = {
   'claude-3-haiku': claude(0.25, 1.25, 0.03, 0.3, 0.5),
 }
 
-// GPT Image 2.5 (developers.openai.com/api/docs/pricing; codex-proxy-rs verified 2026-09-09):
+// GPT Image 2.5/2.6 (developers.openai.com/api/docs/models/gpt-image-2.6-flare, verified 2026-11-06):
 // text input 5 / cached 1.25, image tokens 8 / cached 2 / output 30. Both variants share one price.
 function gptImage() {
   return { ...tokenPrice(5, 0, 1.25, 0, 0), image: { input: 8, output: 30, cache_read: 2 } }
@@ -277,6 +277,8 @@ const OPENAI = {
   'gpt-5.1-chat-latest': openaiFrom({ input: 1.25, output: 10, cache_read: 0.125, cache_write: 0 }),
   'gpt-5.2-codex': openaiFrom({ input: 1.75, output: 14, cache_read: 0.175, cache_write: 0 }),
   'gpt-5.2-chat-latest': openaiFrom({ input: 1.75, output: 14, cache_read: 0.175, cache_write: 0 }),
+  'gpt-image-2.6-flare': gptImage(),
+  'gpt-image-2.6-sunburst': gptImage(),
   'gpt-image-2.5-flare': gptImage(),
   'gpt-image-2.5-sunburst': gptImage(),
   'gpt-image-2': gptImage(),

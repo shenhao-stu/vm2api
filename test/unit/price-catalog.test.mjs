@@ -297,3 +297,13 @@ test('image band override wins; a text-only override keeps the builtin image ban
   assert.equal(sun.input, 6)
   assert.deepEqual(sun.image, { input: 8, output: 30, cache_read: 2 })
 })
+
+test('GPT Image 2.6 variants resolve exact text and image token prices', () => {
+  for (const model of ['gpt-image-2.6-flare', 'gpt-image-2.6-sunburst']) {
+    const { price } = resolvePrice(model)
+    assert.equal(price.input, 5)
+    assert.equal(price.cache_read, 1.25)
+    assert.equal(price.output, 0)
+    assert.deepEqual(price.image, { input: 8, output: 30, cache_read: 2 })
+  }
+})

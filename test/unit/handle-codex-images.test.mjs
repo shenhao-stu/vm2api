@@ -368,3 +368,42 @@ test('the images route reads JSON generations', async () => {
   assert.equal(res.body.error.code, 'proxy_required')
   assert.equal(rows[0].model, 'gpt-image-2.5-flare')
 })
+
+for (const model of ['gpt-image-2.6-flare', 'gpt-image-2.6-sunburst']) {
+  test(`${model} preserves native options and records exact image usage on a Pro Lite slot`, async () => {
+    writeGptVm('vm-prolite', { plan: 'prolite' })
+    const body = { model, prompt: 'a blue dot', size: '1024x1024', n: 1, quality: 'low', output_format: 'png' }
+    const calls = []
+    const { res, logBag } = await images({ body, ops: {
+      fetchImpl: async (url, init) => {
+        calls.push({ url, account: init.headers['chatgpt-account-id'], body: JSON.parse(init.body) })
+        return upstream(200, { data: [{ b64_json: 'aGk=' }], usage: USAGE })
+      },
+    } })
+    assert.deepEqual(calls, [{ url: CODEX_IMAGE_GENERATIONS_URL, account: 'vm-prolite', body }])
+    assert.equal(res.statusCode, 200)
+    assert.equal(logBag.image_model, model)
+    assert.deepEqual(logBag.image_usage, USAGE)
+    saveGptModelPolicy({ image_tools: { [model]: { enabled: false } } })
+    const blocked = await images({ body, ops: { fetchImpl: async () => { throw Error('must not dispatch') } } })
+    assert.equal(blocked.res.statusCode, 400)
+    assert.equal(blocked.logBag.error_code, 'model_disabled')
+  })
+}
+
+for (const status of [0, 500, 502, 504]) {
+  test(`images do not redispatch after an ambiguous ${status} result`, async () => {
+    writeGptVm('vm-a')
+    writeGptVm('vm-b')
+    const calls = []
+    const { res, logBag } = await images({ ops: {
+      postCodexJson: async ({ vm }) => {
+        calls.push(vm.id)
+        return { status, error: 'upstream_transport', text: JSON.stringify({ error: { code: 'upstream_failed' } }), headers: {} }
+      },
+    } })
+    assert.equal(calls.length, 1)
+    assert.equal(logBag.attempt_count, 1)
+    assert.equal(res.statusCode, status || 502)
+  })
+}
