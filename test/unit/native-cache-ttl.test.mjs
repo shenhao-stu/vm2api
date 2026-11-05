@@ -96,3 +96,33 @@ test('native completion reaches a typed tool definition without traversing schem
   }
   assert.deepEqual(body, original)
 })
+
+test('native completion covers only protocol tool and search result descendants', () => {
+  const body = {
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'fixture',
+            content: [
+              {
+                type: 'search_result',
+                source: 'https://example.com',
+                title: 'fixture',
+                content: [{ type: 'text', text: 'fixture', cache_control: { type: 'ephemeral' } }],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  }
+  const before = structuredClone(body)
+  for (const transform of [fillMissingCacheTtl, forceEphemeralCacheTtl]) {
+    const output = transform(body, '1h')
+    assert.equal(output.messages[0].content[0].content[0].content[0].cache_control.ttl, '1h')
+  }
+  assert.deepEqual(body, before)
+})

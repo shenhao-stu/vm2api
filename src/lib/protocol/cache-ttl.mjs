@@ -317,7 +317,11 @@ function downgradePinnedHourToFive() {
 
 function walkCacheNodes(body, mapFn) {
   const mapBlock = (block) => {
-    const node = mapFn(block)
+    let node = mapFn(block)
+    if ((node?.type === 'tool_result' || node?.type === 'search_result') && Array.isArray(node.content)) {
+      const content = node.content.map(mapBlock)
+      if (content.some((child, i) => child !== node.content[i])) node = { ...node, content }
+    }
     const tool = node?.tool
     if (node?.type !== 'tool_addition' || tool?.type !== 'tool_definition' || !tool.definition) return node
     const definition = mapFn(tool.definition)

@@ -300,3 +300,44 @@ test('existing rewrite context and marker layout stay unchanged across native pe
   assert.equal(JSON.parse(result.text).error.code, 'cache_ttl_mixed_unsupported')
   assert.equal(h.captured.length, count)
 })
+
+for (const passthrough of [false, true])
+  test(`nested result TTL survives handler transformation (passthrough=${passthrough})`, async (t) => {
+    const h = await harness(t, passthrough)
+    const result = await h.send({
+      model: 'claude-opus-5-5',
+      max_tokens: 1024,
+      metadata: {
+        user_id: JSON.stringify({
+          device_id: 'a'.repeat(64),
+          account_uuid: '',
+          session_id: '11111111-2222-4333-8444-555555555555',
+        }),
+      },
+      system: [{ type: 'text', text: "You are Claude Code, Anthropic's official CLI for Claude." }],
+      tools: [{ name: 'caller', input_schema: { type: 'object' } }],
+      messages: [
+        { role: 'user', content: 'fixture' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'fixture', name: 'caller', input: {} }] },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'fixture',
+              content: [
+                {
+                  type: 'search_result',
+                  source: 'https://example.com',
+                  title: 'fixture',
+                  content: [{ type: 'text', text: 'fixture', cache_control: { type: 'ephemeral' } }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    })
+    assert.equal(result.status, 200, result.text)
+    assert.equal(h.captured[0].body.messages.at(-1).content[0].content[0].content[0].cache_control.ttl, '1h')
+  })
