@@ -348,3 +348,86 @@ test('raw primary/secondary quota and normalized views agree at local boundaries
   assert.equal(evaluateOpenAIQuotaGate({ utilization_5h: 1.2 }, { limit_5h: 1 }, now).reason, 'quota_5h_local')
   assert.equal(evaluateOpenAIQuotaGate({ utilization_5h: null }, { limit_5h: 0.3 }, now).limited, false)
 })
+
+test('a quota refresh delayed past a verified login adopts the new ticket without overwriting it', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-quota-refresh-cas-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeGptSlot(root)
+  const file = path.join(root, 'vms', 'vm-codex-01', 'codex-credentials.json')
+  let enter, release
+  const entered = new Promise((resolve) => {
+    enter = resolve
+  })
+  const delayed = new Promise((resolve) => {
+    release = resolve
+  })
+  const accesses = []
+  const pending = queryOpenaiQuota({
+    projectRoot: root,
+    vmId: 'vm-codex-01',
+    fetchImpl: async (url, init) => {
+      if (String(url).includes('/oauth/token')) {
+        enter()
+        await delayed
+        return {
+          status: 200,
+          json: async () => ({ access_token: 'late-at', refresh_token: 'late-rt', expires_in: 3600 }),
+        }
+      }
+      if (String(url).startsWith(CHATGPT_USAGE_URL)) {
+        accesses.push(init.headers.authorization)
+        return init.headers.authorization === 'Bearer at'
+          ? { status: 401, json: async () => ({}) }
+          : {
+              status: 200,
+              json: async () => ({ plan_type: 'plus', rate_limit: { primary_window: { used_percent: 1 } } }),
+            }
+      }
+      return { status: 200, json: async () => ({ available_count: 0, credits: [] }) }
+    },
+  })
+  await entered
+  fs.writeFileSync(
+    file,
+    JSON.stringify({
+      accounts: [
+        { id: 'codex', chatgpt_account_id: 'acc-1', access_token: 'verified-at', refresh_token: 'verified-rt' },
+      ],
+    }),
+  )
+  release()
+  const result = await pending
+  assert.equal(result.ok, true)
+  assert.deepEqual(accesses, ['Bearer at', 'Bearer verified-at'])
+  assert.equal(JSON.parse(fs.readFileSync(file)).accounts[0].refresh_token, 'verified-rt')
+})
+
+test('quota refresh quarantines only explicit rejected grants, preserving manual scheduling', async (t) => {
+  for (const [status, payload, expectedReason] of [
+    [400, { error: 'invalid_grant' }, 'oauth_revoked'],
+    [401, { error: { code: 'token_invalidated' } }, 'oauth_revoked'],
+    [403, { error: { code: 'invalid_grant' } }, null],
+    [502, { error: { code: 'invalid_grant' } }, null],
+    [400, { error: { message: 'invalid_grant private-value' } }, null],
+  ]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-quota-auth-failure-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    writeGptSlot(root)
+    const file = path.join(root, 'vms', 'vm-codex-01.json')
+    const vm = JSON.parse(fs.readFileSync(file))
+    fs.writeFileSync(file, JSON.stringify({ ...vm, schedule_off: true }))
+    const result = await queryOpenaiQuota({
+      projectRoot: root,
+      vmId: 'vm-codex-01',
+      fetchImpl: async (url) => {
+        if (String(url).startsWith(CHATGPT_USAGE_URL)) return { status: 401, json: async () => ({}) }
+        return { status, json: async () => payload }
+      },
+    })
+    assert.equal(result.ok, false)
+    const saved = JSON.parse(fs.readFileSync(file))
+    assert.equal(saved.unschedulable?.reason || null, expectedReason)
+    assert.equal(saved.schedule_off, true)
+    assert.equal(JSON.stringify(result).includes('private-value'), false)
+  }
+})

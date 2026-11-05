@@ -137,6 +137,7 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     stats: vm.stats || {},
     fingerprint: vm.fingerprint || null,
     schedulable: vm.schedulable !== false,
+    ...(isCodexVm(vm) && vm.unschedulable ? { unschedulable: vm.unschedulable } : {}),
     schedule_manual: vm.schedule_manual === true,
     schedule_disabled_reason: vm.schedule_disabled_reason || null,
     temp_unschedulable_until: vm.claude?.temp_unschedulable_until || vm.temp_unschedulable_until || null,
@@ -509,6 +510,7 @@ export function setVmSchedulable(
   vm.schedule_updated_at = new Date().toISOString()
   vm.updated_at = vm.schedule_updated_at
   if (schedulable) {
+    if (isCodexVm(vm)) delete vm.unschedulable
     vm.schedule_disabled_reason = null
     if (!preserveStatus && String(vm.status || '').toLowerCase() === 'paused') vm.status = 'running'
   } else {

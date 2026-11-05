@@ -1,3 +1,4 @@
+import { markCodexUnschedulable as markUnschedulable } from '../vm/codex-schedule.mjs'
 import { handleProxyExitGuard } from './proxy-exit-guard-manager.mjs'
 import { getProxyExitGuardPolicy, getProxyExitGuardState } from '../vm/proxy-exit-guard.mjs'
 import { handleProxySubscriptions } from './proxy-subscription-routes.mjs'
@@ -5,6 +6,7 @@ import { handleProxySubscriptions } from './proxy-subscription-routes.mjs'
  * /admin and /api/panel routes. Login / logout / me and { ok, data }
  * envelopes are unchanged; slot start/reload go through startSlotReady.
  */
+import { codexRefreshAuthFailureCode } from '../protocol/codex-models.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import {
@@ -30,7 +32,12 @@ import {
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { parseCodexImportPayload, upsertCodexAccount, readCodexAccounts } from '../vm/codex-slot.mjs'
+import {
+  parseCodexImportPayload,
+  upsertCodexAccount,
+  readCodexAccounts,
+  commitCodexCredentialRefresh,
+} from '../vm/codex-slot.mjs'
 import { generateAuthUrl, exchangeAuthCode, normalizeOauthFlavor } from '../oauth/oauth-auth-url.mjs'
 import { sessionKeyToOAuth, panelImportErrorPayload } from '../oauth/cookie-auth.mjs'
 import { enrichOauthIdentity } from '../oauth/oauth-identity.mjs'
@@ -4950,22 +4957,50 @@ export function createPanelHandler(ctx) {
               error: { code: 'credential_mode_unsupported', message: 'GPT 槽没有 refresh_token，请重新导入 OAuth' },
             })
           }
-          const tok = await refreshCodexAccessToken({
+          const tok = await (ctx.refreshCodexAccessToken || refreshCodexAccessToken)({
             refreshToken,
             proxyUrl: hostProxyUrlForVm(vm),
           })
           if (!tok.ok) {
+            const authCode = codexRefreshAuthFailureCode(tok)
+            if (authCode) {
+              const current = await commitCodexCredentialRefresh(cfg.paths.project, id, {
+                expected: first,
+                proxy: vm.proxy,
+                onCurrent: () =>
+                  markUnschedulable(cfg.paths.project, id, 'oauth_revoked', {
+                    code: authCode,
+                    status: tok.status,
+                    source: 'panel-oauth-refresh',
+                    message: 'OAuth 刷新授权已失效，请管理员重新导入凭据',
+                  }),
+              })
+              if (!current.ok)
+                return json(res, 409, {
+                  ok: false,
+                  error: { code: 'credential_changed', message: '账号凭据已变化，旧刷新结果已忽略，请重试' },
+                })
+            }
             return json(res, 502, {
               ok: false,
-              error: { code: tok.error || 'refresh_failed', message: 'GPT OAuth 刷新失败，请重新导入' },
+              error: { code: authCode || tok.error || 'refresh_failed', message: 'GPT OAuth 刷新失败，请重新导入' },
             })
           }
-          upsertCodexAccount(cfg.paths.project, id, {
-            access_token: tok.access_token,
-            refresh_token: tok.refresh_token,
-            id_token: tok.id_token || first.id_token,
-            expires_at: tok.expires_at || first.expires_at,
+          const saved = await commitCodexCredentialRefresh(cfg.paths.project, id, {
+            expected: first,
+            proxy: vm.proxy,
+            patch: {
+              access_token: tok.access_token,
+              refresh_token: tok.refresh_token,
+              id_token: tok.id_token || first.id_token,
+              expires_at: tok.expires_at || first.expires_at,
+            },
           })
+          if (!saved.ok)
+            return json(res, 409, {
+              ok: false,
+              error: { code: 'credential_changed', message: '账号凭据已变化，旧刷新结果已忽略，请重试' },
+            })
           return json(res, 200, panel.ok({ ok: true, refreshed: true, platform: 'openai' }))
         }
         if (isApiKeyMode(vm?.claude?.mode)) {

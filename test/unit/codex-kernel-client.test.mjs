@@ -1,3 +1,5 @@
+import http from 'node:http'
+import { codexKernelHealth } from '../../src/lib/transport/codex-kernel-client.mjs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import path from 'node:path'
@@ -212,4 +214,24 @@ test('codex kernel starts without inherited proxy variables', async (t) => {
     keys.filter((k) => /_proxy$/i.test(k)),
     [],
   )
+})
+
+test('Codex health always probes the current Unix listener with a fresh connection', async (t) => {
+  const root = fs.mkdtempSync('/tmp/codex-probe-')
+  const socketPath = path.join(root, 'codex.sock')
+  const exec = { vmId: 'fixture', homeDir: root, vm: { runtime: { codex_kernel_socket: socketPath } } }
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  for (const generation of [1, 2]) {
+    const server = http.createServer((req, res) => {
+      assert.equal(req.headers.connection, 'close')
+      res.end(JSON.stringify({ ok: true, generation }))
+    })
+    await new Promise((resolve) => server.listen(socketPath, resolve))
+    try {
+      assert.equal((await codexKernelHealth(exec)).generation, generation)
+    } finally {
+      server.closeAllConnections()
+      await new Promise((resolve) => server.close(resolve))
+    }
+  }
 })

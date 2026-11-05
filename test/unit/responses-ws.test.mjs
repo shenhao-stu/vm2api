@@ -1,3 +1,4 @@
+import { streamCodexKernel } from '../../src/lib/transport/codex-kernel-client.mjs'
 import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -991,5 +992,218 @@ test('unexpected handler failures do not expose internal exception details', asy
   } finally {
     opened.ws.close()
     await live.close()
+  }
+})
+
+test('WebSocket replay preserves parallel tool calls across three rounds with sparse terminal output', async () => {
+  const hops = []
+  const reasoning = { type: 'reasoning', id: 'rs_first', summary: [], encrypted_content: 'opaque-first' }
+  const first = { type: 'function_call', id: 'fc_first', call_id: 'call_first', name: 'first', arguments: '{}' }
+  const second = { type: 'custom_tool_call', id: 'ct_second', call_id: 'call_second', name: 'second', input: 'raw' }
+  const third = { type: 'function_call', id: 'fc_third', call_id: 'call_third', name: 'third', arguments: '{}' }
+  const message = {
+    type: 'message',
+    id: 'msg_second',
+    role: 'assistant',
+    content: [{ type: 'output_text', text: 'next' }],
+  }
+  const results = [
+    { type: 'function_call_output', call_id: 'call_first', output: 'first result' },
+    { type: 'custom_tool_call_output', call_id: 'call_second', output: 'second result' },
+  ]
+  const lastResult = { type: 'function_call_output', call_id: 'call_third', output: 'third result' }
+  const outputs = [[reasoning, first, second], [third, message], []]
+  const live = await listen({
+    routing: ENABLED,
+    requireAuth: allowAuth,
+    async handleProtocol(req, res) {
+      hops.push(await readJson(req))
+      const round = hops.length
+      const id = `resp_sparse_${round}`
+      const output = outputs[round - 1]
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write(`data: ${JSON.stringify({ type: 'response.created', response: { id, output: [] } })}\n\n`)
+      for (let index = output.length - 1; index >= 0; index--) {
+        res.write(
+          `data: ${JSON.stringify({ type: 'response.output_item.done', output_index: index, item: output[index] })}\n\n`,
+        )
+      }
+      const response = { id, status: 'completed' }
+      if (round === 2) response.output = [message]
+      if (round === 3) response.output = []
+      res.end(`data: ${JSON.stringify({ type: 'response.completed', response })}\n\n`)
+    },
+  })
+  const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
+  try {
+    assert.equal(opened.ok, true)
+    for (const [round, input] of ['start', results, [lastResult]].entries()) {
+      const completed = nextFrame(opened.ws, (frame) => frame.type === 'response.completed')
+      opened.ws.send(
+        JSON.stringify({
+          type: 'response.create',
+          model: 'gpt-6-astra',
+          input,
+          ...(round ? { previous_response_id: `resp_sparse_${round}` } : {}),
+        }),
+      )
+      assert.equal((await completed).response.id, `resp_sparse_${round + 1}`)
+    }
+    const start = { type: 'message', role: 'user', content: 'start' }
+    assert.deepEqual(hops[1].input, [start, reasoning, first, second, ...results])
+    assert.deepEqual(hops[2].input, [start, reasoning, first, second, ...results, third, message, lastResult])
+    assert.equal(hops[1].previous_response_id, undefined)
+    assert.equal(hops[2].previous_response_id, undefined)
+  } finally {
+    opened.ws?.close()
+    await live.close()
+  }
+})
+
+for (const terminal of ['response.failed', 'response.incomplete']) {
+  test(`WebSocket replay never remembers tool items from ${terminal}`, async () => {
+    const hops = []
+    const call = { type: 'function_call', id: 'fc_failed', call_id: 'call_failed', name: 'lookup', arguments: '{}' }
+    const live = await listen({
+      routing: ENABLED,
+      requireAuth: allowAuth,
+      async handleProtocol(req, res) {
+        hops.push(await readJson(req))
+        const id = hops.length === 1 ? 'resp_failed' : 'resp_fresh'
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.write(`data: ${JSON.stringify({ type: 'response.created', response: { id, output: [] } })}\n\n`)
+        if (hops.length === 1) {
+          res.write(`data: ${JSON.stringify({ type: 'response.output_item.done', output_index: 0, item: call })}\n\n`)
+          res.end(
+            `data: ${JSON.stringify({ type: terminal, response: { id, status: terminal.slice(9), output: [call] } })}\n\n`,
+          )
+        } else {
+          res.end(
+            `data: ${JSON.stringify({ type: 'response.completed', response: { id, status: 'completed', output: [] } })}\n\n`,
+          )
+        }
+      },
+    })
+    const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    try {
+      assert.equal(opened.ok, true)
+      const failed = nextFrame(opened.ws, (frame) => frame.type === terminal)
+      opened.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-6-astra', input: 'first' }))
+      await failed
+      const rejected = nextFrame(opened.ws, (frame) => frame.type === 'error')
+      opened.ws.send(
+        JSON.stringify({
+          type: 'response.create',
+          model: 'gpt-6-astra',
+          previous_response_id: 'resp_failed',
+          input: [{ type: 'function_call_output', call_id: 'call_failed', output: 'result' }],
+        }),
+      )
+      assert.equal((await rejected).error.code, 'previous_response_not_found')
+      assert.equal(hops.length, 1)
+      const fresh = nextFrame(opened.ws, (frame) => frame.type === 'response.completed')
+      opened.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-6-astra', input: 'fresh' }))
+      assert.equal((await fresh).response.id, 'resp_fresh')
+      assert.equal(hops[1].input, 'fresh')
+    } finally {
+      opened.ws?.close()
+      await live.close()
+    }
+  })
+}
+
+test('real WebSocket and Unix kernel: prewarm completes once before a normal full-input create', async () => {
+  const root = fs.mkdtempSync('/tmp/c2a-warm-ws-')
+  writeGptVm(root, 'vm-gpt-a')
+  const runDir = path.join(root, 'vms', 'vm-gpt-a', 'run')
+  fs.mkdirSync(runDir)
+  fs.writeFileSync(path.join(runDir, 'internal.token'), 'fixture-only', { mode: 0o600 })
+  const hops = []
+  const finishes = []
+  const kernel = http.createServer(async (req, res) => {
+    const envelope = await readJson(req)
+    hops.push(envelope.body)
+    const warmup = envelope.body.generate === false
+    const id = warmup ? 'resp_real_warmup' : 'resp_real_text'
+    const output = warmup ? [] : [{ type: 'message', content: [{ type: 'output_text', text: 'OK' }] }]
+    const events = [
+      { type: 'response.created', response: { id, status: 'in_progress', output: [] } },
+      { type: 'response.in_progress', response: { id, status: 'in_progress', output: [] } },
+      ...(!warmup ? [{ type: 'response.output_text.delta', delta: 'OK' }] : []),
+      {
+        type: 'response.completed',
+        response: {
+          id,
+          status: 'completed',
+          output,
+          ...(!warmup ? { usage: { input_tokens: 1, output_tokens: 1 } } : {}),
+        },
+      },
+    ]
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.end(events.map((event) => `data: ${JSON.stringify(event)}`).join('\n\n'))
+  })
+  await new Promise((resolve) => kernel.listen(path.join(runDir, 'codex-kernel.sock'), resolve))
+  let live
+  let opened
+  try {
+    live = await listenWithHandleProtocol(root, {
+      codexOps: { streamCodexKernel },
+      requestLog: {
+        start: () => ({ request_id: `ws-prewarm-${finishes.length}`, t0: Date.now() }),
+        finish(_ctx, bag) {
+          finishes.push({ ...bag })
+        },
+      },
+      apiKeyStore: { acquire: () => ({ ok: true }), release() {}, recordUsage() {} },
+    })
+    opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    assert.equal(opened.ok, true)
+    const frames = []
+    opened.ws.on('message', (data) => frames.push(JSON.parse(String(data))))
+    const warmDone = nextFrame(opened.ws, (event) => event.type === 'response.completed')
+    opened.ws.send(
+      JSON.stringify({
+        type: 'response.create',
+        model: 'gpt-6-astra',
+        input: 'warm fixture',
+        generate: false,
+        store: false,
+      }),
+    )
+    assert.equal((await warmDone).response.id, 'resp_real_warmup')
+    assert.deepEqual(
+      frames.map((frame) => frame.type),
+      ['response.created', 'response.in_progress', 'response.completed'],
+    )
+    assert.equal(hops.length, 1, 'successful prewarm must not switch accounts or retry')
+    assert.equal(hops[0].generate, false)
+    const textDone = nextFrame(
+      opened.ws,
+      (event) => event.type === 'response.completed' && event.response.id === 'resp_real_text',
+    )
+    opened.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-6-astra', input: 'full fixture' }))
+    assert.equal((await textDone).response.output[0].content[0].text, 'OK')
+    const deadline = Date.now() + 2000
+    while (finishes.length < 2) {
+      assert.ok(Date.now() < deadline, 'request completion logging timeout')
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.equal(hops.length, 2)
+    assert.equal(hops[1].input.length, 1)
+    assert.equal(hops[1].input[0].content[0].text, 'full fixture')
+    assert.equal(hops[1].previous_response_id, undefined)
+    assert.equal(
+      frames.some((frame) => frame.type === 'error'),
+      false,
+    )
+    assert.ok(finishes.every((bag) => bag.final_state === 'verified' && !bag.error_code && bag.attempt_count === 1))
+    assert.equal(finishes[0].first_token_ms, null)
+  } finally {
+    opened?.ws?.terminate()
+    if (live) await live.close()
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
   }
 })

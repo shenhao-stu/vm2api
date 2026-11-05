@@ -2,6 +2,7 @@
  * Shared HTTP helpers for protocol and panel. SSE headers flush immediately
  * and optionally disable Nagle so Claude Code subagent tokens are not delayed.
  */
+import { writeChunkedWithBackpressure } from './write-backpressure.mjs'
 import { ErrorCode, ErrorType, makeError } from '../core/errors.mjs'
 import { CORS_ALLOW_HEADERS, corsHeadersForRequest } from './cors.mjs'
 
@@ -125,7 +126,7 @@ export function createRespond(cfg, options = {}) {
     return options.tcpNodelay !== false
   }
 
-  function json(res, status, body) {
+  function json(res, status, body, delivery = {}) {
     const data = JSON.stringify(body)
     const headers = corsHeadersForRequest(requestFromResponse(res), {
       'content-type': 'application/json; charset=utf-8',
@@ -134,6 +135,9 @@ export function createRespond(cfg, options = {}) {
     if (res._kinRequestId) headers['x-request-id'] = res._kinRequestId
     if (body?.error?.details?.retryable === false) headers['x-should-retry'] = 'false'
     res.writeHead(status, headers)
+    if (delivery.backpressure) {
+      return writeChunkedWithBackpressure(res, data, delivery).then(() => res.end())
+    }
     res.end(data)
   }
 

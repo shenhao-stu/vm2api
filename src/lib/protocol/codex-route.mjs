@@ -165,3 +165,24 @@ export function isCodexProtocolAllowed(protocol, routing = {}) {
 export function listCodexVms(vms = []) {
   return (vms || []).filter((vm) => isCodexVm(vm))
 }
+
+export function isCodexClientStream(body, headers = {}) {
+  if (body?.stream === false || body?.stream === 0 || body?.stream === 'false') return false
+  if (body?.stream === true || body?.stream === 1 || body?.stream === 'true') return true
+  const accept = String(headers?.accept || headers?.Accept || '')
+  const sse = acceptQuality(accept, 'text/event-stream')
+  return sse > 0 && sse > acceptQuality(accept, 'application/json')
+}
+
+/** Highest q-value an Accept header gives `type` (exact media range only); -1 when absent. */
+function acceptQuality(accept, type) {
+  let best = -1
+  for (const part of accept.toLowerCase().split(',')) {
+    const [range, ...params] = part.split(';').map((s) => s.trim())
+    if (range !== type) continue
+    const q = params.find((p) => p.startsWith('q='))
+    const value = q ? Number(q.slice(2)) : 1
+    if (Number.isFinite(value) && value > best) best = value
+  }
+  return best
+}

@@ -3,7 +3,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { atomicWriteJson, readJsonCached } from './vm-file.mjs'
+import { atomicWriteJson, readJsonCached, withVmLock } from './vm-file.mjs'
 import { isCodexVm } from '../protocol/codex-route.mjs'
 import { buildCodexUsageView, extraToCodexSnapshot, hasSpendableCodexCredits } from '../protocol/codex-usage.mjs'
 import { openaiClaimsFromIdToken, openaiIdentityFromOauthTokens } from '../oauth/openai-jwt.mjs'
@@ -297,6 +297,89 @@ export function upsertCodexAccount(projectRoot, vmId, patch = {}, { replaceCrede
   else accounts[0] = cur
   writeCodexAccounts(projectRoot, vmId, accounts)
   return cur
+}
+
+function refreshVersion(account = {}) {
+  const value = enrichCodexAccountIdentity(account)
+  return JSON.stringify(
+    ['id', 'email', 'chatgpt_account_id', 'access_token', 'refresh_token', 'id_token'].map((key) =>
+      String(value[key] || ''),
+    ),
+  )
+}
+
+function sameRefreshIdentity(expected, current) {
+  const before = enrichCodexAccountIdentity(expected)
+  const after = enrichCodexAccountIdentity(current)
+  let known = false
+  for (const key of ['email', 'chatgpt_account_id']) {
+    const normalize = (value) =>
+      key === 'email'
+        ? String(value || '')
+            .trim()
+            .toLowerCase()
+        : String(value || '').trim()
+    const value = normalize(before[key])
+    if (!value) continue
+    known = true
+    if (value !== normalize(after[key])) return false
+  }
+  return known
+}
+
+function refreshProxyVersion(proxy = {}) {
+  return JSON.stringify(
+    ['id', 'scheme', 'host', 'port', 'username', 'password', 'url'].map((key) => String(proxy?.[key] || '')),
+  )
+}
+
+/**
+ * Compare the ticket captured before network I/O with disk under the same VM lock
+ * used by recovery. A late refresh must never overwrite a new login or another
+ * refresh. A null patch only resolves the current compatible ticket for a retry.
+ * This serializes Node writers; independent native writers need their own fence.
+ */
+export function commitCodexCredentialRefresh(projectRoot, vmId, options = {}) {
+  const { expected, patch = null, proxy, onCurrent } = options
+  const vmFile = path.join(projectRoot, 'vms', `${vmId}.json`)
+  return withVmLock(vmFile, () => {
+    if (!expected || (!expected.access_token && !expected.refresh_token))
+      return { ok: false, code: 'credential_changed', account: null }
+    const vm = readJsonCached(vmFile)
+    if (!vm) return { ok: false, code: 'vm_not_found', account: null }
+    if (!isCodexVm(vm)) return { ok: false, code: 'credential_changed', account: null }
+    if (
+      Object.prototype.hasOwnProperty.call(options, 'proxy') &&
+      refreshProxyVersion(vm.proxy) !== refreshProxyVersion(proxy)
+    )
+      return { ok: false, code: 'credential_changed', account: null }
+    const accounts = readCodexAccounts(projectRoot, vmId)
+    const matches = accounts.flatMap((account, index) =>
+      refreshVersion(account) === refreshVersion(expected) ? [index] : [],
+    )
+    if (matches.length !== 1) {
+      const compatible = accounts.filter((account) => sameRefreshIdentity(expected, account))
+      return {
+        ok: false,
+        code: 'credential_changed',
+        account: compatible.length === 1 ? compatible[0] : null,
+      }
+    }
+    const index = matches[0]
+    // Synchronous state changes (for example quarantining a rejected grant)
+    // use the same comparison and lock, never a check followed by an await.
+    if (onCurrent) onCurrent(accounts[index])
+    if (patch == null) return { ok: true, account: accounts[index] }
+    const changes = Object.fromEntries(
+      ['access_token', 'refresh_token', 'id_token', 'expires_at']
+        .filter((key) => Object.prototype.hasOwnProperty.call(patch, key) && patch[key] !== undefined)
+        .map((key) => [key, patch[key]]),
+    )
+    const account = enrichCodexAccountIdentity({ ...accounts[index], ...changes })
+    accounts[index] = account
+    writeCodexAccounts(projectRoot, vmId, accounts)
+    return { ok: true, account }
+  })
 }
 
 export function persistCodexQuotaSnapshot(projectRoot, vmId, { extra, resetCredits, credits, planType } = {}) {

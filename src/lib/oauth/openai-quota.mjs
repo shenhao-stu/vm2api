@@ -1,3 +1,4 @@
+import { markCodexUnschedulable as markUnschedulable } from '../vm/codex-schedule.mjs'
 /**
  * ChatGPT / Codex quota + rate-limit-reset-credit.
  * Upstream via slot SOCKS5 only. Mirrors sub2api OpenAIQuotaService,
@@ -8,14 +9,19 @@ import { getVm, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
-import { readCodexAccounts, upsertCodexAccount, persistCodexQuotaSnapshot } from '../vm/codex-slot.mjs'
+import { readCodexAccounts, commitCodexCredentialRefresh, persistCodexQuotaSnapshot } from '../vm/codex-slot.mjs'
 import {
   buildCodexUsageView,
   extraToCodexSnapshot,
   normalizeCodexCredits,
   normalizeCodexLimits,
 } from '../protocol/codex-usage.mjs'
-import { CODEX_OAUTH_ORIGINATOR, makeProxyFetch, refreshCodexAccessToken } from '../protocol/codex-models.mjs'
+import {
+  CODEX_OAUTH_ORIGINATOR,
+  makeProxyFetch,
+  refreshCodexAccessToken,
+  codexRefreshAuthFailureCode,
+} from '../protocol/codex-models.mjs'
 import { openaiIdentityFromJwt } from './openai-jwt.mjs'
 
 export const CHATGPT_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
@@ -296,14 +302,42 @@ async function rotateIfNeeded(slot, projectRoot, vmId, fetchImpl) {
     fetchImpl,
     timeoutMs: OPENAI_QUOTA_TIMEOUT_MS,
   })
-  if (!tok.ok) return { ...slot, rotateError: tok.error || 'refresh_failed' }
-  upsertCodexAccount(projectRoot, vmId, {
-    access_token: tok.access_token,
-    refresh_token: tok.refresh_token,
-    id_token: tok.id_token || slot.first.id_token,
-    expires_at: tok.expires_at || slot.first.expires_at,
+  if (!tok.ok) {
+    const code = codexRefreshAuthFailureCode(tok)
+    if (code) {
+      const current = await commitCodexCredentialRefresh(projectRoot, vmId, {
+        expected: slot.first,
+        proxy: slot.vm.proxy,
+        onCurrent: () =>
+          markUnschedulable(projectRoot, vmId, 'oauth_revoked', {
+            code,
+            status: tok.status,
+            message: 'OAuth 刷新授权已失效，请管理员重新导入凭据',
+            source: 'quota-oauth-refresh',
+          }),
+      })
+      if (!current.ok && current.account?.access_token)
+        return {
+          ...slot,
+          first: current.account,
+          access: current.account.access_token,
+          refresh: current.account.refresh_token,
+        }
+    }
+    return { ...slot, rotateError: code || tok.error || 'refresh_failed' }
+  }
+  const saved = await commitCodexCredentialRefresh(projectRoot, vmId, {
+    expected: slot.first,
+    proxy: slot.vm.proxy,
+    patch: {
+      access_token: tok.access_token,
+      refresh_token: tok.refresh_token,
+      id_token: tok.id_token || slot.first.id_token,
+      expires_at: tok.expires_at || slot.first.expires_at,
+    },
   })
-  return { ...slot, access: tok.access_token, refresh: tok.refresh_token || slot.refresh }
+  if (!saved.account?.access_token) return { ...slot, access: '', rotateError: saved.code || 'credential_changed' }
+  return { ...slot, first: saved.account, access: saved.account.access_token, refresh: saved.account.refresh_token }
 }
 
 function publicUsage(extra, resetCredits, credits, usagePayload = {}) {

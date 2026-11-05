@@ -16,7 +16,7 @@ import path from 'node:path'
 import { readRoutingConfigFile } from '../core/config.mjs'
 import { getVm, vmHasClaudeCredential } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
-import { summarizeCodexSlot, readCodexAccounts, writeCodexAccounts } from '../vm/codex-slot.mjs'
+import { summarizeCodexSlot, readCodexAccounts, commitCodexCredentialRefresh } from '../vm/codex-slot.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { loadVmIdentity } from '../identity/vm-identity.mjs'
@@ -132,20 +132,8 @@ function listCodexVmsForCatalog(projectRoot, vm) {
   return out
 }
 
-function persistRefreshedCodexAccount(projectRoot, vmId, patch = {}, previous = {}) {
-  const accounts = readCodexAccounts(projectRoot, vmId)
-  let idx = accounts.findIndex(
-    (row) =>
-      (previous.refresh_token && row.refresh_token === previous.refresh_token) ||
-      (previous.access_token && row.access_token === previous.access_token),
-  )
-  if (idx < 0) idx = 0
-  const cur = { ...(accounts[idx] || {}), ...patch }
-  if (!cur.id) cur.id = cur.email || cur.chatgpt_account_id || 'codex'
-  if (!accounts.length) accounts.push(cur)
-  else accounts[idx] = cur
-  writeCodexAccounts(projectRoot, vmId, accounts)
-  return cur
+function persistRefreshedCodexAccount(projectRoot, vmId, patch, previous, proxy) {
+  return commitCodexCredentialRefresh(projectRoot, vmId, { expected: previous, patch, proxy })
 }
 
 /**
@@ -228,7 +216,7 @@ export async function syncCodexCatalog({
           }
           continue
         }
-        persistRefreshedCodexAccount(
+        const saved = await persistRefreshedCodexAccount(
           projectRoot,
           target.id,
           {
@@ -238,8 +226,13 @@ export async function syncCodexCatalog({
             expires_at: tok.expires_at || account.expires_at,
           },
           account,
+          target.proxy,
         )
-        access = tok.access_token
+        if (!saved.account?.access_token) {
+          lastError = { ok: false, error: 'credential_changed', message: '账号凭据已变化，请重试', vm_id: target.id }
+          continue
+        }
+        access = saved.account.access_token
         live = await fetchOnce()
       }
       if (!live.ok || !live.ids?.length) {
@@ -1122,12 +1115,21 @@ export async function runVmTestChat(opts = {}) {
           fetchImpl: opts.fetchImpl,
         })
         if (tok.ok) {
-          persistRefreshedCodexAccount(projectRoot, vmId, {
-            access_token: tok.access_token,
-            refresh_token: tok.refresh_token,
-            id_token: tok.id_token || first.id_token,
-            expires_at: tok.expires_at || first.expires_at,
-          })
+          const saved = await persistRefreshedCodexAccount(
+            projectRoot,
+            vmId,
+            {
+              access_token: tok.access_token,
+              refresh_token: tok.refresh_token,
+              id_token: tok.id_token || first.id_token,
+              expires_at: tok.expires_at || first.expires_at,
+            },
+            first,
+            vm.proxy,
+          )
+          if (!saved.account?.access_token) {
+            return done({ ok: false, vm_id: vmId, model, status: 409, error: '账号凭据已变化，请重试' })
+          }
           result = await postV1Responses({
             baseUrl,
             apiKey,

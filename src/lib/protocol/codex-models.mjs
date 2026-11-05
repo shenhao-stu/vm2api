@@ -191,32 +191,78 @@ export function makeProxyFetch(proxyUrl, timeoutMs = 15000, { maxMs = 30000 } = 
  * User-initiated Codex OAuth refresh. Not used by background model probes.
  * @param {{ refreshToken?: string, proxyUrl?: string, fetchImpl?: Function, timeoutMs?: number }} opts
  */
+const REJECTED_CODEX_GRANT_CODES = new Set([
+  'invalid_grant',
+  'refresh_token_reused',
+  'refresh_token_revoked',
+  'token_revoked',
+  'token_invalidated',
+  'session_expired',
+  'account_deleted',
+  'account_disabled',
+])
+
+export function codexRefreshAuthFailureCode(result = {}) {
+  return [400, 401].includes(result.status) && REJECTED_CODEX_GRANT_CODES.has(result.auth_code)
+    ? result.auth_code
+    : null
+}
+
 export async function refreshCodexAccessToken(opts = {}) {
   const refreshToken = String(opts.refreshToken || '').trim()
   if (!refreshToken) return { ok: false, error: 'missing_refresh_token' }
-  const fetchFn = opts.fetchImpl || makeProxyFetch(opts.proxyUrl, opts.timeoutMs)
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
     refresh_token: refreshToken,
     client_id: CODEX_OAUTH_CLIENT_ID,
     scope: CODEX_OAUTH_SCOPE,
   })
-  try {
-    const res = await fetchFn(CODEX_OAUTH_TOKEN_URL, {
-      method: 'POST',
-      headers: {
-        accept: 'application/json',
-        'content-type': 'application/x-www-form-urlencoded',
-        'user-agent': CODEX_USER_AGENT,
-      },
-      body: String(body),
-    })
-    const status = Number(res?.status) || 0
-    const payload = await readFetchBody(res)
-    if (status === 401 || status === 403) {
-      return { ok: false, error: 'refresh_rejected', status }
+  // Keep the refresh deadline alive through the token response body. A peer
+  // that sends headers then stalls must not retain the catalog single flight.
+  const controller = new AbortController()
+  const timeoutMs = Math.min(30000, Math.max(1, Number(opts.timeoutMs) || 15000))
+  let rejectTimeout
+  const deadline = new Promise((_, reject) => {
+    rejectTimeout = () => {
+      const error = new Error('token refresh deadline exceeded')
+      error.name = 'AbortError'
+      reject(error)
     }
-    if (status >= 400) return { ok: false, error: 'refresh_failed', status }
+    controller.signal.addEventListener('abort', rejectTimeout, { once: true })
+  })
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const proxyUrl = String(opts.proxyUrl || '')
+      .trim()
+      .replace(/^socks5:\/\//i, 'socks5h://')
+    const agent = !opts.fetchImpl && proxyUrl ? createProxyAgent(proxyUrl) : undefined
+    const fetchFn = opts.fetchImpl || fetch
+    const readReply = async () => {
+      const res = await fetchFn(CODEX_OAUTH_TOKEN_URL, {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'content-type': 'application/x-www-form-urlencoded',
+          'user-agent': CODEX_USER_AGENT,
+        },
+        body: String(body),
+        signal: controller.signal,
+        ...(agent ? { agent } : {}),
+      })
+      return { status: Number(res?.status) || 0, payload: await readFetchBody(res) }
+    }
+    const { status, payload } = await Promise.race([readReply(), deadline])
+    // Only fixed provider codes at the token endpoint are authentication
+    // evidence. Never project a provider message or treat a generic 403/CF page
+    // as a revoked grant. AT token_expired alone does not prove a dead RT.
+    const rawCode = [payload?.error?.code, payload?.error?.type, payload?.code, payload?.error].find(
+      (value) => typeof value === 'string' && REJECTED_CODEX_GRANT_CODES.has(value),
+    )
+    const auth = (status === 400 || status === 401) && rawCode ? { auth_code: rawCode } : {}
+    if (status === 401 || status === 403) {
+      return { ok: false, error: 'refresh_rejected', status, ...auth }
+    }
+    if (status >= 400) return { ok: false, error: 'refresh_failed', status, ...auth }
     const access = String(payload?.access_token || '').trim()
     if (!access) return { ok: false, error: 'refresh_empty', status }
     const expiresIn = Number(payload?.expires_in)
@@ -230,6 +276,9 @@ export async function refreshCodexAccessToken(opts = {}) {
   } catch (e) {
     const aborted = e?.name === 'AbortError' || /aborted/i.test(String(e?.message || e))
     return { ok: false, error: aborted ? 'timeout' : 'fetch_failed' }
+  } finally {
+    clearTimeout(timer)
+    controller.signal.removeEventListener('abort', rejectTimeout)
   }
 }
 
