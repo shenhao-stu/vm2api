@@ -22,6 +22,8 @@ NODE_OPTIONS=--max-old-space-size=1024
 
 构建前端时同时指定 `VITE_PANEL_COOKIE_NAME=kin_hosted_panel_token`，使同 IP 不同端口的其他实例登录 Cookie 保持独立。`VM2API_RELEASE_CHANNEL=hosted` 使更新页展示托管分支策略并阻止执行上游一键安装；托管版本通过已验证的 `dev/hosted` 镜像更新。
 
+部署到其他入口时，可用构建参数 `VITE_GPT_CONSOLE_URL` 指定该实例的 GPT 控制台链接，避免页面跳到另一套部署。未配置时保留既有托管站点的链接。
+
 ## 一份共享契约
 
 `src/lib/vm/instance-scope.mjs` 集中实现实例名、端口验证、资源命名和owner判断。函数接受env对象便于离线测试；调用者不应自行拼名或读取另一套namespace配置。
