@@ -1,0 +1,12 @@
+# Include once in the nginx http context. Replace the console origin at install.
+map $http_origin $codex_console_origin_ok {
+    default 0;
+    "" 1;
+    "https://vm2api.getoken.tech" 1;
+}
+map "$request_method:$http_origin:$http_authorization" $codex_console_csrf_ok {
+    default 0;
+    ~^(GET|HEAD|OPTIONS): 1;
+    ~^[A-Z]+:https://vm2api\.getoken\.tech: 1;
+    ~^[A-Z]+::Bearer\ .+ 1;
+}

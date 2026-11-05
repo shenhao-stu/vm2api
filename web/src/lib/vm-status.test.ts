@@ -581,7 +581,7 @@ describe('GPT plan label follows OpenAI plan_type', () => {
   it('maps plan_type like codex-proxy-rs', () => {
     expect(openaiPlanLabel('team')).toBe('Business')
     expect(openaiPlanLabel('plus')).toBe('Plus')
-    expect(openaiPlanLabel('prolite')).toBe('Pro')
+    expect(openaiPlanLabel('prolite')).toBe('Pro Lite')
     expect(openaiPlanLabel(null)).toBe('GPT')
     expect(openaiPlanLabel('future_plan')).toBe('future_plan')
   })

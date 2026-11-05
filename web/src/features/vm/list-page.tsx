@@ -10,6 +10,7 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { selectedController } from '@/lib/controller'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -185,7 +186,9 @@ export function VmListPage() {
         ) : undefined
       }
     >
-      <NativeRelays enabled={me.data?.role === 'admin'} />
+      <NativeRelays
+        enabled={me.data?.role === 'admin' && selectedController() === 'main'}
+      />
       <QueryGate
         loading={vmsQ.isLoading}
         error={vmsQ.error}

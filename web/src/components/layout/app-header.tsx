@@ -4,6 +4,7 @@ import { Header } from '@/components/layout/header'
 import { ProfileDropdown } from '@/components/profile-dropdown'
 import { Search } from '@/components/search'
 import { ThemeSwitch } from '@/components/theme-switch'
+import { ControllerSwitch } from './controller-switch'
 
 type AppHeaderProps = {
   actions?: ReactNode
@@ -15,6 +16,7 @@ export function AppHeader({ actions }: AppHeaderProps) {
       fixed
       className='h-auto min-h-16 xl:h-16 [&>div]:flex-wrap xl:[&>div]:flex-nowrap'
     >
+      <ControllerSwitch />
       <Search placeholder='搜索页面…' />
       <div className='ms-auto flex min-w-0 flex-wrap items-center justify-end gap-2 [&>div]:flex-wrap'>
         {actions}

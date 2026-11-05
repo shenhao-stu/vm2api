@@ -1,3 +1,5 @@
+import { controllerSwitchEnabled } from './controller'
+
 const LS_TOKEN = 'kin_console_token'
 const LS_USER = 'kin_console_user'
 const LS_BASE = 'kin_api_base'
@@ -6,7 +8,7 @@ const COOKIE = 'kin_panel_token'
 export { LS_TOKEN, LS_USER, LS_BASE, COOKIE }
 
 export function sameOriginPanel(host = location.hostname): boolean {
-  return /^kin\.fkcodex\.com$/i.test(host || '')
+  return controllerSwitchEnabled || /^kin\.fkcodex\.com$/i.test(host || '')
 }
 
 export function apiBase(): string {

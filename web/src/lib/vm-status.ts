@@ -614,7 +614,7 @@ export function vmRunning(vm: Vm | undefined): boolean {
   return Boolean(vm.active || s === 'running' || s === 'ok' || !s)
 }
 
-/** Same mapping as codex-proxy-rs `plan_type_display`; unknown raw values pass through. */
+/** Display the actual plan without collapsing Pro Lite into Pro; unknown values pass through. */
 export function openaiPlanLabel(planType: unknown): string {
   const raw = String(planType || '').trim()
   switch (raw.toLowerCase()) {
@@ -629,8 +629,9 @@ export function openaiPlanLabel(planType: unknown): string {
     case 'plus':
       return 'Plus'
     case 'pro':
-    case 'prolite':
       return 'Pro'
+    case 'prolite':
+      return 'Pro Lite'
     case 'team':
     case 'self_serve_business_prolite':
     case 'self_serve_business_usage_based':

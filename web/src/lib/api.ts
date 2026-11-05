@@ -1,4 +1,5 @@
 import type { VmActiveHours, VmQuotaOverride } from '@/types/panel-vm'
+import { controllerPath } from '@/lib/controller'
 import {
   apiBase,
   expirePanelSession,
@@ -115,7 +116,7 @@ export async function panelFetch(
   path: string,
   opts: RequestInit = {}
 ): Promise<Response> {
-  const url = `${apiBase() || ''}${path}`
+  const url = `${apiBase() || ''}${controllerPath(path)}`
   const res = await fetch(url, {
     ...opts,
     credentials: 'include',

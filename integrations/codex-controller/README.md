@@ -1,0 +1,9 @@
+# One console, independent Codex controller
+
+Build `web` with `VITE_CODEX_CONTROLLER=true`. The service picker uses a full navigation (`/console?controller=codex#/vm`) so in-flight state, query caches and slot selections never cross controllers. Login, logout, identity and operator management always remain on the main controller. Existing installations retain their behavior unless opted in.
+
+The fixed same-origin management bridge delegates every request to the main controller's native admin-only `/api/panel/users` authorization. It does not replicate passwords, sessions or roles. Only the server holds the isolated controller's master key, in a root-owned mode-0600 nginx include. Install `maps.conf.example` at http level and `locations.conf.example` inside the existing TLS vhost, replacing the exact console origin, private destinations and master placeholder. Restrict the private upstream listener to loopback/tunnel endpoints. Keep model routes separate and API-key authenticated.
+
+Validation before rollout: unauthenticated, expired and non-admin requests denied; foreign Origin denied; cookie-only unsafe requests without Origin denied; same-origin admin reads/writes/SSE work; no upstream cookies/master exposed. Disable the old independent public admin/login paths only after the shared login works. Keep old assets for open tabs and atomically replace the index after a static build. No Claude gateway or kernel restart is needed. Back up nginx and index; validate `nginx -t` before graceful reload. Preserve pre-existing rate/connection limits and deployment locking.
+
+This unifies management, not process/memory limits or account credentials. GPT OAuth, quotas, keys and sessions stay in its AgentNAS controller. Native ReClaude cards belong only to main. The model transport remains on Sub2API's private API-only bridge.
