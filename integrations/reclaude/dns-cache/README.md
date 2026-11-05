@@ -53,6 +53,21 @@ DROP or reset the exit guard. A stopped cache with redirects still targeting it
 fails DNS resolution; it does not fall back to a direct or alternative proxy.
 Cached DNS answers cannot reopen a connection closed by the exit guard.
 
+## Resolver compatibility
+
+Test the real client's default address-family lookup as well as separate A and
+AAAA queries. An IPv4-only `curl -4` exit check cannot establish that ordinary
+hostname resolution works. In one isolated relay, individual DNS answers worked
+while forced TCP (`options use-vc`) produced `getaddrinfo(AF_UNSPEC)` failures and
+native `/client/account` startup timeouts. Removing only `use-vc` restored the
+official zero-dispatch CLI preparation and a real tool/history exchange.
+
+Use that change only after verifying that both UDP and TCP port 53 redirect to
+the same private cache and guarded helper, external forwarding remains blocked,
+and the original exit is unchanged. Keep resolver timeouts, authentication and
+exit latches intact. A failed AAAA-filter experiment in that deployment was
+reverted; disabling IPv6 filtering is not a prerequisite for this workaround.
+
 ## Measurement limits
 
 A controlled native TCP-DNS comparison on 2026-10-31 showed cache hits around
