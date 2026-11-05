@@ -55,8 +55,43 @@ changing a session's model, system or tools are currently unsupported. An
 explicit `max_tokens`, output `effort` or supported thinking-display change is applied by resuming the
 original native conversation at its latest verified assistant checkpoint. These
 controls are never dropped merely to make a configuration comparison pass.
-Equivalent defaults, system text representations and cache annotations reuse
-the resident process.
+Equivalent defaults and system text representations reuse the resident process.
+
+### Native cache TTL
+
+The CLI rebuilds cache breakpoints; their caller positions are not forwarded.
+For the tested CLI 2.1.304, homogeneous `cache_control.ttl` values select `5m`
+or `1h` through the official `CLAUDE_CODE_PROMPT_CACHE_TTL` and
+`CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL` controls. Missing TTL, including a missing
+cache marker, defaults to `1h`. `FORCE_PROMPT_CACHING_5M` is set per invocation
+so an inherited override cannot silently defeat the chosen TTL.
+
+The selector reads actual system/tool/message annotations, including structured
+tool results, and the optional top-level cache control. It never interprets a
+tool input or JSON Schema property named `cache_control` as protocol metadata.
+The native API wire omits `ttl` for five-minute markers and emits `ttl: "1h"`
+for one-hour markers. This is TTL compatibility, not literal marker forwarding.
+
+A request mixing `5m` and `1h` after defaulting missing TTL cannot be expressed
+by this native route: it returns `400 cache_ttl_mixed_unsupported` before a pool
+lease, grant or model dispatch. Invalid cache controls return `invalid_cache_control`.
+Do not silently unify such requests or rename response usage buckets. Coordinate
+route capabilities with the upstream gateway before deploying this change.
+
+TTL is a mutable turn control outside the fixed session fingerprint. The same
+TTL reuses its resident CLI; a changed TTL resumes the same native conversation
+at a verified assistant checkpoint, using the existing max-token/effort restart
+path. No checkpoint version change or failed-session migration is needed.
+Per-turn TTL changes can therefore add CLI startup latency. Cancellation and
+consumed boundaries remain final. Native usage is always forwarded unchanged.
+
+`tests/offline_cache_ttl.py` exercises the actual unmodified CLI against a
+loopback synthetic provider, with OS-enforced outbound isolation and fresh
+synthetic credentials/profile. It verifies wire TTLs, concurrency, reuse,
+checkpoint and tool-result resume, usage, rejection and cancellation. It does
+not prove live ReClaude billing or upstream cache availability. Official
+controls require [CLI v2.1.242 or later](https://code.claude.com/docs/en/prompt-caching#choose-the-ttl-yourself);
+cache disable settings and provider-side eligibility still apply.
 
 `output_config.format={"type":"json_schema","schema":{...}}` is supported
 through the unmodified CLI's `--json-schema` validator. The native CLI generates

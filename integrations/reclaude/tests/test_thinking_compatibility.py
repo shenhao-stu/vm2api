@@ -18,7 +18,12 @@ class ThinkingCompatibilityTests(unittest.TestCase):
                 body = {**self.body, "thinking": {"type": "adaptive", "display": display}}
                 original = copy.deepcopy(body)
                 environment, options = native_options(body)
-                expected_environment = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096"}
+                expected_environment = {
+                    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096",
+                    "CLAUDE_CODE_PROMPT_CACHE_TTL": "1h",
+                    "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL": "1h",
+                    "FORCE_PROMPT_CACHING_5M": "0",
+                }
                 if display == 'omitted':
                     expected_environment['CLAUDE_CODE_THINKING_DISPLAY_UPDATES'] = '0'
                 self.assertEqual(environment, expected_environment)

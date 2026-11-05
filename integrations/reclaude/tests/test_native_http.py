@@ -214,6 +214,19 @@ class NativeHTTPTests(unittest.TestCase):
         self.assertEqual(self.audit()[0]["readiness_failures"], ["official_proof_unavailable"])
         self.assertEqual(self.created, [])
 
+    def test_mixed_cache_ttl_returns_400_before_admission_or_consumption(self):
+        status, data = self.request(self.body(
+            cache_control={'type': 'ephemeral'},
+            system=[{'type': 'text', 'text': 'fixture',
+                     'cache_control': {'type': 'ephemeral', 'ttl': '5m'}}]))
+        self.assertEqual(status, 400)
+        self.assertIn('cache_ttl_mixed_unsupported', data.decode())
+        self.assertEqual(self.created, [])
+        row = self.audit()[0]
+        self.assertEqual(row['attempts'], 0)
+        self.assertFalse(row['complete'])
+        self.assertEqual(list(self.root.rglob('*.consumed.json')), [])
+
     def test_explicit_sixteen_mib_budget_accepts_large_synthetic_context_once(self):
         self.server.limits = replace(self.server.limits, body_bytes=16 * 1024 * 1024)
         body = self.body(system='x' * 8596819)

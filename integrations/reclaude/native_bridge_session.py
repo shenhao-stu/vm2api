@@ -101,6 +101,34 @@ def output_format(body):
     return copy.deepcopy(fmt)
 
 
+def native_cache_ttl(body):
+    """The CLI owns breakpoints and can express only one TTL per invocation."""
+    def controls(blocks):
+        for block in blocks if isinstance(blocks, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if 'cache_control' in block:
+                yield block['cache_control']
+            if block.get('type') in {'tool_result', 'search_result'}:
+                yield from controls(block.get('content'))
+
+    values = list(controls(body.get('tools'))) + list(controls(body.get('system')))
+    for message in body.get('messages', []):
+        if isinstance(message, dict):
+            values.extend(controls(message.get('content')))
+    if 'cache_control' in body:
+        values.append(body['cache_control'])
+    ttls = set()
+    for control in values:
+        if (not isinstance(control, dict) or control.get('type') != 'ephemeral'
+                or control.get('ttl', '1h') not in ('5m', '1h')):
+            raise ContractError('invalid_cache_control')
+        ttls.add(control.get('ttl', '1h'))
+    if len(ttls) > 1:
+        raise ContractError('cache_ttl_mixed_unsupported')
+    return next(iter(ttls), '1h')
+
+
 def native_options(body):
     """Accept only the tested native CLI contract; never silently ignore controls."""
     fields = {
@@ -116,6 +144,7 @@ def native_options(body):
         "context_management",
         "tool_choice",
         "temperature",
+        "cache_control",
     }
     if not isinstance(body, dict) or set(body) - fields:
         raise ContractError("unsupported_request_parameter")
@@ -172,7 +201,13 @@ def native_options(body):
         validate_system_messages(history_shape(messages))
     except HistoryError as exc:
         raise ContractError(str(exc)) from None
-    environment = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(maximum)}
+    ttl = native_cache_ttl(body)
+    environment = {
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(maximum),
+        "CLAUDE_CODE_PROMPT_CACHE_TTL": ttl,
+        "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL": ttl,
+        "FORCE_PROMPT_CACHING_5M": '1' if ttl == '5m' else '0',
+    }
     if thinking and thinking["display"] == "omitted":
         # Native CC otherwise upgrades an explicit omitted display to updates.
         environment["CLAUDE_CODE_THINKING_DISPLAY_UPDATES"] = "0"
@@ -214,6 +249,7 @@ def configuration(body):
     """The validated subset's effective native configuration, not JSON spelling."""
     thinking = thinking_configuration(body)
     fmt = output_format(body)
+    ttl = native_cache_ttl(body)
     return {
         "model": body.get("model"),
         "system": caller_system(body.get("system", "")),
@@ -222,12 +258,14 @@ def configuration(body):
         "output_config": {"effort": effective_effort(body),
                           **({"format": fmt} if fmt else {})},
         **({"thinking": thinking} if thinking else {}),
+        # Keep old default configuration hashes; only 5m adds a mutable control.
+        **({"cache_ttl": ttl} if ttl != '1h' else {}),
     }
 
 
 def fixed_configuration(body):
     return {k: v for k, v in configuration(body).items()
-            if k not in {"max_tokens", "output_config", "thinking"}}
+            if k not in {"max_tokens", "output_config", "thinking", "cache_ttl"}}
 
 
 def canonical(value):
