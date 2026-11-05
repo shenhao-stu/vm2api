@@ -30,9 +30,9 @@
 | `persona_preset` | `official_full` | 使用独立的完整官方模板；`official` 保留原有官方提示词 |
 | `overlay_preset` | `off` | 不向首条 user 注入 overlay |
 | `persona_park` | `false` | 与 `overlay_preset=off` 对齐 |
-| `cache_ttl` | `1h` | Node 重写时新增点的缺省 TTL；`x-kin-cache-ttl` 参与首次会话选择，不覆盖 native 透传 caller / 模板显式 TTL |
+| `cache_ttl` | `1h` | HTTP rewrite 缺省 TTL；本地 native cli-hop 按调用方同质 TTL，缺省固定 `1h`，不锁定旧会话值 |
 
-**official 模板**保留 billing + Agent SDK identity + 可选 caller_agent / caller_system，并在 agent 块之后写槽位 `# Environment`（`{{env}}`，只含 `Timezone: <槽位时区>`，不挂 cache，不破 agent 块的 1h global 缓存）；不会自动追加完整 agent prompt。
+**official 模板**保留 billing + Agent SDK identity + 可选 caller_agent / caller_system，并在 agent 块之后写槽位 `# Environment`（`{{env}}`，只含 `Timezone: <槽位时区>`，不挂 cache，不改变 agent 块的缓存位置）；不会自动追加完整 agent prompt。
 
 **official_full 模板**在相同前缀后固定追加完整 `agent_official`，带 ephemeral 1h cache；调用方 system 作为末块追加。
 
@@ -56,7 +56,7 @@ native cli-hop 优先完整保留 Node 已组装、带 billing 的 wire system�
 
 遗留 `persona_inject=rewrite|overwrite|append|none` 仍可用，但不是仓库配置默认值。`rewrite` 使用 KIN 短 agent + env；`overwrite` 使用完整 agent_prompt + continuation + Environment。system提示词页保存时三档写回 `official_prompt` / `official_full` / `zero`；自定义才保留旧 inject。
 
-权威开关是 `routing.json` 的 `compatibility.persona_preset`（system提示词）与 `cache_ttl`（设置 → 协议 → 提示词缓存 → 默认缓存写入 TTL，可选 `5m` / `1h`，缺省 `1h`，点击「保存」生效）。该值仅是默认值，不覆盖请求头、请求显式 TTL、已有会话锁定值或 system 模板显式 TTL；官方透传的调用方 marker 及缺失 TTL 保持原样。`vms/<id>/run/kernel.json` 不是第二套面板：面板保存、槽位「跟随全局」、外部改写 `routing.json`，或虚拟机环境保存时区之后，才把解析结果投影进去（`persona_preset`、`system_layout`、`default_cache_ttl`、`timezone`）。`system_layout` 只有 `zero` 与 `identity`（`official` / `official_full` / `custom` 都是 `identity`）。字节没变不重写。kernel 热读该文件，不必重启槽。Codex 槽不写。手改 `kernel.json` 会在下一次投影时被盖掉。
+权威开关是 `routing.json` 的 `compatibility.persona_preset`（system提示词）与 `cache_ttl`（设置 → 协议 → 提示词缓存 → 默认缓存写入 TTL，可选 `5m` / `1h`，缺省 `1h`，点击「保存」生效）。该默认值及请求头/旧会话 pin 规则适用于 HTTP rewrite。本地 native 走下方的同质 TTL 契约：缺省固定 1h、显式 5m 生效、模板自产点跟随本次 TTL，不保留旧会话 TTL。`vms/<id>/run/kernel.json` 不是第二套面板：面板保存、槽位「跟随全局」、外部改写 `routing.json`，或虚拟机环境保存时区之后，才把解析结果投影进去（`persona_preset`、`system_layout`、`default_cache_ttl`、`timezone`）。`system_layout` 只有 `zero` 与 `identity`（`official` / `official_full` / `custom` 都是 `identity`）。字节没变不重写。kernel 热读该文件，不必重启槽。Codex 槽不写。手改 `kernel.json` 会在下一次投影时被盖掉。
 
 面板预览表达 Node 给出的模板内容；cli-hop 最终线序以上述 CLI-owned 前缀为准，不把 Node 对象预览当成最终 wire 抓包。更新 CLI 二进制后需要替换槽内副本并重启相应 kernel/CLI；配置热读不能让旧进程自动加载新 ELF。删除旧环境文本后首次前缀会冷写，后续 cache_read 数值须实测，不能保证必然不低于旧值。0注入 + 常驻约束关闭 + 无调用方 agent 的真实模型可见输出须单独验收。
 
@@ -127,11 +127,13 @@ Rikka / 客户端 `search_web`、`scrape_web` **不是** Anthropic 自带搜索�
 3. 更早的型号仍逐块过滤：签名短于 24、空签名、dummy 签名删掉，合法签名块留下。`redacted_thinking` 不看 `data`，只在签名达到 24 字符时留。
 4. 保留路径（cli-hop 首跳，以及默认 HTTP hop）不走上面的拆链，只在 `stripInvalidThinkingBlocks` 的这一支里处理：`redacted_thinking` 不看 `data` 和签名，原样留。`thinking` 只有签名可用（非空、不少于 24、非 dummy）才留，空正文也留；缺失、空、短于 24、dummy 的删掉，不再补 `signature: ""`。不走保留路径时，`redacted_thinking` 仍按上面第 2、3 条删。当前没有按账号归属过滤签名的步骤。
 
-HTTP hop 与 cli-hop（`prepareCliHopBody`）共用内容预过滤，但缓存职责不同。cli-hop 首跳保留签名可用的 thinking 指纹，没有可用签名的删掉；签名修复重试才清除其余块。官方家族开启 `official_cc_passthrough` 时，Node 保留 system/tools/messages 的 caller marker、显式 TTL、缺失 TTL 和位置，不添点、不裁剪；超过四点、thinking marker、非法 TTL 或 5m（含缺失）后出现 1h，在调度前返回 `400 invalid_cache_control`。
+### 原生 CLI 缓存 TTL
 
-关闭透传或非官方请求仍走 Node rewrite：清除 caller marker，生成最后消息及 `messages.length>=4` 时倒数第二 user 的点，TTL 用入站会话 pin 值。应用 persona 后，模板显式 TTL 保留，只补自产缺失 TTL；超额时优先删 tools、system 尾部的自产点。非法模板返回 request-scoped 400，零上游执行，不换号、不冷却。
+HTTP hop 与 cli-hop（`prepareCliHopBody`）共用内容预过滤，但缓存职责不同。cli-hop 首跳保留签名可用的 thinking 指纹，没有可用签名的删掉；签名修复重试才清除其余块。本地 native 在 persona 前读取调用方真实缓存注释（含 typed tool definition，排除 schema/工具入参中的同名业务字段）：显式 `5m`/`1h` 必须同质，marker 缺 TTL 或无 marker 默认 `1h`。混合请求即使满足 API 的合法顺序，也在调度前返回 `400 cache_ttl_mixed_unsupported`，不派发、不换号、不重分类 usage。这个限制不作用于独立 API/HTTP 后端。
 
-native CLI `2.1.296` 保留带 billing 的 wire system（含官方 CLI / 子代理布局）、wire tools 和 wire messages，不自动给最后一个 tool 加点；caller tool 的缺失 TTL 也保持缺失。仅对 CLI 自有 marker 补 TTL，优先请求显式 TTL（混合时 5m）→ slot `kernel.json.default_cache_ttl` → 1h，并按保留内容占用后的剩余预算裁剪。Rust kernel 不增删 marker、不重打 last、不自动降级 TTL。Node native envelope 不用菜单 TTL 重分类上游 usage，日志/计费保留真实 5m/1h 分桶。Node 对象不等于最终 wire；HTTP hop 原有独立缓存整流不变。
+关闭透传或非官方请求仍走 Node rewrite：清除 caller marker，生成最后消息及 `messages.length>=4` 时倒数第二 user 的点。persona 文本、工具和自产点布局保持原规则；其自产点统一用本次读取的 TTL，包括模板原有的缓存点。TTL 不再 pin 到旧会话；原生 job 边界可在同一 resident slot 从 `1h` 切 `5m` 再切回，不需重启 CLI、改变身份或恢复旧 failed。超额时仍按原规则裁剪自产点。官方透传模式不自动开启；开启后 Node 只给已有点补 `1h`，保留同质显式 TTL 和位置，继续校验四点预算/非法 marker。
+
+现役 native CLI `2.1.296`（验证 SHA `55efe49e…`）会增添/调整原生自有 marker，并把合法混合 `1h→5m` 整流到 `5m`；只看 Node 对象不能声称原位保真。隔离的真实 kernel/CLI wire 已验证同质 TTL、途中 system 消息顺序、工具、原用量桶和同 slot 三次切换。测试使用新假凭据及 `--network=none`，不代表上游真实缓存命中或计费验收。native envelope 保留上游真实 5m/1h 用量桶，不能按请求 TTL 给回包桶改名。
 
 长度够的签名原样转发，由 Anthropic 验。5.5 的非 dummy 签名在非保留路径原样转发，不按 24 字符预过滤；保留路径仍要求不少于 24。签名是 opaque 加密内容，当前模型 / 账户 / 会话前缀不匹配时可能被丢弃或返回 400 `Invalid \`signature\` in \`thinking\` block`。网关不伪造真实签名，也不给缺签名的块补空字段。切换账号时不改写已有签名；`cli-node` 仍按现有登录 / fallback 逻辑清理签名块。
 
@@ -165,7 +167,7 @@ native CLI `2.1.296` 保留带 billing 的 wire system（含官方 CLI / 子代�
 | 头 | 作用 |
 |----|------|
 | `x-kin-delivery: verified` | 缓冲到终态 |
-| `x-kin-cache-ttl: 1h` | Node 重写模式的首次会话 TTL 选择；不覆盖 native 透传 caller / 模板显式 TTL |
+| `x-kin-cache-ttl: 1h` | HTTP rewrite 的首次会话 TTL 选择；本地 native 以 body 的同质 TTL 契约为准 |
 | `x-kin-vm` | 仅 master：钉槽（虚拟机测试 loopback） |
 | `x-session-id` 等 | sticky 键，见 `routing.sticky` |
 | `x-kin-debug` / `x-kin-log` | 单请求日志模式覆盖 |

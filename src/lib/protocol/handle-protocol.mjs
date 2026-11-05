@@ -140,6 +140,8 @@ import {
   cacheBreakpointsFromRoutingFile,
   pinConversationCacheTtl,
   resolveCacheTtl,
+  resolveNativeCacheTtl,
+  forceEphemeralCacheTtl,
   fillMissingCacheTtl,
   validateCacheBreakpoints,
 } from './cache-ttl.mjs'
@@ -1067,8 +1069,21 @@ export function createHandleProtocol(deps) {
         return json(res, error.status, error.body)
       }
     } else if (!apiPassthrough) ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+    let nativeRequestCacheTtl = null
+    if (inferenceBackend !== 'api' && !requestContext) {
+      try {
+        nativeRequestCacheTtl = resolveNativeCacheTtl(ctx.body)
+      } catch (error) {
+        if (!error.body?.error) throw error
+        stats.errors++
+        logBag.error_code = error.body.error.code
+        logBag.error_message = error.body.error.message
+        return json(res, error.status, error.body)
+      }
+    }
     if (!requestContext && officialTraffic && officialCcPassthroughFromRouting(getRouting())) {
       try {
+        ctx.body = fillMissingCacheTtl(ctx.body)
         validateCacheBreakpoints(ctx.body)
       } catch (error) {
         if (!error.body?.error) throw error
@@ -1165,10 +1180,11 @@ export function createHandleProtocol(deps) {
       vmId: stickyBound?.vmId || '',
       epoch: 'pending',
     })
-    const requestedCacheTtl = pinConversationCacheTtl(
-      stickyKey || callerSession || outboundSessionId,
-      resolveCacheTtl({ headers: req.headers, body: inbound, routingFile: routingConfigPath }),
-    )
+    const resolvedCacheTtl = resolveCacheTtl({ headers: req.headers, body: inbound, routingFile: routingConfigPath })
+    const requestedCacheTtl =
+      nativeRequestCacheTtl != null
+        ? nativeRequestCacheTtl
+        : pinConversationCacheTtl(stickyKey || callerSession || outboundSessionId, resolvedCacheTtl)
     let cacheTtl = requestedCacheTtl
     let preserveCacheBreakpoints = false
     const cacheBreakpoints = cacheBreakpointsFromRoutingFile(routingConfigPath)
@@ -1543,7 +1559,7 @@ export function createHandleProtocol(deps) {
                 cliVersion: OFFICIAL_CLI_VERSION,
                 identity,
               })
-              hopBody = fillMissingCacheTtl(hopBody, requestedCacheTtl)
+              hopBody = forceEphemeralCacheTtl(hopBody, requestedCacheTtl)
               enforceCacheLimit(hopBody)
               validateCacheBreakpoints(hopBody)
               personaHideTokens = personaHideForUnofficial(personaIn, hopBody, {

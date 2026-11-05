@@ -70,7 +70,7 @@ x-api-key: sk-vm-…
 | `content-type: application/json` | 必填 |
 | `x-session-id` / `x-conversation-id` / `x-claude-code-session-id` | sticky 键（见 `routing.sticky`） |
 | 交付模式 `verified` | 缓冲到 `message_stop` 再回放 |
-| 缓存 TTL `1h` | Node 新增点的缺省值；`x-kin-cache-ttl: 5m` 参与首次会话选择，不覆盖 native 透传 caller / 模板显式 TTL |
+| 缓存 TTL `1h` | HTTP rewrite 新增点的缺省值；本地 native 以 body 的同质 TTL 契约为准 |
 | 调试开关 | 单请求日志模式 |
 | 钉槽（仅 master） | 虚拟机测试 loopback |
 | `X-Request-ID` | 原样回写响应头 |
@@ -99,7 +99,7 @@ curl -sS http://127.0.0.1:8787/v1/messages \
 
 支持的 Messages 字段原样进入清洗层：`system`、`tools`、`tool_choice`、`thinking`、`output_config`、`metadata`、`stop_sequences`、图片块、`cache_control`。非法 `role` 会洗掉。OpenAI 形态 tools 出现在本口时先转成 Anthropic tools，但仍判非官方。
 
-native cli-hop 开启官方家族透传时，调用方 `cache_control` 的位置、显式 TTL 与缺失 TTL 保留。超过四个 breakpoint、thinking 上打点、非法 TTL，或 `5m`（含缺失 TTL）之后出现 `1h`，返回 `400 invalid_cache_control`，不静默裁剪或降级、不执行上游。非透传仍按协议重写规则生成自产点；kernel 不再替前置层修复 TTL 顺序。
+本地 native cli-hop 在 persona 改写前读取调用方缓存 TTL：显式 `5m` 或 `1h` 必须同质，已有 marker 缺 TTL 以及无 marker 均默认 `1h`。混合请求在调度前返回 `400 cache_ttl_mixed_unsupported`；现役 CLI 会将混合 TTL 整流，不能当作逐块透传。非透传保留既有 persona/自产缓存点布局，只调整这些点的 TTL；同会话后续请求可改变 TTL，不再 pin 旧值。官方透传模式仅补已有 marker 的缺省值，不据此自动开启该模式。计量保留真实上游桶。此原生能力限制不施加给 API 后端或独立 HTTP hop，详见[原生 TTL](PROTOCOL.md#原生-cli-缓存-ttl)。
 
 ### Sonnet 5.5 兼容边界
 

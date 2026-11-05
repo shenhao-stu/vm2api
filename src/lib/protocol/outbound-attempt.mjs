@@ -51,8 +51,10 @@ import {
   applyCacheTtlToBody,
   applyMessageBreakpoints,
   DEFAULT_CACHE_TTL,
+  fillMissingCacheTtl,
   enforceCacheTtlOrder,
   normalizeCacheTtl,
+  resolveNativeCacheTtl,
   removeCacheControlFields,
   stripIllegalCacheControlFields,
   validateCacheBreakpoints,
@@ -195,7 +197,11 @@ export function prepareCliHopBody(
   } = {},
 ) {
   if (requestContext?.purpose === 'auto_mode_classifier') return prepareClassifierBody(canonicalBody, { stream })
-  if (preserveSystem) validateCacheBreakpoints(canonicalBody)
+  if (preserveSystem) {
+    resolveNativeCacheTtl(canonicalBody)
+    canonicalBody = fillMissingCacheTtl(canonicalBody)
+    validateCacheBreakpoints(canonicalBody)
+  }
   let body = officialMessagesBody(canonicalBody, { stream })
   const windowTokens = Number(autoCompactWindow)
   if (Number.isInteger(windowTokens) && windowTokens >= 100_000 && windowTokens <= 1_000_000) {

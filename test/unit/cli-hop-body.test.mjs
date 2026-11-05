@@ -56,20 +56,20 @@ test('prepareCliHopBody preserveSystem keeps official billing and system cache_c
   )
   assert.equal(body.system[0].text, billing)
   assert.match(body.system[1].text, /You are Claude Code/)
-  assert.deepEqual(body.system[2].cache_control, { type: 'ephemeral' })
+  assert.deepEqual(body.system[2].cache_control, { type: 'ephemeral', ttl: '1h' })
 })
 
-test('cli-hop passthrough preserves mixed TTLs, missing TTL and caller marker positions', () => {
+test('cli-hop passthrough preserves explicit TTL and marker positions while defaulting missing TTL', () => {
   const input = {
     model: 'claude-opus-5-5',
     max_tokens: 128,
     tools: [{ name: 'Read', input_schema: { type: 'object' }, cache_control: { type: 'ephemeral', ttl: '1h' } }],
-    system: [{ type: 'text', text: 'caller', cache_control: { type: 'ephemeral', ttl: '5m', scope: 'global' } }],
+    system: [{ type: 'text', text: 'caller', cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global' } }],
     messages: [
       { role: 'user', content: [{ type: 'text', text: 'first', cache_control: { type: 'ephemeral' } }] },
       {
         role: 'assistant',
-        content: [{ type: 'text', text: 'answer', cache_control: { type: 'ephemeral', ttl: '5m' } }],
+        content: [{ type: 'text', text: 'answer', cache_control: { type: 'ephemeral', ttl: '1h' } }],
       },
       { role: 'user', content: [{ type: 'text', text: 'last' }] },
     ],
@@ -78,7 +78,9 @@ test('cli-hop passthrough preserves mixed TTLs, missing TTL and caller marker po
   const body = prepareCliHopBody(input, { preserveSystem: true, cacheTtl: '1h' })
   assert.deepEqual(body.tools[0].cache_control, before.tools[0].cache_control)
   assert.deepEqual(body.system, before.system)
-  assert.deepEqual(body.messages, before.messages)
+  const expectedMessages = structuredClone(before.messages)
+  expectedMessages[0].content[0].cache_control.ttl = '1h'
+  assert.deepEqual(body.messages, expectedMessages)
   assert.deepEqual(input, before)
 })
 
@@ -115,7 +117,6 @@ test('cli-hop passthrough rejects invalid caller markers instead of repairing th
   const marker = (ttl) => ({ type: 'text', text: 'anchor', cache_control: { type: 'ephemeral', ...ttl } })
   for (const content of [
     Array.from({ length: 5 }, () => marker({ ttl: '5m' })),
-    [marker({}), marker({ ttl: '1h' })],
     [marker({ ttl: 'bad' })],
     [{ type: 'thinking', thinking: 'private', cache_control: { type: 'ephemeral' } }],
     [{ type: 'redacted_thinking', data: 'private', cache_control: { type: 'ephemeral' } }],
