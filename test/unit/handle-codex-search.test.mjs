@@ -244,3 +244,44 @@ test('the alpha/search route authenticates, logs and reaches the Codex search ho
   assert.equal(rows[0].api_key_kind, 'managed')
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+test('a search refresh finishing after recovery uses the current ticket and drops its stale reply', async (t) => {
+  const root = tempRoot('late-refresh')
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeGptVm(root, 'vm-gpt-a')
+  const file = path.join(root, 'vms', 'vm-gpt-a', 'codex-credentials.json')
+  let enter, release
+  const entered = new Promise((resolve) => {
+    enter = resolve
+  })
+  const delayed = new Promise((resolve) => {
+    release = resolve
+  })
+  const accesses = []
+  const pending = search(root, {
+    ops: {
+      fetchImpl: async (_url, init) => {
+        accesses.push(init.headers.authorization)
+        return init.headers.authorization === 'Bearer at'
+          ? upstream(401, { error: {} })
+          : upstream(200, { output: 'ok' })
+      },
+      refresh: async () => {
+        enter()
+        await delayed
+        return { ok: true, access_token: 'late-at', refresh_token: 'late-rt' }
+      },
+    },
+  })
+  await entered
+  const current = readCodexAccounts(root, 'vm-gpt-a')[0]
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ accounts: [{ ...current, access_token: 'verified-at', refresh_token: 'verified-rt' }] }),
+  )
+  release()
+  const { res } = await pending
+  assert.equal(res.statusCode, 200)
+  assert.deepEqual(accesses, ['Bearer at', 'Bearer verified-at'])
+  assert.equal(readCodexAccounts(root, 'vm-gpt-a')[0].refresh_token, 'verified-rt')
+})

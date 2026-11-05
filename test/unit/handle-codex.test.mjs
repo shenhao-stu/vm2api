@@ -1,3 +1,12 @@
+import http from 'node:http'
+import { streamCodexKernel } from '../../src/lib/transport/codex-kernel-client.mjs'
+import {
+  codexAuthFailureReason,
+  codexCredentialFingerprint,
+  noteCodexAuthFailure,
+} from '../../src/lib/protocol/handle-codex.mjs'
+import { writeCodexAccounts } from '../../src/lib/vm/codex-slot.mjs'
+import { setScheduleOff } from '../../src/lib/vm/vm-registry.mjs'
 import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -13,7 +22,7 @@ import {
 } from '../../src/lib/protocol/handle-codex.mjs'
 import { persistCodexUsage, getVm } from '../../src/lib/vm/vm-registry.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
-import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
+import { resetOpenAIAccountRuntime, openAIAccountHold } from '../../src/lib/pool/openai-account-runtime.mjs'
 
 beforeEach(() => resetOpenAIAccountRuntime())
 
@@ -776,7 +785,7 @@ function codexArgs(root, ops, extras = {}) {
     res: { headersSent: false, write() {}, end() {} },
     protocol: 'openai.responses',
     ctx: { path: '/v1/responses', body: extras.body || { model: 'gpt-5.5', input: 'hi', stream: false } },
-    inbound: { stream: false },
+    inbound: { stream: extras.body?.stream === true },
     logBag: extras.logBag || {},
     stats: { errors: 0, requests: 0, by_route: {} },
     json: (_res, status, body) => ({ status, body }),
@@ -848,7 +857,7 @@ test('#A04: the fifth GPT slot is reached after four slots fail over', async () 
           return { ok: true, status: 200, terminalState: 'verified' }
         },
       },
-      { logBag, routing: { failover: { max_account_switches: 10 } } },
+      { logBag, routing: { failover: { codex: { max_account_switches: 10 } } } },
     ),
   )
   assert.equal(out.status, 200)
@@ -886,7 +895,7 @@ test('uncommitted 503 server_error fails over to the next GPT slot', async () =>
           return { ok: true, status: 200, terminalState: 'verified' }
         },
       },
-      { logBag, routing: { failover: { max_same_account_retries: 0 } } },
+      { logBag, routing: { failover: { codex: { max_same_account_retries: 0 } } } },
     ),
   )
   assert.equal(out.status, 200)
@@ -922,7 +931,7 @@ test('uncommitted 500 server_error fails over to the next GPT slot', async () =>
           return { ok: true, status: 200, terminalState: 'verified' }
         },
       },
-      { routing: { failover: { max_same_account_retries: 0 } } },
+      { routing: { failover: { codex: { max_same_account_retries: 0 } } } },
     ),
   )
   assert.equal(out.status, 200)
@@ -959,7 +968,9 @@ test('transient GPT failures retry the same account three times before switching
       },
       {
         logBag,
-        routing: { failover: { max_total_attempts: 12, max_same_account_retries: 3, max_account_switches: 3 } },
+        routing: {
+          failover: { codex: { max_total_attempts: 12, max_same_account_retries: 3, max_account_switches: 3 } },
+        },
       },
     ),
   )
@@ -978,14 +989,18 @@ test('same-account retry never replays after the first SSE event', async () => {
   for (const id of ['vm-gpt-a', 'vm-gpt-b']) writeGptVm(root, id)
   const seen = []
   const out = await handleCodexProtocol(
-    codexArgs(root, {
-      ensureCodexKernel: async () => ({ ok: true }),
-      streamCodexKernel: async ({ exec, onEvent }) => {
-        seen.push(exec.vm.id)
-        await onEvent('data: {"type":"response.created"}')
-        return { ok: false, status: 500, committed: false, body: { error: { code: 'server_error' } } }
+    codexArgs(
+      root,
+      {
+        ensureCodexKernel: async () => ({ ok: true }),
+        streamCodexKernel: async ({ exec, onEvent }) => {
+          seen.push(exec.vm.id)
+          await onEvent('data: {"type":"response.created"}')
+          return { ok: false, status: 500, committed: false, body: { error: { code: 'server_error' } } }
+        },
       },
-    }),
+      { body: { model: 'gpt-5.5', input: 'fixture', stream: true } },
+    ),
   )
   assert.equal(out, undefined)
   assert.deepEqual(seen, ['vm-gpt-a'])
@@ -996,10 +1011,15 @@ test('same-account retry never replays after the first SSE event', async () => {
 test('Codex failover stops at the configured attempt budget', async () => {
   const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
   rt.resetOpenAIAccountRuntime()
-  assert.deepEqual(codexFailoverBudget({ failover: { max_total_attempts: 3, max_account_switches: 2 } }), {
+  assert.deepEqual(codexFailoverBudget({ failover: { codex: { max_total_attempts: 3, max_account_switches: 2 } } }), {
     maxAttempts: 3,
     maxSwitches: 2,
-    maxSameAccountRetries: 3,
+    maxSameAccountRetries: 0,
+  })
+  assert.deepEqual(codexFailoverBudget({ failover: { max_total_attempts: 2, max_account_switches: 1 } }), {
+    maxAttempts: 64,
+    maxSwitches: 63,
+    maxSameAccountRetries: 0,
   })
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-budget-'))
   for (const id of ['vm-gpt-a', 'vm-gpt-b', 'vm-gpt-c']) writeGptVm(root, id)
@@ -1014,7 +1034,7 @@ test('Codex failover stops at the configured attempt budget', async () => {
           return { ok: false, status: 500, committed: false, body: { error: { code: 'server_error' } } }
         },
       },
-      { routing: { failover: { max_total_attempts: 2, max_account_switches: 10 } } },
+      { routing: { failover: { codex: { max_total_attempts: 2, max_account_switches: 10 } } } },
     ),
   )
   assert.equal(out.status, 500)
@@ -1637,4 +1657,307 @@ test('a woken GPT waiter whose seat was taken re-parks first instead of waking t
   assert.deepEqual(order, [0, 1, 2, 3, 4])
   rt.resetOpenAIAccountRuntime()
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('explicit invalidated token evidence parks 401, but bare 401, unknown 502 and committed failures never do', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-auth-evidence-'))
+  try {
+    writeGptVm(root, 'vm-gpt-a')
+    const auth = {
+      type: 'invalid_request_error',
+      code: 'token_invalidated',
+      message: 'Your authentication token has been invalidated. Please try signing in again.',
+    }
+    for (const result of [
+      { status: 401, body: { error: { message: 'HTTP 401 unauthorized' } } },
+      { status: 502, body: { error: { code: 'provider_error', message: 'unknown' } } },
+      { status: 401, committed: true, body: { error: auth } },
+      { status: 401, transportError: true, body: { error: auth } },
+    ]) {
+      assert.equal(noteCodexAuthFailure(root, 'vm-gpt-a', { ok: false, ...result }), null)
+      assert.equal(getVm(root, 'vm-gpt-a').unschedulable ?? null, null)
+    }
+    assert.equal(
+      noteCodexAuthFailure(root, 'vm-gpt-a', { ok: false, status: 401, body: { error: auth } }),
+      'oauth_revoked',
+    )
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('revoked upstream credentials stay quarantined after runtime restart and expose panel detail', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-revoked-'))
+  try {
+    for (const id of ['vm-gpt-a', 'vm-gpt-b']) writeGptVm(root, id)
+    const seen = []
+    const ops = {
+      ensureCodexKernel: async () => ({ ok: true }),
+      streamCodexKernel: async ({ exec }) => {
+        seen.push(exec.vm.id)
+        return exec.vm.id === 'vm-gpt-a'
+          ? {
+              ok: false,
+              status: 401,
+              body: { error: { code: 'upstream_auth', message: 'token_revoked Bearer short-secret password=hidden' } },
+            }
+          : { ok: true, status: 200, terminalState: 'verified' }
+      },
+    }
+    assert.equal((await handleCodexProtocol(codexArgs(root, ops))).status, 200)
+    assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-b'])
+    const persisted = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-gpt-a.json'), 'utf8'))
+    assert.equal(persisted.unschedulable.reason, 'oauth_revoked')
+    assert.equal(persisted.unschedulable.detail.status, 401)
+    assert.equal(persisted.unschedulable.detail.code, 'upstream_auth')
+    assert.match(persisted.unschedulable.detail.message, /token_revoked/)
+    assert.doesNotMatch(persisted.unschedulable.detail.message, /short-secret|hidden/)
+    assert.equal(getVm(root, 'vm-gpt-a').schedulable, false)
+    resetOpenAIAccountRuntime()
+    seen.length = 0
+    assert.equal((await handleCodexProtocol(codexArgs(root, ops))).status, 200)
+    assert.deepEqual(seen, ['vm-gpt-b'])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('an old in-flight 401 cannot quarantine freshly imported credentials', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-replaced-'))
+  try {
+    for (const id of ['vm-gpt-a', 'vm-gpt-b']) writeGptVm(root, id)
+    const seen = []
+    const ops = {
+      ensureCodexKernel: async () => ({ ok: true }),
+      streamCodexKernel: async ({ exec }) => {
+        seen.push(exec.vm.id)
+        if (exec.vm.id === 'vm-gpt-a') {
+          writeCodexAccounts(root, 'vm-gpt-a', [
+            { id: 'fresh', access_token: 'fresh-at', refresh_token: 'fresh-rt', chatgpt_account_id: 'vm-gpt-a' },
+          ])
+          return { ok: false, status: 401, body: { error: { code: 'upstream_auth', message: 'token_revoked' } } }
+        }
+        return { ok: true, status: 200, terminalState: 'verified' }
+      },
+    }
+    assert.equal((await handleCodexProtocol(codexArgs(root, ops))).status, 200)
+    assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-b'])
+    assert.equal(getVm(root, 'vm-gpt-a').unschedulable ?? null, null)
+    resetOpenAIAccountRuntime()
+    assert.ok(pickCodexCandidates(root, { headers: {} }).ids.includes('vm-gpt-a'))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('auth quarantine preserves operator off and only accepts confirmed uncommitted auth 401s', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-manual-off-'))
+  try {
+    writeGptVm(root, 'vm-gpt-a')
+    const before = codexCredentialFingerprint(root, 'vm-gpt-a')
+    setScheduleOff(root, 'vm-gpt-a', true)
+    const result = {
+      ok: false,
+      status: 401,
+      body: { error: { code: 'upstream_auth', message: 'authentication failed' } },
+    }
+    assert.equal(noteCodexAuthFailure(root, 'vm-gpt-a', result, { before }), 'credential_blocked')
+    const persisted = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-gpt-a.json'), 'utf8'))
+    assert.equal(persisted.schedule_off, true)
+    assert.equal(persisted.unschedulable.reason, 'credential_blocked')
+    for (const status of [400, 403, 429, 503]) {
+      assert.equal(codexAuthFailureReason({ ...result, status }), null)
+    }
+    assert.equal(codexAuthFailureReason({ ...result, committed: true }), null)
+    assert.equal(codexAuthFailureReason({ ok: false, status: 401, body: { error: { code: 'unknown' } } }), null)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('no_capacity switches immediately to a healthy seat with only a short hold', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-no-capacity-'))
+  try {
+    for (const id of ['vm-gpt-a', 'vm-gpt-b']) writeGptVm(root, id)
+    const seen = []
+    const started = Date.now()
+    const out = await handleCodexProtocol(
+      codexArgs(root, {
+        ensureCodexKernel: async () => ({ ok: true }),
+        streamCodexKernel: async ({ exec }) => {
+          seen.push(exec.vm.id)
+          return exec.vm.id === 'vm-gpt-a'
+            ? { ok: false, status: 503, body: { error: { code: 'no_capacity', message: 'credential busy' } } }
+            : { ok: true, status: 200, terminalState: 'verified' }
+        },
+      }),
+    )
+    assert.equal(out.status, 200)
+    assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-b'])
+    assert.equal(getVm(root, 'vm-gpt-a').unschedulable ?? null, null)
+    assert.deepEqual(codexFailureHold({ ok: false, status: 503, body: { error: { code: 'no_capacity' } } }, started), {
+      until: started + 5_000,
+      reason: 'no_capacity',
+    })
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('all quarantined credentials stay out of scheduling and final errors have safe cause text', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-all-revoked-'))
+  try {
+    for (const id of ['vm-gpt-a', 'vm-gpt-b']) writeGptVm(root, id)
+    const seen = []
+    const logBag = {}
+    const ops = {
+      ensureCodexKernel: async () => ({ ok: true }),
+      streamCodexKernel: async ({ exec }) => {
+        seen.push(exec.vm.id)
+        return {
+          ok: false,
+          status: 401,
+          body: { error: { code: 'upstream_auth', message: 'token_revoked refresh_token=rt-secret totp seed=abcd' } },
+        }
+      },
+    }
+    const out = await handleCodexProtocol(codexArgs(root, ops, { logBag }))
+    assert.equal(out.status, 401)
+    assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-b'])
+    assert.match(logBag.error_message, /HTTP 401 upstream_auth token_revoked/)
+    assert.doesNotMatch(logBag.error_message, /rt-secret|abcd/)
+    resetOpenAIAccountRuntime()
+    seen.length = 0
+    assert.equal((await handleCodexProtocol(codexArgs(root, ops))).status, 503)
+    assert.deepEqual(seen, [])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a real Unix Codex 502 auth wrapper becomes 401, persists quarantine before failover', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const root = fs.mkdtempSync('/tmp/fold-auth-')
+  const servers = []
+  const seen = []
+  try {
+    for (const id of ['vm-gpt-a', 'vm-gpt-b']) {
+      writeGptVm(root, id)
+      const runDir = path.join(root, 'vms', id, 'run')
+      fs.mkdirSync(runDir, { recursive: true })
+      fs.writeFileSync(path.join(runDir, 'internal.token'), 'fixture-private-token', { mode: 0o600 })
+      const server = http.createServer((req, res) => {
+        assert.equal(req.url, '/internal/v1/codex/responses')
+        assert.equal(req.headers['x-internal-token'], 'fixture-private-token')
+        seen.push(id)
+        if (id === 'vm-gpt-a') {
+          res.writeHead(502, { 'content-type': 'application/json' })
+          res.end(
+            JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'worker_error',
+                code: 'provider_error',
+                message:
+                  'provider error: HTTP 401 {"error":{"type":"authentication_error","code":"token_invalidated","message":"Your authentication token has been invalidated. Please try signing in again."}}',
+              },
+            }),
+          )
+        } else {
+          res.writeHead(200, { 'content-type': 'text/event-stream' })
+          res.end(
+            `data: ${JSON.stringify({
+              type: 'response.completed',
+              response: {
+                id: 'fixture-response',
+                status: 'completed',
+                output: [{ type: 'message', content: [{ type: 'output_text', text: 'OK' }] }],
+                usage: { input_tokens: 1, output_tokens: 1 },
+              },
+            })}\n\n`,
+          )
+        }
+      })
+      await new Promise((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(path.join(runDir, 'codex-kernel.sock'), resolve)
+      })
+      servers.push(server)
+    }
+    const args = codexArgs(root, { ensureCodexKernel: async () => ({ ok: true }), streamCodexKernel })
+    assert.equal((await handleCodexProtocol(args)).status, 200)
+    assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-b'])
+    const persisted = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-gpt-a.json'), 'utf8'))
+    assert.equal(persisted.unschedulable.reason, 'oauth_revoked')
+    assert.equal(persisted.unschedulable.detail.status, 401)
+    resetOpenAIAccountRuntime()
+    assert.ok(!pickCodexCandidates(root, { headers: {} }).ids.includes('vm-gpt-a'))
+  } finally {
+    await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a real Unix folded no_capacity immediately switches seats once and applies only a five-second hold', {
+  skip: process.platform === 'win32',
+}, async () => {
+  const root = fs.mkdtempSync('/tmp/fold-busy-')
+  const servers = []
+  const seen = []
+  try {
+    for (const id of ['vm-gpt-a', 'vm-gpt-b']) {
+      writeGptVm(root, id)
+      const runDir = path.join(root, 'vms', id, 'run')
+      fs.mkdirSync(runDir, { recursive: true })
+      fs.writeFileSync(path.join(runDir, 'internal.token'), 'fixture-private-token', { mode: 0o600 })
+      const server = http.createServer((req, res) => {
+        assert.equal(req.url, '/internal/v1/codex/responses')
+        seen.push(id)
+        if (id === 'vm-gpt-a') {
+          res.writeHead(502, { 'content-type': 'application/json' })
+          res.end(
+            JSON.stringify({
+              type: 'error',
+              error: {
+                type: 'worker_error',
+                code: 'provider_error',
+                message: 'provider error: HTTP 503 {"error":{"code":"no_capacity","message":"credential busy"}}',
+              },
+            }),
+          )
+        } else {
+          res.writeHead(200, { 'content-type': 'text/event-stream' })
+          res.end(
+            `data: ${JSON.stringify({
+              type: 'response.completed',
+              response: {
+                id: 'fixture-response',
+                status: 'completed',
+                output: [{ type: 'message', content: [{ type: 'output_text', text: 'OK' }] }],
+                usage: { input_tokens: 1, output_tokens: 1 },
+              },
+            })}\n\n`,
+          )
+        }
+      })
+      await new Promise((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(path.join(runDir, 'codex-kernel.sock'), resolve)
+      })
+      servers.push(server)
+    }
+    const args = codexArgs(root, { ensureCodexKernel: async () => ({ ok: true }), streamCodexKernel })
+    assert.equal((await handleCodexProtocol(args)).status, 200)
+    assert.deepEqual(seen, ['vm-gpt-a', 'vm-gpt-b'], 'busy credentials must skip same-account retries')
+    assert.equal(getVm(root, 'vm-gpt-a').unschedulable ?? null, null)
+    const hold = openAIAccountHold('vm-gpt-a')
+    assert.equal(hold.reason, 'no_capacity')
+    assert.ok(hold.until > Date.now() && hold.until <= Date.now() + 5_000)
+    resetOpenAIAccountRuntime()
+    assert.ok(pickCodexCandidates(root, { headers: {} }).ids.includes('vm-gpt-a'))
+  } finally {
+    await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })

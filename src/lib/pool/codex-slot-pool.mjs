@@ -3,6 +3,7 @@
  * returns `codex_vm`). A Codex hop picks here, then failovers on
  * quota/auth before any SSE byte is committed.
  */
+import { isClientCancelledResult } from '../core/errors.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import {
   extraToCodexSnapshot,
@@ -365,35 +366,30 @@ function withModelAllowed(picked, byId, model) {
 }
 
 export function isCodexFailoverError(result) {
-  if (!result || result.ok === true || result.committed === true) return false
+  if (!result || result.ok === true || result.committed === true || isClientCancelledResult(result)) return false
   const status = Number(result.status) || 0
   const code = String(result.body?.error?.code || result.error_code || '')
   const message = String(result.body?.error?.message || result.error || '')
+  if (status === 499 || code === 'worker_stream_limit' || code === 'downstream_write_timeout') return false
+  if (/content_policy|usage_policy|refusal|guard/i.test(`${code} ${message}`)) return false
+  // This provider verdict is account-specific, unlike a malformed body or unknown model.
+  const accountModelDenied =
+    (status === 400 || status === 404) &&
+    /\bmodel\s+is\s+not\s+supported\s+when\s+using\s+Codex\s+with\s+a\s+ChatGPT\s+account\b/i.test(message)
   // A request-shaped rejection will fail the same way on every seat. Do not
   // burn the pool on a content policy / invalid body / broken tool call.
   if (
     status !== 401 &&
-    /content_policy|usage_policy|refusal|guard|invalid_request|tool_arguments_mismatch|upstream_protocol_error/i.test(
-      `${code} ${message}`,
-    )
+    !accountModelDenied &&
+    /invalid_request|tool_arguments_mismatch|upstream_protocol_error/i.test(`${code} ${message}`)
   )
     return false
+  if (accountModelDenied) return true
+  if (status === 400 || status === 404 || status === 422) return false
   if (result.transportError === true || status === 0) return true
-  if (status === 429 || status === 401 || status === 403) return true
-  // Uncommitted upstream 503 server_error is transient. The caller already
-  // refused committed hops and anything that has written to the client.
-  if (status === 408) return true
-  // The kernel may be busy/cooling down even while the gateway has a seat.
-  if (status === 503 && (code === 'no_capacity' || code === 'overloaded' || /server_error|provider_error/i.test(code)))
-    return true
-  if (status === 502 && /upstream_transport|worker_transport|transport/i.test(code)) return true
-  // 500/502/504 before any downstream byte are replayable on another seat.
-  // A request-shaped error is not: its code names the bad body, not the seat.
-  if (
-    (status === 500 || status === 502 || status === 504) &&
-    (code === '' || /server_error|provider_error|upstream_error|overloaded_error|internal_error/i.test(code))
-  )
-    return true
+  if (status === 401 || status === 402 || status === 403 || status === 408 || status === 429) return true
+  if (status >= 500 && status < 600) return true
+  if (code === 'empty_response') return true
   return /usage_limit_reached|upstream_auth|no_credential|sticky_unavailable/.test(code)
 }
 

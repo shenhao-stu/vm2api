@@ -251,3 +251,52 @@ test('parseCodexModelCatalog rejects non-positive context windows', () => {
   })
   assert.deepEqual(row.catalog, {})
 })
+
+test('refresh failure projects only explicit safe grant codes on 400/401', async () => {
+  for (const status of [400, 401, 403, 502]) {
+    const tok = await refreshCodexAccessToken({
+      refreshToken: 'fixture-rt-private',
+      fetchImpl: async () => ({
+        status,
+        json: async () => ({ error: { code: 'invalid_grant', message: 'fixture-rt-private must never escape' } }),
+      }),
+    })
+    assert.equal(tok.ok, false)
+    assert.equal(tok.auth_code, [400, 401].includes(status) ? 'invalid_grant' : undefined)
+    assert.doesNotMatch(JSON.stringify(tok), /fixture-rt-private|must never escape/)
+  }
+  for (const payload of [
+    { error: { message: 'invalid_grant fixture-secret' } },
+    { error: { code: 'invalid_grant fixture-secret' } },
+    { error: { code: 'token_expired' } },
+    '<html>Cloudflare fixture-secret</html>',
+  ]) {
+    const tok = await refreshCodexAccessToken({
+      refreshToken: 'fixture',
+      fetchImpl: async () => ({ status: 401, json: async () => payload }),
+    })
+    assert.equal(tok.auth_code, undefined)
+    assert.doesNotMatch(JSON.stringify(tok), /fixture-secret|Cloudflare/)
+  }
+})
+
+test('refresh deadline covers token response headers and body without exposing a late ticket', async () => {
+  let requestSignal
+  let finishBody
+  const body = new Promise((resolve) => {
+    finishBody = resolve
+  })
+  const result = await refreshCodexAccessToken({
+    refreshToken: 'fixture-old-rt',
+    timeoutMs: 10,
+    fetchImpl: async (_url, init) => {
+      requestSignal = init.signal
+      return { status: 200, json: () => body }
+    },
+  })
+  assert.deepEqual(result, { ok: false, error: 'timeout' })
+  assert.equal(requestSignal.aborted, true)
+  finishBody({ access_token: 'fixture-late-at', refresh_token: 'fixture-late-rt' })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.doesNotMatch(JSON.stringify(result), /fixture-/)
+})

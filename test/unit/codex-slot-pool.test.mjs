@@ -148,7 +148,7 @@ test('429 and usage_limit_reached fail over; committed hops do not', () => {
       status: 503,
       body: { error: { code: 'codex_kernel_unavailable' } },
     }),
-    false,
+    true,
   )
 })
 

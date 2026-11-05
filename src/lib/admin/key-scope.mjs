@@ -171,3 +171,8 @@ export function assertVmScope(vms, scope) {
   }
   return scope.allowed_vms
 }
+
+/** Managed GPT keys use their configured key policy instead of the legacy global burst bucket. */
+export function usesGatewayRateLimit(record) {
+  return keyScopeFromRecord(record).group_type !== 'openai'
+}

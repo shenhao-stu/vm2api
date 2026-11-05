@@ -65,7 +65,7 @@ export async function streamCodexKernel(opts = {}) {
 }
 
 export async function codexKernelHealth(exec, opts = {}) {
-  const health = await workerHealth(withCodexKernelExec(exec), opts)
+  const health = await workerHealth(withCodexKernelExec(exec), { ...opts, agent: false })
   if (health?.source) {
     return { ...health, source: String(health.source).replace(/go-worker/g, 'codex-kernel') }
   }

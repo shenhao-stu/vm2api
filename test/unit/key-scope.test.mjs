@@ -1,3 +1,4 @@
+import { usesGatewayRateLimit } from '../../src/lib/admin/key-scope.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
@@ -76,4 +77,11 @@ test('a named pool is the only schedule set and a dead pool does not widen', () 
   )
   assert.equal(replaced.vm_pool_id, null)
   assert.deepEqual(replaced.allowed_vms, ['vm-01'])
+})
+
+test('only explicitly GPT-scoped managed keys bypass the legacy gateway bucket', () => {
+  assert.equal(usesGatewayRateLimit({ group_type: 'openai' }), false)
+  for (const record of [null, {}, { group_type: 'all' }, { group_type: 'anthropic' }, { group_type: 'invalid' }]) {
+    assert.equal(usesGatewayRateLimit(record), true)
+  }
 })

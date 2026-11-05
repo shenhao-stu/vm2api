@@ -1,3 +1,4 @@
+import { restoreCodexErrorStatus } from '../protocol/codex-errors.mjs'
 import { createStreamTiming as createHopTiming } from './stream-timing.mjs'
 import http from 'node:http'
 import { randomUUID } from 'node:crypto'
@@ -39,6 +40,56 @@ import { createStreamTiming } from '../protocol/stream-timing.mjs'
 import { mergeUsage } from '../protocol/openai-usage.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
+export const WORKER_STREAM_LIMITS = Object.freeze({
+  lineBytes: 32 * 1024 * 1024,
+  eventBytes: 32 * 1024 * 1024,
+  precommitBytes: 4 * 1024 * 1024,
+})
+
+/** Limits apply to individual frames and the unpublished prefix, never the entire stream. */
+export function normalizeWorkerStreamLimits(value = {}) {
+  return Object.fromEntries(
+    Object.entries(WORKER_STREAM_LIMITS).map(([key, fallback]) => {
+      const n = value?.[key]
+      return [key, typeof n === 'number' && Number.isInteger(n) && n > 0 ? Math.min(n, MAX_BODY) : fallback]
+    }),
+  )
+}
+
+function workerStreamLimit(response) {
+  response.destroy()
+  throw Object.assign(new Error('worker stream exceeds configured buffer limits'), { code: 'worker_stream_limit' })
+}
+
+/** Keep UTF-8 intact across chunks, and bound a line before retaining another piece. */
+async function* workerStreamLines(response, lineLimit, onChunk) {
+  let parts = [],
+    bytes = 0
+  for await (const raw of response) {
+    const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw)
+    onChunk()
+    let start = 0
+    while (start < chunk.length) {
+      const newline = chunk.indexOf(0x0a, start)
+      const end = newline < 0 ? chunk.length : newline
+      const piece = chunk.subarray(start, end)
+      if (bytes + piece.length > lineLimit) workerStreamLimit(response)
+      if (newline < 0) {
+        if (piece.length) parts.push(piece)
+        bytes += piece.length
+        break
+      }
+      const length = bytes + piece.length
+      const text = parts.length ? Buffer.concat([...parts, piece], length).toString('utf8') : piece.toString('utf8')
+      parts = []
+      bytes = 0
+      yield { line: text.replace(/\r$/, ''), bytes: length + 1, terminated: true }
+      start = newline + 1
+    }
+  }
+  if (bytes) yield { line: Buffer.concat(parts, bytes).toString('utf8'), bytes, terminated: false }
+}
+
 const credentialRefreshTail = new Map()
 
 function withCredentialRefreshLock(key, fn) {
@@ -92,6 +143,7 @@ function workerRequest(
     timeoutMode = 'overall',
     headers = {},
     maxRequestBytes = 0,
+    agent,
   } = {},
 ) {
   return new Promise((resolve, reject) => {
@@ -140,6 +192,7 @@ function workerRequest(
     const req = http.request(
       {
         socketPath,
+        agent,
         path: requestPath,
         method,
         headers: requestHeaders,
@@ -165,9 +218,10 @@ function workerRequest(
  * and an old worker without the route just answers 404.
  */
 function cancelOnAbort(exec, signal, requestId) {
-  if (!signal || signal.aborted) return () => {}
+  let cancelFlight = null
   const onAbort = () => {
-    workerRequest(exec, {
+    if (cancelFlight) return cancelFlight
+    cancelFlight = workerRequest(exec, {
       method: 'POST',
       requestPath: '/internal/v1/cancel',
       body: { request_id: requestId },
@@ -177,9 +231,12 @@ function cancelOnAbort(exec, signal, requestId) {
       .catch((error) => {
         console.warn(`[kernel-cancel] ${exec?.vmId || 'slot'} ${requestId}: ${error?.code || error?.message || error}`)
       })
+    return cancelFlight
   }
-  signal.addEventListener('abort', onAbort, { once: true })
-  return () => signal.removeEventListener('abort', onAbort)
+  if (signal && !signal.aborted) signal.addEventListener('abort', onAbort, { once: true })
+  const stop = () => signal?.removeEventListener('abort', onAbort)
+  stop.cancel = onAbort
+  return stop
 }
 
 async function readAll(stream, limit = MAX_BODY) {
@@ -269,7 +326,7 @@ export function isDownstreamCommitEvent(event) {
   if (!event || typeof event !== 'object') return false
   const t = String(event.type || '')
   if (t === 'error' || t === 'message_start' || t === 'response_headers') return false
-  if (t === 'message_stop' || t === 'response.completed' || t === 'response.done' || t === 'message_delta') return false
+  if (t === 'message_stop' || t === 'message_delta') return false
 
   if (t === 'content_block_delta') {
     const d = event.delta || {}
@@ -290,7 +347,155 @@ export function isDownstreamCommitEvent(event) {
       !!(b.text || b.thinking)
     )
   }
-  return t.startsWith('response.output_')
+  if (!t.startsWith('response.')) return false
+  if (
+    (t === 'response.output_item.added' || t === 'response.output_item.done') &&
+    event.item?.type === 'image_generation_call'
+  ) {
+    const item = event.item
+    return !!(
+      item.result ||
+      item.partial_image_b64 ||
+      item.b64_json ||
+      item.url ||
+      item.text ||
+      item.transcript ||
+      item.refusal ||
+      [item.content, item.summary].some(
+        (parts) => Array.isArray(parts) && parts.some((part) => part?.text || part?.transcript || part?.refusal),
+      )
+    )
+  }
+  if (
+    t === 'response.image_generation_call.in_progress' ||
+    t === 'response.image_generation_call.generating' ||
+    t === 'response.image_generation_call.completed'
+  )
+    return !!(
+      event.result ||
+      event.partial_image_b64 ||
+      event.b64_json ||
+      event.url ||
+      event.delta ||
+      event.text ||
+      event.transcript ||
+      event.refusal ||
+      event.input ||
+      event.arguments
+    )
+  if (
+    (t === 'response.output_item.added' || t === 'response.output_item.done') &&
+    event.item?.type === 'reasoning' &&
+    typeof event.item.encrypted_content === 'string' &&
+    event.item.encrypted_content
+  ) {
+    const item = event.item
+    if (
+      !(item.arguments || item.input || item.result || item.text || item.thinking || item.transcript || item.refusal) &&
+      ![item.content, item.summary].some(
+        (parts) => Array.isArray(parts) && parts.some((part) => part?.text || part?.transcript || part?.refusal),
+      )
+    )
+      return false
+  }
+  if (isFirstTokenEvent(event)) return true
+  if (t === 'response.completed' || t === 'response.done')
+    return (
+      Array.isArray(event.response?.output) &&
+      event.response.output.some(
+        (item) =>
+          isDownstreamCommitEvent({ type: 'response.output_item.done', item }) ||
+          ((!event.response.status || event.response.status === 'completed') &&
+            !event.error &&
+            !event.response.error &&
+            item?.type === 'reasoning' &&
+            !!item.encrypted_content),
+      )
+    )
+  if (t === 'response.output_item.added' || t === 'response.output_item.done') {
+    const item = event.item || {}
+    // A tool item can already have started execution; an empty message/reasoning shell has not.
+    return !!(
+      item.arguments ||
+      item.input ||
+      item.result ||
+      item.encrypted_content ||
+      /_call$/.test(item.type || '') ||
+      [item.content, item.summary].some(
+        (parts) =>
+          Array.isArray(parts) &&
+          parts.some((part) => part?.text || part?.transcript || part?.refusal || part?.encrypted_content),
+      )
+    )
+  }
+  if (/^response\.(?:content|reasoning_summary)_part\.(?:added|done)$/.test(t))
+    return !!(event.part?.text || event.part?.transcript || event.part?.refusal)
+  if (/^response\.[a-z_]+_call\./.test(t)) return true
+  return t.endsWith('.done') && !!(event.text || event.transcript || event.arguments || event.input || event.refusal)
+}
+
+function hasGeneratedContent(block) {
+  if (!block || typeof block !== 'object') return false
+  const nonempty = (value) => typeof value === 'string' && value.length > 0
+  if ([block.text, block.thinking, block.refusal].some(nonempty)) return true
+  if (block.type === 'redacted_thinking') return nonempty(block.data)
+  return (
+    (block.type === 'function_call' ||
+      block.type === 'custom_tool_call' ||
+      String(block.type || '').endsWith('tool_use')) &&
+    (nonempty(block.name) || nonempty(block.arguments) || nonempty(block.input))
+  )
+}
+
+function isFirstTokenEvent(event) {
+  if (!event || typeof event !== 'object') return false
+  const type = String(event.type || '')
+  if (type === 'content_block_delta') {
+    const delta = event.delta || {}
+    return (
+      [delta.text, delta.thinking, delta.partial_json, delta.refusal].some(
+        (value) => typeof value === 'string' && value.length > 0,
+      ) ||
+      (delta.type === 'thinking_delta' && Number.isFinite(delta.estimated_tokens) && delta.estimated_tokens > 0)
+    )
+  }
+  if (type === 'content_block_start') return hasGeneratedContent(event.content_block)
+  if (type.startsWith('response.') && type.endsWith('.delta')) {
+    return typeof event.delta === 'string' && event.delta.length > 0
+  }
+  if (type === 'response.content_part.added' || type === 'response.content_part.done')
+    return hasGeneratedContent(event.part)
+  if (type === 'response.output_item.added' || type === 'response.output_item.done') {
+    return (
+      hasGeneratedContent(event.item) ||
+      (Array.isArray(event.item?.content) && event.item.content.some(hasGeneratedContent))
+    )
+  }
+  return false
+}
+
+function normalizeStreamErrorBody(body) {
+  if (body.error && typeof body.error === 'object') return body
+  return { ...body, error: { ...body, type: body.type === 'error' ? 'api_error' : body.type } }
+}
+
+function responseEventKind(type) {
+  if (
+    [
+      'error',
+      'response.created',
+      'response.in_progress',
+      'response.completed',
+      'response.done',
+      'response.failed',
+      'response.incomplete',
+    ].includes(type)
+  )
+    return type.replace('response.', '')
+  if (/^response\.image_generation_call\./.test(type)) return 'image'
+  if (/^response\.(?:output_text|reasoning_text|reasoning_summary_text|refusal)\./.test(type)) return 'text'
+  if (/^response\.(?:output_item|function_call_arguments|custom_tool_call_input)\./.test(type)) return 'item'
+  return 'other'
 }
 
 /** Anthropic SSE: message_start.message.usage + message_delta.usage. OpenAI Responses: response.usage. */
@@ -310,7 +515,8 @@ export { semanticStatusForStreamError } from '../protocol/stream-error-status.mj
  * Kernel `map_kernel` folds every provider failure into 502 `provider_error`.
  * Restore recognized permission denials and plan-limit / overload statuses.
  */
-export function restoreKernelErrorStatus(result = {}, { now = Date.now() } = {}) {
+export function restoreKernelErrorStatus(result = {}, { now = Date.now(), codex = false } = {}) {
+  if (codex) result = restoreCodexErrorStatus(result)
   if (!result || result.ok || Number(result.status) !== 502) return result
   const body = result.body
   if (!(body?.type === 'error' || body?.error)) return result
@@ -344,7 +550,8 @@ function unfinishedEmptyHop(result) {
   }
 }
 
-export function restoreUncommittedHop(result = {}, { now = Date.now() } = {}) {
+export function restoreUncommittedHop(result = {}, { now = Date.now(), codex = false } = {}) {
+  if (codex) result = restoreCodexErrorStatus(result)
   if (!result || result.committed || result.ok || isClientCancelledResult(result)) return result
   if (Number(result.status) < 200 || Number(result.status) >= 300) return result
   const body = result.body
@@ -579,19 +786,22 @@ export async function callGoWorker({
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     const ok = response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error'
     if (ok) rememberThreadTurn(parsed?.id, prepared.thread)
-    return restoreKernelErrorStatus({
-      ok,
-      status: response.statusCode || 0,
-      via: 'go-worker',
-      body: parsed,
-      headers,
-      usage: parsed?.usage || null,
-      model: parsed?.model || null,
-      stopReason: parsed?.stop_reason || null,
-      terminalState: headers['x-terminal-state'] || null,
-      transportError: false,
-      threadBetas: prepared.thread,
-    })
+    return restoreKernelErrorStatus(
+      {
+        ok,
+        status: response.statusCode || 0,
+        via: 'go-worker',
+        body: parsed,
+        headers,
+        usage: parsed?.usage || null,
+        model: parsed?.model || null,
+        stopReason: parsed?.stop_reason || null,
+        terminalState: headers['x-terminal-state'] || null,
+        transportError: false,
+        threadBetas: prepared.thread,
+      },
+      { codex: requestPath === '/internal/v1/codex/responses' },
+    )
   } catch (error) {
     return {
       ok: false,
@@ -622,6 +832,8 @@ export async function streamGoWorker({
   reqHeaders = {},
   timeoutMs,
   idleTimeoutMs = 0,
+  streamLimits = null,
+  allowEmptyCompletedResponse = false,
   maxRequestBytes = 0,
   identity = null,
   routing,
@@ -720,6 +932,14 @@ export async function streamGoWorker({
     }
   }
   let committed = false
+  const responsesHop = requestPath === '/internal/v1/codex/responses'
+  const boundedStream = responsesHop || streamLimits != null
+  const limits = boundedStream
+    ? normalizeWorkerStreamLimits(streamLimits)
+    : { lineBytes: Infinity, eventBytes: Infinity, precommitBytes: Infinity }
+  const streamObservation = { bytes: 0, events: 0, terminal: 'none', kinds: {} }
+  const startedAt = Date.now()
+  let responsesTtftMs = null
   const timing = createStreamTiming()
   const hopTiming = createHopTiming()
   const requestId = randomUUID()
@@ -742,6 +962,11 @@ export async function streamGoWorker({
           requestContext,
           repaired,
         })
+    const responseWarmup =
+      responsesHop &&
+      allowEmptyCompletedResponse === true &&
+      prepared.envelope.body?.generate === false &&
+      prepared.envelope.body?.store !== true
     reportEnvelope(onEnvelope, prepared.envelope)
     hopTiming.mark('worker_dispatch_ms')
     const response = await workerRequest(exec, {
@@ -758,33 +983,47 @@ export async function streamGoWorker({
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, 1024 * 1024)
-      return restoreKernelErrorStatus({
-        ok: false,
-        status: response.statusCode || 0,
-        via: 'go-worker-stream',
-        timing: hopTiming.snapshot(),
-        body: parseJson(data, response.statusCode),
-        headers,
-        committed: false,
-        terminalState: headers['x-terminal-state'] || 'error',
-        transportError: false,
-        threadBetas: prepared.thread,
-      })
+      return restoreKernelErrorStatus(
+        {
+          ok: false,
+          status: response.statusCode || 0,
+          via: 'go-worker-stream',
+          timing: hopTiming.snapshot(),
+          body: parseJson(data, response.statusCode),
+          headers,
+          committed: false,
+          terminalState: headers['x-terminal-state'] || 'error',
+          transportError: false,
+          threadBetas: prepared.thread,
+        },
+        { codex: requestPath === '/internal/v1/codex/responses' },
+      )
     }
     let buffer = ''
+    let bufferBytes = 0
+    let dataBytes = 0
+    let pendingBytes = 0
     let receivedAt = null
     let lastError = null
     let dataBuf = ''
+    let needsSseDelimiter = false
     let sseUsage = null
     let sseModel = null
     let sseStop = null
     let sseRateHeaders = {}
     const assembler = createClaudeMessageAssembler()
     const pendingLines = []
+    const appendData = (piece) => {
+      const added = Buffer.byteLength(piece) + (dataBuf ? 1 : 0)
+      if (dataBytes + added > limits.eventBytes) workerStreamLimit(response)
+      dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
+      dataBytes += added
+    }
     const takeSseEvent = () => {
       try {
         const event = JSON.parse(dataBuf)
         dataBuf = ''
+        dataBytes = 0
         return event && typeof event === 'object' ? event : null
       } catch {
         return null
@@ -798,9 +1037,16 @@ export async function streamGoWorker({
         for (const queued of pendingLines) await onEvent(queued)
       }
       pendingLines.length = 0
+      pendingBytes = 0
     }
-    const emitLine = async (line) => {
+    const emitLine = async (line, bytes = Buffer.byteLength(line) + 1) => {
+      if (responsesHop) {
+        if (line.startsWith('data:')) needsSseDelimiter = true
+        else if (line === '') needsSseDelimiter = false
+      }
       if (!committed) {
+        if (pendingBytes + bytes > limits.precommitBytes) workerStreamLimit(response)
+        pendingBytes += bytes
         pendingLines.push(line)
         return
       }
@@ -808,12 +1054,46 @@ export async function streamGoWorker({
     }
     const observeSseEvent = (event) => {
       if (!event) return event
+      if (responsesHop) {
+        streamObservation.events++
+        const kind = responseEventKind(String(event.type || ''))
+        streamObservation.kinds[kind] = (streamObservation.kinds[kind] || 0) + 1
+        if (event.type === 'error') streamObservation.terminal = 'error'
+        if (['response.completed', 'response.done', 'response.failed', 'response.incomplete'].includes(event.type)) {
+          const status = event.response?.status
+          const terminal = event.type === 'response.done' ? status || 'completed' : event.type.slice(9)
+          streamObservation.terminal =
+            terminal === 'completed' && status && status !== 'completed' ? 'incomplete' : terminal
+          // A completed event's inconsistent metadata is diagnostic only here:
+          // it is still forwarded unchanged, so do not silently reclassify it.
+          const failed =
+            event.type === 'response.failed' ||
+            event.type === 'response.incomplete' ||
+            (event.type === 'response.done' && ['failed', 'incomplete', 'cancelled'].includes(status))
+          if (failed && !lastError && !event.response?.error && !event.error) {
+            lastError = {
+              type: 'error',
+              error: {
+                type: 'api_error',
+                code:
+                  streamObservation.terminal === 'failed' ? 'upstream_response_failed' : 'upstream_response_incomplete',
+                message: 'Upstream Responses stream did not complete',
+              },
+            }
+          }
+        }
+      }
+      if (responsesHop && responsesTtftMs == null && isFirstTokenEvent(event)) responsesTtftMs = Date.now() - startedAt
       timing.observe(event, receivedAt)
       hopTiming.observe(event)
       if (event.type === 'response_headers' && event.headers && typeof event.headers === 'object') {
         sseRateHeaders = { ...sseRateHeaders, ...event.headers }
       }
-      if (event.type === 'error') lastError = event
+      if (event.type === 'error') lastError = responsesHop ? normalizeStreamErrorBody(event) : event
+      if (responsesHop && event.type !== 'error' && (event.response?.error || event.error))
+        lastError = { type: 'error', error: event.response?.error || event.error }
+      if (responsesHop && lastError && !lastError.error?.code)
+        lastError = { ...lastError, error: { ...lastError.error, code: 'upstream_stream_error' } }
       if (event.type === 'message_stop') sawMessageStop = true
       if (event.type === 'message_start') rememberThreadTurn(event.message?.id, prepared.thread)
       const evUsage = usageFromSseEvent(event)
@@ -846,113 +1126,152 @@ export async function streamGoWorker({
       // message_stop is the protocol terminal event, but the kernel still sends
       // job_done and its trailers afterward. Keep reading until the worker
       // closes the response so a normal completion is not mistaken for cancel.
-      response.setEncoding('utf8')
-      for await (const chunk of response) {
+      for await (const frame of workerStreamLines(response, limits.lineBytes, () => {
         receivedAt = Date.now()
         hopTiming.mark('first_chunk_ms')
-        buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
-        let newline
-        while ((newline = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, newline).replace(/\r$/, '')
-          buffer = buffer.slice(newline + 1)
-          // CLI diagnostics share the internal stream, never the caller's SSE.
-          if (line.startsWith('event:')) outboundHeadersFrame = line.slice(6).trim() === 'kin_outbound_headers'
-          if (outboundHeadersFrame) {
-            if (line.startsWith('data:')) {
-              const event = parseJson(line.slice(5).trim())
-              if (
-                event?.type === 'kin_outbound_headers' &&
-                event.headers &&
-                typeof event.headers === 'object' &&
-                !Array.isArray(event.headers) &&
-                typeof onOutboundHeaders === 'function'
-              ) {
-                try {
-                  onOutboundHeaders(event.headers)
-                } catch {
-                  console.warn('[worker] outbound header observer failed')
-                }
+        if (sawChunk && !outboundHeadersFrame) lastChunkAt = receivedAt
+      })) {
+        const { line } = frame
+        if (responsesHop) streamObservation.bytes += frame.bytes
+        if (!frame.terminated) {
+          buffer = line
+          bufferBytes = frame.bytes
+          break
+        }
+        // CLI diagnostics share the internal stream, never the caller's SSE.
+        if (line.startsWith('event:')) outboundHeadersFrame = line.slice(6).trim() === 'kin_outbound_headers'
+        if (outboundHeadersFrame) {
+          if (line.startsWith('data:')) {
+            const event = parseJson(line.slice(5).trim())
+            if (
+              event?.type === 'kin_outbound_headers' &&
+              event.headers &&
+              typeof event.headers === 'object' &&
+              !Array.isArray(event.headers) &&
+              typeof onOutboundHeaders === 'function'
+            ) {
+              try {
+                onOutboundHeaders(event.headers)
+              } catch {
+                console.warn('[worker] outbound header observer failed')
               }
             }
-            if (line === '') outboundHeadersFrame = false
-            continue
           }
-          if (line) {
-            sawChunk = true
-            lastChunkAt = Date.now()
+          if (line === '') outboundHeadersFrame = false
+          continue
+        }
+        if (line) {
+          sawChunk = true
+          lastChunkAt = Date.now()
+        }
+        applyClaudeSSELineToMessage(line, assembler)
+        if (line.startsWith('data:')) {
+          const piece = line.slice(5).trim()
+          if (piece && piece !== '[DONE]') {
+            appendData(piece)
+            const event = observeSseEvent(takeSseEvent())
+            if (isDownstreamCommitEvent(event)) await flushCommit()
           }
-          applyClaudeSSELineToMessage(line, assembler)
-          if (line.startsWith('data:')) {
-            const piece = line.slice(5).trim()
+        } else if (line === '') {
+          if (dataBuf) {
+            const event = takeSseEvent()
+            dataBuf = ''
+            dataBytes = 0
+            observeSseEvent(event)
+            if (isDownstreamCommitEvent(event)) await flushCommit()
+          }
+        } else if (dataBuf && !line.startsWith('event:') && !line.startsWith(':')) {
+          appendData(line)
+          const event = observeSseEvent(takeSseEvent())
+          if (isDownstreamCommitEvent(event)) await flushCommit()
+        }
+        await emitLine(line, frame.bytes)
+      }
+      if (!boundedStream) {
+        if (buffer && !outboundHeadersFrame) {
+          applyClaudeSSELineToMessage(buffer, assembler)
+          if (buffer.startsWith('data:')) {
+            const piece = buffer.slice(5).trim()
             if (piece && piece !== '[DONE]') {
               dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
               const event = observeSseEvent(takeSseEvent())
               if (isDownstreamCommitEvent(event)) await flushCommit()
             }
-          } else if (line === '') {
-            if (dataBuf) {
-              const event = takeSseEvent()
-              dataBuf = ''
-              observeSseEvent(event)
+          }
+          await emitLine(buffer)
+        }
+      } else {
+        if (buffer && !outboundHeadersFrame) {
+          if (buffer.startsWith('data:')) {
+            const piece = buffer.slice(5).trim()
+            if (piece && piece !== '[DONE]') {
+              appendData(piece)
+              const event = observeSseEvent(takeSseEvent())
               if (isDownstreamCommitEvent(event)) await flushCommit()
             }
-          } else if (dataBuf && !line.startsWith('event:') && !line.startsWith(':')) {
-            dataBuf = `${dataBuf}\n${line}`
+          } else if (dataBuf && !buffer.startsWith('event:') && !buffer.startsWith(':')) {
+            appendData(buffer)
             const event = observeSseEvent(takeSseEvent())
             if (isDownstreamCommitEvent(event)) await flushCommit()
           }
-          await emitLine(line)
+          applyClaudeSSELineToMessage(buffer, assembler)
+          await emitLine(buffer, bufferBytes + 1)
+          // EOF may follow a data line without its final SSE delimiter.
+          await emitLine('', 1)
         }
-        if (sawChunk && !outboundHeadersFrame && buffer) lastChunkAt = Date.now()
-      }
-      if (buffer && !outboundHeadersFrame) {
-        applyClaudeSSELineToMessage(buffer, assembler)
-        if (buffer.startsWith('data:')) {
-          const piece = buffer.slice(5).trim()
-          if (piece && piece !== '[DONE]') {
-            dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
-            const event = observeSseEvent(takeSseEvent())
-            if (isDownstreamCommitEvent(event)) await flushCommit()
-          }
-        }
-        await emitLine(buffer)
       }
       if (dataBuf) {
         const event = observeSseEvent(takeSseEvent())
         if (isDownstreamCommitEvent(event)) await flushCommit()
       }
+      if (responsesHop && needsSseDelimiter) await emitLine('', 1)
       const trailers = mergeRateLimitHeaders(publicHeaders(response.trailers))
       const meta = streamMetaFromHeaders({ ...headers, ...trailers })
       const assembled = assembler.message
       const stopReason = meta.stopReason || sseStop || assembled?.stop_reason || null
-      const complete = !lastError && isCompleteAssistantMessage({ body: assembled, stopReason, sawMessageStop })
+      const complete =
+        !lastError &&
+        (isCompleteAssistantMessage({ body: assembled, stopReason, sawMessageStop }) ||
+          (responseWarmup && streamObservation.terminal === 'completed'))
       if (!committed && complete) await flushCommit()
       const terminalState = complete ? 'verified' : 'incomplete'
       const rateHeaders = mergeRateLimitHeaders({ ...sseRateHeaders, ...headers, ...trailers })
-      return restoreUncommittedHop({
-        ok: response.statusCode === 200 && !lastError && complete,
-        status: response.statusCode || 0,
-        via: 'go-worker-stream',
-        timing: hopTiming.snapshot(),
+      return restoreUncommittedHop(
+        {
+          ok: response.statusCode === 200 && !lastError && complete,
+          status: response.statusCode || 0,
+          via: 'go-worker-stream',
+          timing: hopTiming.snapshot(),
 
-        body: lastError || assembled || { type: 'message', role: 'assistant', content: [] },
-        headers: rateHeaders,
-        // Trailer stays authoritative, but it may carry totals only (Codex/Responses hops).
-        // Merge so SSE `input_tokens_details` / cache breakdown survives instead of being short-circuited.
-        usage: mergeUsage(mergeUsage(assembled?.usage || null, sseUsage), meta.usage),
-        model: meta.model || sseModel || assembled?.model || null,
-        stopReason,
-        sawMessageStop,
-        ...timing.snapshot(),
-        committed,
-        terminalState,
-        transportError: false,
-        threadBetas: prepared.thread,
-      })
+          body: lastError || assembled || { type: 'message', role: 'assistant', content: [] },
+          headers: rateHeaders,
+          // Trailer stays authoritative, but it may carry totals only (Codex/Responses hops).
+          // Merge so SSE `input_tokens_details` / cache breakdown survives instead of being short-circuited.
+          usage: mergeUsage(mergeUsage(assembled?.usage || null, sseUsage), meta.usage),
+          model: meta.model || sseModel || assembled?.model || null,
+          stopReason,
+          sawMessageStop,
+          ...timing.snapshot(),
+          ...(responsesHop
+            ? {
+                ttftMs: responsesTtftMs,
+                firstTokenAt: responsesTtftMs == null ? null : startedAt + responsesTtftMs,
+                streamObservation,
+              }
+            : {}),
+          committed,
+          terminalState,
+          transportError: false,
+          threadBetas: prepared.thread,
+        },
+        { codex: requestPath === '/internal/v1/codex/responses' },
+      )
     } finally {
       if (idleTimer) clearInterval(idleTimer)
     }
   } catch (error) {
+    const localStop = boundedStream && ['worker_stream_limit', 'downstream_write_timeout'].includes(error.code)
+    if (localStop) await stopCancel.cancel()
     if (signal?.aborted) {
       return clientCancelledResult({
         via: 'go-worker-stream',
@@ -963,7 +1282,7 @@ export async function streamGoWorker({
     }
     return {
       ok: false,
-      status: error.status === 413 ? 413 : 0,
+      status: error.status === 413 ? 413 : localStop ? 502 : 0,
       via: 'go-worker-stream',
       timing: hopTiming.snapshot(),
       body: {
@@ -978,15 +1297,16 @@ export async function streamGoWorker({
       headers: {},
       ...timing.snapshot(),
       committed,
-      terminalState: committed ? 'incomplete' : error.status === 413 ? 'rejected' : 'transport_error',
-      transportError: error.status !== 413,
+      terminalState: committed ? 'incomplete' : error.status === 413 || localStop ? 'rejected' : 'transport_error',
+      ...(responsesHop ? { streamObservation } : {}),
+      transportError: error.status !== 413 && !localStop,
     }
   } finally {
     stopCancel()
   }
 }
 
-export async function workerHealth(exec, { timeoutMs = 3000, signal } = {}) {
+export async function workerHealth(exec, { timeoutMs = 3000, signal, agent } = {}) {
   if (isCrsMock()) {
     const claude = exec?.vm?.claude || {}
     const hasCredential = hasCredentialPresence(claude)
@@ -1007,6 +1327,7 @@ export async function workerHealth(exec, { timeoutMs = 3000, signal } = {}) {
   try {
     const response = await workerRequest(exec, {
       requestPath: '/internal/health',
+      agent,
       timeoutMs,
       signal,
     })

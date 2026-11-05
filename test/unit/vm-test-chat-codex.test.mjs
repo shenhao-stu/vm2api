@@ -1,3 +1,4 @@
+import { upsertCodexAccount, readCodexAccounts } from '../../src/lib/vm/codex-slot.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import http from 'node:http'
@@ -190,6 +191,61 @@ test('runVmTestChat Codex slot refreshes OAuth after wrapped 401', async (t) => 
   assert.ok(result.log.some((l) => /尝试刷新 OAuth/.test(l.message)))
   const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-codex-01', 'codex-credentials.json'), 'utf8'))
   assert.equal(saved.accounts[0].access_token, 'at-new')
+})
+
+test('test chat drops an OAuth refresh reply that finishes after a verified login', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-testchat-cas-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  seedCodexVm(root)
+  seedRouting(root)
+  upsertCodexAccount(root, 'vm-codex-01', { email: 'one@example.invalid', chatgpt_account_id: 'fixture-codex-account' })
+  let hits = 0
+  const { baseUrl, calls } = await startLoopbackServer(t, () =>
+    ++hits === 1
+      ? { status: 502, body: { error: { code: 'upstream_transport', message: 'HTTP error: 401 Unauthorized' } } }
+      : {
+          status: 200,
+          body: {
+            id: 'fixture-response',
+            object: 'response',
+            model: 'gpt-5.4',
+            status: 'completed',
+            output_text: 'ok',
+          },
+        },
+  )
+  let enter, release
+  const entered = new Promise((resolve) => {
+    enter = resolve
+  })
+  const delayed = new Promise((resolve) => {
+    release = resolve
+  })
+  const pending = runVmTestChat({
+    projectRoot: root,
+    vmId: 'vm-codex-01',
+    model: 'gpt-5.4',
+    prompt: 'fixture',
+    baseUrl,
+    apiKey: 'fixture-master',
+    fetchImpl: async () => {
+      enter()
+      await delayed
+      return { status: 200, json: async () => ({ access_token: 'late-at', refresh_token: 'late-rt' }) }
+    },
+  })
+  await Promise.race([
+    entered,
+    pending.then(() => {
+      throw new Error('probe ended before reaching the refresh fixture')
+    }),
+  ])
+  upsertCodexAccount(root, 'vm-codex-01', { access_token: 'verified-at', refresh_token: 'verified-rt' })
+  release()
+  const result = await pending
+  assert.equal(result.ok, true)
+  assert.equal(calls.length, 2)
+  assert.equal(readCodexAccounts(root, 'vm-codex-01')[0].refresh_token, 'verified-rt')
 })
 
 test('runVmTestChat Codex slot rejects Claude models', async (t) => {

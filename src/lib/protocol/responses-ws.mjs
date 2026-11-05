@@ -260,6 +260,16 @@ export function createSseJsonBridge() {
   let terminal = null
   let responseId = null
   let output = null
+  const completedItems = []
+  let snapshotOutput = null
+
+  function sameItem(left, right) {
+    return !!((left?.id && left.id === right?.id) || (left?.call_id && left.call_id === right?.call_id))
+  }
+
+  function sameAnonymousItem(left, right) {
+    return left?.type === right?.type && !left?.id && !left?.call_id && !right?.id && !right?.call_id
+  }
 
   function takeData() {
     if (!dataLines.length) return null
@@ -273,7 +283,24 @@ export function createSseJsonBridge() {
     const type = parsed.type
     const id = parsed.response?.id
     if (typeof id === 'string' && id) responseId = id
-    if (Array.isArray(parsed.response?.output)) output = parsed.response.output
+    if (Array.isArray(parsed.response?.output)) {
+      output = parsed.response.output
+      snapshotOutput = null
+    }
+    if (type === 'response.output_item.done' && typeof parsed.item?.type === 'string') {
+      const item = parsed.item
+      const index = Number.isInteger(parsed.output_index) && parsed.output_index >= 0 ? parsed.output_index : null
+      const known = completedItems.find(
+        (entry) =>
+          sameItem(entry.item, item) ||
+          (index !== null && entry.index === index && sameAnonymousItem(entry.item, item)),
+      )
+      if (known) {
+        known.item = item
+        if (index !== null) known.index = index
+      } else completedItems.push({ item, index })
+      snapshotOutput = null
+    }
     if (type === 'response.completed') terminal = 'completed'
     else if (type === 'response.failed') terminal = 'failed'
     else if (type === 'response.incomplete') terminal = 'incomplete'
@@ -326,7 +353,20 @@ export function createSseJsonBridge() {
     },
     snapshot() {
       if (!responseId) return null
-      return { id: responseId, output: Array.isArray(output) ? output : [] }
+      if (!snapshotOutput) {
+        snapshotOutput = Array.isArray(output) ? [...output] : []
+        const ordered = [...completedItems].sort((a, b) => (a.index ?? Infinity) - (b.index ?? Infinity))
+        for (const { item, index } of ordered) {
+          if (snapshotOutput.some((candidate) => sameItem(candidate, item))) continue
+          if (index !== null && sameAnonymousItem(snapshotOutput[index], item)) continue
+          snapshotOutput.splice(
+            index === null ? snapshotOutput.length : Math.min(index, snapshotOutput.length),
+            0,
+            item,
+          )
+        }
+      }
+      return { id: responseId, output: snapshotOutput }
     },
   }
 }
@@ -353,6 +393,7 @@ function createProtocolReq(upgradeReq, body) {
   req.panelRole = upgradeReq.panelRole
   req.panelUserId = upgradeReq.panelUserId
   req.panelVmCreateQuota = upgradeReq.panelVmCreateQuota
+  req.kinTimings = { transport: 'websocket' }
   req.abort = () => {
     if (req.aborted) return
     req.aborted = true

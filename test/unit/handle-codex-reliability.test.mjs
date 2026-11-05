@@ -184,7 +184,7 @@ test('busy failover respects the attempt budget and preserves the last error', a
       return { ok: false, status: 503, body: { error: { code: 'no_capacity', message: 'credential busy' } } }
     },
   })
-  fx.args.routing = { failover: { max_total_attempts: 1 } }
+  fx.args.routing = { failover: { codex: { max_total_attempts: 1 } } }
   await handleCodexProtocol(fx.args)
   assert.equal(hops, 1)
   assert.equal(fx.res.statusCode, 503)

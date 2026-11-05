@@ -1,10 +1,15 @@
 /**
  * Codex hop from handle-protocol. Claude convert/pool/CRS never runs here.
  */
+import { writeChunkedWithBackpressure } from '../http/write-backpressure.mjs'
+import { createHash } from 'node:crypto'
+import { upstreamAuthFailureReason } from './codex-errors.mjs'
 import path from 'node:path'
+import { isProtocolWarmup } from './responses-ws.mjs'
+import { semanticStatusForStreamError } from './stream-error-status.mjs'
 import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { isClientStream, fromClaudeToOpenAIChat, fromClaudeToOpenAICompletions } from './convert.mjs'
-import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
+import { getVm, listVms, markUnschedulable, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { isValidVmId, listVmRecordFiles, readJsonCached } from '../vm/vm-file.mjs'
 import { isCodexProtocolAllowed, isCodexVm, normalizeCodexRouting } from './codex-route.mjs'
 import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
@@ -37,7 +42,7 @@ import {
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
-import { readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
+import { readCodexAccounts, commitCodexCredentialRefresh } from '../vm/codex-slot.mjs'
 import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
   CODEX_APP_VERSION,
@@ -151,16 +156,16 @@ function firstUserIdentityFromCodex(body = {}) {
   return extractFirstUserIdentity(body?.messages) || String(body?.prompt || '')
 }
 
-/** Codex failover shares the Claude pool's attempt budget. */
+/** Codex budgets are independent of the Claude account pool. */
 export function codexFailoverBudget(routing = {}) {
-  const failover = routing?.failover || {}
+  const failover = routing?.failover?.codex || {}
   const attempts = Number(failover.max_total_attempts)
   const switches = Number(failover.max_account_switches)
   const sameRetries = Number(failover.max_same_account_retries)
   return {
-    maxAttempts: Number.isFinite(attempts) && attempts > 0 ? Math.min(64, Math.floor(attempts)) : 12,
-    maxSwitches: Number.isFinite(switches) && switches >= 0 ? Math.min(63, Math.floor(switches)) : 3,
-    maxSameAccountRetries: Number.isFinite(sameRetries) && sameRetries >= 0 ? Math.min(16, Math.floor(sameRetries)) : 3,
+    maxAttempts: Number.isFinite(attempts) && attempts > 0 ? Math.min(64, Math.floor(attempts)) : 64,
+    maxSwitches: Number.isFinite(switches) && switches >= 0 ? Math.min(63, Math.floor(switches)) : 63,
+    maxSameAccountRetries: Number.isFinite(sameRetries) && sameRetries >= 0 ? Math.min(16, Math.floor(sameRetries)) : 0,
   }
 }
 
@@ -176,6 +181,16 @@ export function isRetryableSameCodexAccount(
   const message = String(result.body?.error?.message || result.error || '')
   if (
     /content_policy|refusal|usage_policy|guard|tool_arguments_mismatch|upstream_protocol_error/i.test(
+      `${code} ${message}`,
+    )
+  )
+    return false
+  // Capacity and quota are account state: another credential can recover now.
+  if (
+    status === 402 ||
+    status === 429 ||
+    status === 503 ||
+    /server_is_overloaded|overloaded|no_capacity|rate_limit|usage_limit_reached|insufficient_quota|quota_exhausted/i.test(
       `${code} ${message}`,
     )
   )
@@ -328,6 +343,7 @@ export function codexFailureHold(result, now = Date.now()) {
   const status = Number(result.status) || 0
   const code = String(result.body?.error?.code || result.error_code || '')
   const message = String(result.body?.error?.message || result.error || '')
+  if (code === 'worker_stream_limit' || code === 'downstream_write_timeout') return null
   if (status === 400 || status === 422) return null
   if (
     /content_policy|refusal|usage_policy|guard|tool_arguments_mismatch|upstream_protocol_error/i.test(
@@ -336,11 +352,67 @@ export function codexFailureHold(result, now = Date.now()) {
   )
     return null
   if (status === 401) return { until: now + 5 * 60_000, reason: 'oauth_401' }
+  if (status === 402) return { until: now + 60_000, reason: 'payment_required' }
   if (status === 403) return { until: now + 5 * 60_000, reason: 'permission_denied' }
   if (status === 429) return { until: now + 60_000, reason: 'rate_limited' }
+  // 503 no_capacity means "this credential is busy", not that it is broken:
+  // skip it for a moment, never treat it as an auth failure.
+  if (status === 503 && code === 'no_capacity') return { until: now + 5_000, reason: 'no_capacity' }
   if (status === 408 || status >= 500) return { until: now + 30_000, reason: 'upstream_5xx' }
   if (result.transportError === true || status === 0) return { until: now + 30_000, reason: 'transport_error' }
   return null
+}
+
+export function boundedCodexDetail(text, max = 300) {
+  const raw = String(text ?? '')
+    .split(/\r?\n\s*at\s|\r?\n(?:Traceback|\s*File\s)/, 1)[0]
+    .replace(/\bBearer\s+[^\s,;"'}\]]+/gi, 'Bearer [redacted]')
+    .replace(
+      /\b(authorization|(?:(?:access|refresh|id)[_-]?)?token|password|passwd|secret|(?:otp|totp|2fa|mfa|two_factor)(?:[_ -]?(?:seed|secret|code))?)\b["']?\s*(?::|=|\s)\s*(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)/gi,
+      '$1=[redacted]',
+    )
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!raw) return null
+  const clean = raw.replace(/\b[A-Z2-7]{16,}\b|\b[A-Za-z0-9_-]{24,}\b/g, '[redacted]')
+  return clean.length > max ? `${clean.slice(0, Math.max(1, max - 1))}…` : clean
+}
+
+export function codexErrorLogMessage(result, { body = null, req = null } = {}) {
+  if (!result || result.ok === true) return null
+  const status = Number(result.status) || 0
+  const code = String(result.body?.error?.code || result.error_code || '').trim()
+  const message = String(result.body?.error?.message || result.error || '').trim()
+  const prefix = status ? `HTTP ${status}` : result.transportError === true ? 'transport error' : ''
+  const detail = [prefix, code, message].filter(Boolean).join(' ')
+  const observation = result.streamObservation
+  if (!observation) return boundedCodexDetail(detail, 300)
+  const count = (value) => (Number.isSafeInteger(value) && value >= 0 ? Math.min(value, 1_000_000_000) : 0)
+  const terminal = ['none', 'completed', 'failed', 'incomplete', 'cancelled', 'error'].includes(observation.terminal)
+    ? observation.terminal
+    : 'other'
+  const kinds = [
+    'created',
+    'in_progress',
+    'text',
+    'item',
+    'image',
+    'completed',
+    'done',
+    'failed',
+    'incomplete',
+    'error',
+    'other',
+  ]
+    .filter((kind) => count(observation.kinds?.[kind]) > 0)
+    .join(',')
+  const inputs = Array.isArray(body?.input)
+    ? body.input.length
+    : typeof body?.input === 'string' && body.input.length
+      ? 1
+      : 0
+  const diagnostic = ` [events=${count(observation.events)} bytes=${count(observation.bytes)} end=${terminal} kinds=${kinds || 'none'} input=${count(inputs)} tools=${count(body?.tools?.length)} generate=${body?.generate === false ? 'off' : 'on'} via=${req?.kinTimings?.transport === 'websocket' ? 'ws' : 'http'}]`
+  return `${boundedCodexDetail(detail, Math.max(80, 300 - diagnostic.length)) || ''}${diagnostic}`.slice(0, 300)
 }
 
 /** Idle SOCKS / first hop 502 is retryable only before any SSE byte is committed. */
@@ -360,6 +432,55 @@ export function serviceTierFromSseLine(line) {
   } catch {
     return null
   }
+}
+
+export function codexAuthFailureReason(result) {
+  if (!result || result.ok === true || result.committed === true || result.transportError === true) return null
+  if ((Number(result.status) || 0) !== 401) return null
+  return upstreamAuthFailureReason(result.body || { error: { code: result.error_code, message: result.error } })
+}
+
+/** Short, non-reversible fingerprint of the slot's ticket. Never logged or stored. */
+export function codexCredentialFingerprint(projectRoot, vmId) {
+  let first = {}
+  try {
+    first = readCodexAccounts(projectRoot, vmId)[0] || {}
+  } catch {
+    return null
+  }
+  const parts = [first.id, first.access_token, first.refresh_token, first.chatgpt_account_id].map((value) =>
+    String(value || ''),
+  )
+  if (!parts.some(Boolean)) return null
+  return createHash('sha256').update(parts.join('\u0000')).digest('hex').slice(0, 32)
+}
+
+/**
+ * Park a seat whose upstream auth is confirmed dead, before failing over.
+ * `before` is the fingerprint captured before the hop: when the credential on
+ * disk changed meanwhile (a fresh import / the kernel's own refresh), the 401
+ * belongs to the old ticket and must not disable the new one.
+ */
+export function noteCodexAuthFailure(
+  projectRoot,
+  vmId,
+  result,
+  { before = codexCredentialFingerprint(projectRoot, vmId) } = {},
+) {
+  const reason = codexAuthFailureReason(result)
+  if (!reason) return null
+  if (before !== codexCredentialFingerprint(projectRoot, vmId)) return null
+  const detail = {
+    message: codexErrorLogMessage(result),
+    status: 401,
+    code: boundedCodexDetail(result.body?.error?.code || result.error_code || 'upstream_auth', 80),
+  }
+  try {
+    markUnschedulable(projectRoot, vmId, reason, detail)
+  } catch {
+    return null
+  }
+  return reason
 }
 
 /** Responses `usage` object from one SSE data line, if it carries token counts. */
@@ -818,6 +939,10 @@ export async function handleCodexProtocol({
               idleTimeoutMs: resolveStreamIdleTimeoutMs(routing, cfg),
               routing,
               body: outboundBody,
+              allowEmptyCompletedResponse:
+                protocol === 'openai.responses' &&
+                req.kinTimings?.transport === 'websocket' &&
+                isProtocolWarmup(outboundBody),
               reqHeaders: req.headers,
               envelope: {
                 body: outboundBody,
@@ -850,22 +975,25 @@ export async function handleCodexProtocol({
                     protocol === 'anthropic.messages'
                       ? responsesSseToAnthropicEvents(line, anthropicSse)
                       : responsesSseToChatChunk(line, 'codex', chatSse)
-                  if (mapped) res.write(mapped)
+                  if (mapped) await writeChunkedWithBackpressure(res, mapped, { signal: gone.signal })
                 } catch (error) {
                   if (error.code !== 'tool_arguments_mismatch') throw error
                   conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
-                  res.write(
+                  await writeChunkedWithBackpressure(
+                    res,
                     protocol === 'anthropic.messages'
                       ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
                       : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
+                    { signal: gone.signal },
                   )
                 }
                 return
               }
               const named = nameSseEvent(line)
-              if (named) res.write(named)
+              if (named) await writeChunkedWithBackpressure(res, named, { signal: gone.signal })
             },
           })
+        const credentialBeforeHop = codexCredentialFingerprint(projectRoot, vm.id)
         let result = await runHop()
         // A transient seat-local failure gets the same account up to N retries
         // before the request spends a switch. 401/403/429 are never retried here:
@@ -914,8 +1042,15 @@ export async function handleCodexProtocol({
         const preferredUsage = preferUsage(hopUsage, streamedUsage)
         const usage = mergeUsage(preferredUsage === hopUsage ? streamedUsage : hopUsage, preferredUsage)
         // Responses SSE is not a Claude assistant message, so the stream client
-        // reports ok:false / incomplete. A 200 hop that carried tokens still billed.
-        const delivered = !conversionError && (result?.ok || (Number(result?.status) === 200 && usageTokens(usage) > 0))
+        // reports ok:false / incomplete. Input usage alone is not proof of delivered output.
+        const delivered =
+          !conversionError &&
+          (result?.ok ||
+            (Number(result?.status) === 200 &&
+              !result?.body?.error &&
+              result?.body?.type !== 'error' &&
+              (result?.committed === true || hopEmitted) &&
+              usageTokens(usage) > 0))
         if (delivered) {
           attemptKind = 'succeeded'
           bindSticky(outboundSessionId)
@@ -959,18 +1094,43 @@ export async function handleCodexProtocol({
                 error: { type: 'upstream_protocol_error', code: error.code, message: error.message },
               })
             }
-            return json(res, 200, body)
+            try {
+              return await json(res, 200, body, { backpressure: true, signal: gone.signal })
+            } catch (error) {
+              if (!['client_cancelled', 'downstream_write_timeout'].includes(error.code)) throw error
+              stats.errors++
+              logBag.final_state = error.code === 'client_cancelled' ? 'cancelled' : 'incomplete'
+              logBag.error_code = error.code
+              logBag.error_message = 'Codex response delivery did not complete'
+              res.destroy?.()
+              return
+            }
           }
           if (!res.headersSent) writeSSEHeaders(res)
           return res.end()
         }
+        noteCodexAuthFailure(projectRoot, vm.id, result, { before: credentialBeforeHop })
         reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
         const failureHold = codexFailureHold(result)
         if (failureHold) holdOpenAIAccount(vm.id, failureHold)
         if (res.headersSent || hopEmitted) {
           stats.errors++
           logBag.error_code = result?.body?.error?.code || 'codex_upstream'
+          logBag.final_state = gone.signal.aborted || result?.terminalState === 'cancelled' ? 'cancelled' : 'incomplete'
           logBag.upstream_status = result?.status || 0
+          logBag.error_message = codexErrorLogMessage(result, { body: outboundBody, req })
+          if (!stream && !res.headersSent && !gone.signal.aborted && !res.destroyed && !res.writableEnded) {
+            const body = result?.body?.error
+              ? result.body
+              : {
+                  error: {
+                    type: 'api_error',
+                    code: logBag.error_code,
+                    message: logBag.error_message || 'Upstream stream ended before completion',
+                  },
+                }
+            return json(res, Number(result?.status) >= 400 ? result.status : semanticStatusForStreamError(body), body)
+          }
           return res.end()
         }
         if (isCodexFailoverError(result)) {
@@ -996,7 +1156,13 @@ export async function handleCodexProtocol({
   stats.errors++
   logBag.error_code = last?.body?.error?.code || 'codex_upstream'
   logBag.upstream_status = last?.status || 0
-  return json(res, last?.status || 502, last?.body || { error: { type: 'api_error', code: 'codex_upstream' } })
+  logBag.final_state = last?.terminalState === 'cancelled' ? 'cancelled' : 'incomplete'
+  logBag.error_message = codexErrorLogMessage(last, { body: converted.body, req })
+  return json(
+    res,
+    last?.body?.error?.code === 'empty_response' ? 502 : last?.status || 502,
+    last?.body || { error: { type: 'api_error', code: 'codex_upstream' } },
+  )
 }
 
 /** No seat was admitted and nothing ran: say which gate stopped the request. */
@@ -1113,22 +1279,29 @@ function searchCredentials(projectRoot, vm) {
  * refresh token on its own, so first adopt a token it wrote meanwhile; otherwise refresh
  * once per slot, shared by concurrent callers.
  */
-function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl, refresh }) {
+async function refreshSearchAccess(projectRoot, vm, used, { proxyUrl, fetchImpl, refresh }) {
   const now = searchCredentials(projectRoot, vm)
-  if (now.access && now.access !== usedAccess) return now.access
+  if (now.access && now.access !== used.access) {
+    const current = await commitCodexCredentialRefresh(projectRoot, vm.id, { expected: used.first, proxy: vm.proxy })
+    return current.account?.access_token || ''
+  }
   if (!now.refresh) return ''
   let pending = searchRefreshes.get(vm.id)
   if (!pending) {
     pending = (async () => {
       const tok = await refresh({ refreshToken: now.refresh, proxyUrl, fetchImpl })
       if (!tok?.ok || !tok.access_token) return ''
-      upsertCodexAccount(projectRoot, vm.id, {
-        access_token: tok.access_token,
-        refresh_token: tok.refresh_token || now.refresh,
-        id_token: tok.id_token || now.first.id_token,
-        expires_at: tok.expires_at || now.first.expires_at,
+      const saved = await commitCodexCredentialRefresh(projectRoot, vm.id, {
+        expected: now.first,
+        proxy: vm.proxy,
+        patch: {
+          access_token: tok.access_token,
+          refresh_token: tok.refresh_token || now.refresh,
+          id_token: tok.id_token || now.first.id_token,
+          expires_at: tok.expires_at || now.first.expires_at,
+        },
       })
-      return tok.access_token
+      return saved.account?.access_token || ''
     })().finally(() => searchRefreshes.delete(vm.id))
     searchRefreshes.set(vm.id, pending)
   }
@@ -1182,7 +1355,7 @@ async function postCodexJson({
   if (!creds.access && !creds.refresh) return { status: 0, error: 'no_oauth_token' }
   let out = creds.access ? await send(creds.access) : { status: 401 }
   if (out.status === 401 || out.status === 403) {
-    const access = await refreshSearchAccess(projectRoot, vm, creds.access, { proxyUrl, fetchImpl, refresh })
+    const access = await refreshSearchAccess(projectRoot, vm, creds, { proxyUrl, fetchImpl, refresh })
     if (access) out = await send(access)
   }
   return out

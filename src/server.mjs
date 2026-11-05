@@ -7,6 +7,7 @@
  * OAuth import it may spawn official Claude Code once (slot SOCKS5) to seed
  * ~/.claude.json and complete a plan turn.
  */
+import { usesGatewayRateLimit } from './lib/admin/key-scope.mjs'
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -841,7 +842,7 @@ function requireAuth(req, res) {
       }),
     )
   }
-  if (!allowRate(token)) {
+  if (usesGatewayRateLimit(managed.record) && !allowRate(token)) {
     return rejectAuth(
       req,
       res,
