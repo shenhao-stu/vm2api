@@ -323,7 +323,7 @@ export function createRoutingRuntime(ctx) {
     routingConfig.concurrency = {
       ...(routingConfig.concurrency || {}),
       default_max_per_account: Number(def.max_concurrency ?? 2),
-      default_key_concurrency: Number(def.max_concurrency ?? routingConfig.concurrency?.default_key_concurrency ?? 2),
+      default_key_concurrency: Number(routingConfig.concurrency?.default_key_concurrency ?? def.max_concurrency ?? 2),
       default_max_rpm: Number(def.max_rpm ?? 0),
     }
     routingConfig.quota = {

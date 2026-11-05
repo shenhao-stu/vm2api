@@ -10,6 +10,7 @@ import { servePoolSeatStream } from '../../src/lib/admin/pool-seat-stream.mjs'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
+import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 
 const MODEL = 'claude-test'
 
@@ -811,3 +812,53 @@ test('a new device takes an open VM before a draining one, and a draining one wh
   fresh.release()
   last.release()
 })
+
+for (const accounts of [3, 35]) {
+  test(`a shared uncapped key uses ${accounts} single-concurrency accounts and a bounded queue`, async (t) => {
+    const root = project(
+      Array.from({ length: accounts }, (_, i) => ({
+        id: `vm-${String(i).padStart(2, '0')}`,
+        policy: { maxConcurrency: 1, sessionSlots: 10 },
+      })),
+    )
+    const pool = scheduler(root, { queue_max: 50 })
+    const keys = new ApiKeyStore({ dataDir: path.join(root, 'data') })
+    const key = keys.create({ name: 'shared', max_concurrency: 0 })
+    const held = []
+    const abort = new AbortController()
+    const waiting = []
+    t.after(async () => {
+      abort.abort()
+      await Promise.allSettled(waiting)
+      for (const selected of held) selected.release()
+      keys.db.close()
+      fs.rmSync(root, { recursive: true, force: true })
+    })
+    for (let i = 0; i < accounts; i++) {
+      assert.equal(keys.acquire(key).ok, true)
+      const selected = await seat(pool, `active-${i}`, { allowWait: false })
+      assert.equal(selected.ok, true)
+      held.push(selected)
+    }
+    assert.equal(new Set(held.map((x) => x.vmId)).size, accounts)
+    assert.ok([...pool.inflight.values()].every((n) => n === 1))
+    for (let i = 0; i < 50; i++) {
+      assert.equal(keys.acquire(key).ok, true)
+      waiting.push(seat(pool, `waiting-${i}`, { signal: abort.signal }))
+      await waitFor(() => pool.queuedTotal() === i + 1)
+    }
+    assert.equal(keys.canAccept(key).ok, true, 'the key does not duplicate the account cap')
+    await assert.rejects(seat(pool, 'overflow'), { code: 'pool_wait_queue_full' })
+    held[0].release()
+    const selected = await waiting[0]
+    held[0] = selected
+    assert.equal(selected.ok, true)
+    assert.equal(pool.queuedTotal(), 49)
+    assert.ok([...pool.inflight.values()].every((n) => n <= 1))
+    abort.abort()
+    await Promise.allSettled(waiting)
+    assert.equal(pool.queuedTotal(), 0)
+    for (let i = 0; i < accounts + 50; i++) keys.release(key)
+    assert.equal(keys.inflight.size, 0)
+  })
+}

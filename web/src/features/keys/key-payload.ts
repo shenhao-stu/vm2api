@@ -58,7 +58,11 @@ export function selectKeyService(
     allowed_vms: [],
     vm_pool_id: '',
     openai_endpoint_id: service === 'gpt' ? draft.openai_endpoint_id || '' : '',
-    ...(['gpt', 'claude'].includes(service) ? { max_concurrency: 1 } : {}),
+    ...(service === 'claude'
+      ? { max_concurrency: 0 }
+      : service === 'gpt'
+        ? { max_concurrency: 1 }
+        : {}),
   }
 }
 
@@ -81,7 +85,10 @@ export function keyLimitsDraft(
       (createService === 'gpt' && !initial ? 'hybrid' : 'oauth'),
     service: initial ? keyServiceOf(initial) : createService,
     openai_endpoint_id: initial?.openai_endpoint_id || '',
-    max_concurrency: Number(initial?.max_concurrency ?? (initial ? 20 : 1)),
+    max_concurrency: Number(
+      initial?.max_concurrency ??
+        (initial ? 20 : createService === 'claude' ? 0 : 1)
+    ),
     quota_requests: Number(initial?.quota_requests ?? 0),
     quota_usd: Number(initial?.quota_usd ?? 0),
     rpm: Number(initial?.rpm ?? 0),

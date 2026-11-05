@@ -48,8 +48,8 @@ export function KeyConnectionGuide({ baseUrl }: { baseUrl: string }) {
         </div>
       </div>
       <p className='mt-3 text-[11px] leading-6 text-muted-foreground'>
-        新建托管 Key 默认并发 1。GPT 源控制台签发的原生 Key 使用其自身 API
-        地址，与这里的 Key 分开管理。
+        Claude Key 默认不额外限制并发，由账号池分配并排队。GPT
+        源控制台签发的原生 Key 使用其自身 API 地址，与这里的 Key 分开管理。
       </p>
     </section>
   )

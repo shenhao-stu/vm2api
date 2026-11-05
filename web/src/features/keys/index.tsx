@@ -43,6 +43,7 @@ import { KeyLimitsDialog } from './key-limits-dialog'
 import {
   keyLimitsPayload,
   keyServiceLabel,
+  keyServiceOf,
   type KeyLimitsDraft,
 } from './key-payload'
 import { KeyRevealDialog, type RevealedKey } from './key-reveal-dialog'
@@ -209,7 +210,7 @@ export function KeysPage() {
   return (
     <PageHeader
       title={VIEW_TITLES.keys}
-      description='Claude 与 GPT 分别使用独立 Key，托管池默认并发 1。请把对应服务的 Key 发给客户端。'
+      description='Claude 与 GPT 分别使用独立 Key；Claude 的实际并发和排队由账号池控制。请把对应服务的 Key 发给客户端。'
       extra={
         <div className='flex gap-2'>
           <Button
@@ -452,7 +453,12 @@ function KeyRow({
         {pct != null ? <Progress value={pct} className='mt-1 h-1.5' /> : null}
       </TableCell>
       <TableCell className='text-xs'>
-        {conc ? `${conc} 并发` : '并发不限'} · {rpm ? `RPM ${rpm}` : 'RPM 不限'}
+        {conc
+          ? `${conc} 并发`
+          : keyServiceOf(item) === 'claude'
+            ? '由账号池调度'
+            : '并发不限'}{' '}
+        · {rpm ? `RPM ${rpm}` : 'RPM 不限'}
       </TableCell>
       <TableCell
         className={cn('text-xs', expiry.expired && 'text-destructive')}

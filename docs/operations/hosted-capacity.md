@@ -8,9 +8,18 @@ remain in their own configuration.
 The current limits are one concurrent request and ten active session seats per
 Claude account, no per-minute request cap, and the original fifty waiting requests
 across the pool. All Claude tiers inherit these defaults; explicit VM overrides
-must be checked when onboarding. The existing Claude pool Key remains at total
-concurrency one. A busy Key returns an admission 429 before selecting an account;
-clients should serialize requests or use bounded backoff, not fan out retries.
+must be checked when onboarding. The shared Claude Key has `max_concurrency=0`:
+it adds no separate key cap. With N healthy schedulable accounts, at most N
+provider requests execute concurrently; the pool keeps at most 50 waiting
+requests, then returns `pool_wait_queue_full`. A timeout returns
+`pool_queue_timeout`. Clients should use bounded backoff on these capacity
+errors rather than fan out retries. Existing explicit per-key limits and tenant
+limits still apply when an operator chooses them.
+
+`concurrency.default_key_concurrency=0` is independent of the account tier
+concurrency. Saving account defaults must not reset it to one. New Claude keys
+and switching to the Claude service use this pooled default; editing an existing
+key preserves its explicit cap. GPT key defaults and its gateway remain separate.
 
 A session seat covers in-flight work and queued continuation requests. It is not
 a count of all historical conversations or an instruction to delete conversation
@@ -24,13 +33,19 @@ probe. Fable stays excluded and DSH stays disabled.
 
 New sessions use the existing balanced policy: same-priority accounts are ranked
 by active seat occupancy and remaining quota. The managed slots now have equal
-priority and weight; previous manually paused slots remain paused. This balances
+priority and weight. Preserve the live schedulable state when publishing;
+do not restore an older paused-slot snapshot. This balances
 capacity, not an exact round-robin count of requests. Do not move healthy existing
 sessions merely to equalize counts.
 
 When adding the proposed 30 accounts, import each as an independent identity and
 verify its fixed egress, token health, concurrency, seat cap, RPM and pool binding.
-Spread new sessions across healthy capacity; do not raise the shared Key limit
-merely because accounts were added. These controls provide bounded workload and
+Add healthy accounts to the existing authorized VM pool; the same shared Key
+then uses their capacity without key rotation or a new fixed key limit. New
+sessions spread across healthy capacity while existing sessions keep affinity.
+The 35-account regression verifies one active request per account, a 50-request
+queue, overflow rejection, wake-up on release and cancellation cleanup without
+provider calls. This is a scheduler test; actual server resource capacity must
+also be checked when onboarding the proposed fleet. These controls provide bounded workload and
 session continuity; they do not establish provider approval or guarantee against
 account restrictions.

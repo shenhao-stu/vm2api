@@ -1,7 +1,7 @@
 {
   "concurrency": {
     "default_max_per_account": 1,
-    "default_key_concurrency": 1,
+    "default_key_concurrency": 0,
     "default_max_rpm": 0
   },
   "tiers": {

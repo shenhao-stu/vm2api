@@ -148,3 +148,21 @@ test('tier RPM synchronization updates inherited RPM and skips unchanged records
   assert.equal(f.policy().maxRpm, 20)
   assert.equal(f.account().max_rpm, 20)
 })
+
+for (const keyCap of [0, 64]) {
+  test(`tier defaults keep independent key concurrency ${keyCap}`, () => {
+    const routingConfig = {
+      concurrency: { default_key_concurrency: keyCap },
+      tiers: { default: { max_concurrency: 1 } },
+    }
+    createRoutingRuntime({ routingConfig }).syncTierDefaultsIntoRouting()
+    assert.equal(routingConfig.concurrency.default_key_concurrency, keyCap)
+    assert.equal(routingConfig.concurrency.default_max_per_account, 1)
+  })
+}
+
+test('legacy routing without a key default retains the tier fallback', () => {
+  const routingConfig = { tiers: { default: { max_concurrency: 3 } } }
+  createRoutingRuntime({ routingConfig }).syncTierDefaultsIntoRouting()
+  assert.equal(routingConfig.concurrency.default_key_concurrency, 3)
+})

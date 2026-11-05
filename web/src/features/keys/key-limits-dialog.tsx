@@ -202,7 +202,7 @@ export function KeyLimitsDialog({
               </Select>
             </Field>
           ) : null}
-          <Field label='并发'>
+          <Field label='Key 并发上限'>
             <NumSelect
               kind='conc'
               value={draft.max_concurrency}
@@ -309,7 +309,8 @@ export function KeyLimitsDialog({
           ) : null}
           {service === 'claude' ? (
             <p className='text-xs text-muted-foreground sm:col-span-2'>
-              此密钥仅使用所选 Claude 槽位，与 GPT 托管池分别限额和计并发。
+              此密钥仅使用所选 Claude 槽位，与 GPT 托管池分别限额和计并发。 Key
+              并发设为不限时，仍受每个账号的并发限制，繁忙请求进入账号池队列。
             </p>
           ) : null}
           {!scopeReadOnly && !gpt ? (

@@ -185,7 +185,7 @@ describe('API key limit payload', () => {
     ).toBeNull()
   })
 
-  it('creates separate Claude and GPT keys with concurrency one and no cross-service scope', () => {
+  it('creates pooled Claude keys without an extra cap and keeps the GPT default independent', () => {
     const claude = {
       ...keyLimitsDraft(null, true),
       name: 'Claude pool',
@@ -195,7 +195,7 @@ describe('API key limit payload', () => {
       category: 'oauth',
       group_type: 'anthropic',
       allowed_vms: ['line01'],
-      max_concurrency: 1,
+      max_concurrency: 0,
     })
     expect(keyLimitsPayload(claude, 'create')).not.toHaveProperty(
       'openai_endpoint_id'
@@ -307,4 +307,27 @@ describe('API key limit payload', () => {
       openai_endpoint_id: '',
     })
   })
+})
+
+for (const cap of [0, 1, 8]) {
+  it(`preserves an explicit Claude key cap ${cap} during unrelated edits`, () => {
+    const restored = keyLimitsDraft({
+      id: 'claude',
+      category: 'oauth',
+      group_type: 'anthropic',
+      allowed_vms: ['line01'],
+      max_concurrency: cap,
+    })
+    expect(
+      keyLimitsPayload({ ...restored, quota_requests: 50 }, 'edit')
+        .max_concurrency
+    ).toBe(cap)
+  })
+}
+
+it('switching to Claude selects pool scheduling instead of a single-request key cap', () => {
+  expect(
+    selectKeyService(keyLimitsDraft(null, false, 'gpt'), 'claude')
+      .max_concurrency
+  ).toBe(0)
 })
