@@ -111,6 +111,10 @@ def native_cache_ttl(body):
                 yield block['cache_control']
             if block.get('type') in {'tool_result', 'search_result'}:
                 yield from controls(block.get('content'))
+            tool = block.get('tool')
+            if (block.get('type') == 'tool_addition' and isinstance(tool, dict)
+                    and tool.get('type') == 'tool_definition'):
+                yield from controls([tool.get('definition')])
 
     values = list(controls(body.get('tools'))) + list(controls(body.get('system')))
     for message in body.get('messages', []):

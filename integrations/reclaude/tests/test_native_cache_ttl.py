@@ -65,6 +65,23 @@ class NativeCacheTtlTests(unittest.TestCase):
                 'cache_control': {'type': 'ephemeral', 'ttl': '5m'}}]}]}]})
         self.assertEqual(native_cache_ttl(body), '5m')
 
+    def test_tool_addition_definition_ttl_is_protocol_metadata_not_schema_data(self):
+        body = {'messages': [{'role': 'system', 'content': [{'type': 'tool_addition',
+            'tool': {'type': 'tool_definition', 'definition': {
+                'name': 'fixture', 'input_schema': {'type': 'object', 'properties': {
+                    'cache_control': {'ttl': 'business-data'}}},
+                'cache_control': {'type': 'ephemeral', 'ttl': '5m'}}}}]}]}
+        original = copy.deepcopy(body)
+        self.assertEqual(native_cache_ttl(body), '5m')
+        self.assertEqual(body, original)
+        definition = body['messages'][0]['content'][0]['tool']['definition']
+        definition['cache_control'].pop('ttl')
+        self.assertEqual(native_cache_ttl(body), '1h')
+        definition['cache_control']['ttl'] = '5m'
+        body['cache_control'] = {'type': 'ephemeral'}
+        with self.assertRaisesRegex(ContractError, 'cache_ttl_mixed_unsupported'):
+            native_cache_ttl(body)
+
     def test_mixed_and_invalid_ttl_reject_before_pool_admission(self):
         base = {'model': 'fixture', 'max_tokens': 32,
                 'metadata': {'user_id': str(uuid.uuid4())},
