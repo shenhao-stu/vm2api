@@ -846,7 +846,10 @@ export class PoolScheduler extends EventEmitter {
                   vmId: home.vmId,
                   candidates: byVm,
 
-                  stickyUntil: Math.min(failoverDeadline, now + this.config.sticky_wait_timeout_ms),
+                  stickyUntil:
+                    sticky.vmId === home.vmId
+                      ? failoverDeadline
+                      : Math.min(failoverDeadline, now + this.config.sticky_wait_timeout_ms),
                   deadline: failoverDeadline,
                 })
               : this.enqueueTicket({
@@ -868,12 +871,12 @@ export class PoolScheduler extends EventEmitter {
         await this.waitTicket(ticket, { signal, until: Math.min(until, Date.now() + QUEUE_REFRESH_MS) })
         if (ticket.granted) return finish(ticket.granted)
         const after = Date.now()
+        if (after >= ticket.deadline) return fail('pool_queue_timeout')
         if (ticket.kind === 'seat' && after >= ticket.stickyUntil) {
           this.planner.toGlobal(ticket)
           ticket.deadline = Math.min(failoverDeadline, after + this.config.fallback_wait_timeout_ms)
           continue
         }
-        if (after >= ticket.deadline) return fail('pool_queue_timeout')
       }
     } finally {
       this.planner.forgetGranted(ticket)
@@ -901,9 +904,9 @@ export class PoolScheduler extends EventEmitter {
   }
 
   /**
-   * Preferred homes first, but only a home with a free slot. A full machine
-   * VM is not skipped for another VM here; the caller queues on it. Homes
-   * with no free slot drop out, then the configured strategy fills the rest.
+   * Preferred homes first. A healthy busy home queues the continuation instead
+   * of borrowing another account. Draining homes may migrate; a full home
+   * waits on the caller's existing sticky clock.
    */
   openNewSeat(seatKey, candidates, { avoided, homes = [], deviceKey = '' }) {
     const openable = this.openableCandidates(candidates, avoided)
@@ -912,6 +915,15 @@ export class PoolScheduler extends EventEmitter {
       const match = openable.find((candidate) => candidate.vmId === home.vmId)
       const granted = match ? this.claimSeat(seatKey, match, home.reason, deviceKey) : null
       if (granted) return granted
+      const candidate = candidates.find((item) => item.vmId === home.vmId)
+      if (
+        candidate?.busy &&
+        !candidate.draining &&
+        !avoided(candidate) &&
+        stickyShouldWait(candidate.waitReason, candidate.cooldownReason)
+      ) {
+        return null
+      }
     }
     const reserved = new Set(homes.map((home) => home.vmId))
     const elsewhere = openable.filter((candidate) => !reserved.has(candidate.vmId))

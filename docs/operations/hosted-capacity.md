@@ -25,7 +25,10 @@ A session seat covers in-flight work and queued continuation requests. It is not
 a count of all historical conversations or an instruction to delete conversation
 history. The existing 24-hour sticky preference keeps continuations on their
 healthy home account; native idle session caches retain their 10-minute expiry.
-An active session waits on its home concurrency instead of splitting across VMs.
+Continuations also wait on the healthy home after a completed turn releases its
+seat. A busy home keeps this binding until the request deadline; the new-session
+sticky grace cannot spill that continuation onto another account. Draining,
+unavailable or failed accounts retain the existing migration rules.
 Unavailable accounts can fail over before output: at most two attempts and one
 account switch per request, with no same-account retry. Existing circuit policy
 remains three qualifying failures, a five-minute open period and one half-open

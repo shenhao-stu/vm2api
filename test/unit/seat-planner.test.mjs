@@ -275,6 +275,49 @@ test('a restarted scheduler does not restore an ended session seat from sticky V
   assert.equal(restarted.planner.openCount('vm-01'), 0)
 })
 
+test('a tool follow-up waits for its healthy busy account after its previous turn released the seat', async (t) => {
+  const pool = setup(
+    t,
+    [
+      { id: 'vm-01', policy: { sessionSlots: 10, maxConcurrency: 1 } },
+      { id: 'vm-02', policy: { sessionSlots: 10, maxConcurrency: 1 } },
+    ],
+    { sticky: 30 },
+  )
+  const sticky = new StickyRouter({ dataDir: pool.projectRoot, config: { sticky: { enabled: true } } })
+  pool.stickyRouter = sticky
+  const stickyKey = sticky.canonicalSessionKey('tool-conversation')
+  const first = await seat(pool, 'tool-conversation', { stickyKey })
+  sticky.bind(stickyKey, { accountId: first.accountId, vmId: first.vmId, sessionId: 'outbound-tool-session' })
+  first.release()
+  const foreign = await seat(pool, 'other-conversation', { deviceVmId: first.vmId })
+  const holds = [foreign]
+  t.after(() => holds.forEach((hold) => hold.release?.()))
+  assert.equal(foreign.vmId, first.vmId)
+  const immediate = await seat(pool, 'tool-conversation', { stickyKey, allowWait: false })
+  holds.push(immediate)
+  assert.equal(immediate.ok, false, 'capacity must queue the follow-up instead of moving it to a free account')
+  const waiting = seat(pool, 'tool-conversation', { stickyKey, deadline: Date.now() + 2000 })
+  await waitFor(() => pool.planner.pending() === 1)
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  assert.equal(pool.planner.pending(), 1, 'a healthy session home must not spill after the new-session grace')
+  assert.equal(pool.inflight.get('account-2') || 0, 0)
+  foreign.release()
+  const resumed = await waiting
+  holds.push(resumed)
+  assert.equal(resumed.ok, true)
+  assert.equal(resumed.vmId, first.vmId)
+  assert.equal(sticky.resolve(stickyKey).sessionId, 'outbound-tool-session')
+  assert.equal(resumed.queueWaitMs >= 0, true)
+  resumed.release()
+  const blocker = await seat(pool, 'third-conversation', { deviceVmId: first.vmId })
+  holds.push(blocker)
+  const expired = await seat(pool, 'tool-conversation', { stickyKey, deadline: Date.now() + 60 })
+  assert.equal(expired.ok, false)
+  assert.equal(expired.reason, 'pool_queue_timeout')
+  assert.equal(sticky.resolve(stickyKey).vmId, first.vmId)
+})
+
 test('a restarted scheduler does not turn a seatless probe sticky row into a seat', async (t) => {
   const pool = setup(t, [{ id: 'vm-01', policy: { sessionSlots: 1 } }])
   const probe = await seat(pool, 'probe-session', { skipSessionSlot: true, allowWait: false })
