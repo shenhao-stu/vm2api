@@ -620,6 +620,8 @@ class Session:
         self.dispatch_address = None
         self.dispatch_close_observation = None
         self.last_grant_id = None
+        self.channel_store = None
+        self.caller_request_sha = None
         self.model = body["model"]
         self.tools = tool_schema(body.get("tools", []))
         self.history = []
@@ -1078,6 +1080,8 @@ class Session:
         if self.dispatch_process.poll() is not None:
             raise ContractError("native_dispatch_proxy_stopped")
         self.last_grant_id = str(uuid.uuid4())
+        if self.channel_store is not None:
+            self.channel_store.bind(self, self.caller_request_sha, self.last_grant_id)
         directory = self.directory / "dispatch"
         temp = directory / (self.last_grant_id + ".tmp")
         grant = {
@@ -1245,6 +1249,7 @@ class Session:
                 raise ContractError("session_failed_no_replay")
             changed = self.validate_configuration(body)
             request_signature = signature(history_shape(body["messages"]))
+            self.caller_request_sha = request_signature
             if request_signature in self.seen:
                 raise ContractError("request_already_consumed")
             advanced = self.continuation_import(body)
@@ -1439,6 +1444,9 @@ class Session:
                             "awaiting_tools" if self.pending_ids else "idle",
                             request_signature, turn.message["id"],
                         )
+                        if self.channel_store is not None:
+                            self.channel_store.complete(self, request_signature,
+                                                        copy.deepcopy(turn.message.get("usage", {})))
                     yield from converted_events
                     if event.get("type") == "message_stop":
                         return

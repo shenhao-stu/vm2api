@@ -88,6 +88,7 @@ class SessionPool:
         prepared_idle_seconds=120,
         under_pressure=lambda: False,
         allow_history_import=False,
+        configuration_channels=False,
     ):
         if type(capacity) is not int or not 1 <= capacity <= 10 or not 0 < idle_seconds <= 86400:
             raise ValueError("invalid_native_pool_limits")
@@ -108,6 +109,10 @@ class SessionPool:
         self.entries = {}
         self.lock = threading.Lock()
         self.stopped = False
+        self.channel_store = None
+        if configuration_channels:
+            from native_channel_store import ChannelStore
+            self.channel_store = ChannelStore(self.root)
 
     def expire(self):
         now = self.clock()
@@ -172,12 +177,26 @@ class SessionPool:
     def lease(self, tenant, body):
         native_options(body)
         key = session_key(tenant, body)
+        logical = key
         # The reaper handles expiry; hot requests need not wait for other CLIs.
         while True:
             retiring = None
             with self.lock:
                 if self.stopped:
                     raise ContractError("native_pool_stopped")
+                if self.channel_store is not None:
+                    import native_bridge_session as native
+                    from native_channel_policy import select_channel
+                    snapshot = self.channel_store.snapshot(
+                        logical, self.entries, self.capacity)
+                    if snapshot is not None:
+                        decision = select_channel(
+                            tenant, body, snapshot, native=native,
+                            session_identity=session_identity,
+                            allow_history_import=self.allow_history_import, check_capacity=False)
+                        if decision.action == 'reject':
+                            raise ContractError(decision.code)
+                        key = decision.channel_key
                 entry = self.entries.get(key)
                 if entry is not None:
                     if entry.busy:
@@ -196,10 +215,14 @@ class SessionPool:
                     if retiring is None:
                         raise ContractError("native_memory_pressure" if pressure
                                             else "native_session_capacity")
-                elif entry is None:
+                elif entry is None and retiring is None:
+                    if self.channel_store is not None and not existing:
+                        self.channel_store.register(logical, key, body)
                     session = (self.recover if existing else self.factory)(
                         self.root / key, body
                     )
+                    if self.channel_store is not None and self.channel_store.document(logical) is not None:
+                        self.channel_store.attach(session, logical)
                     entry = self.entries[key] = Entry(session, self.clock())
                 if retiring is None:
                     entry.busy = True
@@ -226,3 +249,5 @@ class SessionPool:
             self.entries.clear()
         for session in sessions:
             session.close()
+        if self.channel_store is not None:
+            self.channel_store.close()
