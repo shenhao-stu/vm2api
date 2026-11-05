@@ -88,6 +88,7 @@ import { isTelemetryPath, telemetryIngressResponse } from './lib/identity/teleme
 import { openDatabase, closeDatabase, getDb } from './lib/db/database.mjs'
 import { armWriteBehind } from './lib/db/write-behind.mjs'
 import { JevUsageRepo } from './lib/db/repos/jev-usage-repo.mjs'
+import { installJevKeyHealthStore } from './lib/protocol/jev-intercept.mjs'
 import { installJevUsageRecorder } from './lib/protocol/jev-usage.mjs'
 import { runLegacyImport } from './lib/db/legacy-import.mjs'
 import { initVmDbSync, stopVmWatch } from './lib/vm/vm-db-sync.mjs'
@@ -164,6 +165,7 @@ openDatabase({ dataDir, pooled: true })
 armWriteBehind(getDb())
 const jevUsageRepo = new JevUsageRepo()
 installJevUsageRecorder((event) => jevUsageRepo.record(event))
+installJevKeyHealthStore(new SettingsRepo())
 try {
   loadModelPolicy()
 } catch (e) {

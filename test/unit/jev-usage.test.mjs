@@ -215,3 +215,17 @@ test('configured keys aggregate separately, include unused keys, and distinguish
   assert.equal(keys[2].status, 'unrequested')
   assert.equal(keys[2].last_request_at, null)
 })
+
+test('persisted credential health overrides stale successful usage without inventing a fresh request', (t) => {
+  const repo = fixture(t)
+  const fingerprint = jevKeyFingerprint('synthetic-disabled-after-success')
+  repo.record(normalizeJevUsage(value({ key_fingerprint: fingerprint })))
+  const [row] = repo.configuredKeys([
+    { number: 1, key_fingerprint: fingerprint, retired: true, retirement_reason: 'organization_disabled' },
+  ])
+  assert.equal(row.status, 'organization_disabled')
+  assert.equal(row.retired, true)
+  assert.equal(row.requests, 1)
+  assert.equal(row.successful, 1)
+  assert.equal(row.last_http_status, 200)
+})

@@ -89,6 +89,7 @@ const CODE_MAP = {
   refusal_guard: 'refusal',
   content_filter_refusal: 'refusal',
   policy_blocked: 'refusal',
+  moderation_unavailable: 'upstream',
 }
 
 export const IGNORED_ERROR_CODES = new Set([
@@ -236,7 +237,7 @@ export function classifyRequestError(row = {}) {
   const status = Number(row.status) || 0
   const code = String(row.error_code || '').trim()
   const text = hay(row)
-  let id = CODE_MAP[code] || null
+  let id = code === 'policy_blocked' && /决策模型不可用/.test(text) ? 'upstream' : CODE_MAP[code] || null
 
   if (/signature|thinking block|skip_thought_signature|must contain thinking/.test(text)) id = 'signature'
   else if ((id === 'upstream' || (!id && status === 503)) && /overload|负载过高/.test(text)) id = 'overloaded'

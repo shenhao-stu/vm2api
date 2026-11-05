@@ -85,6 +85,7 @@ export const ErrorCode = {
   REFUSAL_GUARD: 'refusal_guard',
   CONTENT_FILTER_REFUSAL: 'content_filter_refusal',
   POLICY_BLOCKED: 'policy_blocked',
+  MODERATION_UNAVAILABLE: 'moderation_unavailable',
   // resource
   VM_NOT_FOUND: 'vm_not_found',
   NOT_FOUND: 'not_found',

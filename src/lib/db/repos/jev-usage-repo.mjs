@@ -86,19 +86,23 @@ export class JevUsageRepo {
     return keys.map((key) => {
       const last = latest.get(key.key_fingerprint)
       const status =
-        last?.http_status === 402
-          ? 'insufficient_balance'
-          : last?.outcome === 'success'
-            ? 'normal'
-            : last?.http_status === 401 || last?.http_status === 403
-              ? 'auth_error'
-              : last?.http_status === 429
-                ? 'rate_limited'
-                : last
-                  ? 'request_error'
-                  : key.retired
-                    ? 'paused'
-                    : 'unrequested'
+        key.retirement_reason === 'organization_disabled'
+          ? 'organization_disabled'
+          : key.retirement_reason === 'invalid_credentials'
+            ? 'auth_error'
+            : last?.http_status === 402
+              ? 'insufficient_balance'
+              : last?.outcome === 'success'
+                ? 'normal'
+                : last?.http_status === 401 || last?.http_status === 403
+                  ? 'auth_error'
+                  : last?.http_status === 429
+                    ? 'rate_limited'
+                    : last
+                      ? 'request_error'
+                      : key.retired
+                        ? 'paused'
+                        : 'unrequested'
       return {
         ...key,
         requests: 0,

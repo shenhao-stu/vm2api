@@ -5,6 +5,7 @@
  * persisted refusal/device cache, then the model. A block never hops.
  * Device bans and refusal rows are written here so both entry points share them.
  */
+import { ErrorCode, ErrorType, makeError } from '../core/errors.mjs'
 import { detectDistill, distillBlockError, isOpenaiPlatformModel } from '../core/distill-detect.mjs'
 import {
   inboundRefusalDeviceId,
@@ -272,22 +273,25 @@ export async function evaluateProtocolIntercept({
     const verdict = await classifyJev(modelDocument, { ...jev, policy_request_id: requestId, signal }, fetchImpl)
     if (verdict.action === 'block') {
       const unavailable = verdict.reason === 'unavailable'
-      const error = policyBlockError(requestId)
       const detail = String(verdict.detail || '')
         .replace(/\s+/g, ' ')
         .trim()
         .slice(0, 120)
-      if (unavailable) {
-        error.body.error.message = detail
-          ? `${error.body.error.message}: 决策模型不可用（${detail}）。本次请求已拦截，未封禁设备`
-          : `${error.body.error.message}: 决策模型不可用。本次请求已拦截，未封禁设备`
-        error.body.error.details = { reason: 'unavailable', ...(detail ? { detail } : {}) }
-      }
+      const error = unavailable
+        ? makeError({
+            type: ErrorType.API,
+            code: ErrorCode.MODERATION_UNAVAILABLE,
+            status: 503,
+            message: `决策模型不可用${detail ? `（${detail}）` : ''}。本次请求未提交模型，未封禁设备`,
+            request_id: requestId,
+            details: { reason: 'unavailable', ...(detail ? { detail } : {}) },
+          })
+        : policyBlockError(requestId)
       const category = verdict.category || 'safety'
       return block({
         kind: 'jev',
         via: 'jev',
-        final_state: 'policy_blocked',
+        final_state: unavailable ? 'rejected' : 'policy_blocked',
         error,
         errorMessage: unavailable ? error.body.error.message : `${error.body?.error?.message}: ${category}`,
         intercept: gateVerdict({

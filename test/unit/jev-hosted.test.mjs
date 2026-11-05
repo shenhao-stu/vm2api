@@ -335,3 +335,62 @@ test('client disconnect cancels the classifier and settles protocol listeners wi
   assert.equal(req.listenerCount('aborted'), 0)
   assert.equal(res.listenerCount('close'), 0)
 })
+
+const deactivated = () =>
+  new Response(
+    JSON.stringify({
+      detail: {
+        error_type: 'authentication_error',
+        message: 'Your organization has been deactivated. Please contact TypeSafe AI for more information.',
+      },
+    }),
+    { status: 403, headers: { 'content-type': 'application/json' } },
+  )
+
+test('a confirmed deactivated Jev organization retires only its credential and is not polled again', async () => {
+  const cfg = config('deactivated-organization')
+  let calls = 0
+  const fetchImpl = async () => {
+    calls++
+    return deactivated()
+  }
+  assert.equal((await classifyJev('first', cfg, fetchImpl)).reason, 'unavailable')
+  assert.equal((await classifyJev('second', cfg, fetchImpl)).reason, 'unavailable')
+  assert.equal(calls, 1)
+  assert.equal(publicJevKeys(cfg)[0].retired, true)
+  assert.equal(publicJevKeys(cfg)[0].retirement_reason, 'organization_disabled')
+})
+
+test('a confirmed organization failure can use a healthy key on the same endpoint within the attempt budget', async () => {
+  const cfg = config('deactivated-other-key', { api_keys: ['synthetic-first', 'synthetic-second'] })
+  const seen = []
+  const result = await classifyJev('healthy request', cfg, async (_url, init) => {
+    seen.push(init.headers.authorization)
+    return seen.length === 1 ? deactivated() : safe()
+  })
+  assert.equal(result.reason, 'safe')
+  assert.equal(seen.length, 2)
+  assert.equal(new Set(seen).size, 2)
+  assert.equal(publicJevKeys(cfg).filter((key) => key.retired).length, 1)
+})
+
+test('Jev unavailability is a service failure, never a policy verdict or a device ban', async () => {
+  const banned = [],
+    remembered = []
+  const result = await runProtocolIntercept({
+    inbound: { model: 'claude-haiku-4-5-20251001', messages: [{ role: 'user', content: 'What is two plus two?' }] },
+    jev: config('dependency-unavailable', { hard_regex_enabled: false }),
+    policy: { enabled: true, device_block_enabled: true },
+    headers: { 'x-kin-device-id': 'synthetic-failed-dependency' },
+    devices: { block: (row) => banned.push(row), get: () => null },
+    repo: { remember: (row) => remembered.push(row), get: () => null },
+    fetchImpl: async () => deactivated(),
+  })
+  assert.equal(result.error.status, 503)
+  assert.equal(result.error.body.error.code, 'moderation_unavailable')
+  assert.equal(result.final_state, 'rejected')
+  assert.equal(result.jevState, '')
+  assert.equal(result.banDevice, false)
+  assert.deepEqual(banned, [])
+  assert.deepEqual(remembered, [])
+})

@@ -5,11 +5,12 @@
  * configured line blocks (0.5 unless the panel changes it). One score within
  * 0.08 under that line does not. The same state reuses that verdict for the
  * configured window. A dead model fails open unless fail_open is off.
- * 401 retires the key; 429 cools the key and 529 cools its host. A network error or
+ * 401 or confirmed organization deactivation retires the key across restarts; 429 cools the key and 529 cools its host. A network error or
  * other HTTP status skips the rest of that host for this call only.
  * A line may be `https://host[/v1/systemone] <key>`.
  */
 import { ErrorCode, ErrorType, makeError } from '../core/errors.mjs'
+import { createJevKeyHealth, readJevCredentialFailure } from './jev-key-health.mjs'
 import { refusalUserDocument } from '../core/refusal-similarity.mjs'
 import { normalizeText } from '../core/distill-detect.mjs'
 import { hasAccessPresence } from '../oauth/oauth-credentials.mjs'
@@ -1382,7 +1383,11 @@ function unavailable(config, detail = '') {
   return row
 }
 
-const retiredJevKeys = new Set()
+let jevKeyHealth = createJevKeyHealth()
+
+export function installJevKeyHealthStore(settings) {
+  jevKeyHealth = createJevKeyHealth(settings)
+}
 const keyCooldowns = new Map()
 const hostCooldowns = new Map()
 const COOLDOWN_MAX_MS = 24 * 60 * 60 * 1000
@@ -1437,7 +1442,8 @@ export function publicJevKeys(config, now = Date.now()) {
         masked_key:
           target.apiKey.length >= 12 ? `${target.apiKey.slice(0, 4)}********${target.apiKey.slice(-4)}` : '********',
         key_fingerprint: jevKeyFingerprint(target.apiKey),
-        retired: retiredJevKeys.has(target.id),
+        retired: !!jevKeyHealth.reason(target.id),
+        retirement_reason: jevKeyHealth.reason(target.id),
         cooldown_until: cooldown?.until || null,
         cooldown_reason: cooldown ? (cooldown.status === 529 ? 'overloaded' : 'rate_limited') : null,
       }
@@ -1445,10 +1451,7 @@ export function publicJevKeys(config, now = Date.now()) {
 }
 
 function rearmJevKeys(config) {
-  const live = new Set(jevTargets(config).map((target) => target.id))
-  for (const id of [...retiredJevKeys]) {
-    if (live.has(id)) retiredJevKeys.delete(id)
-  }
+  jevKeyHealth.rearm(jevTargets(config).map((target) => target.id))
 }
 
 let keyCursor = 0
@@ -1478,14 +1481,14 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
   const payload = { state: document, questions: questionsFor(config) }
   if (model) payload.model = model
   const all = jevTargets(config)
-  const targets = all.filter((target) => !retiredJevKeys.has(target.id) && !cooldownFor(target, now))
+  const targets = all.filter((target) => !jevKeyHealth.reason(target.id) && !cooldownFor(target, now))
   if (!targets.length)
     return unavailable(
       config,
       all.some((target) => cooldownFor(target, now))
         ? '上游限流或过载，等待冷却'
         : all.some((target) => target.apiKey)
-          ? '密钥失效'
+          ? '审核凭据已停用，请更换有效审核凭据'
           : '',
     )
   const start = keyCursor
@@ -1529,8 +1532,11 @@ export async function classifyJev(text, cfg, fetchImpl = globalThis.fetch, now =
       attemptUsage.outcome = response?.ok ? 'invalid_response' : 'http_error'
       if (!response?.ok) {
         const status = Number(response?.status) || 0
-        if (status === 401) {
-          if (target.apiKey) retiredJevKeys.add(target.id)
+        const failure = await readJevCredentialFailure(response)
+        if (failure) {
+          if (target.apiKey) jevKeyHealth.retire(target.id, failure)
+          if (!http)
+            http = failure === 'organization_disabled' ? '审核账号所属组织已停用，请更换有效审核凭据' : '审核密钥失效'
           continue
         }
         if (status === 429 || status === 529) {

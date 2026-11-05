@@ -336,7 +336,8 @@ test('fail closed blocks this request without banning the device', async () => {
   assert.match(decision.error.body.error.message, /决策模型不可用（上游 500）/)
   assert.match(decision.error.body.error.message, /未封禁设备/)
   assert.deepEqual(decision.error.body.error.details, { reason: 'unavailable', detail: '上游 500' })
-  assert.equal(decision.error.body.error.code, 'policy_blocked')
+  assert.equal(decision.error.body.error.code, 'moderation_unavailable')
+  assert.equal(decision.error.status, 503)
 })
 
 test('content-policy error codes are refusals; generic api errors are not', () => {

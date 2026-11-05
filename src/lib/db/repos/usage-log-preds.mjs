@@ -12,8 +12,9 @@ const SLA_OK_CODES_SQL = slaOkErrorSqlList()
 export const ERROR_PRED = `(status >= 400 OR (error_code IS NOT NULL AND error_code != '' AND error_code NOT IN (${IGNORED_CODES_SQL})))`
 export const SUCCESS_PRED = `(status < 400 AND (error_code IS NULL OR error_code = '' OR error_code IN (${IGNORED_CODES_SQL})))`
 const SLA_OK_PRED = `(status = 429 OR (error_code IS NOT NULL AND error_code != '' AND error_code IN (${SLA_OK_CODES_SQL})))`
-export const SLA_SUCCESS_PRED = `(${SUCCESS_PRED} OR ${SLA_OK_PRED})`
-export const SLA_ERROR_PRED = `(${ERROR_PRED} AND NOT (${SLA_OK_PRED}))`
+const LEGACY_MODERATION_FAILURE = `(IFNULL(error_code, '') = 'policy_blocked' AND IFNULL(error_message, '') LIKE '%决策模型不可用%')`
+export const SLA_SUCCESS_PRED = `((${SUCCESS_PRED} OR ${SLA_OK_PRED}) AND NOT ${LEGACY_MODERATION_FAILURE})`
+export const SLA_ERROR_PRED = `(${ERROR_PRED} AND (NOT (${SLA_OK_PRED}) OR ${LEGACY_MODERATION_FAILURE}))`
 
 // After migration 037 every row stores disjoint input. Prompt (cache hit
 // denominator) is the input-side total; total tokens also include output.

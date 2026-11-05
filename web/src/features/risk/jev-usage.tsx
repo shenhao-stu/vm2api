@@ -46,6 +46,7 @@ const keyStatus: Record<string, string> = {
   normal: '正常请求',
   insufficient_balance: '余额不足',
   auth_error: '鉴权失败',
+  organization_disabled: '审核组织已停用',
   rate_limited: '请求限流',
   request_error: '请求异常',
   unrequested: '未请求',
