@@ -206,6 +206,7 @@ export type UsageLogFilters = {
   statusCode?: number
   /** (`exclude_status_200=1`) 只看非 2xx；与 statusCode 互斥，后者优先。 */
   excludeStatus200?: boolean
+  errorsOnly?: boolean
   /** (`model_mismatch=1`) */
   modelMismatch?: boolean
   /** (`min_attempt_count`) 只看 `attempt_count >= n`，「有重试」= 2。 */
