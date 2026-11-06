@@ -208,7 +208,7 @@ class ChannelTests(unittest.TestCase):
             session.dispatch_process = None
             self.assertFalse((session.directory / 'dispatch/grant.json').exists())
             self.assertEqual(len(list((session.directory / 'caller-grants').glob('*.json'))), 1)
-        with self.assertRaisesRegex(ContractError, 'evidence_unknown'):
+        with self.assertRaisesRegex(ContractError, '^native_request_consumed_no_replay$'):
             with self.pool.lease('tenant-a', {**self.body, 'model': 'sonnet'}):
                 self.fail('claim may not escape via another model')
 
