@@ -196,10 +196,16 @@ describe('logs search', () => {
   it('keeps legacy kind=error / error_class deep links working', () => {
     const search = validateLogsSearch({ kind: 'error', error_class: 'auth' })
     const filters = searchToFilters(search)
-    expect(filters.excludeStatus200).toBe(true)
+    expect(filters.errorsOnly).toBe(true)
+    expect(filters.excludeStatus200).toBeUndefined()
     expect(filters.errorClass).toBe('auth')
+    const api = filtersToApi(filters, [])
+    expect(usageLogFiltersQuery(api, 'codex').get('errors_only')).toBe('1')
+    expect(usageLogFiltersQuery(api, 'main').get('exclude_status_200')).toBe(
+      '1'
+    )
     expect(filtersToSearch(filters)).toEqual({
-      statusCode: '!200',
+      kind: 'error',
       error_class: 'auth',
     })
   })

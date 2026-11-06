@@ -3,6 +3,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 import { api } from '@/lib/api'
+import { controllerPath } from '@/lib/controller'
 import { apiBase } from '@/lib/session'
 import {
   eraseEcho,
@@ -173,7 +174,7 @@ export function WsTerminal({
         if (disposed) return
         const base = new URL(apiBase() || window.location.origin)
         base.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:'
-        base.pathname = socketPath
+        base.pathname = controllerPath(socketPath)
         base.search = new URLSearchParams({
           ticket,
           cols: String(term.cols),

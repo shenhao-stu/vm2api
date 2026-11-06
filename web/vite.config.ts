@@ -5,8 +5,26 @@ import { tanstackRouter } from '@tanstack/router-plugin/vite'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+let controllers = ['main']
+
 export default defineConfig({
   plugins: [
+    {
+      name: 'console-controller-manifest',
+      configResolved(config) {
+        controllers =
+          config.env.VITE_CODEX_CONTROLLER === 'true'
+            ? ['main', 'codex']
+            : ['main']
+      },
+      generateBundle() {
+        this.emitFile({
+          type: 'asset',
+          fileName: 'controllers.json',
+          source: JSON.stringify({ controllers }),
+        })
+      },
+    },
     tanstackRouter({
       target: 'react',
       autoCodeSplitting: true,

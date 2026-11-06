@@ -5,14 +5,11 @@ import {
   QueryClient,
   QueryClientProvider,
 } from '@tanstack/react-query'
-import {
-  RouterProvider,
-  createHashHistory,
-  createRouter,
-} from '@tanstack/react-router'
+import { RouterProvider, createRouter } from '@tanstack/react-router'
 import { toast } from 'sonner'
 import { useAuthStore } from '@/stores/auth-store'
 import { ApiError } from '@/lib/api'
+import { createConsoleHistory } from '@/lib/console-history'
 import { handleServerError } from '@/lib/handle-server-error'
 import { onPanelSessionExpired } from '@/lib/session'
 import { DirectionProvider } from './context/direction-provider'
@@ -52,7 +49,7 @@ const queryClient = new QueryClient({
 
 const router = createRouter({
   routeTree,
-  history: createHashHistory(),
+  history: createConsoleHistory(),
   context: { queryClient },
   defaultPreload: 'intent',
   defaultPreloadStaleTime: 0,

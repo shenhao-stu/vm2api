@@ -10,6 +10,7 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { selectedController } from '@/lib/controller'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -48,6 +49,7 @@ import {
   type VmKindFilter,
   type VmSortKey,
 } from '@/features/vm/vm-table'
+import { CodexQualityCard } from './codex-quality-card'
 
 const SORT_CHIPS = [
   ['status', '状态'],
@@ -185,7 +187,12 @@ export function VmListPage() {
         ) : undefined
       }
     >
-      <NativeRelays enabled={me.data?.role === 'admin'} />
+      {me.data?.role === 'admin' && selectedController() === 'codex' && (
+        <CodexQualityCard />
+      )}
+      <NativeRelays
+        enabled={me.data?.role === 'admin' && selectedController() === 'main'}
+      />
       <QueryGate
         loading={vmsQ.isLoading}
         error={vmsQ.error}

@@ -1,4 +1,5 @@
 import type { UsageLogFilters } from '@/types/panel-usage-logs'
+import { selectedController } from '@/lib/controller'
 
 /**
  * `/logs` 的 URL 查询串。键名沿用 hub（camelCase，`minRetry`、`statusCode=!200`），
@@ -25,13 +26,13 @@ export type LogsSearch = {
   /** 重试次数下限（= 尝试次数 - 1）。 */
   minRetry?: number
   error_class?: string
-  /** 旧深链：等价于 `statusCode=!200`。 */
+  /** 业务错误深链，包含 HTTP 200 的流式失败。 */
   kind?: 'error'
   /** 只看 debug 采样行。 */
   debug?: boolean
 }
 
-/** 筛选面板编辑的草稿形状；`kind=error` 在这里已折叠成 `excludeStatus200`。 */
+/** 筛选面板编辑的草稿形状；业务失败与 HTTP 状态码分别筛选。 */
 export type LogsFilterState = {
   userId?: string
   keyId?: string
@@ -41,6 +42,7 @@ export type LogsFilterState = {
   endTime?: number
   statusCode?: number
   excludeStatus200?: boolean
+  errorsOnly?: boolean
   model?: string
   mismatch?: boolean
   endpoint?: string
@@ -100,7 +102,7 @@ export function validateLogsSearch(
 }
 
 export function searchToFilters(search: LogsSearch): LogsFilterState {
-  const exclude = search.statusCode === '!200' || search.kind === 'error'
+  const exclude = search.statusCode === '!200'
   return {
     userId: search.userId,
     keyId: search.keyId,
@@ -111,6 +113,7 @@ export function searchToFilters(search: LogsSearch): LogsFilterState {
     statusCode:
       typeof search.statusCode === 'number' ? search.statusCode : undefined,
     excludeStatus200: exclude || undefined,
+    errorsOnly: search.kind === 'error' || undefined,
     model: search.model,
     mismatch: search.mismatch,
     endpoint: search.endpoint,
@@ -121,7 +124,7 @@ export function searchToFilters(search: LogsSearch): LogsFilterState {
   }
 }
 
-/** 草稿 → URL。`kind` 不再写回，统一由 `statusCode=!200` 表达。 */
+/** 草稿 → URL。保留业务失败与显式 HTTP 状态过滤的独立语义。 */
 export function filtersToSearch(filters: LogsFilterState): LogsSearch {
   const out: LogsSearch = {}
   if (filters.userId) out.userId = filters.userId
@@ -130,6 +133,7 @@ export function filtersToSearch(filters: LogsFilterState): LogsSearch {
   if (filters.sessionId?.trim()) out.sessionId = filters.sessionId.trim()
   if (filters.startTime != null) out.startTime = filters.startTime
   if (filters.endTime != null) out.endTime = filters.endTime
+  if (filters.errorsOnly) out.kind = 'error'
   if (filters.excludeStatus200) out.statusCode = '!200'
   else if (filters.statusCode != null) out.statusCode = filters.statusCode
   if (filters.model) out.model = filters.model
@@ -158,6 +162,7 @@ export function filtersToApi(
   if (filters.model) out.model = filters.model
   if (filters.endpoint) out.endpoint = filters.endpoint
   if (filters.protocol) out.protocol = filters.protocol
+  if (filters.errorsOnly) out.errorsOnly = true
   if (filters.statusCode != null) out.statusCode = filters.statusCode
   else if (filters.excludeStatus200) out.excludeStatus200 = true
   if (filters.mismatch) out.modelMismatch = true
@@ -175,7 +180,8 @@ export function filtersToApi(
 
 /** `UsageLogFilters` → snake_case 查询串（参数名见契约字段注释）。 */
 export function usageLogFiltersQuery(
-  filters: UsageLogFilters
+  filters: UsageLogFilters,
+  controller = selectedController()
 ): URLSearchParams {
   const qs = new URLSearchParams()
   const set = (key: string, value: string | number | undefined) => {
@@ -191,6 +197,10 @@ export function usageLogFiltersQuery(
   set('protocol', filters.protocol)
   set('status_code', filters.statusCode)
   if (filters.excludeStatus200) qs.set('exclude_status_200', '1')
+  if (filters.errorsOnly) {
+    // The original main gateway supports the legacy HTTP-status filter.
+    qs.set(controller === 'codex' ? 'errors_only' : 'exclude_status_200', '1')
+  }
   if (filters.modelMismatch) qs.set('model_mismatch', '1')
   set('min_attempt_count', filters.minAttemptCount)
   set('error_class', filters.errorClass)
@@ -212,6 +222,7 @@ export function activeFilterCount(filters: LogsFilterState): number {
   if (filters.vmId) count++
   if (filters.sessionId) count++
   if (filters.statusCode != null || filters.excludeStatus200) count++
+  if (filters.errorsOnly) count++
   if (filters.model) count++
   if (filters.mismatch) count++
   if (filters.endpoint) count++

@@ -1,5 +1,6 @@
 import type { OpenAIQuotaPolicy } from '@/types/panel-vm'
 import { Fingerprint, ShieldCheck, Waypoints } from 'lucide-react'
+import { selectedController } from '@/lib/controller'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -7,6 +8,7 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { SettingRow } from '@/components/setting-row'
 import { OpenaiQuotaSection } from './openai-quota-section'
+import { QualityProbePane } from './quality-probe-pane'
 import { ChipGroup, PaneSection } from './scheduler-controls'
 
 type Block = Record<string, unknown>
@@ -68,6 +70,7 @@ export function OpenaiPane({
 
   return (
     <div className='space-y-4'>
+      {selectedController() === 'codex' && <QualityProbePane />}
       <PaneSection
         icon={Waypoints}
         title='传输'
