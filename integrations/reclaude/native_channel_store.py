@@ -233,7 +233,7 @@ class ChannelStore:
                                     resident=entry is not None, busy=bool(entry and entry.busy),
                                     pending_ids=pending, history_controls=controls,
                                     history_pending=pending_witness, paid_input=paid_input, sibling=sibling))
-        parents = {c.key: c.identity for c in channels if not c.sibling}
+        parents = {c.key: c.identity for c in channels}
         for channel in channels:
             sibling = channel.sibling
             if sibling and (parents.get(sibling.parent) != channel.identity or

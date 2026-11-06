@@ -6,7 +6,7 @@ import uuid
 from unittest.mock import Mock
 
 import test_native_configuration_channels as fixtures
-from native_bridge_session import ContractError, history_shape
+from native_bridge_session import ContractError, history_shape, initial_request
 from native_channel_store import read_json, write_json
 
 
@@ -85,7 +85,7 @@ class PaidSiblingTests(unittest.TestCase):
             self.assertEqual(events[-1]['type'], 'message_stop')
             sent = [json.loads(line) for line in stdin.getvalue().splitlines()]
             self.assertEqual(len(sent), 1)
-            self.assertEqual(sent[0]['message']['content'], history_shape(body['messages'])[-1]['content'])
+            self.assertEqual(sent[0]['message']['content'], initial_request(body, True)[1])
             self.assertEqual(history_shape(session.history[:-1]), history_shape(body['messages']))
             claim = read_json(session.directory / 'caller-grants' / (session.caller_request_sha + '.json'))
             self.assertEqual(claim['terminal_usage'], {'input_tokens': 7, 'output_tokens': 3})
@@ -148,6 +148,75 @@ class PaidSiblingTests(unittest.TestCase):
         next((self.parent / 'dispatch').glob('*.consumed.json')).unlink()
         self.refused(self.alternate)
         self.assertEqual(len([p for p in self.parent.parent.iterdir() if p.is_dir() and not p.name.startswith('.')]), 1)
+
+    def extension(self, body, text='Continue after delivery failed'):
+        body = copy.deepcopy(body)
+        last = body['messages'][-1]
+        content = last['content']
+        if isinstance(content, str):
+            content = [{'type': 'text', 'text': content}]
+        last['content'] = content + [{'type': 'text', 'text': text}]
+        return body
+
+    def test_new_user_text_after_lost_response_does_not_replay_the_paid_turn(self):
+        body = self.extension(self.body)
+        before = evidence(self.parent)
+        with self.pool.lease('tenant-a', body) as child:
+            child_path = child.directory
+            self.assertNotEqual(child_path, self.parent)
+            history = self.bill_one_turn(child, body)
+        self.assertEqual(evidence(self.parent), before)
+        self.restart()
+        self.refused(self.body)
+        self.refused(body)
+        following = {**body, 'messages': history + [user('next turn')]}
+        with self.pool.lease('tenant-a', following) as child:
+            self.assertEqual(child.directory, child_path)
+            self.bill_one_turn(child, following)
+        self.assertEqual(len(list(child_path.glob('dispatch/*.consumed.json'))), 2)
+        self.assertEqual(evidence(self.parent), before)
+
+    def test_new_user_extension_can_follow_an_already_proven_sibling(self):
+        with self.pool.lease('tenant-a', self.alternate) as child:
+            self.completed(child, self.alternate, [tool('lost_child')], ['lost_child'])
+            child_path = child.directory
+        before = {p: evidence(p) for p in (self.parent, child_path)}
+        self.restart()
+        extended = self.extension(self.alternate)
+        with self.pool.lease('tenant-a', extended) as grandchild:
+            self.assertNotIn(grandchild.directory, before)
+            self.bill_one_turn(grandchild, extended)
+        self.restart()
+        for p, value in before.items():
+            self.assertEqual(evidence(p), value)
+        for old in (self.body, self.alternate, extended):
+            self.refused(old)
+
+    def test_user_extension_needs_new_text_and_exact_prior_paid_input(self):
+        changed = self.extension(self.body)
+        changed['messages'][0] = user('different old input')
+        bad = [self.extension(self.body, ''), self.extension(self.body, '  '), changed]
+        for body in bad:
+            with self.subTest(body=body['messages'][-1]):
+                self.refused(body)
+
+    def test_merged_tool_results_continue_and_new_system_controls_retain_their_semantics(self):
+        body = {**self.body, 'metadata': {'user_id': str(uuid.uuid4())}, 'messages': [
+            user('new anchor'), {'role': 'system', 'content': 'same policy'},
+            assistant([tool('previous')]), user([result('previous')]),
+            {'role': 'system', 'content': 'old turn hint'}]}
+        with self.pool.lease('tenant-a', body) as parent:
+            self.completed(parent, body, [tool('lost_response')], ['lost_response'])
+            before = evidence(parent.directory)
+        extended = copy.deepcopy(body)
+        extended['messages'][1]['output_config'] = {'effort': 'high'}
+        extended['messages'][-2]['content'].append({'type': 'text', 'text': 'Continue'})
+        extended['messages'][-1]['content'] = 'new turn hint'
+        with self.pool.lease('tenant-a', extended) as child:
+            self.bill_one_turn(child, extended)
+            self.assertEqual(child.history[1]['output_config'], {'effort': 'high'})
+            self.assertEqual(child.history[-2]['content'], 'new turn hint')
+        self.assertEqual(evidence(parent.directory), before)
 
 
 if __name__ == '__main__':

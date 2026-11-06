@@ -8,7 +8,7 @@ not fields accepted from an HTTP client. No files, sessions or grants are mutate
 from dataclasses import dataclass
 import hashlib
 
-from native_paid_sibling import PaidSibling, proven_sibling
+from native_paid_sibling import PaidSibling, proven_sibling, proven_user_extension, related_channels
 
 
 @dataclass(frozen=True)
@@ -159,7 +159,9 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
     dialogue = [m for m in messages if m['role'] != 'system']
     siblings = [c for c in channels if c.sibling]
     matches = [c for c in siblings if c.sibling.matches(dialogue, native.signature)]
-    if len(matches) > 1:
+    matches.sort(key=lambda c: (c.sibling.assistant_offset, c.sibling.user_blocks), reverse=True)
+    if len(matches) > 1 and (matches[0].sibling.assistant_offset, matches[0].sibling.user_blocks) == (
+            matches[1].sibling.assistant_offset, matches[1].sibling.user_blocks):
         return reject('native_channel_ambiguous')
     if matches:
         match = matches[0]
@@ -180,11 +182,13 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
                 channel.history_pending if channel.status == 'awaiting_tools' else None)
         except native.ContractError as error:
             if (str(error) == 'history_prefix_mismatch' and allow_history_import
-                    and not matches and len(same_anchor) == 1 and channel.identity == identity
-                    and not any(c.pending_ids for c in snapshot.channels if c.key != channel.key)
+                    and len(same_anchor) == 1 and channel.identity == identity
+                    and not any(c.pending_ids for c in snapshot.channels
+                                if not related_channels(snapshot.channels, c.key, channel.key))
                     and not any(c.sibling.parent == channel.key and
                                 c.sibling.paid_input == channel.paid_input for c in siblings)):
-                sibling = proven_sibling(channel, messages, request_sha, native.signature)
+                sibling = (proven_sibling(channel, messages, request_sha, native.signature)
+                           or proven_user_extension(channel, messages, request_sha, native.signature))
                 if sibling:
                     if snapshot.memory_pressure:
                         return reject('native_memory_pressure')
@@ -219,8 +223,7 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
     for other in snapshot.channels:
         if other in channels or not other.pending_ids:
             continue
-        related = selected and ((selected.sibling and selected.sibling.parent == other.key)
-                                or (other.sibling and other.sibling.parent == selected.key))
+        related = selected and related_channels(snapshot.channels, selected.key, other.key)
         if not related:
             return reject('native_pending_tools_no_branch')
     if selected is None and not allow_history_import and any(
