@@ -106,6 +106,7 @@ const REFUSAL_MATCH: Record<string, string> = {
   refusal_guard: '精确指纹',
   refusal_similar: '近似正文',
   refusal_device: '封禁 device',
+  refusal_session_isolated: '会话隔离',
 }
 
 /** The part of the stored block message that says why: `nsfw: 关键词`. */
