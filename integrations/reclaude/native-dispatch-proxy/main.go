@@ -147,6 +147,13 @@ func (g *Gate) forward(conn net.Conn, reader *bufio.Reader) {
 		return
 	}
 	defer response.Body.Close()
+	// These headers finish this one-shot model attempt. A retry inside Claude
+	// Code would only see the grant guard's 429 and misreport a quota limit.
+	if modelRequest && (response.StatusCode == 502 || response.StatusCode == 503 || response.StatusCode == 504) {
+		g.recordGatewayError(grantID, response.StatusCode)
+		reply(conn, http.StatusBadRequest, "native_gateway_error_no_replay")
+		return
+	}
 	response.Close = true
 	// RFC 9112: 304 ends at the headers, regardless of a malformed chunk marker.
 	if response.StatusCode == 304 || response.StatusCode == 204 || req.Method == "HEAD" {

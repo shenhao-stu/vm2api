@@ -595,6 +595,39 @@ class NativeHTTPTests(unittest.TestCase):
         self.identity = str(uuid.uuid4())
         self.assertEqual(self.request(self.body(model='claude-fable-5-1'))[0], 200)
 
+    def test_gateway_status_uses_this_consumed_grant_even_if_cli_reports_quota(self):
+        def rejected(session, body):
+            stream = original(session, body)
+            next(stream)
+            stream.close()
+            receipt, = (session.directory / "dispatch").glob("*.consumed.json")
+            grant = receipt.name.split(".")[0]
+            receipt.write_text(json.dumps({"id": grant}))
+            receipt.with_name(grant + ".gateway-error.json").write_text(
+                json.dumps({"id": grant, "status": 502}))
+            raise NativeRateLimit(body["model"])
+            yield
+
+        original = FixtureSession.request
+        with patch.object(FixtureSession, "request", rejected):
+            status, data = self.request()
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(data)["error"]["details"], {
+            "upstream_type": "gateway_error", "upstream_status": 502, "no_replay": True})
+        row, = self.audit(1)
+        self.assertEqual((row["attempts"], row["native_error"]), (1, "native_upstream_gateway_error"))
+
+    def test_previously_claimed_request_stops_sub_failover_without_a_second_attempt(self):
+        def duplicate(session, body):
+            raise RequestRejected("native_request_consumed_no_replay")
+            yield
+
+        with patch.object(FixtureSession, "request", duplicate):
+            status, data = self.request()
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(data)["error"]["details"], {"no_replay": True})
+        self.assertEqual(self.audit(1)[0]["attempts"], 0)
+
     def test_native_limit_without_dispatch_does_not_claim_a_consumed_request(self):
         def rejected(session, body):
             raise NativeRateLimit(body['model'])

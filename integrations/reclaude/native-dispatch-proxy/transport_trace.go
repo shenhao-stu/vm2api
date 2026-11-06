@@ -86,3 +86,20 @@ func (g *Gate) recordTransport(grantID string, body []byte, started time.Time, s
 		g.TraceFailures.Add(1)
 	}
 }
+
+// This sidecar describes only the first response headers of a consumed grant.
+// Its absence cannot authorize another POST or establish a billing outcome.
+func (g *Gate) recordGatewayError(id string, status int) {
+	file, err := os.OpenFile(filepath.Join(g.Directory, id+".gateway-error.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		g.TraceFailures.Add(1)
+		return
+	}
+	defer file.Close()
+	if err := json.NewEncoder(file).Encode(struct {
+		ID     string `json:"id"`
+		Status int    `json:"status"`
+	}{id, status}); err != nil || file.Sync() != nil {
+		g.TraceFailures.Add(1)
+	}
+}

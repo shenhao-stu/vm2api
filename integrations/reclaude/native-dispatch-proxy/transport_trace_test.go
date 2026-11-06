@@ -195,3 +195,28 @@ func TestTransportDiagnosticDoesNotFollowSymlink(t *testing.T) {
 		t.Fatal("diagnostic followed a symlink or changed dispatch")
 	}
 }
+
+func TestConsumedGateway502IsNotRetriedAsQuota(t *testing.T) {
+	g, conn := traceRequest(t, func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 502, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("private upstream message"))}, nil
+	}, false)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 400 || !bytes.Contains(body, []byte("native_gateway_error_no_replay")) || bytes.Contains(body, []byte("private upstream")) {
+		t.Fatalf("CLI response was %d", resp.StatusCode)
+	}
+	data, err := os.ReadFile(filepath.Join(g.Directory, grantID+".gateway-error.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec struct {
+		ID     string
+		Status int
+	}
+	if json.Unmarshal(data, &rec) != nil || rec.ID != grantID || rec.Status != 502 || g.Attempts.Load() != 1 {
+		t.Fatal("missing original HTTP status or duplicate dispatch")
+	}
+}

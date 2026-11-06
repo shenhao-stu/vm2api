@@ -6,6 +6,13 @@ export function safeNativeRelayError(status, error, model) {
 
   const details = consumed ? { no_replay: true } : {}
   const quota = error?.details
+  if (consumed && quota?.upstream_type === 'gateway_error' && [502, 503, 504].includes(quota.upstream_status)) {
+    return {
+      type: 'api_error', code,
+      message: `ReClaude gateway returned HTTP ${quota.upstream_status}. This request was dispatched once. To continue with new input and the same local history, use claude --resume <session-id> --fork-session.`,
+      details: { ...details, upstream_type: 'gateway_error', upstream_status: quota.upstream_status },
+    }
+  }
   if (
     quota?.upstream_type === 'rate_limit_error' &&
     quota.model === model &&

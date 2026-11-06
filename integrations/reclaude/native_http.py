@@ -141,6 +141,23 @@ def safe_thinking_summary(thinking):
     return result
 
 
+def consumed_gateway_status(receipts):
+    """Only the grant consumed by this HTTP request can explain its failure."""
+    if len(receipts) != 1:
+        return None
+    receipt = next(iter(receipts))
+    grant = receipt.name.removesuffix(".consumed.json")
+    try:
+        witness = json.loads(receipt.with_name(grant + ".gateway-error.json").read_bytes())
+        if (not isinstance(witness, dict) or witness.get("id") != grant
+                or json.loads(receipt.read_bytes()).get("id") != grant):
+            return None
+        status = witness.get("status")
+        return status if type(status) is int and status in (502, 503, 504) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 class NativeHandler(RelayHandler):
     def send_json(self, status, body):
         if not getattr(self, "request_body_read", False):
@@ -381,6 +398,7 @@ class NativeHandler(RelayHandler):
                             "history_prefix_mismatch",
                             "session_configuration_changed",
                             "request_already_consumed",
+                            "native_request_consumed_no_replay",
                         }
                         else (
                             504
@@ -398,9 +416,17 @@ class NativeHandler(RelayHandler):
                 set((session.directory / "dispatch").glob("*.consumed.json")) - before
                 if session else set()
             )
+            if code == "native_request_consumed_no_replay":
+                error_details = {"no_replay": True}
+                record["no_replay"] = True
             if not committed and consumed:
                 # A 5xx can make an upstream pool redispatch this paid turn.
                 # An inadmissible turn must not be retried by a pool or SDK.
+                upstream_status = consumed_gateway_status(consumed)
+                if upstream_status is not None:
+                    code = "native_upstream_gateway_error"
+                    error_details = {"upstream_type": "gateway_error", "upstream_status": upstream_status}
+                    record["upstream_error"] = error_details
                 record["native_error"] = code
                 status, code = 400, "native_request_consumed_no_replay"
                 record['no_replay'] = True

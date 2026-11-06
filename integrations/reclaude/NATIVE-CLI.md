@@ -440,3 +440,17 @@ creates a new UUID and therefore remains a cold-session measurement.
 Audit records distinguish `operation=prepare` from `messages`, report native
 CLI reuse and pool lease time, and timestamp the first non-empty text delta.
 Handshake bytes and readiness responses are never reported as model first tokens.
+
+
+When the ReClaude gateway returns HTTP 502, 503 or 504 on a dispatched model
+request, the per-CLI proxy records its first status against the consumed grant.
+The client receives a non-retryable error. A second SDK attempt cannot supply
+a quota window or replace the first status. The public error retains
+`native_request_consumed_no_replay`. An exact retry of an indexed claim
+without a terminal receipt also returns a non-retryable 400.
+This receipt records dispatch, not upstream billing.
+
+For a fresh instruction, retain the local conversation and let the shared pool
+choose an available account. If the original session remains held, Claude Code
+supports `claude --resume <session-id> --fork-session` to carry the local
+history into a new session. Inspect any pending tool's actual outcome first.

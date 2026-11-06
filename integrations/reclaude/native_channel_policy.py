@@ -131,14 +131,18 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
         return reject("native_session_evidence_unknown")
     if snapshot.logical_key != scope:
         return reject("session_scope_mismatch")
-    if snapshot.stopped:
-        return reject("native_pool_stopped")
-    if not snapshot.evidence_complete or snapshot.unknown_dispatch:
-        return reject("native_session_evidence_unknown")
     channels = snapshot.channels
     if (any(c.identity.logical_key != scope for c in channels)
             or len({c.key for c in channels}) != len(channels)):
         return reject("session_scope_mismatch")
+    # A positive claim is decisive even when its terminal is unknown. A 5xx
+    # here would invite another account to execute the very same request.
+    if not snapshot.evidence_complete or snapshot.unknown_dispatch:
+        if request_sha in snapshot.consumed:
+            return reject("native_request_consumed_no_replay")
+        return reject("native_session_evidence_unknown")
+    if snapshot.stopped:
+        return reject("native_pool_stopped")
     if snapshot.inflight or any(c.busy or c.status in {"in_flight", "closing"}
                                for c in channels):
         return reject("session_busy")

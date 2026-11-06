@@ -29,6 +29,27 @@ class ChannelTests(unittest.TestCase):
                            capacity=capacity, allow_history_import=True,
                            configuration_channels=True)
 
+    def test_known_claim_without_a_terminal_cannot_become_a_retryable_pool_failure(self):
+        with self.pool.lease('tenant', self.body) as session:
+            session.caller_request_sha = signature(history_shape(self.body['messages']))
+            session.dispatch_process = Mock(poll=lambda: None)
+            (session.directory / 'dispatch').mkdir(exist_ok=True)
+            session.authorize_dispatch()
+            grant = read_json(session.directory / 'dispatch/grant.json')
+            write_json(session.directory / 'dispatch' / (grant['id'] + '.consumed.json'), grant)
+            session.dispatch_process = None
+            session.failed = True
+            session.checkpoint('failed')
+        self.pool.close()
+        self.pool = self.new_pool()
+        with self.assertRaisesRegex(ContractError, '^native_request_consumed_no_replay$'):
+            with self.pool.lease('tenant', self.body):
+                self.fail('duplicate leased')
+        different = {**self.body, 'messages': [{'role':'user', 'content':'another request'}]}
+        with self.assertRaisesRegex(ContractError, '^native_session_evidence_unknown$'):
+            with self.pool.lease('tenant', different):
+                self.fail('uncertain scope leased')
+
     def tearDown(self):
         self.pool.close()
         self.temp.cleanup()

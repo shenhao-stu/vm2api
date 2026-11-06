@@ -220,6 +220,22 @@ test('native relay errors expose only validated quota fields, never upstream deb
   assert.ok(!JSON.stringify(response.body).includes('origin.private.invalid'))
 })
 
+test('consumed gateway failure keeps its first status and safe recovery guidance', async (t) => {
+  const code = 'native_request_consumed_no_replay'
+  const details = { upstream_type: 'gateway_error', upstream_status: 502, no_replay: true }
+  const { invoke } = await fixture(t, true, { status: 400, type: 'application/json',
+    body: JSON.stringify({ error: { code, message: 'private-invalid', details: { ...details, url: 'private-invalid' } } }) })
+  const res = await invoke(body)
+  assert.equal(res.status, 400)
+  assert.equal(res.body.error.code, code)
+  assert.match(res.body.error.message, /HTTP 502/)
+  assert.deepEqual(res.body.error.details, details)
+  assert.ok(!JSON.stringify(res.body).includes('private-invalid'))
+  for (const upstream_status of [429, '502', 200]) {
+    assert.deepEqual(safeNativeRelayError(400, { code, details: { ...details, upstream_status } }, body.model).details, { no_replay: true })
+  }
+})
+
 test('unrelated passthrough errors retain the existing bounded normalization', async (t) => {
   const { invoke } = await fixture(t, true, {
     status: 400,
