@@ -24,7 +24,7 @@ import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
-import { createRefusalSessionIsolation } from './refusal-session-isolation.mjs'
+import { createRefusalSessionIsolation, protectsClaudePro } from './refusal-session-isolation.mjs'
 import { jevScopeWaits, readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
 import {
@@ -1716,6 +1716,7 @@ export function createHandleProtocol(deps) {
           const keptVm = extra.freshSlot ? '' : attemptBound?.vmId || ''
           const attemptSessionId = resolveOutboundSessionId(callerSession, {
             ...sessionContext,
+            scopeToSlot: protectsClaudePro(selected),
             accountId: selected.accountId,
             boundSessionId: keptSession,
             boundAccountId: keptAccount,

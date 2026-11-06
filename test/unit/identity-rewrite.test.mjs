@@ -440,3 +440,18 @@ test('resolveSeatIdentity: a short one-shot probe takes no seat', () => {
   const probe = { max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }
   assert.deepEqual(resolveSeatIdentity({ inbound: probe, clientIp: '10.0.0.7' }), { key: null, source: 'probe' })
 })
+
+test('a Pro tool continuation retains its bound session on the same slot and gets a distinct ID on a new slot', () => {
+  const caller = 'tool-session'
+  const original = { scopeToSlot: true, vmId: 'line01', accountId: 'acc01', epoch: 'pending' }
+  const old = resolveOutboundSessionId(caller, original)
+  const binding = { boundVmId: original.vmId, boundAccountId: original.accountId, boundSessionId: old }
+  assert.equal(resolveOutboundSessionId(caller, { ...original, ...binding }), old)
+  for (const destination of [{ vmId: 'line07', accountId: 'acc07' }, { vmId: 'line01', accountId: 'replacement' }]) {
+    const target = { ...original, ...destination }
+    const moved = resolveOutboundSessionId(caller, { ...target, ...binding })
+    assert.notEqual(moved, old)
+    assert.equal(moved, resolveOutboundSessionId(caller, target))
+  }
+  assert.equal(resolveOutboundSessionId(caller, { ...original, mode: 'passthrough', officialClient: true }), caller)
+})
