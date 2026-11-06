@@ -25,12 +25,43 @@ export function servePoolSeatStream({
   visibleVmIds = null,
   throttleMs = SEAT_STREAM_THROTTLE_MS,
   pingMs = SEAT_STREAM_PING_MS,
+  drainTimeoutMs = 30_000,
 }) {
   writeSSEHeaders(res)
   let scheduler = null
   let seatTimer = null
   let proxyTimer = null
   let closed = false
+  let blocked = false
+  let drainTimer = null
+  let ping = null
+  const dirty = new Set()
+  const signatures = new Map()
+  const write = (frame) => {
+    if (closed || blocked) return
+    try {
+      if (res.write(frame) === false) {
+        blocked = true
+        drainTimer = setTimeout(() => {
+          close()
+          res.destroy()
+        }, drainTimeoutMs)
+        drainTimer.unref?.()
+      }
+    } catch {
+      close()
+    }
+  }
+  const emit = (event, frame) => {
+    if (blocked) {
+      dirty.add(event)
+      return
+    }
+    const signature = JSON.stringify(frame)
+    if (signatures.get(event) === signature) return
+    signatures.set(event, signature)
+    write(`event: ${event}\ndata: ${JSON.stringify({ ...frame, ts: Date.now() })}\n\n`)
+  }
 
   const scope = (byVm) => {
     const visible = visibleVmIds ? visibleVmIds() : null
@@ -45,15 +76,13 @@ export function servePoolSeatStream({
       seats: scope(snap.seats || {}),
       global_queue_depth: Number(snap.global_queue_depth) || 0,
       queue_max: Number(snap.queue_max) || 0,
-      ts: Date.now(),
     }
-    res.write(`event: seats\ndata: ${JSON.stringify(frame)}\n\n`)
+    emit('seats', frame)
   }
   const sendProxies = () => {
     proxyTimer = null
     if (closed || !proxyPool) return
-    const frame = { proxies: scope(proxyPool.liveStatusByVm?.() || {}), ts: Date.now() }
-    res.write(`event: proxy\ndata: ${JSON.stringify(frame)}\n\n`)
+    emit('proxy', { proxies: scope(proxyPool.liveStatusByVm?.() || {}) })
   }
   // Both run inside acquire/release and probe paths: only arm a timer, never throw.
   const onSeatChange = () => {
@@ -73,26 +102,39 @@ export function servePoolSeatStream({
     return true
   }
 
-  bind()
-  proxyPool?.on?.('change', onProxyChange)
-  sendSeats()
-  sendProxies()
-  const ping = setInterval(() => {
-    if (closed) return
-    if (bind()) onSeatChange()
-    res.write(': ping\n\n')
-  }, pingMs)
-
-  const close = () => {
+  function close() {
     if (closed) return
     closed = true
     clearTimeout(seatTimer)
     clearTimeout(proxyTimer)
     clearInterval(ping)
+    clearTimeout(drainTimer)
+    dirty.clear()
+    res.off('drain', onDrain)
     scheduler?.off?.('change', onSeatChange)
     proxyPool?.off?.('change', onProxyChange)
   }
+  function onDrain() {
+    if (closed) return
+    blocked = false
+    clearTimeout(drainTimer)
+    const pending = new Set(dirty)
+    dirty.clear()
+    if (pending.has('seats')) sendSeats()
+    if (pending.has('proxy')) sendProxies()
+  }
+  res.on('drain', onDrain)
   req.on('close', close)
   res.on('close', close)
   res.on('error', close)
+  bind()
+  proxyPool?.on?.('change', onProxyChange)
+  sendSeats()
+  sendProxies()
+  if (closed) return
+  ping = setInterval(() => {
+    if (closed) return
+    if (bind()) onSeatChange()
+    write(': ping\n\n')
+  }, pingMs)
 }

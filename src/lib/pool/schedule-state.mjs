@@ -165,7 +165,11 @@ export function deriveScheduleFields(vm, { preserveStatus = true } = {}) {
 }
 
 /** 调度关 / 调度开 by the operator. Turning on also clears 不可调度 (decision 6). */
-export function applyScheduleOff(vm, off, { reason = null, now = Date.now(), preserveStatus = true } = {}) {
+export function applyScheduleOff(
+  vm,
+  off,
+  { reason = null, now = Date.now(), preserveStatus = true, preserveUnschedulable = false } = {},
+) {
   if (off) {
     vm.schedule_off = true
     if (reason && reason !== 'disabled') vm.schedule_off_reason = String(reason).slice(0, 64)
@@ -173,7 +177,7 @@ export function applyScheduleOff(vm, off, { reason = null, now = Date.now(), pre
   } else {
     delete vm.schedule_off
     delete vm.schedule_off_reason
-    delete vm.unschedulable
+    if (!preserveUnschedulable) delete vm.unschedulable
   }
   stamp(vm, now)
   return deriveScheduleFields(vm, { preserveStatus })

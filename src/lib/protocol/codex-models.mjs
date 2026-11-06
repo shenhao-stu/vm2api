@@ -434,21 +434,43 @@ export async function fetchChatgptModelCatalog(opts = {}) {
   if (accountId) headers['chatgpt-account-id'] = accountId
 
   const url = `${CODEX_MODELS_URL}?client_version=${encodeURIComponent(catalogVersion)}`
-  const fetchFn = opts.fetchImpl || makeProxyFetch(proxyUrl, opts.timeoutMs)
-  try {
-    const res = await fetchFn(url, { method: 'GET', headers })
-    const status = Number(res?.status) || 0
-    if (status === 401 || status === 403) {
-      return { ok: false, error: 'upstream_auth', status, ids: [], models: [] }
+  // Catalog discovery is read-only and must finish even when the peer sends
+  // headers then stalls its JSON body. Keep the same signal through both steps.
+  const controller = new AbortController()
+  const timeoutMs = Math.min(30000, Math.max(1, Number(opts.timeoutMs) || 15000))
+  let rejectTimeout
+  const deadline = new Promise((_, reject) => {
+    rejectTimeout = () => {
+      const error = new Error('catalog deadline exceeded')
+      error.name = 'AbortError'
+      reject(error)
     }
-    if (status >= 400) return { ok: false, error: 'upstream_error', status, ids: [], models: [] }
-    const body = await readFetchBody(res)
-    const models = parseCodexModelCatalog(body)
-    const ids = models.map((row) => row.id)
-    if (!ids.length) return { ok: false, error: 'empty_catalog', status, ids: [], models: [] }
-    return { ok: true, status: status || 200, ids, models, source: 'codex' }
+    controller.signal.addEventListener('abort', rejectTimeout, { once: true })
+  })
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const fetchFn = opts.fetchImpl || fetch
+    const agent = !opts.fetchImpl && proxyUrl ? createProxyAgent(proxyUrl) : undefined
+    const readCatalog = async () => {
+      const res = await fetchFn(url, { method: 'GET', headers, signal: controller.signal, ...(agent ? { agent } : {}) })
+      const status = Number(res?.status) || 0
+      if (status >= 400) res.body?.destroy?.()
+      if (status === 401 || status === 403) {
+        return { ok: false, error: 'upstream_auth', status, ids: [], models: [] }
+      }
+      if (status >= 400) return { ok: false, error: 'upstream_error', status, ids: [], models: [] }
+      const body = await readFetchBody(res)
+      const models = parseCodexModelCatalog(body)
+      const ids = models.map((row) => row.id)
+      if (!ids.length) return { ok: false, error: 'empty_catalog', status, ids: [], models: [] }
+      return { ok: true, status: status || 200, ids, models, source: 'codex' }
+    }
+    return await Promise.race([readCatalog(), deadline])
   } catch (e) {
     const aborted = e?.name === 'AbortError' || /aborted/i.test(String(e?.message || e))
     return { ok: false, error: aborted ? 'timeout' : 'fetch_failed', ids: [], models: [] }
+  } finally {
+    clearTimeout(timer)
+    controller.signal.removeEventListener('abort', rejectTimeout)
   }
 }

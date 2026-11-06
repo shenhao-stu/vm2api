@@ -1,3 +1,4 @@
+import { QualityProbeRunner } from './lib/admin/quality-probe.mjs'
 /**
  * vm2api — Node control plane.
  * Inference data plane: one long-lived Go slot worker per VM
@@ -533,6 +534,20 @@ const vmTestSchedule = new VmTestScheduleRunner({
       accountQuota,
     }),
 })
+const qualityProbe = new QualityProbeRunner({
+  projectRoot: cfg.paths.project,
+  isOwner: () => !_shuttingDown,
+  getQuotaPolicy: () => routingConfig.codex?.quota,
+  runTest: (vmId, params) =>
+    runVmTestChat({
+      projectRoot: cfg.paths.project,
+      vmId,
+      ...params,
+      baseUrl: `http://127.0.0.1:${cfg.port}`,
+      apiKey: cfg.api_key,
+      accountQuota,
+    }),
+})
 credentialRefreshMonitor = createCredentialRefreshMonitor({
   config: normalizeCredentialRefreshConfig(routingConfig.credential_refresh),
   listTargets: () =>
@@ -615,6 +630,17 @@ const backupService = new BackupService({
   projectRoot: cfg.paths.project,
   configDir: path.dirname(routingConfigPath),
 })
+backupService.onBeforeRestore(async () => {
+  await qualityProbe.stop()
+  requestLog.stopCleanupScheduler()
+  await requestLog.waitForCleanup()
+  return () => {
+    if (!_shuttingDown) {
+      requestLog.startCleanupScheduler()
+      qualityProbe.start()
+    }
+  }
+})
 backupService.onRestored((db) => {
   // A restore swaps the DatabaseSync instance and routing files. Rebuild every
   // holder before reporting success; otherwise requests keep stale snapshots
@@ -656,6 +682,7 @@ backupService.onRestored((db) => {
   initPoolRuntime()
   reloadActiveVm(cfg)
   vmTestSchedule.reload()
+  qualityProbe.reload()
 })
 backupService.startScheduler()
 
@@ -1060,6 +1087,7 @@ const handlePanel = createPanelHandler({
   panelUsers,
   requestLog,
   vmTestSchedule,
+  qualityProbe,
   backupService,
   stats,
   persistRoutingPatch,
@@ -1333,7 +1361,14 @@ async function shutdown(signal) {
   installJevUsageRecorder(null)
   console.log(`[shutdown] ${signal} — closing`)
   try {
+    requestLog.stopCleanupScheduler()
+    await requestLog.waitForCleanup()
+  } catch {
+    console.warn('[request-log] cleanup failed during shutdown')
+  }
+  try {
     vmTestSchedule.stop()
+    await qualityProbe.stop()
   } catch {}
   try {
     backupService.stopScheduler()
@@ -1396,6 +1431,7 @@ server.timeout = 0
 server.listen(cfg.port, cfg.host, () => {
   try {
     vmTestSchedule.start()
+    qualityProbe.start()
   } catch (e) {
     console.warn('[vm-test-schedule] start failed', e?.message || e)
   }

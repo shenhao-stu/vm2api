@@ -12,7 +12,7 @@ import {
   syncGptIdsIntoPolicy,
 } from '../../src/lib/protocol/gpt-model-policy.mjs'
 import { clearModelsCache } from '../../src/lib/protocol/models.mjs'
-import { readCatalogSync, syncClaudeCatalog } from '../../src/lib/admin/catalog-monitor.mjs'
+import { readCatalogSync, syncClaudeCatalog, syncGptCatalog } from '../../src/lib/admin/catalog-monitor.mjs'
 
 function seedClaudeVm(root, id) {
   fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
@@ -82,7 +82,7 @@ test('Claude sync without a reachable slot records the failure and changes nothi
   assert.deepEqual(getModelPolicy().models, before)
 })
 
-test('a GPT id new to the policy starts disabled; known ids keep their switch', (t) => {
+test('a new GPT id stays disabled until review; known ids keep their switch', (t) => {
   withDb(t)
   const result = syncGptIdsIntoPolicy([{ id: 'gpt-5.6' }, { id: 'gpt-7-preview' }])
   assert.deepEqual(result.added, ['gpt-7-preview'])
@@ -90,4 +90,46 @@ test('a GPT id new to the policy starts disabled; known ids keep their switch', 
   assert.equal(models['gpt-5.6'].enabled, true)
   assert.equal(models['gpt-7-preview'].enabled, false)
   assert.ok(!result.ids.includes('gpt-7-preview'))
+})
+
+test('GPT sync persists safe discovery totals and client version for the model page', async (t) => {
+  const root = withDb(t)
+  const id = 'vm-codex-sync'
+  fs.mkdirSync(path.join(root, 'vms', id), { recursive: true })
+  fs.writeFileSync(
+    path.join(root, 'vms', `${id}.json`),
+    JSON.stringify({
+      id,
+      status: 'running',
+      family: 'codex',
+      platform: 'openai',
+      schedulable: true,
+      proxy: { url: 'socks5h://127.0.0.1:1080' },
+    }),
+  )
+  fs.writeFileSync(
+    path.join(root, 'vms', id, 'codex-credentials.json'),
+    JSON.stringify({
+      accounts: [{ access_token: 'private-access-ticket', refresh_token: 'private-refresh-ticket' }],
+    }),
+  )
+  const result = await syncGptCatalog({
+    projectRoot: root,
+    rotate: false,
+    catalogClientVersion: '0.164.0',
+    fetchImpl: async (url) => {
+      assert.ok(String(url).includes('/codex/models?'))
+      return { status: 200, json: async () => ({ models: [{ slug: 'gpt-status-discovery' }] }) }
+    },
+  })
+  assert.equal(result.ok, true)
+  const status = readCatalogSync().codex
+  assert.equal(status.status, 'ok')
+  assert.equal(status.synced, 1)
+  assert.equal(status.catalog_version, '0.164.0')
+  assert.equal(status.interval_sec, 21600)
+  assert.equal(status.attempted_accounts, 1)
+  assert.equal(status.successful_accounts, 1)
+  assert.deepEqual(status.added, ['gpt-status-discovery'])
+  assert.ok(!JSON.stringify(status).includes('private-'))
 })

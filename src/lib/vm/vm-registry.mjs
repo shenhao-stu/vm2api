@@ -546,8 +546,15 @@ function writeSchedule(projectRoot, id, mutate) {
 }
 
 /** 调度关 / 调度开 by the operator. Turning on also clears 不可调度. */
-export function setScheduleOff(projectRoot, id, off, { reason = null, preserveStatus = true } = {}) {
-  return writeSchedule(projectRoot, id, (vm) => applyScheduleOff(vm, off, { reason, preserveStatus }))
+export function setScheduleOff(
+  projectRoot,
+  id,
+  off,
+  { reason = null, preserveStatus = true, preserveUnschedulable = false } = {},
+) {
+  return writeSchedule(projectRoot, id, (vm) =>
+    applyScheduleOff(vm, off, { reason, preserveStatus, preserveUnschedulable }),
+  )
 }
 
 /** A deterministic failure: the slot stays out until an operator action clears it. */
