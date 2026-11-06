@@ -1,3 +1,4 @@
+import { hostedModelDenial } from './hosted-model-policy.mjs'
 /**
  * User protocol: POST /v1/messages/count_tokens and GET /v1/usage.
  * Peek only — never bind/unbind sticky or bill tokens_in.
@@ -276,6 +277,8 @@ export async function handleUserCountTokens(req, res, deps) {
   }
   const parsed = parseCountTokensBody(inbound)
   if (!parsed.ok) return json(res, parsed.error.status, parsed.error.body)
+  const denial = hostedModelDenial(req.apiKeyKind === 'managed' ? req.apiKeyRecord : null, parsed.body.model)
+  if (denial) return json(res, 403, { error: { type: 'permission_error', ...denial } })
   const routing = typeof deps.getRoutingConfig === 'function' ? deps.getRoutingConfig() : null
   if (
     claudeCodeOnlyFromRouting(routing) &&

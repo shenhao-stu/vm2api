@@ -1,3 +1,4 @@
+import { mergeCodexImageQuota } from '../protocol/codex-usage.mjs'
 /**
  * Multi-VM registry — load all vms/*.json (except active.json)
  * Writes go through atomicWriteJson so the DB credential mirror
@@ -205,6 +206,21 @@ export function persistAccountTier(projectRoot, vmId, tier, { source = null } = 
  * Merge live `x-codex-*` headers (and optional park-until) into vm.codex.
  * Cluster 5H/7D meters read this via summarizeCodexSlot -> usage.quota.
  */
+export function persistCodexImageUsage(projectRoot, vmId, { headers, status, now = Date.now() } = {}) {
+  const file = path.join(projectRoot, 'vms', `${vmId}.json`)
+  const vm = getVm(projectRoot, vmId)
+  if (!vm || !isCodexVm(vm)) return null
+  const imageUsage = mergeCodexImageQuota(vm.codex?.image_usage, headers, status, now)
+  if (!imageUsage) return vm
+  const updated = {
+    ...vm,
+    codex: { ...(vm.codex || {}), image_usage: imageUsage },
+    updated_at: new Date(now).toISOString(),
+  }
+  atomicWriteJson(file, updated, { mode: 0o600 })
+  return updated
+}
+
 export function persistCodexUsage(
   projectRoot,
   vmId,

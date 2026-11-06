@@ -234,3 +234,56 @@ export function mergeUsage(current, next) {
   }
   return out
 }
+
+function tokenMass(usage) {
+  if (!usage || typeof usage !== 'object') return 0
+  if (isOpenaiWireUsage(usage)) {
+    const extracted = extractOpenaiUsage(usage)
+    if (!extracted) return 0
+    // Inclusive OpenAI input already contains cache; reasoning is inside output.
+    return (extracted.input_tokens || 0) + (extracted.output_tokens || 0)
+  }
+  const disjoint = disjointOpenaiUsage(usage) || usage
+  return (
+    (asU64(disjoint.input_tokens) || 0) +
+    (asU64(disjoint.output_tokens) || asU64(disjoint.completion_tokens) || 0) +
+    (asU64(disjoint.cache_read_input_tokens) || asU64(disjoint.cache_read_tokens) || 0) +
+    (asU64(disjoint.cache_creation_input_tokens) || asU64(disjoint.cache_creation_tokens) || 0)
+  )
+}
+
+function detailScore(usage) {
+  if (!usage || typeof usage !== 'object') return 0
+  let score = 0
+  if (usage.input_tokens_details) score++
+  if (usage.prompt_tokens_details) score++
+  if (usage.output_tokens_details) score++
+  if (usage.completion_tokens_details) score++
+  if (usage.cache_creation && typeof usage.cache_creation === 'object') score++
+  if (usage.cached_tokens != null || usage.cache_read_input_tokens != null || usage.cache_read_tokens != null) score++
+  if (
+    usage.cache_write_tokens != null ||
+    usage.cache_creation_tokens != null ||
+    usage.cache_creation_input_tokens != null
+  ) {
+    score++
+  }
+  if (usage.reasoning_tokens != null) score++
+  return score
+}
+
+/**
+ * Pick the richer of two complete snapshots. Prefer mergeUsage for incremental
+ * SSE/trailer combination. Token mass does not add cache on top of inclusive
+ * OpenAI input and does not add reasoning on top of output. Equal mass prefers
+ * the snapshot with more cache/reasoning detail.
+ */
+export function preferUsage(left, right) {
+  if (!right) return left || null
+  if (!left) return right
+  const leftMass = tokenMass(left)
+  const rightMass = tokenMass(right)
+  if (rightMass > leftMass) return right
+  if (leftMass > rightMass) return left
+  return detailScore(right) > detailScore(left) ? right : left
+}

@@ -790,6 +790,7 @@ test('decodeResponseInterrupt and accepted frame helpers mirror CPR envelope fie
 })
 
 test('real handleProtocol: an ended WebSocket response logs once after the handler settles', async () => {
+  const keyCalls = []
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-responses-ws-finish-'))
   writeGptVm(root, 'vm-gpt-a')
   const finishCalls = []
@@ -800,7 +801,16 @@ test('real handleProtocol: an ended WebSocket response logs once after the handl
         finishCalls.push(bag)
       },
     },
-    apiKeyStore: { recordUsage() {}, release() {} },
+    apiKeyStore: {
+      acquire() {
+        keyCalls.push('acquire')
+        return { ok: true }
+      },
+      recordUsage() {},
+      release() {
+        keyCalls.push('release')
+      },
+    },
     codexOps: {
       streamCodexKernel: async ({ onEvent }) => {
         await onEvent(
@@ -822,6 +832,7 @@ test('real handleProtocol: an ended WebSocket response logs once after the handl
     assert.equal(finishCalls.length, 1)
     assert.equal(finishCalls[0].final_state, 'verified')
     assert.equal(finishCalls[0].error_code, null)
+    assert.deepEqual(keyCalls, ['acquire', 'release'])
   } finally {
     ws?.terminate()
     await live.close()
@@ -842,6 +853,7 @@ test('real handleProtocol: one in-flight interrupt yields a single cancelled fin
       },
     },
     apiKeyStore: {
+      acquire: () => ({ ok: true }),
       recordUsage(_key, usage) {
         usageRecords.push(usage)
       },
@@ -898,6 +910,7 @@ test('real handleProtocol: interrupt after hop finish bills once without duplica
       },
     },
     apiKeyStore: {
+      acquire: () => ({ ok: true }),
       recordUsage(_key, usageRow) {
         usageRecords.push(usageRow)
       },
@@ -937,7 +950,9 @@ test('real handleProtocol: interrupt after hop finish bills once without duplica
     assert.equal(finishCalls[0].error_code, null)
     assert.equal(finishCalls[0].input_tokens, 12)
     assert.equal(finishCalls[0].output_tokens, 4)
-    assert.equal(usageRecords.length, 0)
+    assert.equal(usageRecords.length, 1)
+    assert.equal(usageRecords[0].input_tokens, 12)
+    assert.equal(usageRecords[0].output_tokens, 4)
     opened.ws.close()
   } finally {
     await live.close()

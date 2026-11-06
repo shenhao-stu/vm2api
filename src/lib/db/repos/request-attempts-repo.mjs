@@ -55,6 +55,7 @@ export class RequestAttemptsRepo {
     this._list = db.prepare(`
       SELECT * FROM request_attempts WHERE request_id = ? ORDER BY attempt_no
     `)
+    this._get = db.prepare('SELECT * FROM request_attempts WHERE request_id = ? AND attempt_no = ?')
     this._removeOld = db.prepare(`
       DELETE FROM request_attempts WHERE started_at < ?
     `)
@@ -82,7 +83,7 @@ export class RequestAttemptsRepo {
       null,
       null,
     )
-    return this.list(requestId).find((item) => item.attempt_no === attemptNo) || null
+    return rowToAttempt(this._get.get(requestId, attemptNo))
   }
 
   complete(requestId, attemptNo, result = {}) {
@@ -100,7 +101,7 @@ export class RequestAttemptsRepo {
       requestId,
       attemptNo,
     )
-    return this.list(requestId).find((item) => item.attempt_no === attemptNo) || null
+    return rowToAttempt(this._get.get(requestId, attemptNo))
   }
 
   list(requestId) {

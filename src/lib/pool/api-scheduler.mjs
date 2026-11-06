@@ -1,7 +1,18 @@
+import { CLAUDE_OFFICIAL_URL, OPENAI_OFFICIAL_URL, normalizeProtocol, trimBaseUrl } from './api-presets.mjs'
+import {
+  isCatalogModelId,
+  isCodexCatalogModel,
+  listGptPublicModels,
+  listOfficialModels,
+  resolveCatalogModel,
+} from '../protocol/models.mjs'
+import { isGptSeriesId } from '../protocol/gpt-ids.mjs'
+
 /**
  * CLIProxy-shaped picker: grouped round-robin by endpoint then key.
  * Same alias across endpoints shares a model id; prefix/alias pins an endpoint.
  */
+import { isFableModel } from '../protocol/hosted-model-policy.mjs'
 
 function norm(s) {
   return String(s || '').trim()
@@ -9,6 +20,20 @@ function norm(s) {
 
 function lower(s) {
   return norm(s).toLowerCase()
+}
+
+function isOfficialClaude(ep) {
+  if (!ep) return false
+  if (ep.kind === 'claude') return true
+  const u = trimBaseUrl(ep.base_url)
+  return u === CLAUDE_OFFICIAL_URL
+}
+
+function isOfficialOpenAI(ep) {
+  if (!ep) return false
+  if (ep.kind === 'openai') return true
+  const u = trimBaseUrl(ep.base_url)
+  return u === OPENAI_OFFICIAL_URL
 }
 
 export function stripPrefix(model, prefix) {
@@ -24,23 +49,22 @@ export function modelIdsForEndpoint(ep, { forcePrefix = false } = {}) {
   const prefix = norm(ep.prefix)
   const ids = []
   const seen = new Set()
+  const keyOf = ep.kind === 'local_gateway' ? norm : lower
+  const add = (alias) => {
+    if (!alias || isFableModel(alias)) return
+    const names = [...(!forcePrefix || !prefix ? [alias] : []), ...(prefix ? [prefix + '/' + alias] : [])]
+    for (const name of names)
+      if (!seen.has(keyOf(name))) {
+        seen.add(keyOf(name))
+        ids.push(name)
+      }
+  }
   for (const m of ep.models || []) {
-    const alias = norm(m.alias)
-    if (!alias) continue
-    const key = ep.kind === 'local_gateway' ? alias : lower(alias)
-    if (!forcePrefix || !prefix) {
-      if (!seen.has(key)) {
-        seen.add(key)
-        ids.push(alias)
-      }
-    }
-    if (prefix) {
-      const pref = `${prefix}/${alias}`
-      const prefKey = ep.kind === 'local_gateway' ? pref : lower(pref)
-      if (!seen.has(prefKey)) {
-        seen.add(prefKey)
-        ids.push(pref)
-      }
+    if (!isFableModel(m.name || m.upstream_name)) add(norm(m.alias))
+  }
+  if (isOfficialClaude(ep) || isOfficialOpenAI(ep)) {
+    for (const m of isOfficialClaude(ep) ? listOfficialModels() : listGptPublicModels()) {
+      if (!(ep.models || []).some((row) => lower(row.alias) === lower(m.id))) add(m.id)
     }
   }
   return ids
@@ -54,12 +78,22 @@ export function resolveUpstreamPool(ep, requestedModel) {
   for (const m of ep.models || []) {
     if (lower(m.alias) !== want) continue
     const name = norm(m.name) || norm(m.upstream_name) || norm(m.alias)
+    if (isFableModel(name) || isFableModel(m.alias)) continue
     const key = lower(name)
     if (seen.has(key)) continue
     seen.add(key)
     out.push(name)
   }
-  return out
+  if (out.length || (ep.models || []).some((m) => lower(m.alias) === want)) return out
+  const raw = stripPrefix(requestedModel, ep.prefix)
+  if (isFableModel(raw)) return []
+  if (isOfficialClaude(ep)) {
+    const resolved = resolveCatalogModel(raw)
+    if (resolved?.ok && resolved.model && !isFableModel(resolved.model)) return [resolved.model]
+    if (isCatalogModelId(raw) && !isCodexCatalogModel(raw)) return [raw]
+  }
+  if (isOfficialOpenAI(ep) && listGptPublicModels().some((m) => lower(m.id) === want)) return [raw]
+  return []
 }
 
 export function endpointMatchesModel(ep, requestedModel) {
@@ -70,6 +104,10 @@ export function endpointMatchesModel(ep, requestedModel) {
     return resolveUpstreamPool(ep, raw).length > 0
   }
   return resolveUpstreamPool(ep, raw).length > 0
+}
+
+function matchesGroup(ep, group) {
+  return group === 'all' || normalizeProtocol(ep.protocol, ep.kind) === group
 }
 
 function keyReady(key, now, disableCooling) {
@@ -92,11 +130,11 @@ export class ApiScheduler {
     this.endpoints = Array.isArray(endpoints) ? endpoints : []
   }
 
-  catalog() {
+  catalog({ groupType = 'all' } = {}) {
     const data = []
     const seen = new Set()
     for (const ep of this.endpoints) {
-      if (ep.disabled || ep.kind === 'local_gateway') continue
+      if (ep.disabled || ep.kind === 'local_gateway' || !matchesGroup(ep, groupType)) continue
       for (const id of modelIdsForEndpoint(ep, { forcePrefix: this.forcePrefix })) {
         const k = lower(id)
         if (seen.has(k)) continue
@@ -113,8 +151,11 @@ export class ApiScheduler {
     return { object: 'list', data, source: 'api-endpoints' }
   }
 
-  pick(requestedModel, now = Date.now(), { localGatewayId = null } = {}) {
+  pick(requestedModel, now = Date.now(), { localGatewayId = null, groupType = 'all' } = {}) {
+    if (isFableModel(requestedModel))
+      return { ok: false, code: 'model_disabled', message: 'Fable models are disabled on this hosted platform' }
     const parents = this.endpoints
+      .filter((ep) => matchesGroup(ep, groupType))
       .filter((ep) =>
         localGatewayId ? ep.id === localGatewayId && ep.kind === 'local_gateway' : ep.kind !== 'local_gateway',
       )

@@ -1,3 +1,6 @@
+import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
+import { isCodexSlotParked } from '../pool/codex-slot-pool.mjs'
+import { openAIAccountHold, openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
 /**
  * Per-VM connectivity probe.
  *
@@ -21,7 +24,7 @@ import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { loadVmIdentity } from '../identity/vm-identity.mjs'
 import { snapshotOauth } from '../vm/execution-context.mjs'
-import { atomicWriteJson } from '../vm/vm-file.mjs'
+import { atomicWriteJson, isValidVmId } from '../vm/vm-file.mjs'
 import { applyCrsUnofficialPersona } from '../identity/crs-persona.mjs'
 import { claudeCodeInboundBody, claudeCodeInboundHeaders } from '../protocol/claude-code-inbound.mjs'
 import { credentialModeFromOauth, credentialModeOfVm } from '../oauth/credential-mode.mjs'
@@ -132,67 +135,169 @@ function listCodexVmsForCatalog(projectRoot, vm) {
   return out
 }
 
-function persistRefreshedCodexAccount(projectRoot, vmId, patch, previous, proxy) {
-  return commitCodexCredentialRefresh(projectRoot, vmId, { expected: previous, patch, proxy })
+function catalogDeadlineError() {
+  const error = new Error('模型探测超时')
+  error.code = 'timeout'
+  return error
+}
+
+function persistRefreshedCodexAccount(projectRoot, vmId, patch, previous, proxy, deadline) {
+  if (!Number.isFinite(deadline)) {
+    return commitCodexCredentialRefresh(projectRoot, vmId, { expected: previous, patch, proxy })
+  }
+  let cancelled = false
+  const assertTimeLeft = () => {
+    if (cancelled || Date.now() >= deadline) throw catalogDeadlineError()
+  }
+  assertTimeLeft()
+  // The existing CAS callback runs synchronously under the VM lock immediately
+  // before writing. If the lock arrives late, the expired scan cannot write.
+  const pending = commitCodexCredentialRefresh(projectRoot, vmId, {
+    expected: previous,
+    patch,
+    proxy,
+    onCurrent: assertTimeLeft,
+  })
+  let timer
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => {
+        cancelled = true
+        reject(catalogDeadlineError())
+      },
+      Math.max(1, deadline - Date.now()),
+    )
+  })
+  return Promise.race([pending, expired]).finally(() => clearTimeout(timer))
+}
+
+const codexCatalogFlights = new Map()
+const codexCatalogCursors = new Map()
+const CATALOG_DOWN = new Set(['stopped', 'dead', 'error', 'disabled'])
+
+function healthyCatalogVm(vm) {
+  if (!vm?.id || !isCodexVm(vm)) return false
+  if (CATALOG_DOWN.has(String(vm?.status || '').toLowerCase())) return false
+  if (vm?.schedule_off || vm?.schedule_manual || vm?.schedulable === false) return false
+  if (vm?.unschedulable || vm?.schedule_hold) return false
+  return (
+    !openAIAccountHold(vm?.id) &&
+    openAIRuntimeSignals(vm?.id).inFlight === 0 &&
+    evaluateActiveHours(activeHoursOf(vm), Date.now(), vm.timezone).active &&
+    !isCodexSlotParked(vm)
+  )
 }
 
 /**
- * Pull ChatGPT GPT/Codex ids into model_policy.
- * rotate=true (panel sync) may refresh OAuth via refresh_token.
- * rotate=false (test-models probe) never rotates.
+ * Discover a bounded union through healthy, proxy-bound slots. One project has
+ * one active scan; overlapping identical requests share it, other scans wait
+ * for the caller to retry. Background callers always pass rotate:false.
  */
-export async function syncCodexCatalog({
+export function syncCodexCatalog(opts = {}) {
+  const { projectRoot, vmId = '', rotate = true, catalogClientVersion = 'auto' } = opts
+  if (!projectRoot) {
+    return Promise.resolve({ ok: false, error: 'invalid_request', message: 'projectRoot required', ids: [], synced: 0 })
+  }
+  if (vmId) {
+    const vm = isValidVmId(vmId) ? getVm(projectRoot, vmId) : null
+    if (!vm || !isCodexVm(vm)) {
+      return Promise.resolve({
+        ok: false,
+        error: 'no_codex_slot',
+        message: '指定的 GPT OAuth 槽不存在',
+        ids: [],
+        synced: 0,
+      })
+    }
+  }
+  const key = path.resolve(projectRoot)
+  const signature = JSON.stringify([vmId, rotate, catalogClientVersion])
+  const active = codexCatalogFlights.get(key)
+  if (active) {
+    if (active.signature === signature) return active.promise
+    return Promise.resolve({
+      ok: false,
+      error: 'catalog_sync_busy',
+      message: '模型探测正在进行，请稍后重试',
+      ids: [],
+      synced: 0,
+    })
+  }
+  const promise = Promise.resolve()
+    .then(() => runCodexCatalogSync(opts))
+    .finally(() => {
+      if (codexCatalogFlights.get(key)?.promise === promise) codexCatalogFlights.delete(key)
+    })
+  codexCatalogFlights.set(key, { signature, promise })
+  return promise
+}
+
+async function runCodexCatalogSync({
   projectRoot,
-  vmId,
+  vmId = '',
   fetchImpl,
   rotate = true,
   catalogClientVersion = 'auto',
+  maxAttempts = 6,
+  maxSuccesses = 3,
+  budgetMs = 60000,
+  requestTimeoutMs = 10000,
 } = {}) {
-  if (!projectRoot) {
-    return { ok: false, error: 'invalid_request', message: 'projectRoot required', ids: [], synced: 0 }
-  }
+  const startedAt = Date.now()
+  const deadline = startedAt + Math.min(60000, Math.max(1, Number(budgetMs) || 60000))
+  const attemptLimit = Math.min(6, Math.max(1, Number(maxAttempts) || 6))
+  const successLimit = Math.min(3, Math.max(1, Number(maxSuccesses) || 3))
   const vm = vmId ? getVm(projectRoot, vmId) : null
-  const targets = listCodexVmsForCatalog(projectRoot, vm && isCodexVm(vm) ? vm : null)
-  if (!targets.length) {
-    return { ok: false, error: 'no_codex_slot', message: '没有可用的 GPT OAuth 槽', ids: [], synced: 0 }
+  if (vmId && (!vm || !isCodexVm(vm))) {
+    return { ok: false, error: 'no_codex_slot', message: '指定的 GPT OAuth 槽不存在', ids: [], synced: 0 }
   }
+  const candidates = listCodexVmsForCatalog(projectRoot, vm)
+    .filter((target) => vmId || healthyCatalogVm(target))
+    .sort((a, b) => a.id.localeCompare(b.id))
+  if (!candidates.length) {
+    return { ok: false, error: 'no_codex_slot', message: '没有健康的 GPT OAuth 槽可供探测', ids: [], synced: 0 }
+  }
+  const cursorKey = path.resolve(projectRoot)
+  const start = vmId ? 0 : (codexCatalogCursors.get(cursorKey) || 0) % candidates.length
+  const targets = [...candidates.slice(start), ...candidates.slice(0, start)]
   const catalogVersion = await resolveCodexCatalogVersion({
     configuredVersion: catalogClientVersion,
     cachePath: path.join(
       String(process.env.KIN_DATA_DIR || '').trim() || path.join(projectRoot, 'data'),
       'codex-catalog-client.json',
     ),
-    // Unit callers can provide the already resolved version while keeping
-    // their fetch mock reserved for ChatGPT catalog traffic.
+    timeoutMs: Math.min(5000, Math.max(1, deadline - Date.now())),
   })
   if (!catalogVersion.ok) {
-    return {
-      ok: false,
-      error: catalogVersion.error,
-      message: '无法获取 Codex catalog client 版本',
-      ids: [],
-      synced: 0,
-    }
+    return { ok: false, error: catalogVersion.error, message: '无法获取 Codex catalog client 版本', ids: [], synced: 0 }
   }
   const merged = new Map()
   let usedVm = null
   let lastError = null
-  for (const target of targets) {
+  let attemptedAccounts = 0
+  let successfulAccounts = 0
+  let failedAccounts = 0
+  for (const [index, candidate] of targets.entries()) {
+    const target = getVm(projectRoot, candidate.id)
+    if (!target || (!vmId && !healthyCatalogVm(target))) continue
+    if (successfulAccounts >= successLimit || attemptedAccounts >= attemptLimit || Date.now() >= deadline) break
+    if (!vmId) codexCatalogCursors.set(cursorKey, (start + index + 1) % candidates.length)
     const direct = isLocalEgressProxy(target.proxy)
     const proxyUrl = hostProxyUrlForVm(target)
     if (!proxyUrl && !fetchImpl && !direct) {
-      lastError = {
-        ok: false,
-        error: 'proxy_required',
-        message: 'GPT 槽未绑定 SOCKS5',
-        vm_id: target.id,
-      }
+      lastError = { ok: false, error: 'proxy_required', message: 'GPT 槽未绑定 SOCKS5', vm_id: target.id }
       continue
     }
     const accounts = readCodexAccounts(projectRoot, target.id)
-    const rows = accounts.length ? accounts : [target.codex || {}]
+    const available = accounts.length ? accounts : [target.codex || {}]
+    const current = available.find((row) => row?.access_token) || available[0]
+    // Background sampling uses one current access ticket per VM and never
+    // rotates refresh tokens. Explicit legacy refresh keeps its existing CAS.
+    const rows = rotate ? available : current ? [current] : []
     for (const account of rows) {
+      if (successfulAccounts >= successLimit || attemptedAccounts >= attemptLimit || Date.now() >= deadline) break
       let access = account.access_token || target.codex?.access_token
+      if (!access) continue
       const accountId = account.chatgpt_account_id || target.codex?.chatgpt_account_id
       const refreshToken = account.refresh_token || target.codex?.refresh_token
       const fetchOnce = () =>
@@ -203,10 +308,35 @@ export async function syncCodexCatalog({
           fetchImpl,
           direct,
           catalogVersion: catalogVersion.version,
+          timeoutMs: Math.min(
+            15000,
+            Math.max(1, Number(requestTimeoutMs) || 10000),
+            Math.max(1, deadline - Date.now()),
+          ),
         })
+      attemptedAccounts++
       let live = await fetchOnce()
+      if (Date.now() >= deadline) {
+        failedAccounts++
+        lastError = { error: 'timeout', message: '模型探测超时', vm_id: target.id }
+        break
+      }
       if (live.error === 'upstream_auth' && rotate && refreshToken) {
-        const tok = await refreshCodexAccessToken({ refreshToken, proxyUrl, fetchImpl })
+        const tok = await refreshCodexAccessToken({
+          refreshToken,
+          proxyUrl,
+          fetchImpl,
+          timeoutMs: Math.min(
+            15000,
+            Math.max(1, Number(requestTimeoutMs) || 10000),
+            Math.max(1, deadline - Date.now()),
+          ),
+        })
+        if (Date.now() >= deadline) {
+          failedAccounts++
+          lastError = { error: 'timeout', message: '模型探测超时', vm_id: target.id }
+          break
+        }
         if (!tok.ok) {
           lastError = {
             ok: false,
@@ -214,28 +344,50 @@ export async function syncCodexCatalog({
             message: 'GPT OAuth 刷新失败，请重新登录',
             vm_id: target.id,
           }
+          failedAccounts++
           continue
         }
-        const saved = await persistRefreshedCodexAccount(
-          projectRoot,
-          target.id,
-          {
-            access_token: tok.access_token,
-            refresh_token: tok.refresh_token,
-            id_token: tok.id_token || account.id_token,
-            expires_at: tok.expires_at || account.expires_at,
-          },
-          account,
-          target.proxy,
-        )
+        let saved
+        try {
+          saved = await persistRefreshedCodexAccount(
+            projectRoot,
+            target.id,
+            {
+              access_token: tok.access_token,
+              refresh_token: tok.refresh_token,
+              id_token: tok.id_token || account.id_token,
+              expires_at: tok.expires_at || account.expires_at,
+            },
+            account,
+            target.proxy,
+            deadline,
+          )
+        } catch (error) {
+          if (error?.code !== 'timeout') throw error
+          failedAccounts++
+          lastError = { error: 'timeout', message: '模型探测超时', vm_id: target.id }
+          break
+        }
+        if (Date.now() >= deadline) {
+          failedAccounts++
+          lastError = { error: 'timeout', message: '模型探测超时', vm_id: target.id }
+          break
+        }
         if (!saved.account?.access_token) {
           lastError = { ok: false, error: 'credential_changed', message: '账号凭据已变化，请重试', vm_id: target.id }
+          failedAccounts++
           continue
         }
         access = saved.account.access_token
         live = await fetchOnce()
       }
+      if (Date.now() >= deadline) {
+        failedAccounts++
+        lastError = { error: 'timeout', message: '模型探测超时', vm_id: target.id }
+        break
+      }
       if (!live.ok || !live.ids?.length) {
+        failedAccounts++
         const auth = live.error === 'upstream_auth'
         lastError = {
           ok: false,
@@ -245,14 +397,31 @@ export async function syncCodexCatalog({
         }
         continue
       }
+      successfulAccounts++
       usedVm = target.id
       const rowsLive = live.models?.length ? live.models : live.ids.map((id) => ({ id }))
       for (const row of rowsLive) {
         const id = String(row?.id || row || '').trim()
         if (!id) continue
+        const prior = merged.get(id.toLowerCase())
+        // A visible sample is enough to discover a row. A later account's
+        // hidden version must not turn that same newly discovered model off.
+        if (
+          prior &&
+          !['hide', 'none'].includes(prior.catalog?.visibility) &&
+          ['hide', 'none'].includes(row.catalog?.visibility)
+        )
+          continue
         merged.set(id.toLowerCase(), typeof row === 'object' ? row : { id })
       }
     }
+  }
+  const metrics = {
+    catalog_version: catalogVersion.version,
+    attempted_accounts: attemptedAccounts,
+    successful_accounts: successfulAccounts,
+    failed_accounts: failedAccounts,
+    partial: failedAccounts > 0 || successfulAccounts < candidates.length,
   }
   if (!merged.size) {
     return {
@@ -260,7 +429,7 @@ export async function syncCodexCatalog({
       error: lastError?.error || 'empty_catalog',
       message: lastError?.message || '同步 GPT 目录失败',
       vm_id: lastError?.vm_id || targets[0].id,
-      catalog_version: catalogVersion.version,
+      ...metrics,
       ids: [],
       synced: 0,
     }
@@ -270,7 +439,7 @@ export async function syncCodexCatalog({
   return {
     ok: true,
     vm_id: usedVm,
-    catalog_version: catalogVersion.version,
+    ...metrics,
     ids: models.map((row) => row.id),
     added,
     synced: models.length,
@@ -664,12 +833,64 @@ function extractResponsesText(body) {
   return parts.join('')
 }
 
+// Safety-buffering telemetry: the two x-codex-safety-buffering-* headers are
+// configuration only (they are always present, even on normal samples) and the
+// actual tri-state comes exclusively from strict booleans on the JSON body or
+// SSE events. Never infer the flag from a header value.
+const SAFETY_HEADER_ENABLED = 'x-codex-safety-buffering-enabled'
+const SAFETY_HEADER_FASTER_MODEL = 'x-codex-safety-buffering-faster-model'
+const SAFETY_VALUE_MAX_LEN = 200
+
+function boundedSafetyValue(value) {
+  if (value == null) return null
+  if (typeof value === 'object') return null
+  const s = String(value).trim()
+  if (!s) return null
+  return s.slice(0, SAFETY_VALUE_MAX_LEN)
+}
+
+/**
+ * Copy the two whitelisted safety headers (lower-cased key match) from a plain
+ * header bag (loopback HTTP headers or codex.response.metadata.headers).
+ * Nothing else from the bag is ever copied.
+ */
+function readSafetyHeaderPair(source, into) {
+  if (!source || typeof source !== 'object') return
+  for (const [rawKey, rawVal] of Object.entries(source)) {
+    const key = String(rawKey ?? '')
+      .trim()
+      .toLowerCase()
+    if (key !== SAFETY_HEADER_ENABLED && key !== SAFETY_HEADER_FASTER_MODEL) continue
+    const val = boundedSafetyValue(rawVal)
+    if (val == null) continue
+    if (key === SAFETY_HEADER_ENABLED) into.enabled = val
+    else into.faster = val
+  }
+}
+
+/**
+ * Aggregate safety-buffering tri-state. Strict booleans only (the strings
+ * 'true'/'false' never count); true dominates any conflicting false.
+ */
+function observeSafetyBuffering(current, value) {
+  if (value === true) return true
+  if (value === false) return current === true ? true : false
+  return current
+}
+
+function safetyBufferingFlag(result) {
+  return typeof result?.safety_buffering === 'boolean' ? result.safety_buffering : null
+}
+
 async function consumeResponsesResponse(res) {
   const status = res.status
   const headers = {}
   res.headers.forEach((v, k) => {
     headers[k.toLowerCase()] = v
   })
+  const safetyConfig = { enabled: null, faster: null }
+  readSafetyHeaderPair(headers, safetyConfig)
+  let safetyBuffering = null
   if (status < 200 || status >= 300) {
     let body = null
     try {
@@ -681,12 +902,26 @@ async function consumeResponsesResponse(res) {
         body = { error: { message: 'upstream error' } }
       }
     }
-    return { ok: false, status, headers, body, text: '', usage: null, stop_reason: null, model: null }
+    safetyBuffering = observeSafetyBuffering(safetyBuffering, body?.safety_buffering)
+    return {
+      ok: false,
+      status,
+      headers,
+      body,
+      text: '',
+      usage: null,
+      stop_reason: null,
+      model: null,
+      safety_buffering: safetyBuffering,
+      safety_buffering_enabled: safetyConfig.enabled,
+      safety_buffering_faster_model: safetyConfig.faster,
+    }
   }
 
   const ctype = String(headers['content-type'] || '')
   if (!ctype.includes('text/event-stream') && !ctype.includes('text/plain')) {
     const body = await res.json().catch(() => null)
+    safetyBuffering = observeSafetyBuffering(safetyBuffering, body?.safety_buffering)
     return {
       ok: true,
       status,
@@ -697,6 +932,9 @@ async function consumeResponsesResponse(res) {
       stop_reason: body?.status || body?.stop_reason || null,
       model: body?.model || null,
       vm_id: body?.kin?.vm_id || null,
+      safety_buffering: safetyBuffering,
+      safety_buffering_enabled: safetyConfig.enabled,
+      safety_buffering_faster_model: safetyConfig.faster,
     }
   }
 
@@ -712,13 +950,23 @@ async function consumeResponsesResponse(res) {
   const onEvent = (ev) => {
     if (!ev || typeof ev !== 'object') return
     const type = String(ev.type || '')
+    safetyBuffering = observeSafetyBuffering(safetyBuffering, ev.safety_buffering)
+    if (type === 'codex.response.metadata') {
+      readSafetyHeaderPair(ev.headers, safetyConfig)
+      return
+    }
     if (type === 'response.output_text.delta') {
       text += String(ev.delta || ev.text || '')
       return
     }
+    if ((type === 'response.created' || type === 'response.completed') && ev.response) {
+      if (ev.response.safety_buffering !== undefined) {
+        safetyBuffering = observeSafetyBuffering(safetyBuffering, ev.response.safety_buffering)
+      }
+      if (ev.response.model) model = ev.response.model
+    }
     if (type === 'response.completed' && ev.response) {
       if (ev.response.id) responseId = ev.response.id
-      if (ev.response.model) model = ev.response.model
       if (ev.response.usage) usage = ev.response.usage
       const completed = extractResponsesText(ev.response)
       if (completed && !text) text = completed
@@ -730,13 +978,31 @@ async function consumeResponsesResponse(res) {
     }
     if (ev.model) model = ev.model
   }
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buf += dec.decode(value, { stream: true })
-    buf = parseSseBuffer(buf, onEvent)
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += dec.decode(value, { stream: true })
+      buf = parseSseBuffer(buf, onEvent)
+    }
+    if (buf) parseSseBuffer(buf + '\n', onEvent)
+  } catch (e) {
+    // A failed stream can still contain an explicit pause signal. Carry only
+    // its observations to the failure path, without treating partial text as an answer.
+    e.vmTestObserved = {
+      model,
+      safety_buffering: safetyBuffering,
+      safety_buffering_enabled: safetyConfig.enabled,
+      safety_buffering_faster_model: safetyConfig.faster,
+    }
+    throw e
   }
-  if (buf) parseSseBuffer(buf + '\n', onEvent)
+
+  const safetyFields = {
+    safety_buffering: safetyBuffering,
+    safety_buffering_enabled: safetyConfig.enabled,
+    safety_buffering_faster_model: safetyConfig.faster,
+  }
 
   if (lastError) {
     return {
@@ -748,6 +1014,7 @@ async function consumeResponsesResponse(res) {
       usage,
       stop_reason: stopReason,
       model,
+      ...safetyFields,
     }
   }
   return {
@@ -766,6 +1033,7 @@ async function consumeResponsesResponse(res) {
     usage,
     stop_reason: stopReason,
     model,
+    ...safetyFields,
   }
 }
 
@@ -822,6 +1090,7 @@ async function postV1Loopback({ path, baseUrl, apiKey, inbound, headers, vmId, t
     return endpoint === '/v1/responses' ? await consumeResponsesResponse(res) : await consumeMessagesResponse(res)
   } catch (e) {
     const aborted = ac.signal.aborted
+    const observed = e?.vmTestObserved || {}
     return {
       ok: false,
       status: 0,
@@ -836,7 +1105,10 @@ async function postV1Loopback({ path, baseUrl, apiKey, inbound, headers, vmId, t
       text: '',
       usage: null,
       stop_reason: null,
-      model: null,
+      model: observed.model ?? null,
+      safety_buffering: observed.safety_buffering ?? null,
+      safety_buffering_enabled: observed.safety_buffering_enabled ?? null,
+      safety_buffering_faster_model: observed.safety_buffering_faster_model ?? null,
     }
   } finally {
     clearTimeout(timer)
@@ -1104,7 +1376,7 @@ export async function runVmTestChat(opts = {}) {
       timeoutMs,
       extraHeaders: opts.extraHeaders || {},
     })
-    if (codex && !result?.ok && looksLikeCodexUnauthorized(result)) {
+    if (codex && opts.allowCredentialRefresh !== false && !result?.ok && looksLikeCodexUnauthorized(result)) {
       const first = readCodexAccounts(projectRoot, vmId)[0] || {}
       const refreshToken = String(first.refresh_token || '').trim()
       if (refreshToken) {
@@ -1223,6 +1495,7 @@ export async function runVmTestChat(opts = {}) {
     stop_reason: result?.stop_reason || result?.body?.stop_reason || null,
     usage,
     text: text ? text.slice(0, 4000) : null,
+    text_truncated: text.length > 4000,
     body: result?.ok ? result.body : null,
     error: result?.ok ? null : errObj,
     duration_ms: duration,
@@ -1249,6 +1522,9 @@ export async function runVmTestChat(opts = {}) {
       thinking: inbound?.thinking?.type || null,
       hit_vm: result?.vm_id || null,
       upstream_model: result?.model || result?.body?.model || null,
+      safety_buffering: safetyBufferingFlag(result),
+      safety_buffering_enabled: boundedSafetyValue(result?.safety_buffering_enabled),
+      safety_buffering_faster_model: boundedSafetyValue(result?.safety_buffering_faster_model),
       inference_engine: inferenceEngine,
       dataplane,
       official_cc_inference: codex ? null : cliHop ? 'cli-hop' : 'http',

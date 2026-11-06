@@ -1,4 +1,5 @@
-import { markCodexUnschedulable as markUnschedulable } from '../vm/codex-schedule.mjs'
+import { markCodexUnschedulable as markUnschedulable, setCodexScheduleOff } from '../vm/codex-schedule.mjs'
+import { QUALITY_PROBE_PAUSE_REASON } from './quality-probe.mjs'
 import { handleProxyExitGuard } from './proxy-exit-guard-manager.mjs'
 import { getProxyExitGuardPolicy, getProxyExitGuardState } from '../vm/proxy-exit-guard.mjs'
 import { handleProxySubscriptions } from './proxy-subscription-routes.mjs'
@@ -80,6 +81,7 @@ import { getModelPolicy, saveModelPolicy, resetModelPolicy, listPolicyModels } f
 import {
   getGptModelPolicy,
   listGptPolicyModels,
+  listImageToolModels,
   saveGptModelPolicy,
   resetGptModelPolicy,
 } from '../protocol/gpt-model-policy.mjs'
@@ -1612,10 +1614,11 @@ export function createPanelHandler(ctx) {
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
-          const scope = normalizeKeyScope(scopeInput, { gatewayOnly: body?.category === 'hybrid' })
+          const isApi = body?.category === 'api'
+          const scope = normalizeKeyScope(scopeInput, { isApi, gatewayOnly: body?.category === 'hybrid' })
           const pools = vmPoolsFor(apiKeyStore.db)
           if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-          else assertVmScope(keyScopeVms(req), scope)
+          else if (!isApi) assertVmScope(keyScopeVms(req), scope)
           const defaultConc = Number(
             ctx.routingConfig?.concurrency?.default_key_concurrency ??
               ctx.routingConfig?.concurrency?.default_max_per_account ??
@@ -1691,12 +1694,14 @@ export function createPanelHandler(ctx) {
               error: { code: 'key_scope_forbidden', message: '只有管理员可以修改 GPT 网关密钥范围' },
             })
           }
+          const isApi = (body?.category ?? currentRec?.category) === 'api'
           const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
           const scope = normalizeKeyScope(scopeInput, {
             partial: true,
+            isApi,
             current: currentRec,
             gatewayOnly: (body?.category ?? currentRec?.category) === 'hybrid',
           })
@@ -1706,7 +1711,7 @@ export function createPanelHandler(ctx) {
             }
             const pools = vmPoolsFor(apiKeyStore.db)
             if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-            else assertVmScope(keyScopeVms(req), scope)
+            else if (!isApi) assertVmScope(keyScopeVms(req), scope)
             input.group_type = scope.group_type
             input.allowed_vms = scope.allowed_vms
             input.vm_pool_id = scope.vm_pool_id
@@ -1782,7 +1787,7 @@ export function createPanelHandler(ctx) {
           const result = await fetchUpstreamModels({
             cfg,
             kind: body?.kind,
-            protocol: body?.protocol,
+            protocol: body?.protocol || saved?.protocol,
             base_url: body?.base_url || saved?.base_url,
             api_key: body?.api_key || saved?.api_key,
             proxy_url: proxyUrl,
@@ -1839,6 +1844,7 @@ export function createPanelHandler(ctx) {
               proxy_id: String(body?.proxy_id || '').trim(),
             })
           }
+          if (Array.isArray(body?.fetched_models)) apiEndpointStore.mergeFetchedModels(id, body.fetched_models)
           apiScheduler.reload(apiEndpointStore.listRaw())
           const saved = apiEndpointStore.getRaw(id) || rec
           return json(res, 200, { ok: true, item: publicEndpointView(saved) })
@@ -1917,7 +1923,7 @@ export function createPanelHandler(ctx) {
         const item = publicEndpointView(ep)?.api_key_entries?.find((k) => k.id === kid)
         return json(res, 200, { ok: true, item })
       }
-      if (req.method === 'POST' && p === '/api/panel/anthropic/messages') {
+      if (req.method === 'POST' && /^\/api\/panel\/(?:api|anthropic)\/messages$/.test(p)) {
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
         try {
           const result = await runAnthropicConsole({
@@ -3244,6 +3250,31 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok({ restored: restored.length }))
       }
 
+      if (p === '/api/panel/quality-probe' || p === '/api/panel/quality-probe/run') {
+        if (panelIdentity(req).role !== 'admin')
+          return json(res, 403, { ok: false, error: { message: '仅管理员可操作' } })
+        try {
+          if (p === '/api/panel/quality-probe' && req.method === 'GET')
+            return json(res, 200, panel.ok(ctx.qualityProbe.snapshot()))
+          if (p === '/api/panel/quality-probe' && req.method === 'PUT') {
+            const body = await readBody(req, 96 * 1024)
+            return json(res, 200, panel.ok(ctx.qualityProbe.saveConfig(body)))
+          }
+          if (p === '/api/panel/quality-probe/run' && req.method === 'POST') {
+            void ctx.qualityProbe
+              .runNow({ manual: true })
+              .catch(() => console.warn('[quality-probe] manual round failed'))
+            return json(res, 202, panel.ok(ctx.qualityProbe.snapshot()))
+          }
+          return json(res, 405, { ok: false, error: { message: 'method not allowed' } })
+        } catch (error) {
+          return json(res, error.status || 400, {
+            ok: false,
+            error: { code: error.code || 'invalid_quality_probe_request', message: error.message },
+          })
+        }
+      }
+
       // POST /api/panel/vms/:id/schedulable — sub2api-style schedule toggle
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/schedulable$/.test(p)) {
         const id = p.split('/')[4]
@@ -3261,6 +3292,12 @@ export function createPanelHandler(ctx) {
           return json(res, 400, { ok: false, error: { message: 'schedulable required' } })
         }
         const currentVm = getVm(cfg.paths.project, id)
+        if (body.expected_reason != null && body.expected_reason !== currentVm?.schedule_disabled_reason) {
+          return json(res, 409, {
+            ok: false,
+            error: { code: 'schedule_state_changed', message: '账号暂停原因已变化，请刷新后再操作' },
+          })
+        }
         const credentialFailure =
           /oauth_revoked|oauth_invalid_grant|invalid_grant|refresh_token_missing|token has been revoked/i.test(
             `${currentVm?.claude?.refresh_error || ''} ${currentVm?.schedule_disabled_reason || ''}`,
@@ -3272,10 +3309,19 @@ export function createPanelHandler(ctx) {
           })
         }
         const reason = body.schedulable ? null : body.reason || 'disabled'
-        const summary = setVmSchedulable(cfg.paths.project, id, body.schedulable, reason, {
-          preserveStatus: true,
-          source: 'manual',
-        })
+        const qualityPaused = currentVm?.schedule_disabled_reason === QUALITY_PROBE_PAUSE_REASON
+        const summary =
+          !isCodexVm(currentVm) || !currentVm.schedule_off
+            ? setVmSchedulable(cfg.paths.project, id, body.schedulable, reason, {
+                preserveStatus: true,
+                source: 'manual',
+              })
+            : setCodexScheduleOff(cfg.paths.project, id, !body.schedulable, {
+                reason,
+                preserveStatus: true,
+                preserveUnschedulable: qualityPaused,
+              })
+        if (body.schedulable && isCodexVm(currentVm)) ctx.qualityProbe?.resetAccount(id)
         return json(
           res,
           200,
@@ -5098,7 +5144,17 @@ export function createPanelHandler(ctx) {
         if (platform === 'openai' || platform === 'gpt' || platform === 'codex') {
           const pol = getGptModelPolicy()
           const models = listGptPolicyModels()
-          return json(res, 200, panel.ok({ policy: pol, models, effective: models, platform: 'openai' }))
+          return json(
+            res,
+            200,
+            panel.ok({
+              policy: pol,
+              models,
+              effective: models,
+              image_tools: listImageToolModels(),
+              platform: 'openai',
+            }),
+          )
         }
         const pol = getModelPolicy()
         return json(
@@ -5118,7 +5174,17 @@ export function createPanelHandler(ctx) {
         if (platform === 'openai' || platform === 'gpt' || platform === 'codex') {
           const saved = saveGptModelPolicy(body.policy || body)
           const models = listGptPolicyModels()
-          return json(res, 200, panel.ok({ policy: saved, models, effective: models, platform: 'openai' }))
+          return json(
+            res,
+            200,
+            panel.ok({
+              policy: saved,
+              models,
+              effective: models,
+              image_tools: listImageToolModels(),
+              platform: 'openai',
+            }),
+          )
         }
         const saved = saveModelPolicy(body.policy || body)
         seedModelCatalog()
@@ -5140,7 +5206,17 @@ export function createPanelHandler(ctx) {
         if (platform === 'openai' || platform === 'gpt' || platform === 'codex') {
           const saved = resetGptModelPolicy()
           const models = listGptPolicyModels()
-          return json(res, 200, panel.ok({ policy: saved, models, effective: models, platform: 'openai' }))
+          return json(
+            res,
+            200,
+            panel.ok({
+              policy: saved,
+              models,
+              effective: models,
+              image_tools: listImageToolModels(),
+              platform: 'openai',
+            }),
+          )
         }
         const saved = resetModelPolicy()
         seedModelCatalog()
@@ -5218,7 +5294,7 @@ export function createPanelHandler(ctx) {
         const result = await syncGptCatalog({
           projectRoot: cfg.paths.project,
           vmId: body?.vm_id || body?.vmId || url.searchParams.get('vm_id') || '',
-          rotate: true,
+          rotate: body?.rotate === true,
           catalogClientVersion:
             body?.catalog_client_version ||
             body?.catalogClientVersion ||
@@ -5248,6 +5324,7 @@ export function createPanelHandler(ctx) {
           200,
           panel.ok({
             policy: getGptModelPolicy(),
+            image_tools: listImageToolModels(),
             models: listGptPolicyModels(),
             effective: listGptPolicyModels(),
             platform: 'openai',

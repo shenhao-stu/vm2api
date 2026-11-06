@@ -20,7 +20,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import type { KeyGroupType, KeyLimitsDraft } from './key-payload'
+import {
+  keyLimitsDraft,
+  keyServiceOf,
+  selectKeyService,
+  type KeyGroupType,
+  type KeyLimitsDraft,
+  type KeyService,
+} from './key-payload'
 
 const CONC = [0, 1, 2, 4, 8, 16, 20, 32, 64]
 const QUOTA_CREATE = [0, 1000, 5000, 10000, 50000]
@@ -95,7 +102,8 @@ export function KeyLimitsDialog({
   onSubmit,
   vms = [],
   pools,
-  endpoints,
+  endpoints = [],
+  createService = 'claude',
 }: {
   mode: 'create' | 'edit'
   open: boolean
@@ -106,45 +114,38 @@ export function KeyLimitsDialog({
   vms?: Vm[]
   pools?: VmPool[]
   endpoints?: ApiEndpoint[]
+  createService?: 'claude' | 'gpt'
 }) {
-  const [draft, setDraft] = useState<KeyLimitsDraft>(blankDraft())
+  const withPools = pools !== undefined
+  const [draft, setDraft] = useState<KeyLimitsDraft>(keyLimitsDraft())
 
   useEffect(() => {
     if (!open) return
-    if (mode === 'edit' && initial) {
-      const pooled = !!pools && !!initial.vm_pool_id
-      const group = pooled ? 'pool' : groupOf(initial.group_type)
-      setDraft({
-        name: initial.name || '',
-        category:
-          initial.category === 'hybrid'
-            ? 'hybrid'
-            : initial.category === 'api'
-              ? 'api'
-              : 'oauth',
-        openai_endpoint_id: initial.openai_endpoint_id || '',
-        max_concurrency: Number(initial.max_concurrency ?? 20),
-        quota_requests: Number(initial.quota_requests ?? 0),
-        quota_usd: Number(initial.quota_usd ?? 0),
-        rpm: Number(initial.rpm ?? 0),
-        expires_in_days: 0,
-        group_type: group,
-        allowed_vms:
-          group === 'all' || group === 'pool' ? [] : initial.allowed_vms || [],
-        ...(pools ? { vm_pool_id: initial.vm_pool_id || '' } : {}),
-      })
-      return
-    }
-    setDraft(blankDraft())
+    setDraft(
+      keyLimitsDraft(mode === 'edit' ? initial : null, withPools, createService)
+    )
     // pools is only the option list. Reloading it must not wipe an open form.
-  }, [open, mode, initial])
+  }, [open, mode, initial, withPools, createService])
 
   const quotaOpts = mode === 'edit' ? QUOTA_EDIT : QUOTA_CREATE
   const rpmOpts = mode === 'edit' ? RPM_EDIT : RPM_CREATE
+  const hybrid = draft.category === 'hybrid'
+  const service = keyServiceOf(draft)
+  const gpt = service === 'gpt'
+  const claudeScope = service === 'claude' || service === 'legacy_hybrid'
+  const scopeReadOnly = hybrid && pools === undefined && mode === 'edit'
+  const gateways = endpoints.filter(
+    (endpoint) => endpoint.kind === 'local_gateway'
+  )
+  const gateway = gateways.find(
+    (endpoint) => endpoint.id === draft.openai_endpoint_id
+  )
+  const isApi = draft.category === 'api'
   const listed = vmsInGroup(vms || [], draft.group_type)
-  const scopeBlocked =
-    draft.category === 'hybrid'
-      ? !draft.openai_endpoint_id
+  const scopeBlocked = isApi
+    ? false
+    : gpt
+      ? false
       : draft.group_type === 'pool'
         ? !draft.vm_pool_id
         : draft.group_type !== 'all' && draft.allowed_vms.length === 0
@@ -179,38 +180,32 @@ export function KeyLimitsDialog({
               />
             </Field>
           ) : null}
-          <Field label='分类'>
-            <Select
-              value={draft.category}
-              onValueChange={(v) =>
-                setDraft((d) => ({
-                  ...d,
-                  category:
-                    v === 'hybrid' ? 'hybrid' : v === 'api' ? 'api' : 'oauth',
-                  ...(v === 'hybrid'
-                    ? {
-                        group_type: 'openai',
-                        allowed_vms: [],
-                        vm_pool_id: '',
-                        openai_endpoint_id: '',
-                      }
-                    : { openai_endpoint_id: '' }),
-                }))
-              }
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value='oauth'>OAuth 槽位</SelectItem>
-                <SelectItem value='api'>API 直连</SelectItem>
-                {endpoints ? (
-                  <SelectItem value='hybrid'>GPT 本机网关</SelectItem>
-                ) : null}
-              </SelectContent>
-            </Select>
-          </Field>
-          <Field label='并发'>
+          {pools ? (
+            <Field label='托管服务'>
+              <Select
+                value={service}
+                onValueChange={(v) =>
+                  setDraft((d) => selectKeyService(d, v as KeyService))
+                }
+              >
+                <SelectTrigger aria-label='托管服务'>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value='claude'>Claude 托管池</SelectItem>
+                  <SelectItem value='gpt'>GPT 托管池</SelectItem>
+                  <SelectItem value='native'>OAuth 槽位</SelectItem>
+                  <SelectItem value='api'>API 直连</SelectItem>
+                  {service === 'legacy_hybrid' ? (
+                    <SelectItem value='legacy_hybrid' disabled>
+                      历史 Claude + GPT（保留）
+                    </SelectItem>
+                  ) : null}
+                </SelectContent>
+              </Select>
+            </Field>
+          ) : null}
+          <Field label='Key 并发上限'>
             <NumSelect
               kind='conc'
               value={draft.max_concurrency}
@@ -257,31 +252,73 @@ export function KeyLimitsDialog({
               />
             </Field>
           ) : null}
-          {draft.category === 'hybrid' ? (
-            <Field label='GPT 网关'>
-              <Select
-                value={draft.openai_endpoint_id || ''}
-                onValueChange={(id) =>
-                  setDraft((d) => ({ ...d, openai_endpoint_id: id }))
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder='选择已配置的本机网关' />
-                </SelectTrigger>
-                <SelectContent>
-                  {(endpoints || [])
-                    .filter((ep) => ep.kind === 'local_gateway' && !ep.disabled)
-                    .map((ep) => (
-                      <SelectItem key={ep.id} value={ep.id}>
-                        {ep.name || ep.id}
-                      </SelectItem>
-                    ))}
-                </SelectContent>
-              </Select>
-            </Field>
-          ) : (
+          {hybrid ? (
+            <div className='space-y-2 sm:col-span-2'>
+              <p className='text-xs text-muted-foreground'>
+                {gpt
+                  ? '此密钥仅使用指定 GPT 网关，与 Claude 托管池分别限额和计并发。'
+                  : '历史混合密钥：Claude 使用所选原生槽位，GPT 使用指定本机网关的模型。新密钥按服务分别创建。'}
+              </p>
+              {pools ? (
+                <Field label='GPT 本机网关'>
+                  <Select
+                    value={draft.openai_endpoint_id || ''}
+                    onValueChange={(id) =>
+                      setDraft((d) => ({ ...d, openai_endpoint_id: id }))
+                    }
+                  >
+                    <SelectTrigger aria-label='GPT 本机网关'>
+                      <SelectValue placeholder='选择已配置的本机网关' />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {draft.openai_endpoint_id && !gateway ? (
+                        <SelectItem value={draft.openai_endpoint_id}>
+                          当前绑定不可用 · {draft.openai_endpoint_id}
+                        </SelectItem>
+                      ) : null}
+                      {gateways.map((endpoint) => (
+                        <SelectItem key={endpoint.id} value={endpoint.id}>
+                          {endpoint.name || endpoint.id}
+                          {endpoint.disabled ? ' · 停用' : ''}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </Field>
+              ) : (
+                <p className='text-xs text-muted-foreground'>
+                  {gpt
+                    ? 'GPT 网关由管理员维护。'
+                    : 'Claude 范围和 GPT 网关由管理员维护。'}
+                </p>
+              )}
+              {gateway ? (
+                <p className='text-xs text-muted-foreground'>
+                  GPT 模型：
+                  {(gateway.models || [])
+                    .map((model) =>
+                      [gateway.prefix, model.alias || model.name]
+                        .filter(Boolean)
+                        .join('/')
+                    )
+                    .join('、') || '尚未配置模型'}
+                </p>
+              ) : pools && !gateways.length ? (
+                <p className='text-xs text-muted-foreground'>
+                  请先在 API 地址中添加本机网关及允许的 GPT 模型。
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+          {service === 'claude' ? (
+            <p className='text-xs text-muted-foreground sm:col-span-2'>
+              此密钥仅使用所选 Claude 槽位，与 GPT 托管池分别限额和计并发。 Key
+              并发设为不限时，仍受每个账号的并发限制，繁忙请求进入账号池队列。
+            </p>
+          ) : null}
+          {!scopeReadOnly && !gpt ? (
             <>
-              <Field label='分组'>
+              <Field label={claudeScope ? 'Claude 范围' : '分组'}>
                 <Select
                   value={draft.group_type}
                   onValueChange={(v) => {
@@ -309,16 +346,22 @@ export function KeyLimitsDialog({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value='all'>all · 全局可调度</SelectItem>
-                    {pools ? (
+                    {!claudeScope ? (
+                      <SelectItem value='all'>all · 全局可调度</SelectItem>
+                    ) : null}
+                    {pools && !isApi ? (
                       <SelectItem value='pool'>账号池</SelectItem>
                     ) : null}
-                    <SelectItem value='anthropic'>anthropic</SelectItem>
-                    <SelectItem value='openai'>openai</SelectItem>
+                    <SelectItem value='anthropic'>
+                      {claudeScope ? 'Claude 原生槽位' : 'anthropic'}
+                    </SelectItem>
+                    {!claudeScope ? (
+                      <SelectItem value='openai'>openai</SelectItem>
+                    ) : null}
                   </SelectContent>
                 </Select>
               </Field>
-              {draft.group_type === 'pool' ? (
+              {isApi ? null : draft.group_type === 'pool' ? (
                 <Field label='账号池'>
                   <Select
                     value={draft.vm_pool_id || ''}
@@ -345,7 +388,7 @@ export function KeyLimitsDialog({
                 </p>
               ) : (
                 <div className='sm:col-span-2'>
-                  <Field label='可用 VM'>
+                  <Field label={claudeScope ? 'Claude 可用槽位' : '可用 VM'}>
                     <div className='max-h-40 space-y-1 overflow-y-auto rounded-md border p-2'>
                       {listed.length === 0 ? (
                         <p className='text-xs text-muted-foreground'>
@@ -387,7 +430,7 @@ export function KeyLimitsDialog({
                 </div>
               )}
             </>
-          )}
+          ) : null}
         </div>
         <DialogFooter>
           <Button
@@ -402,7 +445,8 @@ export function KeyLimitsDialog({
             disabled={
               pending ||
               (mode === 'create' && !draft.name.trim()) ||
-              scopeBlocked
+              (!scopeReadOnly && scopeBlocked) ||
+              (hybrid && !!pools && !draft.openai_endpoint_id)
             }
             loading={pending}
           >
@@ -412,20 +456,6 @@ export function KeyLimitsDialog({
       </DialogContent>
     </Dialog>
   )
-}
-
-function blankDraft(): KeyLimitsDraft {
-  return {
-    name: '',
-    category: 'oauth',
-    max_concurrency: 20,
-    quota_requests: 0,
-    quota_usd: 0,
-    rpm: 0,
-    expires_in_days: 30,
-    group_type: 'all',
-    allowed_vms: [],
-  }
 }
 
 function groupOf(value: string | undefined): KeyGroupType {

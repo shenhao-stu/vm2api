@@ -127,6 +127,10 @@ function cacheCreationBreakdown(usage) {
   return { cache_creation_5m_tokens: five, cache_creation_1h_tokens: hour }
 }
 
+function imageTokenCount(v) {
+  return Number.isSafeInteger(v) && v > 0 ? v : 0
+}
+
 function webSearchRequestsOf(usage) {
   const n = Number(usage?.server_tool_use?.web_search_requests ?? usage?.web_search_requests)
   return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0
@@ -138,6 +142,7 @@ const PRICED_COLUMN_KEYS = [
   'cache_read_cost',
   'cache_creation_cost',
   'web_search_cost',
+  'image_cost',
   'total_cost',
   'pricing_model',
   'price_source',
@@ -147,19 +152,27 @@ const PRICED_COLUMN_KEYS = [
   'long_context',
 ]
 
+/** Image generation usage on this row; an Images endpoint row (`openai.images`) bills it alone. */
+function imageForLog(extra) {
+  const only = extra.protocol === 'openai.images'
+  if (!extra.image_usage && !only) return null
+  return { usage: extra.image_usage || null, model: extra.image_model || null, only }
+}
+
 function costColumnsForLog(usage, model, extra = {}) {
   if (extra.pricing_model != null) {
     const out = {}
     for (const key of PRICED_COLUMN_KEYS) out[key] = extra[key] ?? null
     return out
   }
-  const priced = costColumnsFromUsage(usage, model)
+  const priced = costColumnsFromUsage(usage, model, imageForLog(extra))
   return {
     input_cost: priced.input_cost ?? null,
     output_cost: priced.output_cost ?? null,
     cache_read_cost: priced.cache_read_cost ?? null,
     cache_creation_cost: priced.cache_creation_cost ?? null,
     web_search_cost: priced.web_search_cost ?? null,
+    image_cost: priced.image_cost ?? null,
     total_cost: priced.total_cost ?? null,
     pricing_model: priced.pricing_model ?? null,
     price_source: priced.price_source ?? null,
@@ -389,6 +402,10 @@ export class RequestLogStore {
     this._mem = [] // recent normal summaries for panel hot path
     this._memMax = 200
     this._cleanupTimer = null
+    this._cleanupFlight = null
+    this._cleanupController = null
+    this.cleanupMode = 'batched'
+    this._cleanupIntervalMs = CLEANUP_INTERVAL_MS
   }
 
   setConfig({ mode, retainDays, debugRetainDays, maxMb, mutedErrorClasses } = {}) {
@@ -573,6 +590,11 @@ export class RequestLogStore {
       reasoning_effort: REASONING_EFFORTS.has(extra.reasoning_effort) ? extra.reasoning_effort : null,
       // Gate verdict JSON from intercept-gate; the risk audit groups on it.
       intercept: extra.intercept ? String(extra.intercept).slice(0, 400) : null,
+      upstream_service_tier: extra.upstream_service_tier || null,
+      image_model: extra.image_model || null,
+      image_usage: extra.image_usage ? JSON.stringify(extra.image_usage) : null,
+      image_input_tokens: imageTokenCount(extra.image_usage?.input_tokens),
+      image_output_tokens: imageTokenCount(extra.image_usage?.output_tokens),
       // sub2api ownership + billing columns
       user_id: extra.user_id ?? null,
       vm_owner_user_id: this.repo.vmOwnerOf(extra.vm_id),
@@ -770,13 +792,63 @@ export class RequestLogStore {
     this._cleanupLegacyFiles(this.debugRetainDays, path.join(this.root, 'debug'))
   }
 
-  startCleanupScheduler({ intervalMs = CLEANUP_INTERVAL_MS } = {}) {
+  /** Serving-path maintenance: short SQLite batches and asynchronous legacy IO. */
+  cleanupAsync({ signal, batchSize = 500 } = {}) {
+    if (this._cleanupFlight) return this._cleanupFlight
+    const controller = new AbortController()
+    this._cleanupController = controller
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal
+    const flight = (async () => {
+      const result = await this.repo.cleanupIncremental(
+        {
+          retainDays: this.retainDays,
+          debugRetainDays: this.debugRetainDays,
+          maxBytes: this.maxMb > 0 ? this.maxMb * 1024 * 1024 : 0,
+        },
+        { signal: combined, batchSize },
+      )
+      combined.throwIfAborted()
+      await this._cleanupLegacyFilesAsync(this.retainDays, this.root, combined)
+      await this._cleanupLegacyFilesAsync(this.debugRetainDays, path.join(this.root, 'debug'), combined)
+      return result
+    })().finally(() => {
+      if (this._cleanupFlight === flight) {
+        this._cleanupFlight = null
+        this._cleanupController = null
+      }
+    })
+    this._cleanupFlight = flight
+    return flight
+  }
+
+  /** Call after stopCleanupScheduler and before closing/replacing the database. */
+  async waitForCleanup() {
+    try {
+      await this._cleanupFlight
+    } catch (error) {
+      if (error?.name !== 'AbortError') throw error
+    }
+  }
+
+  /** Runtime rollback changes policy only after the previous batch has stopped. */
+  async setCleanupMode(mode) {
+    if (!['batched', 'legacy'].includes(mode))
+      throw Object.assign(new Error('Invalid log maintenance mode'), { code: 'runtime_maintenance_mode_invalid' })
+    const running = !!this._cleanupTimer
     this.stopCleanupScheduler()
+    await this.waitForCleanup()
+    this.cleanupMode = mode
+    if (running) this.startCleanupScheduler({ intervalMs: this._cleanupIntervalMs })
+  }
+
+  startCleanupScheduler({ intervalMs = CLEANUP_INTERVAL_MS } = {}) {
+    // Restarting the timer must not cancel the initial asynchronous cleanup.
+    clearInterval(this._cleanupTimer)
     const ms = Math.max(60_000, Number(intervalMs) || CLEANUP_INTERVAL_MS)
+    this._cleanupIntervalMs = ms
     const run = () => {
-      try {
-        this.cleanup()
-      } catch {}
+      if (this.cleanupMode === 'legacy') this.cleanup()
+      else void this.cleanupAsync().catch(() => {})
     }
     this._cleanupTimer = setInterval(run, ms)
     if (typeof this._cleanupTimer.unref === 'function') this._cleanupTimer.unref()
@@ -785,6 +857,26 @@ export class RequestLogStore {
   stopCleanupScheduler() {
     clearInterval(this._cleanupTimer)
     this._cleanupTimer = null
+    this._cleanupController?.abort()
+  }
+
+  async _cleanupLegacyFilesAsync(days, dir, signal) {
+    const cutoff = Date.now() - days * 86400_000
+    let names
+    try {
+      names = await fs.promises.readdir(dir)
+    } catch (error) {
+      if (error.code === 'ENOENT') return
+      throw error
+    }
+    for (const name of names) {
+      signal?.throwIfAborted()
+      if (!/^\d{4}-\d{2}-\d{2}/.test(name)) continue
+      const dayMs = Date.parse(name.slice(0, 10) + 'T00:00:00Z')
+      if (!Number.isFinite(dayMs) || dayMs >= cutoff) continue
+      await fs.promises.rm(path.join(dir, name), { recursive: true, force: true })
+    }
+    signal?.throwIfAborted()
   }
 
   _cleanupLegacyFiles(days, dir) {

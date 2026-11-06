@@ -260,7 +260,10 @@ export class ApiKeyStore {
             allowed_vms: input.allowed_vms,
             ...(Object.prototype.hasOwnProperty.call(input, 'vm_pool_id') ? { vm_pool_id: input.vm_pool_id } : {}),
           },
-          { gatewayOnly: normalizeKeyCategory(input.category) === 'hybrid' },
+          {
+            gatewayOnly: normalizeKeyCategory(input.category) === 'hybrid',
+            isApi: normalizeKeyCategory(input.category) === 'api',
+          },
         ),
       ),
     }
@@ -317,7 +320,12 @@ export class ApiKeyStore {
     }
     if (Object.prototype.hasOwnProperty.call(patch, 'openai_endpoint_id'))
       rec.openai_endpoint_id = patch.openai_endpoint_id || null
-    const scope = normalizeKeyScope(patch, { partial: true, current: rec, gatewayOnly: rec.category === 'hybrid' })
+    const scope = normalizeKeyScope(patch, {
+      partial: true,
+      current: rec,
+      gatewayOnly: rec.category === 'hybrid',
+      isApi: rec.category === 'api',
+    })
     if (scope) Object.assign(rec, storedKeyScope(scope))
     this._validateGatewayBinding(rec)
     rec.updated_at = nowIso()

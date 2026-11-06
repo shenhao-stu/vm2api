@@ -1,3 +1,4 @@
+import { isFableModel } from './hosted-model-policy.mjs'
 /**
  * Gateway model catalog.
  * Claude: console model-policy. GPT: gpt_model_policy from Codex /codex/models.
@@ -15,7 +16,7 @@ import {
 } from './model-policy.mjs'
 import { hasClaudeCode1mSuffix, stripClaudeCode1mSuffix } from './context-1m.mjs'
 import { isGptSeriesId } from './gpt-ids.mjs'
-import { listGptPolicyModels } from './gpt-model-policy.mjs'
+import { listGptPolicyModels, listGptFastAliases, listImageToolModels } from './gpt-model-policy.mjs'
 
 const FAMILY_ALIASES = new Map([
   ['sonnet', 'sonnet'],
@@ -42,9 +43,9 @@ export function seedModelCatalog() {
   return setModelCatalog(ids, { source: 'model-policy' })
 }
 
-function listGptPublicModels() {
+export function listGptPublicModels(mappingKeys = []) {
   try {
-    return listGptPolicyModels().map((m) => ({
+    const models = listGptPolicyModels().map((m) => ({
       id: m.id,
       object: 'model',
       type: 'model',
@@ -54,6 +55,35 @@ function listGptPublicModels() {
       enabled: m.enabled !== false,
       source: 'gpt-model-policy',
     }))
+    return [
+      ...models,
+      ...listGptFastAliases({ mappingKeys }).map((m) => ({
+        ...m,
+        object: 'model',
+        type: 'model',
+        owned_by: 'openai',
+      })),
+    ]
+  } catch {
+    return []
+  }
+}
+
+/** Enabled GPT image models, listed like OpenAI's own /v1/models so clients can find them. */
+function listImagePublicModels() {
+  try {
+    return listImageToolModels()
+      .filter((m) => m.enabled)
+      .map((m) => ({
+        id: m.id,
+        object: 'model',
+        type: 'model',
+        display_name: m.display_name,
+        owned_by: 'openai',
+        family: 'gpt-image',
+        enabled: true,
+        source: 'gpt-model-policy',
+      }))
   } catch {
     return []
   }
@@ -63,16 +93,16 @@ function listGptPublicModels() {
  * Local catalog for GET /v1/models and boot. Does not touch workers.
  * groupType is the key's group_type: openai lists GPT only, anthropic lists Claude only, all lists both.
  */
-export function gatewayModelCatalog({ groupType = 'all' } = {}) {
+export function gatewayModelCatalog({ groupType = 'all', mappingKeys = [] } = {}) {
   seedModelCatalog()
   try {
     loadModelPolicy()
   } catch {}
-  const gpt = groupType === 'anthropic' ? [] : listGptPublicModels()
+  const gpt = groupType === 'anthropic' ? [] : [...listGptPublicModels(mappingKeys), ...listImagePublicModels()]
   const claude = groupType === 'openai' ? [] : listOfficialModels()
   return {
     object: 'list',
-    data: [...gpt, ...claude],
+    data: [...gpt, ...claude].filter(({ id }) => !isFableModel(id)),
     source: cache.source || 'model-policy',
   }
 }

@@ -533,7 +533,7 @@ test('unpriced models and unsupported billing/image parameters reject before any
   assert.equal(calls, 0)
 })
 
-test('explicit gateway endpoint never shadows native Fable endpoints', () => {
+test('prohibited model cannot be selected or advertised by either endpoint', () => {
   const scheduler = new ApiScheduler()
   const native = {
     ...endpoint(),
@@ -542,8 +542,11 @@ test('explicit gateway endpoint never shadows native Fable endpoints', () => {
     models: [{ name: 'claude-fable-5-1', alias: 'claude-fable-5-1' }],
   }
   scheduler.reload([endpoint(), native])
-  assert.equal(scheduler.pick('claude-fable-5-1').ok, true)
-  assert.ok(scheduler.catalog().data.some((entry) => entry.id === 'claude-fable-5-1'))
+  assert.equal(scheduler.pick('claude-fable-5-1').code, 'model_disabled')
+  assert.equal(
+    scheduler.catalog().data.some((entry) => entry.id === 'claude-fable-5-1'),
+    false,
+  )
 })
 
 test('invalid timer budgets and server-side history references never dispatch', async (t) => {

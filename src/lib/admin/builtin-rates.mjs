@@ -95,6 +95,12 @@ const ANTHROPIC = {
   'claude-3-haiku': claude(0.25, 1.25, 0.03, 0.3, 0.5),
 }
 
+// GPT Image 2.5/2.6 (developers.openai.com/api/docs/models/gpt-image-2.6-flare, verified 2026-11-06):
+// text input 5 / cached 1.25, image tokens 8 / cached 2 / output 30. Both variants share one price.
+function gptImage() {
+  return { ...tokenPrice(5, 0, 1.25, 0, 0), image: { input: 8, output: 30, cache_read: 2 } }
+}
+
 const OPENAI = {
   'gpt-6-astra': openaiFrom(
     { input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
@@ -104,6 +110,17 @@ const OPENAI = {
       long_standard: [20, 75, 2],
       long_flex: [10, 37.5, 1],
       long_fast: [40, 150, 4],
+    },
+  ),
+  // Official standard/long-context and Flex/Fast rates, checked 2026-11-06.
+  'gpt-6.1-terra': openaiFrom(
+    { input: 1, output: 5, cache_read: 0.05, cache_write: 1.25 },
+    {
+      flex: [0.5, 2.5, 0.025],
+      fast: [2, 10, 0.1],
+      long_standard: [2, 7.5, 0.1],
+      long_flex: [1, 3.75, 0.05],
+      long_fast: [4, 15, 0.2],
     },
   ),
   'gpt-6.1-sol': openaiFrom(
@@ -271,6 +288,11 @@ const OPENAI = {
   'gpt-5.1-chat-latest': openaiFrom({ input: 1.25, output: 10, cache_read: 0.125, cache_write: 0 }),
   'gpt-5.2-codex': openaiFrom({ input: 1.75, output: 14, cache_read: 0.175, cache_write: 0 }),
   'gpt-5.2-chat-latest': openaiFrom({ input: 1.75, output: 14, cache_read: 0.175, cache_write: 0 }),
+  'gpt-image-2.6-flare': gptImage(),
+  'gpt-image-2.6-sunburst': gptImage(),
+  'gpt-image-2.5-flare': gptImage(),
+  'gpt-image-2.5-sunburst': gptImage(),
+  'gpt-image-2': gptImage(),
 }
 
 /** Dated / legacy / family ids → canonical priced id. OpenAI: verified snapshot aliases only. */
@@ -309,6 +331,9 @@ export const BUILTIN_ALIASES = {
   'gpt-5.4-pro-2026-03-05': 'gpt-5.4-pro',
   'gpt-5.5-2026-04-23': 'gpt-5.5',
   'gpt-5.5-pro-2026-04-23': 'gpt-5.5-pro',
+  'gpt-image-2.5-flare-2026-09-08': 'gpt-image-2.5-flare',
+  'gpt-image-2.5-sunburst-2026-09-08': 'gpt-image-2.5-sunburst',
+  'gpt-image-2-2026-04-21': 'gpt-image-2',
   'gpt-daybreak-blue-latest': 'gpt-5.6-sol',
   'gpt-daybreak-red-latest': 'gpt-5.6-cyber',
   'o1-2024-12-17': 'o1',

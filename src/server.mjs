@@ -1,3 +1,6 @@
+import { accountIdOf } from './lib/pool/pool-scheduler.mjs'
+import { loopbackMeasurement } from './lib/admin/codex-quality.mjs'
+import { QualityProbeRunner } from './lib/admin/quality-probe.mjs'
 /**
  * vm2api — Node control plane.
  * Inference data plane: one long-lived Go slot worker per VM
@@ -34,7 +37,7 @@ import { ensureTelemetrySidecar } from './lib/vm/slot-process-status.mjs'
 
 import { createSlotBridgeHealer, powerOnSlot, reviveDownSlots } from './lib/vm/slot-recovery.mjs'
 import { createUsageProbeMonitor, normalizeUsageProbeConfig } from './lib/oauth/usage-probe-monitor.mjs'
-import { createCatalogMonitor } from './lib/admin/catalog-monitor.mjs'
+import { claudeCatalogBusy, createCatalogMonitor } from './lib/admin/catalog-monitor.mjs'
 import { normalizeOfficialCcConfig } from './lib/oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './lib/admin/panel-live-credentials.mjs'
 import { normalizeHealthProbeConfig, createHealthProbeMonitor, HEALTH_REAL_HEADER } from './lib/admin/health-probe.mjs'
@@ -525,6 +528,19 @@ const vmTestSchedule = new VmTestScheduleRunner({
       accountQuota,
     }),
 })
+// Only the dedicated controller owns Codex probes. Its admin bridge shares UI, not seats.
+const qualityProbe = new QualityProbeRunner({
+  projectRoot: cfg.paths.project,
+  isOwner: () => process.env.VM2API_CODEX_QUALITY === '1' && !_shuttingDown,
+  getQuotaPolicy: () => routingConfig.codex?.quota,
+  guarded: true,
+  runTest: loopbackMeasurement({
+    project: cfg.paths.project,
+    port: cfg.port,
+    apiKey: cfg.api_key,
+    receipt: (id) => requestLog.repo.getByRequestId(id),
+  }),
+})
 credentialRefreshMonitor = createCredentialRefreshMonitor({
   config: normalizeCredentialRefreshConfig(routingConfig.credential_refresh),
   listTargets: () =>
@@ -592,6 +608,7 @@ usageProbeMonitor = createUsageProbeMonitor({
 })
 catalogMonitor = createCatalogMonitor({
   projectRoot: cfg.paths.project,
+  isClaudeBusy: (vm) => claudeCatalogBusy(poolScheduler, vm.id, accountIdOf(vm, cfg.paths.project)),
   codexCatalogVersion: () => routingConfig.codex?.catalog_client_version || 'auto',
   log: (event) => console.log(JSON.stringify(event)),
 })
@@ -614,6 +631,17 @@ const backupService = new BackupService({
   dataDir,
   projectRoot: cfg.paths.project,
   configDir: path.dirname(routingConfigPath),
+})
+backupService.onBeforeRestore(async () => {
+  await qualityProbe.stop()
+  requestLog.stopCleanupScheduler()
+  await requestLog.waitForCleanup()
+  return () => {
+    if (!_shuttingDown) {
+      requestLog.startCleanupScheduler()
+      qualityProbe.start()
+    }
+  }
 })
 backupService.onRestored((db) => {
   // A restore swaps the DatabaseSync instance and routing files. Rebuild every
@@ -656,6 +684,7 @@ backupService.onRestored((db) => {
   initPoolRuntime()
   reloadActiveVm(cfg)
   vmTestSchedule.reload()
+  qualityProbe.reload()
 })
 backupService.startScheduler()
 
@@ -884,7 +913,7 @@ const importCommit = createImportCommit({
 
 const { commitImportedOauth, requireSlotProxy, officialCcStatsHandler } = importCommit
 
-const { handleProtocol, handleSearch } = createHandleProtocol({
+const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
   json,
   writeSSEHeaders,
   readBody,
@@ -1057,6 +1086,7 @@ const handlePanel = createPanelHandler({
   panelUsers,
   requestLog,
   vmTestSchedule,
+  qualityProbe,
   backupService,
   stats,
   persistRoutingPatch,
@@ -1175,7 +1205,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && p === '/v1/models') {
       if (!requireAuth(req, res)) return
       if (resolveInferenceBackend(req) === 'api') {
-        return json(res, 200, apiScheduler.catalog())
+        return json(res, 200, apiScheduler.catalog({ groupType: keyScopeFromRequest(req).group_type }))
       }
       const result = isGatewayOnlyRecord(req.apiKeyRecord)
         ? { object: 'list', data: [] }
@@ -1227,6 +1257,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && (p === '/v1/completions' || p === '/completions')) {
       return await handleProtocol(req, res, 'openai.completions', p)
     }
+    if (req.method === 'POST' && (p === '/v1/images/generations' || p === '/images/generations')) {
+      return await handleImages(req, res, p, 'generations')
+    }
+    if (req.method === 'POST' && (p === '/v1/images/edits' || p === '/images/edits')) {
+      return await handleImages(req, res, p, 'edits')
+    }
+
     if (req.method === 'POST' && (p === '/v1/responses' || p === '/responses')) {
       return await handleProtocol(req, res, 'openai.responses', p)
     }
@@ -1321,7 +1358,14 @@ async function shutdown(signal) {
   _shuttingDown = true
   console.log(`[shutdown] ${signal} — closing`)
   try {
+    requestLog.stopCleanupScheduler()
+    await requestLog.waitForCleanup()
+  } catch {
+    console.warn('[request-log] cleanup failed during shutdown')
+  }
+  try {
     vmTestSchedule.stop()
+    await qualityProbe.stop()
   } catch {}
   try {
     backupService.stopScheduler()
@@ -1378,6 +1422,7 @@ await bootApiKernel(cfg)
 server.listen(cfg.port, cfg.host, () => {
   try {
     vmTestSchedule.start()
+    qualityProbe.start()
   } catch (e) {
     console.warn('[vm-test-schedule] start failed', e?.message || e)
   }

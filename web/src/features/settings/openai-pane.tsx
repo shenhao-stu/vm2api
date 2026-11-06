@@ -332,6 +332,7 @@ export function OpenaiPane({
           </div>
         </div>
       </PaneSection>
+      <QualityProbePane />
     </div>
   )
 }

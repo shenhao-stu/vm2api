@@ -3,11 +3,9 @@ import { detectInboundPlatform } from '../protocol/platform-detect.mjs'
 import { slotAllowsModel } from './slot-model-gate.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { parseAllowedVms } from '../admin/key-scope.mjs'
-export function isGatewayOnlyRecord(record) {
-  return record?.category === 'hybrid' && record?.group_type === 'openai'
-}
+import { isGatewayOnlyRecord, isFableModel } from '../protocol/hosted-model-policy.mjs'
 
-const isFableModel = (model) => /fable/i.test(String(model || ''))
+export { isGatewayOnlyRecord }
 
 export function gatewayError(code, message, status = 400) {
   return Object.assign(new Error(message), { code, status })
@@ -109,6 +107,7 @@ export function hybridModelCatalog(nativeCatalog, endpoint, { nativeVms = [], re
   const native = (nativeCatalog?.data || []).filter(
     (m) =>
       !isGatewayOnlyRecord(record) &&
+      !isFableModel(m.id) &&
       detectInboundPlatform(m.id).platform === 'anthropic' &&
       nativeVms.some(
         (vm) =>

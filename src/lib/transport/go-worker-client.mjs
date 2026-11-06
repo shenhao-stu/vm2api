@@ -1077,10 +1077,11 @@ export async function streamGoWorker({
       // job_done and its trailers afterward. Keep reading until the worker
       // closes the response so a normal completion is not mistaken for cancel.
       if (!boundedStream) {
+        response.setEncoding('utf8')
         for await (const chunk of response) {
           sawChunk = true
           lastChunkAt = Date.now()
-          buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
+          buffer += chunk
           let newline
           while ((newline = buffer.indexOf('\n')) >= 0) {
             const line = buffer.slice(0, newline).replace(/\r$/, '')

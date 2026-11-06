@@ -105,17 +105,14 @@ export function extraFromRateLimit(rateLimit = {}, now = Date.now()) {
   const extra = {
     codex_usage_updated_at: new Date(now).toISOString(),
   }
-  if (primary) {
-    extra.codex_primary_used_percent = primary.used_percent
-    extra.codex_primary_reset_after_seconds = primary.reset_after_seconds
-    extra.codex_primary_window_minutes = primary.window_minutes
-    extra.codex_primary_reset_at = primary.reset_at
-  }
-  if (secondary) {
-    extra.codex_secondary_used_percent = secondary.used_percent
-    extra.codex_secondary_reset_after_seconds = secondary.reset_after_seconds
-    extra.codex_secondary_window_minutes = secondary.window_minutes
-    extra.codex_secondary_reset_at = secondary.reset_at
+  for (const [role, window] of [
+    ['primary', primary],
+    ['secondary', secondary],
+  ]) {
+    extra[`codex_${role}_used_percent`] = window?.used_percent ?? null
+    extra[`codex_${role}_reset_after_seconds`] = window?.reset_after_seconds ?? null
+    extra[`codex_${role}_window_minutes`] = window?.window_minutes ?? null
+    extra[`codex_${role}_reset_at`] = window?.reset_at ?? null
   }
   const limits = normalizeCodexLimits(extraToCodexSnapshot(extra))
   extra.codex_5h_used_percent = limits.used_5h_percent

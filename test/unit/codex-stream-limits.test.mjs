@@ -244,25 +244,27 @@ test('many valid frames in one chunk may exceed per-frame limits in aggregate an
   assert.equal(result.stopReason, 'end_turn')
 })
 
-test('UTF-8 codepoints split between transport chunks are preserved', async (t) => {
-  const text = '你好🙂'
-  const raw = Buffer.from(delta(text))
-  const index = raw.indexOf(Buffer.from('你')) + 1
-  const f = await fixture(t, async (res) => {
-    res.write(start + block)
-    res.write(raw.subarray(0, index))
-    await delay(5)
-    res.write(raw.subarray(index, index + 4))
-    await delay(5)
-    res.write(raw.subarray(index + 4))
-    res.end(stop)
+for (const requestPath of ['/internal/v1/codex/responses', '/internal/v1/messages']) {
+  test(`split UTF-8 codepoints survive ${requestPath}`, async (t) => {
+    const text = '你好🙂'
+    const raw = Buffer.from(delta(text))
+    const index = raw.indexOf(Buffer.from('你')) + 1
+    const f = await fixture(t, async (res) => {
+      res.write(start + block)
+      res.write(raw.subarray(0, index))
+      await delay(5)
+      res.write(raw.subarray(index, index + 4))
+      await delay(5)
+      res.write(raw.subarray(index + 4))
+      res.end(stop)
+    })
+    const lines = []
+    const result = await f.run({ requestPath, onEvent: (line) => lines.push(line) })
+    assert.equal(result.ok, true)
+    assert.equal(result.body.content[0].text, text)
+    assert.ok(lines.some((line) => line.includes(text)))
   })
-  const lines = []
-  const result = await f.run({ onEvent: (line) => lines.push(line) })
-  assert.equal(result.ok, true)
-  assert.equal(result.body.content[0].text, text)
-  assert.ok(lines.some((line) => line.includes(text)))
-})
+}
 
 test('normal image-sized JSON and complete tool parameters remain unchanged', async (t) => {
   const input = { image: 'a'.repeat(12 * 1024), query: 'fixture' }

@@ -1,9 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { keyLimitsPayload, type KeyLimitsDraft } from './key-payload'
+import {
+  keyLimitsDraft,
+  keyLimitsPayload,
+  keyServiceLabel,
+  selectKeyService,
+  type KeyLimitsDraft,
+} from './key-payload'
 
 const draft: KeyLimitsDraft = {
   name: ' ops ',
-  category: 'api',
+  category: 'oauth',
   max_concurrency: 4,
   quota_requests: 12,
   quota_usd: 3.5,
@@ -17,7 +23,7 @@ describe('API key limit payload', () => {
   it('keeps request and USD quotas separate', () => {
     expect(keyLimitsPayload(draft, 'create')).toEqual({
       name: 'ops',
-      category: 'api',
+      category: 'oauth',
       max_concurrency: 4,
       quota_requests: 12,
       quota_usd: 3.5,
@@ -26,6 +32,18 @@ describe('API key limit payload', () => {
       group_type: 'anthropic',
       allowed_vms: ['vm-01'],
     })
+  })
+
+  it('sends category only for admins', () => {
+    expect(keyLimitsPayload(draft, 'create', { isAdmin: true }).category).toBe(
+      'oauth'
+    )
+    expect(
+      keyLimitsPayload(draft, 'create', { isAdmin: false })
+    ).not.toHaveProperty('category')
+    expect(
+      keyLimitsPayload(draft, 'edit', { isAdmin: false })
+    ).not.toHaveProperty('category')
   })
 
   it('omits create-only fields from edits and rejects invalid quotas', () => {
@@ -49,8 +67,21 @@ describe('API key limit payload', () => {
       allowed_vms: [],
     })
     expect(() =>
-      keyLimitsPayload({ ...draft, allowed_vms: [] }, 'create')
+      keyLimitsPayload(
+        { ...draft, category: 'oauth', allowed_vms: [] },
+        'create'
+      )
     ).toThrow('至少选择一台 VM')
+    expect(
+      keyLimitsPayload(
+        { ...draft, category: 'api', group_type: 'openai', allowed_vms: [] },
+        'create'
+      )
+    ).toMatchObject({
+      category: 'api',
+      group_type: 'openai',
+      allowed_vms: [],
+    })
   })
 
   it('handles vm_pool_id for admin and strips it for non-admin', () => {
@@ -98,34 +129,231 @@ describe('API key limit payload', () => {
     expect(tenantTampered).not.toHaveProperty('vm_pool_id')
     expect(tenantTampered.group_type).toBe('all')
   })
+
+  it('editing a unified key preserves its native Claude scope and selected GPT gateway', () => {
+    const restored = keyLimitsDraft(
+      {
+        id: 'key_unified',
+        category: 'hybrid',
+        group_type: 'anthropic',
+        allowed_vms: ['line01', 'line02'],
+        openai_endpoint_id: 'ep_0123456789ab',
+        max_concurrency: 1,
+      },
+      true
+    )
+    expect(
+      keyLimitsPayload({ ...restored, quota_requests: 100 }, 'edit')
+    ).toMatchObject({
+      category: 'hybrid',
+      group_type: 'anthropic',
+      allowed_vms: ['line01', 'line02'],
+      openai_endpoint_id: 'ep_0123456789ab',
+      max_concurrency: 1,
+      quota_requests: 100,
+    })
+    expect(() =>
+      keyLimitsPayload({ ...restored, group_type: 'all' }, 'edit')
+    ).toThrow('Claude')
+    expect(() =>
+      keyLimitsPayload({ ...restored, openai_endpoint_id: '' }, 'edit')
+    ).toThrow('GPT')
+  })
+
+  it('keeps hybrid pools Anthropic-scoped and leaves admin routing untouched in tenant limit edits', () => {
+    const restored = keyLimitsDraft(
+      {
+        id: 'key_unified',
+        category: 'hybrid',
+        group_type: 'anthropic',
+        vm_pool_id: 'pool_12345678',
+        openai_endpoint_id: 'ep_0123456789ab',
+      },
+      true
+    )
+    expect(keyLimitsPayload(restored, 'edit')).toMatchObject({
+      group_type: 'anthropic',
+      allowed_vms: [],
+      vm_pool_id: 'pool_12345678',
+      category: 'hybrid',
+    })
+    const tenant = keyLimitsPayload(restored, 'edit', { isAdmin: false })
+    expect(() =>
+      keyLimitsPayload(restored, 'create', { isAdmin: false })
+    ).toThrow('管理员')
+    for (const field of [
+      'category',
+      'group_type',
+      'allowed_vms',
+      'vm_pool_id',
+      'openai_endpoint_id',
+    ]) {
+      expect(tenant).not.toHaveProperty(field)
+    }
+    expect(keyLimitsDraft().category).toBe('oauth')
+    expect(keyLimitsDraft({ id: 'api', category: 'api' }).category).toBe('api')
+    expect(
+      keyLimitsPayload({ ...restored, category: 'oauth' }, 'edit')
+        .openai_endpoint_id
+    ).toBeNull()
+  })
+
+  it('creates pooled Claude keys without an extra cap and keeps the GPT default independent', () => {
+    const claude = {
+      ...keyLimitsDraft(null, true),
+      name: 'Claude pool',
+      allowed_vms: ['line01'],
+    }
+    expect(keyLimitsPayload(claude, 'create')).toMatchObject({
+      category: 'oauth',
+      group_type: 'anthropic',
+      allowed_vms: ['line01'],
+      max_concurrency: 0,
+    })
+    expect(keyLimitsPayload(claude, 'create')).not.toHaveProperty(
+      'openai_endpoint_id'
+    )
+    const gpt = {
+      ...keyLimitsDraft(null, true, 'gpt'),
+      name: 'GPT pool',
+      openai_endpoint_id: 'ep_0123456789ab',
+    }
+    expect(keyLimitsPayload(gpt, 'create')).toMatchObject({
+      category: 'hybrid',
+      group_type: 'openai',
+      allowed_vms: [],
+      vm_pool_id: null,
+      openai_endpoint_id: 'ep_0123456789ab',
+      max_concurrency: 1,
+    })
+    expect(keyServiceLabel(gpt)).toBe('GPT 托管池')
+    expect(keyServiceLabel(claude)).toBe('Claude 托管池')
+    expect(() =>
+      keyLimitsPayload({ ...gpt, allowed_vms: ['line01'] }, 'create')
+    ).toThrow('不绑定原生槽位')
+    expect(() =>
+      keyLimitsPayload({ ...gpt, vm_pool_id: 'pool_12345678' }, 'create')
+    ).toThrow('不绑定原生槽位')
+    expect(() => keyLimitsPayload(gpt, 'create', { isAdmin: false })).toThrow(
+      '管理员'
+    )
+  })
+
+  it('edits a GPT key without requiring native VMs or downgrading its gateway binding', () => {
+    const gpt = keyLimitsDraft(
+      {
+        id: 'key_gpt',
+        category: 'hybrid',
+        group_type: 'openai',
+        allowed_vms: [],
+        vm_pool_id: null,
+        openai_endpoint_id: 'ep_0123456789ab',
+        max_concurrency: 1,
+      },
+      true
+    )
+    expect(keyLimitsPayload(gpt, 'edit')).toMatchObject({
+      category: 'hybrid',
+      group_type: 'openai',
+      allowed_vms: [],
+      vm_pool_id: null,
+      openai_endpoint_id: 'ep_0123456789ab',
+    })
+    const tenant = keyLimitsPayload(gpt, 'edit', { isAdmin: false })
+    for (const field of [
+      'category',
+      'group_type',
+      'allowed_vms',
+      'vm_pool_id',
+      'openai_endpoint_id',
+    ])
+      expect(tenant).not.toHaveProperty(field)
+  })
+
+  it('explicit service changes reset incompatible routes; new mixed keys are rejected', () => {
+    const claude = {
+      ...keyLimitsDraft(null, true),
+      allowed_vms: ['line01'],
+      vm_pool_id: 'pool_12345678',
+    }
+    const gpt = selectKeyService(claude, 'gpt')
+    expect(gpt).toMatchObject({
+      category: 'hybrid',
+      group_type: 'openai',
+      allowed_vms: [],
+      vm_pool_id: '',
+      max_concurrency: 1,
+    })
+    const back = selectKeyService(
+      { ...gpt, openai_endpoint_id: 'ep_0123456789ab' },
+      'claude'
+    )
+    expect(back).toMatchObject({
+      category: 'oauth',
+      group_type: 'anthropic',
+      openai_endpoint_id: '',
+      allowed_vms: [],
+    })
+    expect(
+      keyLimitsPayload(
+        { ...back, group_type: 'pool', vm_pool_id: 'pool_12345678' },
+        'create'
+      )
+    ).toMatchObject({
+      category: 'oauth',
+      group_type: 'anthropic',
+      vm_pool_id: 'pool_12345678',
+    })
+    expect(() =>
+      keyLimitsPayload(
+        {
+          ...claude,
+          category: 'hybrid',
+          openai_endpoint_id: 'ep_0123456789ab',
+        },
+        'create'
+      )
+    ).toThrow('分别创建')
+    expect(selectKeyService(gpt, 'api')).toMatchObject({
+      category: 'api',
+      group_type: 'all',
+      openai_endpoint_id: '',
+    })
+  })
 })
 
-it('GPT gateway keys bind only an explicit endpoint with no VM or pool', () => {
-  const gateway: KeyLimitsDraft = {
-    ...draft,
-    category: 'hybrid',
-    openai_endpoint_id: 'ep_123456789abc',
-    group_type: 'openai',
-    allowed_vms: [],
-    vm_pool_id: '',
-  }
-  expect(keyLimitsPayload(gateway, 'create')).toMatchObject({
-    category: 'hybrid',
-    openai_endpoint_id: 'ep_123456789abc',
-    group_type: 'openai',
+for (const cap of [0, 1, 8]) {
+  it(`preserves an explicit Claude key cap ${cap} during unrelated edits`, () => {
+    const restored = keyLimitsDraft({
+      id: 'claude',
+      category: 'oauth',
+      group_type: 'anthropic',
+      allowed_vms: ['line01'],
+      max_concurrency: cap,
+    })
+    expect(
+      keyLimitsPayload({ ...restored, quota_requests: 50 }, 'edit')
+        .max_concurrency
+    ).toBe(cap)
+  })
+}
+
+it('switching to Claude selects pool scheduling instead of a single-request key cap', () => {
+  expect(
+    selectKeyService(keyLimitsDraft(null, false, 'gpt'), 'claude')
+      .max_concurrency
+  ).toBe(0)
+})
+
+it('API keys scope protocol groups without VM or pool ownership', () => {
+  expect(
+    keyLimitsPayload(
+      { ...draft, category: 'api', vm_pool_id: 'pool_12345678' },
+      'create'
+    )
+  ).toMatchObject({
+    group_type: 'anthropic',
     allowed_vms: [],
     vm_pool_id: null,
   })
-  expect(() => keyLimitsPayload(gateway, 'create', { isAdmin: false })).toThrow(
-    '管理员'
-  )
-  expect(() =>
-    keyLimitsPayload({ ...gateway, openai_endpoint_id: '' }, 'create')
-  ).toThrow('选择 GPT')
-  expect(() =>
-    keyLimitsPayload({ ...gateway, allowed_vms: ['vm-one'] }, 'create')
-  ).toThrow('不能绑定')
-  expect(() =>
-    keyLimitsPayload({ ...gateway, vm_pool_id: 'pool_one' }, 'create')
-  ).toThrow('不能绑定')
 })

@@ -33,6 +33,7 @@ import { collapseBlockKeywords, foldInterceptRows } from '../../protocol/interce
 
 /** settings key: ISO instant before which usage_logs rows may have been pruned. Monotonic. */
 const PRUNED_THROUGH_KEY = 'usage_logs_pruned_through'
+const PRUNE_PENDING_KEY = 'usage_logs_prune_pending'
 const BILLING_STATS_CACHE_TTL_MS = 10_000
 const BILLING_BACKFILL_INTERVAL_MS = 60_000
 
@@ -115,6 +116,7 @@ const SUMMARY_COLUMNS = [
   'actual_cost',
   'rate_multiplier',
   'service_tier',
+  'upstream_service_tier',
   'speed',
   'long_context',
   'session_id',
@@ -122,10 +124,16 @@ const SUMMARY_COLUMNS = [
   'reasoning_effort',
   'intercept',
   'vm_owner_user_id',
+  'image_model',
+  'image_usage',
+  'image_input_tokens',
+  'image_output_tokens',
+  'image_cost',
 ]
 
 function toRow(rec) {
   return SUMMARY_COLUMNS.map((c) => {
+    if (c === 'image_input_tokens' || c === 'image_output_tokens') return Number(rec[c]) || 0
     if (c === 'created_at') return rec.created_at ?? rec.ts ?? null
     if (c === 'ip_address') return rec.ip_address ?? rec.ip ?? null
     if (c === 'stream') return rec.stream ? 1 : 0
@@ -311,11 +319,32 @@ export class UsageLogsRepo {
     this._debugCount = db.prepare('SELECT COUNT(*) AS n FROM request_log_debug')
     this._deleteOldUsage = db.prepare('DELETE FROM usage_logs WHERE created_at < ?')
     this._deleteOldDebug = db.prepare('DELETE FROM request_log_debug WHERE ts < ?')
-    this._deleteOldestDebug = db.prepare(`
-      DELETE FROM request_log_debug WHERE request_id IN (
-        SELECT request_id FROM request_log_debug ORDER BY ts ASC LIMIT ?
+    this._deleteUsageBatch = db.prepare(`
+      DELETE FROM usage_logs WHERE rowid IN (
+        SELECT rowid FROM usage_logs WHERE created_at < ? ORDER BY created_at ASC, id ASC LIMIT ?
       )
     `)
+    this._hasOldUsage = db.prepare('SELECT 1 FROM usage_logs WHERE created_at < ? LIMIT 1')
+    this._deleteDebugBatch = db.prepare(`
+      DELETE FROM request_log_debug WHERE request_id IN (
+        SELECT request_id FROM request_log_debug WHERE ts < ? ORDER BY ts ASC, request_id ASC LIMIT ?
+      )
+    `)
+    this._oldestDebugSizes = db.prepare(`
+      SELECT OCTET_LENGTH(record_json) AS bytes FROM request_log_debug ORDER BY ts ASC, request_id ASC LIMIT ?
+    `)
+    this._deleteOldestDebug = db.prepare(`
+      DELETE FROM request_log_debug WHERE request_id IN (
+        SELECT request_id FROM request_log_debug ORDER BY ts ASC, request_id ASC LIMIT ?
+      )
+    `)
+    this._getMaintenanceSetting = db.prepare('SELECT value FROM settings WHERE key = ?')
+    this._putMaintenanceSetting = db.prepare(`
+      INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `)
+    this._clearPrunePending = db.prepare('DELETE FROM settings WHERE key = ?')
+    this._cleanupFlight = null
   }
 
   /** Cheap EXISTS: ≥1 2xx row visible to the caller (same ownerPred as request-log stats). */
@@ -578,13 +607,24 @@ export class UsageLogsRepo {
     }
   }
 
+  /** Stored image generation usage for re-pricing; Images endpoint rows bill it alone. */
+  _imageForPrice(row) {
+    const only = row.protocol === 'openai.images'
+    if (!row.image_usage && !only) return null
+    let usage = null
+    try {
+      usage = row.image_usage ? JSON.parse(row.image_usage) : null
+    } catch {}
+    return { usage, model: row.image_model, only }
+  }
+
   _repriceRows(rows, { writeActualCost = false } = {}) {
     if (!rows.length) return { rows: 0, changed: 0, still_unpriced: 0, delta_usd: 0 }
     const upd = writeActualCost
       ? this.db.prepare(`
       UPDATE usage_logs
          SET input_cost = ?, output_cost = ?, cache_read_cost = ?,
-             cache_creation_cost = ?, web_search_cost = ?, total_cost = ?,
+             cache_creation_cost = ?, web_search_cost = ?, image_cost = ?, total_cost = ?,
              actual_cost = ?, pricing_model = ?, price_source = ?, price_version = ?,
              long_context = ?
        WHERE id = ?
@@ -592,7 +632,7 @@ export class UsageLogsRepo {
       : this.db.prepare(`
       UPDATE usage_logs
          SET input_cost = ?, output_cost = ?, cache_read_cost = ?,
-             cache_creation_cost = ?, web_search_cost = ?, total_cost = ?,
+             cache_creation_cost = ?, web_search_cost = ?, image_cost = ?, total_cost = ?,
              pricing_model = ?, price_source = ?, price_version = ?, long_context = ?
        WHERE id = ?
     `)
@@ -603,13 +643,14 @@ export class UsageLogsRepo {
     try {
       for (const r of rows) {
         const model = r.upstream_model || r.model || r.requested_model
-        const priced = costColumnsFromUsage(this._usageForPrice(r), model)
+        const priced = costColumnsFromUsage(this._usageForPrice(r), model, this._imageForPrice(r))
         const same =
           (r.input_cost ?? null) === (priced.input_cost ?? null) &&
           (r.output_cost ?? null) === (priced.output_cost ?? null) &&
           (r.cache_read_cost ?? null) === (priced.cache_read_cost ?? null) &&
           (r.cache_creation_cost ?? null) === (priced.cache_creation_cost ?? null) &&
           (r.web_search_cost ?? null) === (priced.web_search_cost ?? null) &&
+          (r.image_cost ?? null) === (priced.image_cost ?? null) &&
           (r.total_cost ?? null) === (priced.total_cost ?? null) &&
           (r.pricing_model ?? null) === (priced.pricing_model ?? null) &&
           (r.price_source ?? null) === (priced.price_source ?? null) &&
@@ -631,6 +672,7 @@ export class UsageLogsRepo {
             priced.cache_read_cost ?? null,
             priced.cache_creation_cost ?? null,
             priced.web_search_cost ?? null,
+            priced.image_cost ?? null,
             priced.total_cost ?? null,
             actual,
             priced.pricing_model ?? UNPRICED_MODEL,
@@ -646,6 +688,7 @@ export class UsageLogsRepo {
             priced.cache_read_cost ?? null,
             priced.cache_creation_cost ?? null,
             priced.web_search_cost ?? null,
+            priced.image_cost ?? null,
             priced.total_cost ?? null,
             priced.pricing_model ?? UNPRICED_MODEL,
             priced.price_source ?? null,
@@ -677,9 +720,9 @@ export class UsageLogsRepo {
       SELECT id, model, upstream_model, requested_model,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
-             rate_multiplier, service_tier, speed,
+             rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
              input_cost, output_cost, cache_read_cost, cache_creation_cost, web_search_cost,
-             total_cost, pricing_model, price_source, price_version, long_context
+             image_cost, total_cost, pricing_model, price_source, price_version, long_context
       FROM usage_logs
       WHERE pricing_model IS NULL
       LIMIT ?
@@ -697,9 +740,9 @@ export class UsageLogsRepo {
       SELECT rowid AS _rowid, id, model, upstream_model, requested_model,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
-             rate_multiplier, service_tier, speed,
+             rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
              input_cost, output_cost, cache_read_cost, cache_creation_cost, web_search_cost,
-             total_cost, pricing_model, price_source, price_version, long_context
+             image_cost, total_cost, pricing_model, price_source, price_version, long_context
       FROM usage_logs ${where}
       ORDER BY rowid
       LIMIT 2000
@@ -1203,6 +1246,7 @@ export class UsageLogsRepo {
    * it does not bring deleted rows back) can stand in for that boundary.
    */
   logCoverageStart() {
+    if (this._pendingPruneCutoff()) return null
     const created = Date.parse(
       this.db.prepare("SELECT MIN(applied_at) AS t FROM schema_migrations WHERE version = '001'").get()?.t || '',
     )
@@ -1565,39 +1609,21 @@ export class UsageLogsRepo {
     const usage_logs = this._pruneUsage(cfg.usageCutoff)
     const debug_by_age = this._deleteOldDebug.run(cfg.debugCutoff).changes
     const debug_by_size = this.trimDebugToMaxBytes(cfg.maxBytes)
-    if (usage_logs + debug_by_age + debug_by_size > 0) {
-      try {
-        this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
-      } catch {}
-    }
-    try {
-      this.db.exec('PRAGMA optimize')
-    } catch {}
-    return {
-      usage_logs,
-      request_log_debug: debug_by_age + debug_by_size,
-      debug_by_age,
-      debug_by_size,
-    }
+    // SQLite's normal WAL auto-checkpoint remains enabled. Maintenance must
+    // not request an exclusive TRUNCATE checkpoint on the serving thread.
+    return { usage_logs, request_log_debug: debug_by_age + debug_by_size, debug_by_age, debug_by_size }
   }
 
   /** Delete summaries before `cutoff` and advance the prune boundary in one transaction. */
   _pruneUsage(cutoff) {
+    const pending = this._pendingPruneCutoff()
+    if (pending && pending > cutoff) cutoff = pending
     this.db.exec('BEGIN')
     try {
       const deleted = this._deleteOldUsage.run(cutoff).changes
-      if (deleted > 0) {
-        const prev = this._prunedThrough()
-        if (!prev || prev < cutoff) {
-          this.db
-            .prepare(`
-              INSERT INTO settings (key, value, updated_at) VALUES ('${PRUNED_THROUGH_KEY}', ?, ?)
-              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-            `)
-            .run(JSON.stringify(cutoff), new Date().toISOString())
-        }
-      }
+      if (deleted > 0 || pending) this._completePrune(cutoff)
       this.db.exec('COMMIT')
+      if (deleted > 0 || pending) this._billingStatsCache.clear()
       return deleted
     } catch (e) {
       try {
@@ -1605,6 +1631,99 @@ export class UsageLogsRepo {
       } catch {}
       throw e
     }
+  }
+
+  _pendingPruneCutoff() {
+    try {
+      const value = JSON.parse(this._getMaintenanceSetting.get(PRUNE_PENDING_KEY)?.value || 'null')
+      return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : null
+    } catch {
+      return null
+    }
+  }
+
+  _completePrune(cutoff) {
+    const previous = this._prunedThrough()
+    if (!previous || previous < cutoff)
+      this._putMaintenanceSetting.run(PRUNED_THROUGH_KEY, JSON.stringify(cutoff), new Date().toISOString())
+    this._clearPrunePending.run(PRUNE_PENDING_KEY)
+  }
+
+  _pruneUsageBatch(cutoff, batchSize) {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const pending = this._pendingPruneCutoff()
+      if (pending && pending > cutoff) cutoff = pending
+      let deleted = 0
+      if (this._hasOldUsage.get(cutoff)) {
+        this._putMaintenanceSetting.run(PRUNE_PENDING_KEY, JSON.stringify(cutoff), new Date().toISOString())
+        deleted = this._deleteUsageBatch.run(cutoff, batchSize).changes
+      }
+      const done = !this._hasOldUsage.get(cutoff)
+      if (done && (deleted > 0 || pending)) this._completePrune(cutoff)
+      this.db.exec('COMMIT')
+      if (deleted > 0 || pending) this._billingStatsCache.clear()
+      return { deleted, done }
+    } catch (error) {
+      try {
+        this.db.exec('ROLLBACK')
+      } catch {}
+      throw error
+    }
+  }
+
+  /** Bounded transactions, with an event-loop turn between batches. */
+  cleanupIncremental(opts = {}, { signal, batchSize = 500, yieldControl = () => new Promise(setImmediate) } = {}) {
+    if (this._cleanupFlight) return this._cleanupFlight
+    const limit = Math.max(1, Math.min(1000, Math.trunc(Number(batchSize)) || 500))
+    const run = async () => {
+      const cfg = this._cleanupOpts(opts)
+      const result = { usage_logs: 0, request_log_debug: 0, debug_by_age: 0, debug_by_size: 0 }
+      const betweenBatches = async () => {
+        await yieldControl()
+        signal?.throwIfAborted()
+      }
+      await betweenBatches()
+      for (;;) {
+        signal?.throwIfAborted()
+        const batch = this._pruneUsageBatch(cfg.usageCutoff, limit)
+        result.usage_logs += batch.deleted
+        if (batch.done) break
+        await betweenBatches()
+      }
+      await betweenBatches()
+      for (;;) {
+        signal?.throwIfAborted()
+        const deleted = this._deleteDebugBatch.run(cfg.debugCutoff, limit).changes
+        result.debug_by_age += deleted
+        if (deleted < limit) break
+        await betweenBatches()
+      }
+      if (cfg.maxBytes > 0) {
+        await betweenBatches()
+        let used = this.debugBytes()
+        // One initial measurement and one final reconciliation. Each bounded
+        // trim transaction returns actual removed bytes, avoiding repeated SUMs.
+        for (let pass = 0; pass < 2; pass++) {
+          while (used > cfg.maxBytes) {
+            signal?.throwIfAborted()
+            const deleted = this._trimDebugBatch(used - cfg.maxBytes, limit)
+            if (!deleted.count) break
+            result.debug_by_size += deleted.count
+            used -= deleted.bytes
+            await betweenBatches()
+          }
+          if (pass === 0) used = this.debugBytes()
+        }
+      }
+      result.request_log_debug = result.debug_by_age + result.debug_by_size
+      return result
+    }
+    const flight = run().finally(() => {
+      if (this._cleanupFlight === flight) this._cleanupFlight = null
+    })
+    this._cleanupFlight = flight
+    return flight
   }
 
   _cleanupOpts(opts) {
@@ -1631,19 +1750,37 @@ export class UsageLogsRepo {
   trimDebugToMaxBytes(maxBytes) {
     const cap = Math.max(0, Number(maxBytes) || 0)
     if (cap <= 0) return 0
-    let deleted = 0
-    for (let i = 0; i < 8; i++) {
-      const used = this.debugBytes()
-      if (used <= cap) return deleted
-      const count = this.countDebug()
-      if (!count) return deleted
-      const avg = Math.max(1, Math.floor(used / count))
-      const need = Math.min(count, Math.max(1, Math.ceil((used - cap) / avg) + 1))
-      const n = this._deleteOldestDebug.run(need).changes
-      if (!n) return deleted
-      deleted += n
+    let deleted = 0,
+      used = this.debugBytes()
+    while (used > cap) {
+      const batch = this._trimDebugBatch(used - cap, 500)
+      if (!batch.count) break
+      deleted += batch.count
+      used -= batch.bytes
     }
     return deleted
+  }
+
+  _trimDebugBatch(excess, limit) {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const rows = this._oldestDebugSizes.all(limit)
+      let count = 0,
+        bytes = 0
+      for (const row of rows) {
+        count++
+        bytes += Number(row.bytes) || 0
+        if (bytes >= excess) break
+      }
+      if (count) this._deleteOldestDebug.run(count)
+      this.db.exec('COMMIT')
+      return { count, bytes }
+    } catch (error) {
+      try {
+        this.db.exec('ROLLBACK')
+      } catch {}
+      throw error
+    }
   }
 
   count() {

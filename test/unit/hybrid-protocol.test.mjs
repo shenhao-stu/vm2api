@@ -351,7 +351,7 @@ test('separate GPT and Claude keys reject cross-pool requests and each retain co
   assert.equal(h.keys.getById(claudeKey.id).requests, 1)
 })
 
-test('GPT-only keys reject Claude models without changing native Fable scheduling', async (t) => {
+test('prohibited model is rejected before the native or gateway hop', async (t) => {
   let calls = 0
   const origin = await upstream(t, (_req, res) => {
     calls++
@@ -363,7 +363,7 @@ test('GPT-only keys reject Claude models without changing native Fable schedulin
     { protocol: 'anthropic.messages' },
   ).done
   assert.equal(denied.statusCode, 403)
-  assert.equal(denied.body.error.code, 'key_group_mismatch')
+  assert.equal(denied.body.error.code, 'model_disabled')
   assert.equal(calls, 0)
   assert.equal(h.nativeCalls.length, 0)
 })

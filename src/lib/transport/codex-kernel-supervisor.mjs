@@ -1,3 +1,4 @@
+import { writeJsonIfChanged } from '../vm/vm-file.mjs'
 /**
  * Host-side Codex kernel lifecycle. Dedicated Codex VMs listen on
  * vms/<id>/run/codex-kernel.sock; Claude workers are never reused.
@@ -16,10 +17,27 @@ import { codexKernelHealth, codexKernelPaths } from './codex-kernel-client.mjs'
 import { computedUpstreamTransport, normalizeCodexRouting } from '../protocol/codex-route.mjs'
 
 const starts = new Map()
+const stops = new Map()
 
 function assertCodexExitSupported() {
   if (getProxyExitGuardPolicy(null).required) throw exitGuardError('exit_guard_unsupported_platform')
 }
+
+// A healthy kernel is a local process this control plane spawned. Its health
+// answer is reused for a very short window so a burst of requests (and its
+// failover retries) does not pay a Unix-socket roundtrip each time. Anything
+// else on the request path (proxy binding, account gate, quota, model/request
+// rewrite) stays untouched by this cache.
+const healthCache = new Map()
+const healthProbes = new Map()
+const kernelGenerations = new Map()
+const HEALTH_TTL_MS = 2000
+// Cold starts become healthy in tens of milliseconds; the first polls are
+// shorter than the steady 100ms so a warm-up does not add a flat 100ms. The
+// loop still stops at the caller's deadline and never busy-spins.
+const HEALTH_POLL_DELAYS_MS = [20, 40, 80]
+const HEALTH_POLL_DELAY_MS = 100
+const HEALTH_PROBE_TIMEOUT_MS = 500
 
 // The kernel exits only through config.proxy_url; inherited proxy variables would give it a second, unseen exit.
 function kernelEnv(env = process.env) {
@@ -77,7 +95,7 @@ export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxy
     } catch {}
   }
   if (!secret) secret = crypto.randomBytes(24).toString('hex')
-  fs.writeFileSync(tokenPath, secret + '\n', { mode: 0o600 })
+  writeJsonIfChanged(tokenPath, secret + '\n', { mode: 0o600 })
   const local = isLocalEgressProxy(vm?.proxy)
   // Only a slot on this host treats local egress as the deployment proxy.
   // A node slot is handed that node's forwarder; replacing it would exit from here.
@@ -109,7 +127,7 @@ export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxy
     ...codexKernelRequestOptions(routing),
     test_endpoints: process.env.KIN_CODEX_TEST_ENDPOINTS === '1',
   }
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 })
+  writeJsonIfChanged(configPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 })
   return { runDir, socketPath, configPath, credentialPath, tokenPath, installationId: deviceId }
 }
 
@@ -143,7 +161,165 @@ function configRequestBytes(configPath) {
 }
 
 function childHasExited(child) {
-  return !child || child.exitCode != null || child.signalCode != null
+  return !child?.pid || child.exitCode != null || child.signalCode != null
+}
+
+function normalizeHealthTtl(value) {
+  if (value == null || value === '') return HEALTH_TTL_MS
+  const ms = Number(value)
+  if (!Number.isFinite(ms) || ms <= 0) return 0
+  return Math.min(ms, HEALTH_TTL_MS)
+}
+
+function kernelGeneration(vmId) {
+  return kernelGenerations.get(vmId) || 0
+}
+
+/** A new process generation can never be served by an older health answer. */
+function bumpKernelGeneration(vmId) {
+  if (!vmId) return 0
+  const next = kernelGeneration(vmId) + 1
+  kernelGenerations.set(vmId, next)
+  healthCache.delete(vmId)
+  return next
+}
+
+/** Forget health after a transport failure without touching the process or account. */
+export function invalidateCodexKernelHealth(vmId) {
+  // Fence pending probes too, so an older answer cannot undo invalidation.
+  bumpKernelGeneration(vmId)
+}
+
+/** Drop the cached answer, but never one that already belongs to a newer process. */
+function forgetKernelHealth(vmId, child = null, generation = null) {
+  const entry = vmId ? healthCache.get(vmId) : null
+  if (!entry) return
+  if (child && entry.child !== child) return
+  if (generation != null && entry.generation !== generation) return
+  healthCache.delete(vmId)
+}
+
+/**
+ * Stat only: changes to config, token or the socket itself require a fresh
+ * probe. Include paths and inode so atomic replacement cannot reuse health.
+ */
+function kernelHealthIdentity(paths = {}) {
+  const stamp = (file, socket = false) => {
+    if (!file) return null
+    try {
+      const stats = fs.statSync(file, { bigint: true })
+      if (socket && !stats.isSocket()) return null
+      return [file, String(stats.dev), String(stats.ino), String(stats.size), String(stats.mtimeNs)]
+    } catch {
+      return null
+    }
+  }
+  const stamps = [stamp(paths.configPath), stamp(paths.tokenPath), stamp(paths.socketPath, true)]
+  return stamps.every(Boolean) ? JSON.stringify(stamps) : null
+}
+
+function healthSnapshot(exec) {
+  const vmId = exec?.vmId
+  const paths = codexKernelPaths(exec)
+  return {
+    vmId,
+    child: starts.get(vmId),
+    generation: kernelGeneration(vmId),
+    paths,
+    identity: kernelHealthIdentity(paths),
+  }
+}
+
+function rememberKernelHealth(snapshot, health) {
+  const { vmId, child, generation, paths, identity } = snapshot
+  if (!vmId || health?.ok !== true || !identity) return
+  // Only a kernel this process spawned and still owns is reusable. An
+  // untracked socket may belong to a previous control plane or be replaced.
+  if (!child || childHasExited(child) || starts.get(vmId) !== child) return
+  if (generation !== kernelGeneration(vmId)) return
+  // The answer belongs to the files observed BEFORE this probe. A changed
+  // config/socket during await must not be stamped healthy by an old reply.
+  if (kernelHealthIdentity(paths) !== identity) return
+  healthCache.set(vmId, {
+    child,
+    generation,
+    identity,
+    at: Date.now(),
+    health,
+  })
+}
+
+/**
+ * Short bounded reuse of a healthy answer. Every identity component and the
+ * owning live child must still match, and the socket must still exist.
+ */
+function cachedKernelHealth(exec, healthTtlMs) {
+  const ttl = normalizeHealthTtl(healthTtlMs)
+  const vmId = exec?.vmId
+  if (!(ttl > 0) || !vmId) return null
+  const entry = healthCache.get(vmId)
+  if (!entry) return null
+  const child = starts.get(vmId)
+  if (!child || entry.child !== child || childHasExited(child)) {
+    healthCache.delete(vmId)
+    return null
+  }
+  if (entry.generation !== kernelGeneration(vmId)) {
+    healthCache.delete(vmId)
+    return null
+  }
+  if (kernelHealthIdentity(codexKernelPaths(exec)) !== entry.identity || Date.now() - entry.at >= ttl) {
+    healthCache.delete(vmId)
+    return null
+  }
+  return entry.health
+}
+
+/**
+ * One socket roundtrip at a time per identical kernel. Concurrent request
+ * paths share the probe, but each waits at most for its own deadline and sees
+ * the failure itself, so a caller is never extended or blinded.
+ */
+function sharedKernelHealth(exec, deadline) {
+  const remaining = deadline - Date.now()
+  if (!(remaining > 0)) return Promise.resolve(null)
+  const snapshot = healthSnapshot(exec)
+  const key = JSON.stringify([snapshot.vmId, snapshot.generation, snapshot.paths, snapshot.identity])
+  let probe = healthProbes.get(key)
+  if (!probe) {
+    probe = codexKernelHealth(exec, { timeoutMs: HEALTH_PROBE_TIMEOUT_MS })
+      .catch((error) => ({ ok: false, reason: 'health_error', error: String(error?.message || error) }))
+      .then((health) => ({ health, snapshot }))
+    healthProbes.set(key, probe)
+    const clear = () => {
+      if (healthProbes.get(key) === probe) healthProbes.delete(key)
+    }
+    probe.then(clear, clear)
+  }
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const timer = setTimeout(() => finish(null), remaining)
+    probe.then(finish)
+  })
+}
+
+function trackKernelChild(vmId, child) {
+  starts.set(vmId, child)
+  bumpKernelGeneration(vmId)
+  // An exit or spawn error invalidates immediately; the next call re-probes.
+  const dropped = () => {
+    if (starts.get(vmId) !== child) return
+    bumpKernelGeneration(vmId)
+    if (childHasExited(child)) starts.delete(vmId)
+  }
+  child.once('exit', dropped)
+  child.once('error', dropped)
 }
 
 function waitForChildExit(child, timeoutMs) {
@@ -185,8 +361,40 @@ export async function finishCodexRecycle(child, socketPath, { termMs = 2000, kil
   return { exited: true }
 }
 
-export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
+/** Explicit reload must stop the host process, not just its slot container. */
+export function stopCodexKernelAndWait(exec, opts = {}) {
+  const vmId = exec?.vmId
+  if (stops.has(vmId)) return stops.get(vmId)
+  const pending = (async () => {
+    bumpKernelGeneration(vmId)
+    const child = starts.get(vmId)
+    const paths = codexKernelPaths(exec)
+    if (!child) {
+      const health = await codexKernelHealth(exec, { timeoutMs: 500 })
+      if (health.code === 'ENOENT' || health.code === 'ECONNREFUSED') return { ok: true, stopped: false }
+      // A prior Node process may have left a detached kernel. Do not unlink a
+      // listening socket or claim success when we cannot verify its owner's exit.
+      return { ok: false, reason: 'untracked_kernel' }
+    }
+    const gone = await finishCodexRecycle(child, paths.socketPath, opts)
+    if (!gone.exited) return { ok: false, reason: 'recycle_timeout' }
+    if (starts.get(vmId) === child) starts.delete(vmId)
+    return { ok: true, stopped: true }
+  })()
+  const settled = pending.finally(() => {
+    if (stops.get(vmId) === settled) stops.delete(vmId)
+  })
+  stops.set(vmId, settled)
+  return settled
+}
+
+export async function ensureCodexKernel(exec, { timeoutMs = 8000, healthTtlMs = HEALTH_TTL_MS } = {}) {
   assertCodexExitSupported()
+  const stopping = stops.get(exec?.vmId)
+  if (stopping) {
+    const stopped = await stopping
+    if (!stopped.ok) return stopped
+  }
   const bin = codexKernelBinPath()
   if (!bin) return { ok: false, reason: 'bin_missing' }
   const paths = codexKernelPaths(exec)
@@ -206,10 +414,20 @@ export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
       }
     }
   }
-  const live = await waitForHealth(exec, Math.min(800, Math.max(200, Number(timeoutMs) || 800)))
-  if (live.ok) return { ok: true, reused: true, health: live.health }
+  // Reuse a recent healthy answer for a kernel this process still owns. The
+  // proxy write, account gate and quota checks already ran on this request;
+  // only the liveness roundtrip is skipped.
+  const cached = cachedKernelHealth(exec, healthTtlMs)
+  if (cached) return { ok: true, reused: true, cached: true, health: cached }
+  // A genuinely cold slot has no process or socket to become healthy. Spawn
+  // it immediately instead of spending the preflight budget probing ENOENT.
+  // Existing sockets still get checked, including an untracked live kernel.
+  if (!childHasExited(starts.get(exec.vmId)) || (paths.socketPath && fs.existsSync(paths.socketPath))) {
+    const live = await waitForHealth(exec, Math.min(800, Math.max(200, Number(timeoutMs) || 800)))
+    if (live.ok) return { ok: true, reused: true, health: live.health }
+  }
   const current = starts.get(exec.vmId)
-  if (current && !current.killed) return waitForHealth(exec, timeoutMs)
+  if (!childHasExited(current)) return waitForHealth(exec, timeoutMs)
   try {
     if (paths.socketPath) fs.unlinkSync(paths.socketPath)
   } catch {}
@@ -219,27 +437,40 @@ export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
     detached: true,
   })
   child.unref()
-  starts.set(exec.vmId, child)
+  trackKernelChild(exec.vmId, child)
   writeLimitStamp(paths.configPath, wanted)
   return waitForHealth(exec, timeoutMs)
 }
 
 async function waitForHealth(exec, timeoutMs) {
   const deadline = Date.now() + Math.max(200, Number(timeoutMs) || 8000)
+  const vmId = exec?.vmId
+  const child = starts.get(vmId)
+  const generation = kernelGeneration(vmId)
   let last = { ok: false, reason: 'not_ready' }
+  let polls = 0
   while (Date.now() < deadline) {
-    last = await codexKernelHealth(exec, { timeoutMs: 500 }).catch((error) => ({
-      ok: false,
-      reason: 'health_error',
-      error: String(error.message || error),
-    }))
-    if (last?.ok || Number(last?.status) === 200) return { ok: true, health: last }
-    await new Promise((r) => setTimeout(r, 100))
+    const probed = await sharedKernelHealth(exec, deadline)
+    // null means this caller's deadline passed while waiting.
+    if (!probed) break
+    last = probed.health
+    if (last?.ok !== true) forgetKernelHealth(vmId, probed.snapshot.child, probed.snapshot.generation)
+    if (last?.ok || Number(last?.status) === 200) {
+      rememberKernelHealth(probed.snapshot, last)
+      return { ok: true, health: last }
+    }
+    const delay = HEALTH_POLL_DELAYS_MS[polls] ?? HEALTH_POLL_DELAY_MS
+    polls += 1
+    const remaining = deadline - Date.now()
+    if (!(remaining > 0)) break
+    await new Promise((r) => setTimeout(r, Math.min(delay, remaining)))
   }
+  forgetKernelHealth(vmId, child, generation)
   return { ok: false, reason: 'health_timeout', health: last }
 }
 
 export function stopCodexKernel(vmId) {
+  bumpKernelGeneration(vmId)
   const child = starts.get(vmId)
   if (child) {
     try {
@@ -257,4 +488,16 @@ export function codexKernelTracked(vmId) {
 
 export function stopAllCodexKernels() {
   for (const vmId of [...starts.keys()]) stopCodexKernel(vmId)
+}
+
+/** Stop only tracked children, with the same bounded recycle protocol as reload. */
+export async function stopAllCodexKernelsAndWait() {
+  await Promise.all(
+    [...starts.entries()].map(async ([vmId, child]) => {
+      bumpKernelGeneration(vmId)
+      const result = await finishCodexRecycle(child, null)
+      if (!result.exited) throw new Error('codex_kernel_stop_timeout')
+      if (starts.get(vmId) === child) starts.delete(vmId)
+    }),
+  )
 }

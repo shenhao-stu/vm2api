@@ -1,3 +1,8 @@
+import { hostedModelDenial } from './hosted-model-policy.mjs'
+import { readRawBody } from '../http/respond.mjs'
+import { imageModelAnswer, imageModelStreamError, imagesRequestFromTurn } from './image-model-bridge.mjs'
+import { canonicalImageToolModel } from './image-tool-models.mjs'
+import { isMultipartFormData, normalizeImageEditBody } from './image-edit-multipart.mjs'
 /**
  * /v1 protocol handler. URLs, auth, and response envelopes stay with the
  * server wiring; this factory owns convert → pool → Go/Rust hop → client.
@@ -38,7 +43,7 @@ import {
 import { sanitizeInboundBody, defaultSeedPolicy, callerAutoCompactWindow } from './seed-policy.mjs'
 import { fingerprintRequest } from './client-fingerprint.mjs'
 import { validateOfficialModel } from './models.mjs'
-import { handleCodexProtocol, handleCodexSearch } from './handle-codex.mjs'
+import { handleCodexImages, handleCodexProtocol, handleCodexSearch } from './handle-codex.mjs'
 import { disjointOpenaiUsage } from './openai-usage.mjs'
 import { costColumnsFromUsage } from '../admin/pricing.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
@@ -53,7 +58,7 @@ import {
   formatHealthSse,
   healthUnavailableError,
 } from '../admin/health-probe.mjs'
-import { resolveInferenceBackend, runApiInference } from '../pool/api-protocol.mjs'
+import { resolveInferenceBackend, runApiInference, validateApiOpenAIRequest } from '../pool/api-protocol.mjs'
 import { assertHybridKeyScope, isHybridKey } from '../pool/local-gateway-policy.mjs'
 import { runHostedGateway } from './hosted-gateway.mjs'
 import { classifyClaudeRequestPurpose, prepareClassifierBody, classifierRequestSummary } from './request-purpose.mjs'
@@ -196,6 +201,20 @@ export function createHandleProtocol(deps) {
     return !!(res?.destroyed || res?.writableEnded || res?.closed)
   }
 
+  function rejectHostedModel(req, res, body, logBag) {
+    const denial = hostedModelDenial(req.apiKeyKind === 'managed' ? req.apiKeyRecord : null, body?.model)
+    if (!denial) return false
+    stats.errors++
+    Object.assign(logBag, {
+      attempt_count: 0,
+      final_state: 'rejected',
+      error_code: denial.code,
+      error_message: denial.message,
+    })
+    json(res, 403, { error: { type: 'permission_error', ...denial } })
+    return true
+  }
+
   function rejectUnsupportedExitPath(body, res, logBag, { search = false } = {}) {
     try {
       if (!getProxyExitGuardPolicy(null).required) return false
@@ -226,6 +245,71 @@ export function createHandleProtocol(deps) {
     if (next && cacheTtl) next = applyCacheTtlToUsage(next, cacheTtl)
     if (next && requestedSpeed) next = { ...next, requested_speed: requestedSpeed }
     return disjointOpenaiUsage(next)
+  }
+
+  function keyGateErrorBody(gate) {
+    return makeError({
+      type: gate.status === 429 ? ErrorType.RATE_LIMIT : ErrorType.PERMISSION,
+      code: gate.code,
+      message: gate.message,
+      status: gate.status,
+      details: gate.detail || undefined,
+    }).body
+  }
+
+  // Codex handlers write usage onto logBag themselves. The key is charged the
+  // official cost usage_logs prices for the same row (image generation
+  // included) times the group rate; logBag is left as is so the row is too.
+  function billCodexKey(managedKey, logBag) {
+    if (logBag.final_state !== 'verified') return
+    const model = logBag.upstream_model || logBag.model
+    const image = logBag.image_usage
+      ? { usage: logBag.image_usage, model: logBag.image_model || null, only: logBag.protocol === 'openai.images' }
+      : null
+    try {
+      const priced = costColumnsFromUsage(logBag.usage || {}, model, image)
+      apiKeyStore.recordUsage(managedKey, logBag.usage || {}, {
+        model,
+        rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey.group_id ?? 1),
+        officialCost: priced.total_cost,
+      })
+    } catch {}
+  }
+
+  /** Codex handlers take the same managed-key acquire / release / spend as the Claude paths. */
+  async function runWithCodexKey(req, res, logBag, run) {
+    const managedKey = req.apiKeyRecord || null
+    if (!managedKey) return run()
+    const gate = apiKeyStore.acquire(managedKey)
+    if (!gate.ok) {
+      stats.errors++
+      logBag.error_code = gate.code
+      logBag.error_message = gate.message
+      return json(res, gate.status, keyGateErrorBody(gate))
+    }
+    try {
+      return await run()
+    } finally {
+      try {
+        apiKeyStore.release(managedKey)
+      } catch {}
+      billCodexKey(managedKey, logBag)
+    }
+  }
+
+  function rejectHybridProtocol(req, res, logBag) {
+    if (!isHybridKey(req)) return false
+    logBag.attempt_count = 0
+    logBag.final_state = 'rejected'
+    logBag.error_code = 'hybrid_protocol_unsupported'
+    json(res, 400, {
+      error: {
+        type: 'invalid_request_error',
+        code: logBag.error_code,
+        message: 'Hybrid keys support HTTP chat, Responses and Messages only',
+      },
+    })
+    return true
   }
 
   function attachPricing(logBag, { managedKey = null, rateMultiplier = 1, bill = false } = {}) {
@@ -448,7 +532,18 @@ export function createHandleProtocol(deps) {
     return jevScopeWaits(jev, 'claude')
   }
 
-  async function applyProtocolIntercept({ req, inbound, body, fp, logBag, requestId, res, account = null }) {
+  async function applyProtocolIntercept({
+    req,
+    inbound,
+    body,
+    fp,
+    logBag,
+    requestId,
+    res,
+    account = null,
+    scopeMatched = false,
+    distillOnly = false,
+  }) {
     const official =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       isOfficialClaudeClient(fp.client_class) ||
@@ -473,6 +568,8 @@ export function createHandleProtocol(deps) {
       devices: deviceRepo(),
       requestId,
       account,
+      scopeMatched,
+      distillOnly,
     })
     if (!decision || decision.action !== 'block') {
       if (decision?.intercept) logBag.intercept = decision.intercept
@@ -735,6 +832,7 @@ export function createHandleProtocol(deps) {
     )
       return
 
+    if (rejectHostedModel(req, res, inbound, logBag)) return
     const fp = fingerprintRequest(req, inbound)
     // Before the health probe: its synthesized or fail-closed replies would otherwise answer
     // probe-shaped third-party traffic, and with the switch on no probe is answered at all.
@@ -824,12 +922,6 @@ export function createHandleProtocol(deps) {
       }
     }
     const apiPassthrough = inferenceBackend === 'api' && cfg.api_passthrough === true
-    if (apiPassthrough && protocol !== 'anthropic.messages') {
-      return json(res, 400, {
-        type: 'error',
-        error: { type: 'invalid_request_error', code: 'messages_required', message: 'Use the Anthropic Messages API.' },
-      })
-    }
     let ctx = {
       path: pathName,
       protocol,
@@ -838,6 +930,7 @@ export function createHandleProtocol(deps) {
       autoCompactWindow,
     }
     ctx = applyIntercept(cfg.intercept.rules, 'before_convert', ctx)
+    if (rejectHostedModel(req, res, ctx.body, logBag)) return
     const bodyCheck = validateRequestBody(protocol, ctx.body)
     if (!bodyCheck.ok) {
       stats.errors++
@@ -849,7 +942,10 @@ export function createHandleProtocol(deps) {
       return json(res, errorResult.status, errorResult.body)
     }
     let want1m = hasClaudeCode1mSuffix(inbound?.model) || hasClaudeCode1mSuffix(ctx.body?.model)
-    const modelRewrite = applyCodexInboundModelRewrite(ctx.body, getRouting() || {})
+    const modelRewrite =
+      hybrid || inferenceBackend === 'api'
+        ? { ok: true, mapped: false }
+        : applyCodexInboundModelRewrite(ctx.body, getRouting() || {})
     if (!modelRewrite.ok) {
       stats.errors++
       const errorResult = makeError({
@@ -867,7 +963,56 @@ export function createHandleProtocol(deps) {
       ctx = { ...ctx, body: modelRewrite.body }
       logBag.upstream_model = modelRewrite.upstreamModel || null
     }
-    const platform = detectInboundPlatform(ctx.body?.model)
+    if (inferenceBackend === 'api' && ownerScopeFromRequest(req, apiKeyStore?.users).type !== 'platform') {
+      return json(res, 403, {
+        error: { code: 'api_backend_forbidden', message: 'Tenant keys cannot use platform endpoints' },
+      })
+    }
+    if (inferenceBackend === 'api') ctx = applyIntercept(cfg.intercept.rules, 'before_upstream', ctx)
+    if (rejectHostedModel(req, res, ctx.body, logBag)) return
+    // The local distillation rule applies before API endpoint selection, including model/body overrides.
+    if (
+      inferenceBackend === 'api' &&
+      cfg.distill?.enabled &&
+      (await applyProtocolIntercept({
+        req,
+        inbound,
+        body: ctx.body,
+        fp,
+        logBag,
+        requestId: logCtx.request_id,
+        res,
+        distillOnly: true,
+      }))
+    )
+      return
+    const apiInbound = inferenceBackend === 'api' ? ctx.body : null
+    const apiPicked = apiInbound
+      ? apiScheduler.pick(apiInbound.model, Date.now(), { groupType: keyScopeFromRequest(req).group_type })
+      : null
+    if (apiPicked && !apiPicked.ok) {
+      logBag.error_code = apiPicked.code
+      return json(res, apiPicked.code === 'model_not_found' ? 404 : 503, {
+        error: { code: apiPicked.code, message: apiPicked.message },
+      })
+    }
+    const imageModel = !apiPicked && canonicalImageToolModel(ctx.body?.model)
+    const platform = apiPicked
+      ? { ok: true, platform: apiPicked.endpoint.protocol === 'openai' ? 'openai' : 'anthropic' }
+      : imageModel
+        ? { ok: true, platform: 'openai' }
+        : detectInboundPlatform(ctx.body?.model)
+    const apiOpenAI = apiPicked && platform.platform === 'openai'
+    const apiRiskReview = !!apiPicked && !apiOpenAI && apiPicked.endpoint.risk_review_enabled === true
+    const preReviewEnabled = !apiPicked || apiOpenAI || apiRiskReview
+    const apiInputError = apiOpenAI ? validateApiOpenAIRequest(protocol, apiInbound) : null
+    if (apiInputError) return json(res, 400, { error: { type: 'invalid_request_error', ...apiInputError } })
+    if (apiPassthrough && !apiOpenAI && protocol !== 'anthropic.messages') {
+      return json(res, 400, {
+        type: 'error',
+        error: { type: 'invalid_request_error', code: 'messages_required', message: 'Use the Anthropic Messages API.' },
+      })
+    }
     if (!platform.ok) {
       stats.errors++
       logBag.attempt_count = 0
@@ -910,10 +1055,16 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, 403, errorResult.body)
     }
+    if (imageModel) {
+      if (rejectHybridProtocol(req, res, logBag) || rejectUnsupportedExitPath(ctx.body, res, logBag, { search: true }))
+        return
+      return serveImageModelTurn({ req, res, protocol, body: ctx.body, logBag })
+    }
     // Codex returns before conversion. Distill does not apply to OpenAI platform models; the rest
     // of the gate scans them only when jev.openai_platform_enabled is on.
     if (
       platform.platform !== 'openai' &&
+      inferenceBackend !== 'api' &&
       protocol === 'anthropic.messages' &&
       getHealthMonitor()?.getConfig?.()?.intercept_warmup === true
     ) {
@@ -935,17 +1086,30 @@ export function createHandleProtocol(deps) {
         return json(res, 200, mock)
       }
     }
-    if (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res })) {
+    if (
+      preReviewEnabled &&
+      (await applyProtocolIntercept({
+        req,
+        inbound,
+        body: ctx.body,
+        fp,
+        logBag,
+        requestId: logCtx.request_id,
+        res,
+        scopeMatched: apiRiskReview,
+      }))
+    ) {
       return
     }
     if (gatewayTurn) return serveHostedGateway(req, res, protocol, ctx.body, logBag)
-    if (platform.platform === 'openai') {
+    if (platform.platform === 'openai' && inferenceBackend !== 'api') {
       const routing = getRouting() || {}
       const codexSticky = {
         requestStartedAt: logCtx.t0,
         stickyRouter,
         sessions: accountQuota?.sessions || null,
         body: ctx.body,
+        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
       }
       // Account scope needs the slot, so the Codex hop runs the same gate again
       // once a candidate is claimed. Without a scope the pre-hop verdict stands.
@@ -962,7 +1126,39 @@ export function createHandleProtocol(deps) {
         })
       if (protocol === 'anthropic.messages') {
         const codex = normalizeCodexRouting(routing.codex)
-        return handleCodexProtocol({
+        return runWithCodexKey(req, res, logBag, () =>
+          handleCodexProtocol({
+            req,
+            res,
+            protocol,
+            ctx,
+            inbound,
+            logBag,
+            stats,
+            json,
+            writeSSEHeaders,
+            routing: {
+              ...routing,
+              codex: {
+                ...codex,
+                protocols: {
+                  ...codex.protocols,
+                  'anthropic.messages': { mode: 'convert', enabled: true },
+                },
+                convert: { ...codex.convert, anthropic_to_codex: true },
+              },
+            },
+            projectRoot: cfg.paths.project,
+            captureOutbound: logCtx.capture_outbound === true,
+            accountGate,
+            cfg,
+            ops: deps.codexOps || {},
+            ...codexSticky,
+          }),
+        )
+      }
+      return runWithCodexKey(req, res, logBag, () =>
+        handleCodexProtocol({
           req,
           res,
           protocol,
@@ -972,45 +1168,17 @@ export function createHandleProtocol(deps) {
           stats,
           json,
           writeSSEHeaders,
-          routing: {
-            ...routing,
-            codex: {
-              ...codex,
-              protocols: {
-                ...codex.protocols,
-                'anthropic.messages': { mode: 'convert', enabled: true },
-              },
-              convert: { ...codex.convert, anthropic_to_codex: true },
-            },
-          },
+          routing,
           projectRoot: cfg.paths.project,
           captureOutbound: logCtx.capture_outbound === true,
           accountGate,
           cfg,
           ops: deps.codexOps || {},
           ...codexSticky,
-        })
-      }
-      return handleCodexProtocol({
-        req,
-        res,
-        protocol,
-        ctx,
-        inbound,
-        logBag,
-        stats,
-        json,
-        writeSSEHeaders,
-        routing,
-        projectRoot: cfg.paths.project,
-        captureOutbound: logCtx.capture_outbound === true,
-        accountGate,
-        cfg,
-        ops: deps.codexOps || {},
-        ...codexSticky,
-      })
+        }),
+      )
     }
-    if (protocol === 'openai.responses') {
+    if (protocol === 'openai.responses' && inferenceBackend !== 'api') {
       stats.errors++
       logBag.error_code = 'protocol_not_allowed'
       return json(
@@ -1053,7 +1221,9 @@ export function createHandleProtocol(deps) {
     else if (converted.mode === 'rewrite') stats.rewrite++
     else stats.convert++
 
-    ctx = applyIntercept(cfg.intercept.rules, 'before_upstream', { ...ctx, body: converted.claude })
+    ctx = { ...ctx, body: converted.claude }
+    if (!apiInbound) ctx = applyIntercept(cfg.intercept.rules, 'before_upstream', ctx)
+    if (rejectHostedModel(req, res, ctx.body, logBag)) return
     const officialTraffic =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound, req.headers))
@@ -1070,7 +1240,8 @@ export function createHandleProtocol(deps) {
         logBag.error_message = error.body.error.message
         return json(res, error.status, error.body)
       }
-    } else if (!apiPassthrough) ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+    } else if (!apiPassthrough && !apiOpenAI)
+      ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
     let nativeRequestCacheTtl = null
     if (inferenceBackend !== 'api' && !requestContext) {
       try {
@@ -1098,6 +1269,8 @@ export function createHandleProtocol(deps) {
 
     if (
       !apiPassthrough &&
+      !apiRiskReview &&
+      preReviewEnabled &&
       (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res }))
     ) {
       return
@@ -1193,7 +1366,7 @@ export function createHandleProtocol(deps) {
     const openaiCompat = String(protocol || '').startsWith('openai.')
     syncClaudeKernelConfigsFromFile(cfg.paths?.project, routingConfigPath)
     const personaMode = personaModeFromRoutingFile(routingConfigPath)
-    if (!apiPassthrough && !requestContext && !officialClient && !officialTraffic) {
+    if (!apiPassthrough && !apiOpenAI && !requestContext && !officialClient && !officialTraffic) {
       ctx.body = ensureClaudeWebSearch(ctx.body, {
         enabled: shouldInjectClaudeWebSearch({
           officialClient: officialTraffic,
@@ -1205,9 +1378,9 @@ export function createHandleProtocol(deps) {
     }
     // After OpenAI→Anthropic conversion so function tools already have input_schema;
     // leftover OpenAI-shaped tools are still marked (rewrite / mixed inbound).
-    if (!apiPassthrough) ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
+    if (!apiPassthrough && !apiOpenAI) ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
     const personaIn = ctx.body
-    if (!apiPassthrough && !requestContext)
+    if (!apiPassthrough && !apiOpenAI && !requestContext)
       ctx.body = applyCrsUnofficialPersona(ctx.body, {
         officialClient: officialTraffic,
         routingFile: routingConfigPath,
@@ -1283,9 +1456,10 @@ export function createHandleProtocol(deps) {
           res,
           cfg,
           scheduler: apiScheduler,
+          picked: apiPicked,
           store: apiEndpointStore,
           protocol,
-          inbound,
+          inbound: apiInbound,
           convertedBody: ctx.body,
           clientHeaders: apiPassthrough ? req.headers : null,
           clientStream,
@@ -1360,7 +1534,10 @@ export function createHandleProtocol(deps) {
       if (protocol === 'anthropic.messages') output = clientBody
       else if (protocol === 'openai.chat') output = fromClaudeToOpenAIChat(clientBody, inbound.model)
       else if (protocol === 'openai.completions') output = fromClaudeToOpenAICompletions(clientBody, inbound.model)
-      else output = fromClaudeToResponses(clientBody, inbound.model, result.endpointId, converted.mode)
+      else
+        output = apiOpenAI
+          ? result.body
+          : fromClaudeToResponses(clientBody, inbound.model, result.endpointId, converted.mode)
       return json(res, 200, output)
     }
 
@@ -1995,21 +2172,244 @@ export function createHandleProtocol(deps) {
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeBody(body)
+    if (rejectHostedModel(req, res, body, logBag)) return
     if (rejectUnsupportedExitPath(body, res, logBag, { search: true })) return
-    return handleCodexSearch({
-      req,
-      res,
-      body,
-      logBag,
-      stats,
-      json,
-      routing: getRouting() || {},
-      projectRoot: cfg.paths.project,
-      stickyRouter,
+    return runWithCodexKey(req, res, logBag, () =>
+      handleCodexSearch({
+        req,
+        res,
+        body,
+        logBag,
+        stats,
+        json,
+        routing: getRouting() || {},
+        projectRoot: cfg.paths.project,
+        stickyRouter,
+        ops: deps.codexOps,
+        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+      }),
+    )
+  }
+
+  /** Field names and image count only: Images bodies carry base64 uploads. */
+  function summarizeImagesBody(body) {
+    if (!body || typeof body !== 'object') return null
+    return {
+      model: typeof body.model === 'string' ? body.model : null,
+      fields: Object.keys(body).sort(),
+      images: Array.isArray(body.images) ? body.images.length : body.image ? 1 : 0,
+      mask: body.mask != null,
+    }
+  }
+
+  /**
+   * Chat Completions / Responses turn on an image model: one Images call (generation, or edit
+   * when the last user message carries images) answered in the caller's protocol. The row is
+   * an Images row, so it bills image usage alone like /v1/images.
+   */
+  async function serveImageModelTurn({ req, res, protocol, body, logBag }) {
+    const turn = imagesRequestFromTurn(protocol, body)
+    if (!turn.ok) {
+      stats.errors++
+      logBag.error_code = turn.code
+      logBag.error_message = turn.message
+      return json(
+        res,
+        400,
+        makeError({
+          type: ErrorType.INVALID_REQUEST,
+          code: turn.code,
+          message: turn.message,
+          status: 400,
+          param: turn.param,
+        }).body,
+      )
+    }
+    logBag.protocol = 'openai.images'
+    logBag.inbound_summary = summarizeImagesBody(turn.body)
+    const stream = isClientStream(body, req.headers)
+    const streamKeepaliveMs = Number(
+      getRouting()?.failover?.stream_keepalive_ms ?? cfg.limits.stream_keepalive_ms ?? 15_000,
+    )
+    // Generation takes minutes: past the queue delay a stream commits SSE and pings so a
+    // proxy in front does not time out. Before that, failures keep their HTTP status.
+    const keepalive =
+      stream && streamKeepaliveMs > 0
+        ? createDownstreamKeepalive({
+            intervalMs: streamKeepaliveMs,
+            protocol,
+            write: (chunk) => {
+              if (responseClosed(res)) return
+              if (!res.headersSent) writeSSEHeaders(res)
+              res.write(chunk)
+            },
+          })
+        : null
+    let reply = null
+    try {
+      await runWithCodexKey(req, res, logBag, () => {
+        keepalive?.armAfter(queueKeepaliveDelayMs(getRouting(), cfg.limits?.queue_keepalive_delay_ms))
+        return handleCodexImages({
+          req,
+          res,
+          kind: turn.kind,
+          body: turn.body,
+          logBag,
+          stats,
+          json: (_res, status, payload) => {
+            reply = { status, payload }
+          },
+          routing: getRouting() || {},
+          projectRoot: cfg.paths.project,
+          stickyRouter,
+          ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+          ops: deps.codexOps || {},
+        })
+      })
+    } finally {
+      keepalive?.stop()
+    }
+    if (responseClosed(res)) return
+    if (!reply) {
+      // Client gone (cancelled) or the key gate already answered.
+      if (res.headersSent && !res.writableEnded) res.end()
+      return
+    }
+    let { status, payload } = reply
+    if (status < 400) {
+      const answer = imageModelAnswer(protocol, payload, {
+        model: body.model,
+        stream,
+        includeUsage: body.stream_options?.include_usage === true,
+      })
+      if (answer.ok) {
+        if (!stream) return json(res, 200, answer.body)
+        if (!res.headersSent) writeSSEHeaders(res)
+        res.write(answer.sse)
+        return res.end()
+      }
+      stats.errors++
+      logBag.final_state = 'upstream_error'
+      logBag.error_code = answer.code
+      logBag.error_message = answer.message
+      status = 502
+      payload = { error: { type: 'api_error', code: answer.code, message: answer.message } }
+    } else if (!logBag.error_message) {
+      logBag.error_message = payload?.error?.message || null
+    }
+    if (!res.headersSent) return json(res, status, payload)
+    res.write(imageModelStreamError(protocol, payload))
+    return res.end()
+  }
+
+  /** POST /v1/images/{generations,edits}: same logging and auth as search; edits also take multipart. */
+  async function handleImages(req, res, pathName, kind) {
+    const protocol = 'openai.images'
+    const logCtx = requestLog.start(req, { protocol, pathName })
+    res._kinRequestId = logCtx.request_id
+    requestLog.tapResponse?.(logCtx, res)
+    const logBag = {
+      protocol,
+      model: null,
+      stream: false,
+      inbound_summary: null,
+      upstream_status: null,
+      vm_id: null,
+      account_id: null,
+      usage: null,
+      error_code: null,
+      error_message: null,
+      via: 'codex-images',
+      attempt_count: null,
+      final_state: null,
+    }
+    res.on('finish', () => {
+      try {
+        const groupId = req.apiKeyRecord?.group_id ?? 1
+        requestLog.finish(logCtx, {
+          status: res.statusCode || 0,
+          api_key_kind: req.apiKeyKind || null,
+          api_key_id: req.apiKeyRecord?.id || null,
+          user_id: req.apiKeyRecord?.user_id ?? null,
+          group_id: groupId,
+          rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
+          ...logBag,
+        })
+      } catch {}
     })
+    if (!requireAuth(req, res)) {
+      logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
+      logBag.error_message = req.authError?.message || 'Invalid credentials'
+
+      return
+    }
+    if (rejectHybridProtocol(req, res, logBag)) return
+    let body
+    try {
+      const raw = await readRawBody(req, inboundBodyLimit(getRouting(), cfg.limits.max_body_bytes))
+      const contentType = req.headers?.['content-type']
+      if (kind === 'edits' && isMultipartFormData(contentType)) {
+        const converted = await normalizeImageEditBody(raw, contentType)
+        if (!converted.ok) {
+          stats.errors++
+          logBag.error_code = 'invalid_image_edit'
+          logBag.error_message = converted.message
+          return json(
+            res,
+            400,
+            makeError({
+              type: ErrorType.INVALID_REQUEST,
+              code: 'invalid_image_edit',
+              message: converted.message,
+              status: 400,
+            }).body,
+          )
+        }
+        body = converted.body
+      } else {
+        const text = raw.toString('utf8')
+        body = text ? JSON.parse(text) : {}
+      }
+    } catch (error) {
+      stats.errors++
+      logBag.error_code = error?.body?.error?.code || ErrorCode.INVALID_JSON
+      logBag.error_message = error?.body?.error?.message || String(error?.message || error)
+      if (error?.body?.error) return json(res, error.status || 400, error.body)
+      return json(
+        res,
+        400,
+        makeError({
+          type: ErrorType.INVALID_REQUEST,
+          code: ErrorCode.INVALID_JSON,
+          message: String(error?.message || error),
+          status: 400,
+        }).body,
+      )
+    }
+    logBag.model = typeof body?.model === 'string' ? body.model : null
+    logBag.inbound_summary = summarizeImagesBody(body)
+    if (rejectHostedModel(req, res, body, logBag)) return
+    if (rejectUnsupportedExitPath(body, res, logBag, { search: true })) return
+    return runWithCodexKey(req, res, logBag, () =>
+      handleCodexImages({
+        req,
+        res,
+        kind,
+        body,
+        logBag,
+        stats,
+        json,
+        routing: getRouting() || {},
+        projectRoot: cfg.paths.project,
+        stickyRouter,
+        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+        ops: deps.codexOps || {},
+      }),
+    )
   }
 
   return {
+    handleImages,
     handleProtocol,
     handleSearch,
     mapProtocolClientError,
