@@ -124,7 +124,10 @@ export function RefusalSettings() {
         hint='上游拒答过的正文记成指纹。精确命中直接 503；近似只比较用户正文，短于 512 字不做。改动立即生效。'
       >
         <ToggleList>
-          <ToggleItem label='拦截重复拒答' desc='REFUSAL_GUARD=0 会关掉整关'>
+          <ToggleItem
+            label='拦截重复拒答'
+            desc='控制拒答指纹、近似正文和设备拦截'
+          >
             <Switch
               checked={data.enabled}
               disabled={save.isPending}

@@ -90,7 +90,11 @@ export function RiskAuditPage() {
         ? 'on'
         : 'off'
       : 'loading',
-    refusal: refusal.data ? (refusal.data.enabled ? 'on' : 'off') : 'loading',
+    refusal: refusal.data
+      ? refusal.data.enabled || refusal.data.session_isolation_enabled
+        ? 'on'
+        : 'off'
+      : 'loading',
     jev: jev.data
       ? jev.data.enabled
         ? jev.data.base_url.trim()
