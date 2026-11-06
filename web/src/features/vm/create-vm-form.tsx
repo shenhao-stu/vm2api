@@ -11,6 +11,7 @@ import type { RuntimeType } from '@/types/panel-vm'
 import { ChevronRight } from 'lucide-react'
 import { toast } from 'sonner'
 import { api, isApiError } from '@/lib/api'
+import { selectedController } from '@/lib/controller'
 import { importErrorMessage } from '@/lib/import-errors'
 import { cn } from '@/lib/utils'
 import { vmIdOf } from '@/lib/vm-name'
@@ -164,7 +165,9 @@ export function useCreateVmDraft({
   onCreated?: (id: string) => void
 } = {}): CreateVmDraft {
   const qc = useQueryClient()
-  const [platform, setPlatform] = useState<Platform>('anthropic')
+  const [platform, setPlatform] = useState<Platform>(() =>
+    selectedController() === 'codex' ? 'openai' : 'anthropic'
+  )
   const [kernel, setKernel] = useState<string>(KERNELS[0].id)
   const [name, setName] = useState('')
   const [after, setAfter] = useState<string>(pinnedAfter || 'start')
