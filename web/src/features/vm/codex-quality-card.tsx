@@ -6,6 +6,11 @@ type Mode = 'manual' | 'daily' | 'hourly'
 type Probe = {
   mode: Mode
   model: string
+  config?: {
+    failure_threshold: number
+    interval_minutes: number
+    concurrency: number
+  }
   running: boolean
   items: {
     vm_id: string
@@ -28,6 +33,7 @@ const labels: Record<string, string> = {
   model_mismatch: '返回模型不同',
   skipped: '暂不具备探测条件',
   transport_error: '连接失败',
+  error: '探测失败',
   pending: '待核验',
 }
 const time = (ms: number) =>
@@ -54,7 +60,10 @@ export function CodexQualityCard() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ mode }),
           }),
-    onSuccess: (data) => client.setQueryData(key, data),
+    onSuccess: (data) => {
+      client.setQueryData(key, data)
+      void client.invalidateQueries({ queryKey: ['panel', 'quality-probe'] })
+    },
   })
   const data = q.data
   return (
@@ -73,6 +82,12 @@ export function CodexQualityCard() {
                 disabled={action.isPending || data.running}
                 onChange={(e) => action.mutate(e.target.value as Mode)}
               >
+                {data.config &&
+                  ![60, 1440].includes(data.config.interval_minutes) && (
+                    <option value='custom'>
+                      {data.config.interval_minutes} 分钟
+                    </option>
+                  )}
                 <option value='manual'>仅手动</option>
                 <option value='daily'>每天</option>
                 <option value='hourly'>每小时</option>
@@ -88,7 +103,8 @@ export function CodexQualityCard() {
             </Button>
           </div>
           <p className='text-xs text-muted-foreground'>
-            {data.model} · 空闲账号逐个测。连续两次有效答错静置 24 小时，间隔 10
+            {data.model} · 仅测空闲账号，连续{' '}
+            {data.config?.failure_threshold ?? 2} 次答错静置 24 小时，间隔 10
             分钟两次答对后恢复。
           </p>
           {data.items.map((s) => (

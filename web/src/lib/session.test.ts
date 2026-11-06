@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { logoutRequest } from './api'
+import { controllerSwitchEnabled } from './controller'
 import {
   LS_BASE,
   LS_TOKEN,
@@ -50,13 +51,15 @@ describe('panel session storage', () => {
     expect(hasSession()).toBe(false)
   })
 
-  it('keeps the bearer fallback for a separate API origin', () => {
+  it('pins the unified console to its origin and allows a separate API on standalone installs', () => {
     const values = installBrowser('localhost')
     setApiBase('http://127.0.0.1:8787')
 
     setSession('secret-token', 'admin')
 
-    expect(values.get(LS_BASE)).toBe('http://127.0.0.1:8787')
+    expect(values.get(LS_BASE)).toBe(
+      controllerSwitchEnabled ? undefined : 'http://127.0.0.1:8787'
+    )
     expect(values.get(LS_TOKEN)).toBe('secret-token')
   })
 

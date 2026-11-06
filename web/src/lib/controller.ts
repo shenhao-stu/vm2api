@@ -4,7 +4,7 @@ export const controllerSwitchEnabled =
   import.meta.env.VITE_CODEX_CONTROLLER === 'true'
 
 export function selectedController(
-  search = location.search,
+  search = globalThis.location?.search ?? '',
   enabled = controllerSwitchEnabled
 ): Controller {
   return enabled && new URLSearchParams(search).get('controller') === 'codex'
