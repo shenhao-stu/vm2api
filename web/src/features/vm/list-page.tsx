@@ -10,6 +10,7 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { CodexQualityCard } from './codex-quality-card'
 import { selectedController } from '@/lib/controller'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -186,6 +187,7 @@ export function VmListPage() {
         ) : undefined
       }
     >
+      {me.data?.role === 'admin' && selectedController() === 'codex' && <CodexQualityCard />}
       <NativeRelays
         enabled={me.data?.role === 'admin' && selectedController() === 'main'}
       />
