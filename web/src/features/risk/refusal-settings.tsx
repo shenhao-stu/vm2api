@@ -173,6 +173,21 @@ export function RefusalSettings() {
               ))}
             </div>
           </ToggleItem>
+          {typeof data.session_isolation_enabled === 'boolean' && (
+            <ToggleItem
+              label='隔离被拒的 Claude Pro 会话'
+              desc='Anthropic 拒绝后，继续该对话会被本地拦截，请新建会话。仅适用于非 ReClaude 的 Claude Pro 托管槽。'
+            >
+              <Switch
+                aria-label='隔离被拒的 Claude Pro 会话'
+                checked={data.session_isolation_enabled}
+                disabled={save.isPending}
+                onCheckedChange={(v) =>
+                  save.mutate({ session_isolation_enabled: v })
+                }
+              />
+            </ToggleItem>
+          )}
         </ToggleList>
       </Group>
 

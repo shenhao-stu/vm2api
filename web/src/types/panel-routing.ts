@@ -94,6 +94,7 @@ export type RefusalGuardConfig = {
   /** 80、85、90 或 95。 */
   similarity: number
   device_block_enabled: boolean
+  session_isolation_enabled?: boolean
   count: number
   items: RefusalGuardItem[]
   device_count: number
