@@ -27,6 +27,7 @@ class Channel:
     resident: bool = True
     busy: bool = False
     pending_ids: frozenset[str] = frozenset()
+    history_controls: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -148,12 +149,17 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
     identity = request_identity(scope, body, native)
     same_anchor = [c for c in channels
                    if c.identity.anchor_sha256 == identity.anchor_sha256]
+    boundaries = {}
     for channel in same_anchor:
         length = channel.history_length
-        if (type(length) is not int or length < 0
-                or length >= len(messages)
-                or native.signature(messages[:length]) != channel.history_sha256):
+        try:
+            _, prefix = native.frozen_history_prefix(
+                messages, length, channel.history_sha256, channel.history_controls)
+        except native.ContractError as error:
+            return reject(str(error))
+        if prefix >= len(messages):
             return reject("history_prefix_mismatch")
+        boundaries[channel.key] = prefix
     exact = [c for c in channels if c.identity == identity]
     if len(exact) > 1:
         return reject("native_channel_ambiguous")
@@ -164,7 +170,7 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
         if channel.status == "awaiting_tools" or channel.pending_ids:
             if channel is not selected:
                 return reject("native_pending_tools_no_branch")
-            tail = [m for m in messages[channel.history_length:] if m["role"] != "system"]
+            tail = [m for m in messages[boundaries[channel.key]:] if m["role"] != "system"]
             ids = [b["tool_use_id"] for b in tail[0]["content"]
                    if b["type"] == "tool_result"] if tail else []
             if (not channel.pending_ids or not tail or tail[0]["role"] != "user"

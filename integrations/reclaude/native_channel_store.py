@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import native_bridge_session as native
+from native_history_boundary import control_record
 from native_channel_policy import Channel, Identity, Snapshot, request_identity
 
 
@@ -119,6 +120,9 @@ class ChannelStore:
             status = 'failed' if session is not None and session.failed else state.get('status', 'unknown')
             length = state.get('history_length', 0)
             history_sha = state.get('history_sha256', native.signature([]))
+            controls = native.checkpoint_controls(directory, state)
+            if controls is None and session is not None and session.history:
+                controls = control_record(native.history_shape(session.history))
             pending = frozenset(getattr(session, 'pending_ids', ()))
             # A nonresident tool wait cannot be branched: the existing native
             # recover() still verifies the exact result set on its own path.
@@ -164,7 +168,7 @@ class ChannelStore:
                 raise native.ContractError('native_channel_evidence_unknown') from None
             channels.append(Channel(key, identity, status, length, history_sha,
                                     resident=entry is not None, busy=bool(entry and entry.busy),
-                                    pending_ids=pending))
+                                    pending_ids=pending, history_controls=controls))
         return Snapshot(logical, tuple(channels), frozenset(consumed), complete,
                         len(entries), capacity, unknown_dispatch=unknown,
                         stopped=stopped, memory_pressure=pressure)

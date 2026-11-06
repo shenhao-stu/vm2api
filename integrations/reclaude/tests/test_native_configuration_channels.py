@@ -239,5 +239,116 @@ class ChannelTests(unittest.TestCase):
             with self.pool.lease('tenant-a', next_body):
                 self.fail('missing consumed evidence must not open a fresh paid branch')
 
+    def test_withdrawn_turn_system_hint_preserves_verified_history(self):
+        for mode in ['resident', 'restart', 'legacy_restart']:
+            with self.subTest(mode=mode):
+                body = {**self.body, 'metadata': {'user_id': str(uuid.uuid4())}}
+                with self.pool.lease('tenant-a', body) as session:
+                    first = self.completed(session, body)
+                second = {**body, 'messages': first + [
+                    {'role': 'user', 'content': 'second input'},
+                    {'role': 'system', 'content': 'TRANSIENT_TOOL_HINT'}]}
+                with self.pool.lease('tenant-a', second) as session:
+                    history = self.completed(session, second)
+                    original_directory = session.directory
+                follow = {**body, 'messages': [m for m in history
+                    if m['role'] != 'system'] + [
+                    {'role': 'user', 'content': 'third input'},
+                    {'role': 'system', 'content': 'TRANSIENT_TOOL_HINT'}]}
+                path = original_directory / 'continuation.json'
+                if mode == 'legacy_restart':
+                    state = read_json(path)
+                    state.pop('history_controls_sha256', None)
+                    write_json(path, state)
+                frozen = path.read_bytes()
+                if mode != 'resident':
+                    self.pool.close()
+                    self.pool = self.new_pool()
+                with self.pool.lease('tenant-a', follow) as continued:
+                    self.assertEqual(continued.directory, original_directory)
+                    self.assertEqual(history_shape(continued.history), history_shape(history))
+                    self.assertIsNone(continued.continuation_import(follow))
+                self.assertEqual(path.read_bytes(), frozen)
+
+    def test_withdrawn_hint_preserves_pending_tool_ids_after_restart(self):
+        body = {**self.body, 'tools': [{'name': 'Read', 'input_schema': {'type': 'object'}}],
+                'messages': self.body['messages'] + [{'role': 'system', 'content': 'old hint'}]}
+        with self.pool.lease('tenant-a', body) as session:
+            content = [{'type': 'tool_use', 'id': 'call_exact', 'name': 'Read', 'input': {}}]
+            history = self.completed(session, body, content, ['call_exact'])
+            original = session.directory
+        self.pool.close(); self.pool = self.new_pool()
+        follow = {**body, 'messages': [m for m in history if m['role'] != 'system'] + [
+            {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'call_exact',
+                                         'content': 'complete tool result'}]},
+            {'role': 'system', 'content': 'new turn hint'}]}
+        bad = copy.deepcopy(follow)
+        bad['messages'][-2]['content'][0]['tool_use_id'] = 'wrong_call'
+        with self.assertRaises(ContractError):
+            with self.pool.lease('tenant-a', bad):
+                self.fail('unknown results must not be dispatched')
+        with self.pool.lease('tenant-a', follow) as restored:
+            self.assertEqual(restored.directory, original)
+            self.assertEqual(restored.pending_ids, {'call_exact'})
+            self.assertIsNone(restored.continuation_import(follow))
+            prefix = restored.history_prefix(follow['messages'])
+            self.assertEqual(follow['messages'][prefix:], follow['messages'][-2:])
+            self.assertEqual(len(list((original / 'caller-grants').glob('*.json'))), 1)
+
+    def test_corrupt_control_witness_cannot_fall_back_to_legacy(self):
+        body = {**self.body, 'messages': self.body['messages'] + [
+            {'role': 'system', 'content': 'private hint'}]}
+        with self.pool.lease('tenant-a', body) as session:
+            history = self.completed(session, body)
+            checkpoint = read_json(session.directory / 'continuation.json')
+            path = session.directory / 'history-controls' / (checkpoint['history_sha256'] + '.json')
+            path.unlink()
+        self.pool.close(); self.pool = self.new_pool()
+        follow = {**body, 'messages': history + [{'role': 'user', 'content': 'next'}]}
+        with self.assertRaisesRegex(ContractError, 'history_controls_unavailable'):
+            with self.pool.lease('tenant-a', follow):
+                self.fail('lost evidence must fail closed even for exact input')
+
+    def test_request_delivers_current_hint_and_keeps_one_paid_grant(self):
+        import io
+        body = {**self.body, 'messages': self.body['messages'] + [
+            {'role': 'system', 'content': 'old transient hint'}]}
+        with self.pool.lease('tenant-a', body) as session:
+            history = self.completed(session, body)
+        follow = {**body, 'messages': [m for m in history if m['role'] != 'system'] + [
+            {'role': 'user', 'content': 'new caller input'},
+            {'role': 'system', 'content': 'current transient hint'}]}
+        with self.pool.lease('tenant-a', follow) as session:
+            session.prepare = lambda: None
+            session.process = Mock(stdin=io.StringIO(), poll=lambda: None)
+            session.dispatch_process = Mock(poll=lambda: None)
+            message_id = 'msg_current'
+            session.assistants[message_id] = str(uuid.uuid4())
+            events = [
+                {'type': 'message_start', 'message': {'id': message_id, 'type': 'message',
+                 'role': 'assistant', 'model': 'opus', 'content': [], 'stop_reason': None,
+                 'usage': {'input_tokens': 7, 'output_tokens': 0}}},
+                {'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}},
+                {'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': 'done'}},
+                {'type': 'content_block_stop', 'index': 0},
+                {'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {'output_tokens': 3}},
+                {'type': 'message_stop'}]
+            authorize = session.authorize_dispatch
+            def consume():
+                authorize()
+                grant = read_json(session.directory / 'dispatch/grant.json')
+                write_json(session.directory / 'dispatch' / (grant['id'] + '.consumed.json'),
+                           grant, exclusive=True)
+            session.authorize_dispatch = consume
+            for event in events:
+                session.events.put(event)
+            self.assertEqual(list(session.request(follow))[-1]['type'], 'message_stop')
+            self.assertEqual(read_json(session.directory / 'context.pending.json'),
+                             ['current transient hint'])
+            sent = json.loads(session.process.stdin.getvalue())
+            self.assertEqual(sent['message']['content'], [{'type': 'text', 'text': 'new caller input'}])
+            self.assertEqual(len(list((session.directory / 'dispatch').glob('*.consumed.json'))), 2)
+            session.process = session.dispatch_process = None
+
 if __name__ == '__main__':
     unittest.main()

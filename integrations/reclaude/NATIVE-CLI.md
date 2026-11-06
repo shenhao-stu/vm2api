@@ -208,6 +208,16 @@ history hash. Failed or unfinished turns are never replayed. Invalid new input
 does not destroy an otherwise healthy conversation. Configuration and histories
 are not interchangeable across sessions.
 
+Callers may withdraw historical per-turn `system` controls while retaining every
+user, assistant and tool-result message exactly. New tail controls are still
+delivered once. Terminal checkpoints bind a private, immutable
+`history-controls/<history-sha>.json` witness containing only system controls;
+keep it with the session state during backup, migration and rollback. Recovery
+reconstructs and verifies the original full history hash before resuming. A
+missing or altered witness fails closed. Legacy checkpoints can recover one
+withdrawn hint before the last assistant only when the current caller supplies
+that hint and the original full hash matches; unknown histories remain blocked.
+
 Version-two continuation checkpoints distinguish idle, prepared and
 awaiting-tools states. Restart recovery accepts only idle or unconsumed prepared
 checkpoints. Resuming a pending tool turn requires the current process owner's

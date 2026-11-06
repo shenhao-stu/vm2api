@@ -24,6 +24,7 @@ import uuid
 import urllib.request
 from native_history import (HistoryError, active_efforts, import_plan, trailing_system_text,
                             validate_system_messages, write_transcript)
+import native_history_boundary as boundary
 
 
 STRUCTURED_RESPONSE_LIMIT = 16 * 1024 * 1024
@@ -416,6 +417,25 @@ def history_shape(messages):
     return [message_shape(message) for message in messages]
 
 
+def frozen_history_prefix(messages, length, history_sha, controls=None):
+    try:
+        shaped = history_shape(messages)
+        history, prefix = boundary.frozen_prefix(shaped, length, history_sha,
+                                                signature, controls)
+        if prefix == length and history == shaped[:length]:
+            history = messages[:length]
+        return history, prefix
+    except boundary.BoundaryError as error:
+        raise ContractError(str(error)) from None
+
+
+def checkpoint_controls(directory, state):
+    try:
+        return boundary.read_controls(directory, state)
+    except boundary.BoundaryError as error:
+        raise ContractError(str(error)) from None
+
+
 def caller_system(content):
     """The native CLI must generate its own runtime header, not inherit a caller's."""
     blocks = text_blocks(content)
@@ -690,11 +710,11 @@ class Session:
             return
         if state["status"] not in {"idle", "awaiting_tools"}:
             raise ContractError("native_session_incomplete_no_replay")
-        history = body["messages"][: state["history_length"]]
         if not matching:
             raise ContractError("session_configuration_changed")
-        if signature(history_shape(history)) != state["history_sha256"]:
-            raise ContractError("history_prefix_mismatch")
+        history, prefix = frozen_history_prefix(
+            body['messages'], state['history_length'], state['history_sha256'],
+            checkpoint_controls(self.directory, state))
         self.native_id = str(uuid.UUID(state["native_id"]))
         self.resume_uuid = str(uuid.UUID(state["assistant_uuid"]))
         self.resume_message_id = state.get("message_id")
@@ -705,7 +725,7 @@ class Session:
             blocks = history[-1].get("content", []) if history else []
             ids = [b.get("id") for b in blocks if isinstance(b, dict)
                    and b.get("type") == "tool_use"]
-            tail = [m for m in body["messages"][len(history):] if m.get("role") != "system"]
+            tail = [m for m in body["messages"][prefix:] if m.get("role") != "system"]
             results = [b.get("tool_use_id") for b in native_blocks(tail[0]["content"])
                        if b.get("type") == "tool_result"] if tail else []
             if (not ids or not tail or tail[0].get("role") != "user"
@@ -760,6 +780,13 @@ class Session:
                         "request_sha256": request_sha256,
                     }
                 )
+                try:
+                    controls_sha = boundary.write_controls(
+                        self.directory, history_shape(self.history), state['history_sha256'])
+                except boundary.BoundaryError as error:
+                    raise ContractError(str(error)) from None
+                if controls_sha is not None:
+                    state['history_controls_sha256'] = controls_sha
         self.write_checkpoint(state)
         self.checkpoint_configuration = state.get("configuration")
 
@@ -799,14 +826,19 @@ class Session:
         if not self.history:
             return None
         messages = body['messages']
-        if history_shape(messages[:len(self.history)]) != history_shape(self.history):
-            raise ContractError('history_prefix_mismatch')
-        tail = [m for m in messages[len(self.history):] if m['role'] != 'system']
+        prefix = self.history_prefix(messages)
+        tail = [m for m in messages[prefix:] if m['role'] != 'system']
         if len(tail) <= 1 and not self.structured_checkpoint:
             return None
         if self.history_profile is None:
             raise ContractError('unsupported_history_tail')
         return initial_request(body, allow_history_import=True)
+
+    def history_prefix(self, messages):
+        try:
+            return boundary.prefix_boundary(history_shape(self.history), history_shape(messages))
+        except boundary.BoundaryError as error:
+            raise ContractError(str(error)) from None
 
     def restart_for_request(self, body):
         """Resume at a verified assistant boundary; never replay a model turn."""
@@ -1290,23 +1322,13 @@ class Session:
                 self.dispatch_user_input(dispatch_blocks(blocks))
             else:
                 messages = body["messages"]
-                tail = messages[len(self.history) :]
+                tail = messages[self.history_prefix(messages):]
                 user_tail = [m for m in tail if m.get('role') != 'system']
                 if (
                     not user_tail
-                    or history_shape(messages[: len(self.history)])
-                    != history_shape(self.history)
                     or user_tail[0].get("role") != "user"
                 ):
-                    raise ContractError(
-                        "history_prefix_mismatch "
-                        + str(
-                            difference_path(
-                                history_shape(self.history),
-                                history_shape(messages[: len(self.history)]),
-                            )
-                        )
-                    )
+                    raise ContractError('history_prefix_mismatch')
                 if len(user_tail) != 1:
                     raise ContractError("unsupported_history_tail")
                 blocks = native_blocks(user_tail[0]["content"])
