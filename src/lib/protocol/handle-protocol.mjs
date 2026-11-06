@@ -718,7 +718,6 @@ export function createHandleProtocol(deps) {
       ensureCredential: (exec) => ensureWorkerCredential(exec),
       onEvent: async (line) => {
         observePolicyEvent?.(line)
-        if (/response_headers/.test(String(line))) return
         applyClaudeSSELineToMessage(restoreToolNamesInSSELine(line, toolNames), assembler)
       },
     })

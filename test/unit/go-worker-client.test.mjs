@@ -1145,3 +1145,44 @@ test('workerHealth fails closed when socket is absent', async () => {
   )
   assert.equal(result.ok, false)
 })
+
+unixTest('assembling a non-streaming reply preserves response_headers inside a tool argument', async (t) => {
+  const { createHandleProtocol } = await import('../../src/lib/protocol/handle-protocol.mjs')
+  const previousBin = process.env.KIN_KERNEL_BIN
+  process.env.KIN_KERNEL_BIN = process.execPath
+  t.after(() => {
+    if (previousBin === undefined) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previousBin
+  })
+  const fx = await fixture(async (req, res) => {
+    if (req.url === '/internal/health') {
+      res.setHeader('content-type', 'application/json')
+      return res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 1 }))
+    }
+    req.resume()
+    res.setHeader('content-type', 'text/event-stream')
+    const push = (type, fields = {}) => writeData(res, { type, ...fields })
+    push('message_start', { message: { id: 'msg_test', role: 'assistant', content: [] } })
+    push('response_headers', { headers: { 'x-test': 'internal' } })
+    push('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'tool_1', name: 'read', input: {} } })
+    for (const partial_json of ['{"path":"', 'response_headers', '.json"}']) {
+      push('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json } })
+    }
+    push('content_block_stop', { index: 0 })
+    push('message_delta', { delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 8 } })
+    push('message_stop')
+    res.end()
+  })
+  t.after(() => fx.close())
+  fx.exec.vm.runtime.kernel_socket = fx.exec.vm.runtime.worker_socket
+  const { streamAndAssembleClaudeMessage } = createHandleProtocol({ getRouting: () => ({}) })
+  const result = await streamAndAssembleClaudeMessage({
+    candidate: { exec: fx.exec },
+    body: { model: 'claude-haiku-4-5-20251001', messages: [{ role: 'user', content: 'read the file' }] },
+    reqHeaders: {},
+    timeoutMs: 3000,
+    idleTimeoutMs: 3000,
+  })
+  assert.equal(result.ok, true, JSON.stringify(result.body))
+  assert.deepEqual(result.body.content[0].input, { path: 'response_headers.json' })
+})
