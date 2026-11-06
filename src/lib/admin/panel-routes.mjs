@@ -3188,6 +3188,22 @@ export function createPanelHandler(ctx) {
         return await handleVmTestSchedule(req, res, p.split('/')[4])
       }
 
+      if (ctx.codexQuality && (p === '/api/panel/quality-probe' || p === '/api/panel/quality-probe/run')) {
+        if (panelIdentity(req).role !== 'admin') return json(res, 403, { error: { code: 'admin_required' } })
+        if (p.endsWith('/run') && req.method === 'POST') {
+          const round = ctx.codexQuality.run(true)
+          if (!round) return json(res, 409, { error: { code: 'quality_probe_busy' } })
+          void round.catch(() => console.warn('[codex-quality] manual round failed'))
+          return json(res, 202, ctx.codexQuality.snapshot())
+        }
+        if (!p.endsWith('/run') && req.method === 'GET') return json(res, 200, ctx.codexQuality.snapshot())
+        if (!p.endsWith('/run') && req.method === 'PUT') {
+          const body = await readBody(req, 1024)
+          if (!['manual', 'daily', 'hourly'].includes(body?.mode)) return json(res, 400, { error: { code: 'invalid_quality_mode' } })
+          return json(res, 200, ctx.codexQuality.configure(body.mode))
+        }
+        return json(res, 405, { error: { code: 'method_not_allowed' } })
+      }
       if (req.method === 'GET' && p === '/api/panel/test-schedule/default') {
         return await handleVmTestScheduleDefault(req, res)
       }

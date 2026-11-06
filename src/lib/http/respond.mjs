@@ -16,6 +16,15 @@ function requestFromResponse(res) {
   return res?.req || res?._kinReq || null
 }
 
+// A declared oversize Codex upload can be rejected before retaining any of its body.
+function codexBodyPath(req) {
+  return /^\/v1\/(?:responses|chat\/completions|images\/(?:edits|generations))(?:[/?]|$)/.test(req.url || '')
+}
+function sizeError(maxBytes, bytes, field) {
+  return makeError({ type: ErrorType.INVALID_REQUEST, code: ErrorCode.BODY_TOO_LARGE,
+    message: `Request body exceeds limit of ${maxBytes} bytes`, status: 413, details: { max_bytes: maxBytes, [field]: bytes } })
+}
+
 function collectBody(req, maxBytes) {
   return new Promise((resolve, reject) => {
     const chunks = []
@@ -24,24 +33,23 @@ function collectBody(req, maxBytes) {
     const fail = (error) => {
       if (settled) return
       settled = true
+      chunks.length = 0
       req.removeAllListeners('data')
       req.on('data', () => {})
       req.resume()
       reject(error)
     }
+    const declared = Number(req.headers?.['content-length'])
+    if (codexBodyPath(req) && declared > maxBytes) {
+      req.on('error', () => {})
+      fail(sizeError(maxBytes, declared, 'declared'))
+      return
+    }
     req.on('data', (c) => {
       if (settled) return
       size += c.length
       if (size > maxBytes) {
-        fail(
-          makeError({
-            type: ErrorType.INVALID_REQUEST,
-            code: ErrorCode.BODY_TOO_LARGE,
-            message: `Request body exceeds limit of ${maxBytes} bytes`,
-            status: 413,
-            details: { max_bytes: maxBytes, received: size },
-          }),
-        )
+        fail(sizeError(maxBytes, size, 'received'))
         return
       }
       chunks.push(c)
@@ -74,9 +82,9 @@ export function readBody(req, maxBytes) {
       throw makeError({
         type: ErrorType.INVALID_REQUEST,
         code: ErrorCode.INVALID_JSON,
-        message: 'Request body is not valid JSON: ' + (e.message || 'parse error'),
+        message: codexBodyPath(req) ? 'Request body is not valid JSON' : 'Request body is not valid JSON: ' + (e.message || 'parse error'),
         status: 400,
-        details: { parse_error: String(e.message || e) },
+        details: codexBodyPath(req) ? undefined : { parse_error: String(e.message || e) },
       })
     }
   })

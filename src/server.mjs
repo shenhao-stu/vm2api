@@ -39,6 +39,7 @@ import { invalidateLiveCredentialCache } from './lib/admin/panel-live-credential
 import { normalizeHealthProbeConfig, createHealthProbeMonitor, HEALTH_REAL_HEADER } from './lib/admin/health-probe.mjs'
 import { normalizeNotifyConfig, createNotifyMonitor } from './lib/admin/notify.mjs'
 import { snapshotVmConnectivity } from './lib/admin/vm-connectivity.mjs'
+import { CodexQualityMonitor, loopbackMeasurement } from './lib/admin/codex-quality.mjs'
 import { runVmTestChat } from './lib/admin/vm-test-chat.mjs'
 import { VmTestScheduleRunner } from './lib/admin/vm-test-schedule.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
@@ -519,6 +520,11 @@ healthMonitor = createHealthProbeMonitor({
       extraHeaders: { [HEALTH_REAL_HEADER]: '1' },
     }),
 })
+const codexQuality = process.env.VM2API_CODEX_QUALITY === '1' ? new CodexQualityMonitor({
+  project: cfg.paths.project,
+  quotaPolicy: () => routingConfig.codex?.quota,
+  measure: loopbackMeasurement({ project: cfg.paths.project, port: cfg.port, apiKey: cfg.api_key, receipt: id => requestLog.repo.getByRequestId(id) }),
+}) : null
 const vmTestSchedule = new VmTestScheduleRunner({
   projectRoot: cfg.paths.project,
   settings: () => new SettingsRepo(),
@@ -1060,6 +1066,7 @@ const handlePanel = createPanelHandler({
   panelUsers,
   requestLog,
   vmTestSchedule,
+  codexQuality,
   backupService,
   stats,
   persistRoutingPatch,
@@ -1334,6 +1341,7 @@ async function shutdown(signal) {
   console.log(`[shutdown] ${signal} — closing`)
   try {
     vmTestSchedule.stop()
+    await codexQuality?.stop()
   } catch {}
   try {
     backupService.stopScheduler()
@@ -1396,6 +1404,7 @@ server.timeout = 0
 server.listen(cfg.port, cfg.host, () => {
   try {
     vmTestSchedule.start()
+    codexQuality?.start()
   } catch (e) {
     console.warn('[vm-test-schedule] start failed', e?.message || e)
   }

@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events'
 import http from 'node:http'
 import { streamCodexKernel } from '../../src/lib/transport/codex-kernel-client.mjs'
 import {
@@ -1959,5 +1960,95 @@ test('a real Unix folded no_capacity immediately switches seats once and applies
   } finally {
     await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))))
     fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('GPT admission releases its seat when the account gate throws, rejects or blocks', async (t) => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  for (const outcome of ['throw', 'reject', 'block']) {
+    await t.test(outcome, async (t) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-gate-release-'))
+      const waits = []
+      t.after(async () => {
+        rt.resetOpenAIAccountRuntime()
+        await Promise.all(waits)
+        fs.rmSync(root, { recursive: true, force: true })
+      })
+      writeGptVm(root, 'vm-gpt-a')
+      const args = codexArgs(root, {
+        writeCodexKernelConfig: () => assert.fail('a rejected account gate must not prepare the kernel'),
+      })
+      const error = new Error(`account gate ${outcome}`)
+      const woken = []
+      args.accountGate = () => {
+        assert.equal(rt.openAIRuntimeSignals('vm-gpt-a').inFlight, 1)
+        for (let i = 0; i < 2; i += 1) {
+          waits.push(rt.waitForOpenAICapacity({ deadline: Date.now() + 60_000 }).then(() => woken.push(i)))
+        }
+        if (outcome === 'throw') throw error
+        if (outcome === 'reject') return Promise.reject(error)
+        args.res.statusCode = 403
+        return true
+      }
+      const pending = handleCodexProtocol(args)
+      if (outcome === 'block') {
+        assert.equal(await pending, undefined)
+        assert.equal(args.res.statusCode, 403)
+      } else {
+        await assert.rejects(pending, (caught) => caught === error)
+      }
+      assert.equal(rt.openAIRuntimeSignals('vm-gpt-a').inFlight, 0)
+      assert.deepEqual(woken, [0], 'one released seat wakes only one waiter')
+      assert.equal(rt.openAIWaiterCount(), 1)
+      assert.equal(args.stats.requests, 1)
+      assert.equal(args.stats.errors, 0)
+      assert.equal(args.logBag.attempt_count, 0)
+    })
+  }
+})
+
+test('GPT admission releases a cancelled request after its pending account gate settles', async (t) => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  for (const event of ['aborted', 'close']) {
+    await t.test(event, async (t) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-gate-cancel-'))
+      t.after(() => {
+        rt.resetOpenAIAccountRuntime()
+        fs.rmSync(root, { recursive: true, force: true })
+      })
+      writeGptVm(root, 'vm-gpt-a')
+      let enterGate
+      const entered = new Promise((resolve) => {
+        enterGate = resolve
+      })
+      let finishGate
+      const gate = new Promise((resolve) => {
+        finishGate = resolve
+      })
+      const args = codexArgs(root, {
+        writeCodexKernelConfig: () => assert.fail('a cancelled request must not prepare the kernel'),
+      })
+      args.req = Object.assign(new EventEmitter(), args.req)
+      args.res = Object.assign(new EventEmitter(), args.res)
+      args.accountGate = async () => {
+        enterGate()
+        return gate
+      }
+      const pending = handleCodexProtocol(args)
+      await entered
+      assert.equal(rt.openAIRuntimeSignals('vm-gpt-a').inFlight, 1)
+      const emitter = event === 'aborted' ? args.req : args.res
+      emitter.emit(event)
+      finishGate(false)
+      assert.equal(await pending, undefined)
+      assert.equal(rt.openAIRuntimeSignals('vm-gpt-a').inFlight, 0)
+      assert.equal(args.logBag.final_state, 'cancelled')
+      assert.equal(args.logBag.attempt_count, 0)
+      assert.equal(args.stats.errors, 0)
+      assert.equal(args.req.listenerCount('aborted'), 0)
+      assert.equal(args.res.listenerCount('close'), 0)
+      emitter.emit(event)
+      assert.equal(rt.openAIRuntimeSignals('vm-gpt-a').inFlight, 0)
+    })
   }
 })

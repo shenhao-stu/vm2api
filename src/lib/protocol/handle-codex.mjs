@@ -1,6 +1,8 @@
 /**
  * Codex hop from handle-protocol. Claude convert/pool/CRS never runs here.
  */
+import { qualityExitBinding } from '../pool/codex-quality-exit.mjs'
+import { eligibleQualitySlot } from '../pool/codex-quality-gate.mjs'
 import { writeChunkedWithBackpressure } from '../http/write-backpressure.mjs'
 import { createHash } from 'node:crypto'
 import { upstreamAuthFailureReason } from './codex-errors.mjs'
@@ -242,6 +244,8 @@ export function pickCodexCandidates(
   if (pin) {
     const vm = getVm(projectRoot, pin)
     if (!vm || !isCodexVm(vm)) return { error: 'platform_mismatch', pin, ids: [] }
+    if (req.headers['x-kin-quality-probe'] === '1' && (!qualityExitBinding(projectRoot, vm) || !eligibleQualitySlot(vm, projectRoot, model, routingPolicy, Date.now())))
+      return { error: 'capacity_unavailable', pin, ids: [], candidates: [] }
     if (!keyAllowsVm(scope, vm)) return { error: 'key_group_mismatch', pin, ids: [] }
     if (!codexSlotAllowsModel(vm, model)) return { error: 'model_not_allowed', pin, ids: [] }
     const ordered = orderCodexSessionSlots([vm], {
@@ -575,6 +579,9 @@ async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal })
       })
       if (lease) return { picked, vmId: candidate.id, lease }
     }
+    if (signal?.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
+    if (pinnedVmId(req) && req.headers['x-kin-quality-probe'] === '1')
+      return { picked: { error: 'capacity_unavailable', ids: [] } }
     const waitIds = picked.candidates?.length ? picked.candidates.map((candidate) => candidate.id) : picked.waitIds
     // A woken waiter that missed a seat it can use lost it to a newer request;
     // passing the wake on would only re-run selection for every waiter behind
@@ -652,6 +659,7 @@ export async function runCodexKernelHop({ hop, args = {}, onEvent, onReasoningFa
     if (onEvent) await onEvent(line)
   }
   let result = await hop({ ...args, onEvent: wrapped })
+  if (args.singleAttempt) return result
   if (!result?.ok && !emitted && isRetryableCodexTransport(result)) {
     result = { ...(await hop({ ...args, onEvent: wrapped })), transport_retried: true }
   }
@@ -781,7 +789,8 @@ export async function handleCodexProtocol({
   }
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
-  const failoverBudget = codexFailoverBudget(routing)
+  const singleAttempt = !!pinnedVmId(req) && req.headers['x-kin-quality-probe'] === '1'
+  const failoverBudget = singleAttempt ? { maxAttempts: 1, maxSwitches: 0, maxSameAccountRetries: 0 } : codexFailoverBudget(routing)
   const sameRetryDelay = Number(routing?.failover?.same_account_retry_delay_ms)
   const sameRetryDelayMs =
     Number.isFinite(sameRetryDelay) && sameRetryDelay >= 0 ? Math.min(10_000, sameRetryDelay) : 100
@@ -805,60 +814,60 @@ export async function handleCodexProtocol({
         if (last) break
         return rejectCodexAdmission({ res, json, stats, logBag, picked, model: converted.body?.model })
       }
-      const vm = getVm(projectRoot, admitted.vmId)
       const lease = admitted.lease
-      if (!vm || !isCodexVm(vm)) {
-        lease.release()
-        pickOpts.excluded.add(admitted.vmId)
-        continue
-      }
-      attempts += 1
-      if (attempts > failoverBudget.maxAttempts) {
-        lease.release()
-        break
-      }
-      if (!counted) {
-        counted = true
-        stats.requests++
-        stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
-      }
-      // The slot is known here, so an account scope can be applied. `true`
-      // means the 403 is already written.
-      if (accountGate) {
-        logBag.vm_id = vm.id
-        const blocked = await accountGate(scopeAccountFromVm(vm))
-        if (blocked) {
-          lease.release()
+      let claimsWindow = false
+      let windowGen = null
+      try {
+        const vm = getVm(projectRoot, admitted.vmId)
+        if (!vm || !isCodexVm(vm)) {
+          pickOpts.excluded.add(admitted.vmId)
+          continue
+        }
+        attempts += 1
+        if (attempts > failoverBudget.maxAttempts) {
+          break
+        }
+        if (!counted) {
+          counted = true
+          stats.requests++
+          stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
+        }
+        // The slot is known here, so an account scope can be applied. `true`
+        // means the 403 is already written.
+        if (accountGate) {
+          logBag.vm_id = vm.id
+          const blocked = await accountGate(scopeAccountFromVm(vm))
+          if (blocked) return
+        }
+        if (gone.signal.aborted) {
+          logBag.final_state = 'cancelled'
           return
         }
-      }
-      const stickyKeys = picked.stickyKeys?.length ? picked.stickyKeys : picked.sessionKey ? [picked.sessionKey] : []
-      const stickyBound = picked.sessionKey ? stickyRouter?.resolve?.(picked.sessionKey) : null
-      // The home (or first placement) owns the conversation window; a borrowed
-      // seat elsewhere takes only this request's execution lease.
-      const claimsWindow = !!picked.sessionKey && (!picked.home || picked.home === vm.id)
-      let windowGen = null
-      if (claimsWindow) {
-        try {
-          windowGen = sessions?.touch?.(vm.id, picked.sessionKey) ?? null
-        } catch {}
-      }
-      const ownsPin = !!stickyBound?.vmId && stickyBound.vmId === vm.id
-      const bindSticky = (sessionId = null) => {
-        if (!picked.sessionKey || !stickyRouter?.bind) return
-        const payload = { accountId: vm.id, vmId: vm.id }
-        if (sessionId) payload.sessionId = sessionId
-        for (const key of stickyKeys) stickyRouter.bind(key, payload)
-      }
-      const leaveSticky = () => {
-        if (!ownsPin || !picked.sessionKey) return
-        try {
-          sessions?.drop?.(vm.id, picked.sessionKey)
-        } catch {}
-        for (const key of stickyKeys) stickyRouter?.unbind?.(key)
-      }
-      let attemptKind = 'failed'
-      try {
+        const stickyKeys = picked.stickyKeys?.length ? picked.stickyKeys : picked.sessionKey ? [picked.sessionKey] : []
+        const stickyBound = picked.sessionKey ? stickyRouter?.resolve?.(picked.sessionKey) : null
+        // The home (or first placement) owns the conversation window; a borrowed
+        // seat elsewhere takes only this request's execution lease.
+        claimsWindow = !!picked.sessionKey && (!picked.home || picked.home === vm.id)
+        if (claimsWindow) {
+          try {
+            windowGen = sessions?.touch?.(vm.id, picked.sessionKey) ?? null
+          } catch {}
+        }
+        const ownsPin = !!stickyBound?.vmId && stickyBound.vmId === vm.id
+        const bindSticky = (sessionId = null) => {
+          if (!picked.sessionKey || !stickyRouter?.bind) return
+          const payload = { accountId: vm.id, vmId: vm.id }
+          if (sessionId) payload.sessionId = sessionId
+          for (const key of stickyKeys) stickyRouter.bind(key, payload)
+        }
+        const leaveSticky = () => {
+          if (!ownsPin || !picked.sessionKey) return
+          try {
+            sessions?.drop?.(vm.id, picked.sessionKey)
+          } catch {}
+          for (const key of stickyKeys) stickyRouter?.unbind?.(key)
+        }
+        let attemptKind = 'failed'
         const localExit = isLocalEgressProxy(vm.proxy)
         const written = writeCfg(projectRoot, vm, {
           // Same rule as slot start: a node on local egress must leave through
@@ -935,6 +944,7 @@ export async function handleCodexProtocol({
             args: {
               exec: execFor(projectRoot, vm),
               signal: gone.signal,
+              singleAttempt,
               timeoutMs: cfg?.limits?.upstream_timeout_ms ?? 600_000,
               idleTimeoutMs: resolveStreamIdleTimeoutMs(routing, cfg),
               routing,
@@ -1145,7 +1155,7 @@ export async function handleCodexProtocol({
         lease.release()
         if (claimsWindow) {
           try {
-            sessions?.release?.(vm.id, picked.sessionKey, { gen: windowGen })
+            sessions?.release?.(admitted.vmId, picked.sessionKey, { gen: windowGen })
           } catch {}
         }
       }
