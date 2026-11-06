@@ -579,3 +579,34 @@ export function restoreToolNamesInSSELine(line, reverse = {}) {
   if (payload?.message) payload.message = restoreToolNames(payload.message, reverse)
   return `${prefix} ${JSON.stringify(payload)}`
 }
+
+function stripBillingText(text) {
+  return String(text || '').replace(/^[ \t]*x-anthropic-billing-header:[^\n]*(?:\n|$)/gim, '')
+}
+
+export function stripCallerBilling(body) {
+  if (!body || typeof body !== 'object' || body.system == null) return body
+  const keep = (block) => {
+    const raw = typeof block === 'string' ? block : block?.text
+    if (typeof raw !== 'string' || !/x-anthropic-billing-header:/i.test(raw)) return block
+    const text = stripBillingText(raw)
+    if (!text) return null
+    if (text === raw) return block
+    return typeof block === 'string' ? text : { ...block, text }
+  }
+  if (typeof body.system === 'string') {
+    const text = keep(body.system)
+    if (text === body.system) return body
+    const next = { ...body }
+    if (text) next.system = text
+    else delete next.system
+    return next
+  }
+  if (!Array.isArray(body.system)) return body
+  const system = body.system.map(keep).filter((block) => block != null)
+  if (system.length === body.system.length && system.every((block, index) => block === body.system[index])) return body
+  const next = { ...body }
+  if (system.length) next.system = system
+  else delete next.system
+  return next
+}

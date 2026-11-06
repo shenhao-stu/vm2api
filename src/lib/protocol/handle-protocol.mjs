@@ -13,6 +13,7 @@ import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
 import {
   inboundRefusalDeviceId,
   isRefusalGuardEnabled,
+  readSessionIsolationPolicy,
   isUpstreamRefusal,
   refusalFingerprint,
   refusalGuardPolicy,
@@ -23,6 +24,7 @@ import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
+import { createRefusalSessionIsolation } from './refusal-session-isolation.mjs'
 import { jevScopeWaits, readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
 import {
@@ -197,6 +199,12 @@ export function createHandleProtocol(deps) {
     typeof deps.getHealthMonitor === 'function' ? deps.getHealthMonitor() : deps.healthMonitor
   const getFailoverRunner = () =>
     typeof deps.getFailoverRunner === 'function' ? deps.getFailoverRunner() : deps.failoverRunner
+  const refusalSession = createRefusalSessionIsolation({
+    readPolicy: () => {
+      const settings = deps.settings || new SettingsRepo()
+      return readSessionIsolationPolicy((key, fallback) => settings.get(key, fallback))
+    },
+  })
   const thinkingOwnerStore = deps.thinkingOwners || defaultThinkingOwners
   function responseClosed(res) {
     return !!(res?.destroyed || res?.writableEnded || res?.closed)
@@ -688,6 +696,7 @@ export function createHandleProtocol(deps) {
     requestContext = null,
     routing = {},
     noGoFallback = false,
+    observePolicyEvent = null,
   }) {
     const assembler = createClaudeMessageAssembler()
     const workerResult = await dispatchStreamInference({
@@ -708,6 +717,7 @@ export function createHandleProtocol(deps) {
       noGoFallback,
       ensureCredential: (exec) => ensureWorkerCredential(exec),
       onEvent: async (line) => {
+        observePolicyEvent?.(line)
         if (/response_headers/.test(String(line))) return
         applyClaudeSSELineToMessage(restoreToolNamesInSSELine(line, toolNames), assembler)
       },
@@ -1542,6 +1552,12 @@ export function createHandleProtocol(deps) {
       return json(res, 200, output)
     }
 
+    const isolation = refusalSession({
+      keyId: req.apiKeyRecord?.id || req.apiKeyKind || 'unkeyed',
+      sessionId: callerSession,
+      system: converted.claude.system,
+      messages: converted.claude.messages,
+    })
     const canonicalBody = officialMessagesBody(ctx.body)
     const streamKeepaliveMs = Number(
       getRouting()?.failover?.stream_keepalive_ms ?? cfg.limits.stream_keepalive_ms ?? 15_000,
@@ -1659,6 +1675,8 @@ export function createHandleProtocol(deps) {
         deliveryMode,
         signal: clientAbort.signal,
         applyAttempt: async (body, selected, extra = {}) => {
+          const denial = isolation.admit(selected)
+          if (denial) return { localDenial: denial }
           // Only this account's own thinking replays as thinking. Another
           // account's signature, or one with no record, goes out as text.
           const owned = filterThinkingForAccount(body, selected.accountId, thinkingOwnerStore)
@@ -1877,11 +1895,15 @@ export function createHandleProtocol(deps) {
           logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(prepared.body) || attemptSessionId)
           return { body: prepared.body, meta: { toolNames: prepared.toolNames, sessionId: attemptSessionId } }
         },
+        onAttempt: ({ result }) => {
+          isolation.complete(result)
+        },
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
           if (!clientStream) {
             return streamAndAssembleClaudeMessage({
               candidate,
               body,
+              observePolicyEvent: isolation.observeLine,
               reqHeaders: req.headers,
               timeoutMs: cfg.limits.upstream_timeout_ms,
               idleTimeoutMs: streamIdleTimeoutMs,
@@ -1946,6 +1968,7 @@ export function createHandleProtocol(deps) {
                 onCommit()
               },
               onEvent: async (line) => {
+                isolation.observeLine(line)
                 line = restoreToolNamesInSSELine(line, attemptMeta?.toolNames || {})
                 if (personaHideTokens) line = hidePersonaUsageInSseLine(line, personaHideTokens, cacheTtl)
                 if (protocol === 'anthropic.messages') {
@@ -1998,6 +2021,20 @@ export function createHandleProtocol(deps) {
       for (const frame of anthropicFrames.push('')) writeAnthropicFrame(frame)
     }
 
+    if (result?.localDenial) {
+      const { status, body } = result.localDenial
+      stats.errors++
+      Object.assign(logBag, {
+        via: 'refusal-guard',
+        final_state: status === 403 ? 'refusal_session_isolated' : 'rejected',
+        error_code: body.error.code,
+        error_message: body.error.message,
+        attempt_count: result.attemptCount,
+      })
+      if (!res.headersSent) return json(res, status, body)
+      if (protocol === 'anthropic.messages') return res.end(buildAnthropicSseError(body.error))
+      return res.end(`data: ${JSON.stringify({ error: body.error })}\n\ndata: [DONE]\n\n`)
+    }
     if (result?.responseSent) return
 
     result = acceptAssistantHop(result)

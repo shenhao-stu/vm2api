@@ -159,6 +159,7 @@ test('panel policy defaults on at 90 and rejects an unknown threshold', () => {
     similarity_enabled: true,
     similarity: 90,
     device_block_enabled: true,
+    session_isolation_enabled: true,
   })
   const settings = new Map()
   const store = {
@@ -175,6 +176,7 @@ test('panel policy defaults on at 90 and rejects an unknown threshold', () => {
       similarity_enabled: false,
       similarity: 85,
       device_block_enabled: true,
+      session_isolation_enabled: true,
     },
   )
 })

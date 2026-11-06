@@ -40,6 +40,7 @@ const DEFAULT_VIA = 'go-worker-pool'
 const BLOCKED_STATES = {
   distill_blocked: 'distill',
   refusal_guard: 'refusal_guard',
+  refusal_session_isolated: 'refusal_guard',
   refusal_similar: 'refusal_guard',
   refusal_device: 'refusal_guard',
   policy_blocked: 'policy',

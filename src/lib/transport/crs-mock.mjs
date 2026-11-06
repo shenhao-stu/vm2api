@@ -88,6 +88,15 @@ export function mockCrsPayload(options = {}) {
       },
     }
   }
+  if (scenario === 'policy_refusal') {
+    return {
+      ok: true,
+      status: 200,
+      via: 'go-worker',
+      body: message({ text: 'Declined', stop: 'refusal' }),
+      headers: {},
+    }
+  }
   if (scenario === 'tool_use') {
     return {
       ok: true,
