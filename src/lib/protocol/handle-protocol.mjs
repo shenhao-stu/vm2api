@@ -137,7 +137,8 @@ import {
   isClaudeCodeFamilyRequest,
   isClaudeDesktopConnectionProbe,
 } from '../identity/claude-code-only.mjs'
-import { createDownstreamKeepalive } from './stream-keepalive.mjs'
+import { createDownstreamKeepalive, parseSseDataLine } from './stream-keepalive.mjs'
+import { createSseFrameBuffer } from './sse-frame-buffer.mjs'
 import {
   buildAnthropicSseError,
   createAnthropicSseErrorRemapper,
@@ -1676,6 +1677,20 @@ export function createHandleProtocol(deps) {
           })
         : null
     anthropicKeepalive?.armAfter(queueKeepaliveDelay)
+    const anthropicFrames = clientStream && protocol === 'anthropic.messages' ? createSseFrameBuffer() : null
+    const writeAnthropicFrame = (frame, keepalive = anthropicKeepalive) => {
+      if (frame.some((line) => parseSseDataLine(line)?.type === 'response_headers')) return
+      let outbound = ''
+      for (const line of [...frame, '']) {
+        keepalive?.observeLine(line)
+        streamTracker?.observe(line)
+        const mapped = anthropicSseErrorRemapper ? anthropicSseErrorRemapper.remapLine(line) : line
+        outbound += String(mapped).endsWith('\n') ? String(mapped) : String(mapped) + '\n'
+      }
+      if (!res.headersSent) writeSSEHeaders(res)
+      res.write(outbound)
+    }
+
     const upstreamStream = true
     const requestedDelivery = String(
       req.headers['x-kin-delivery'] || getRouting()?.failover?.delivery_mode || 'realtime',
@@ -2088,17 +2103,18 @@ export function createHandleProtocol(deps) {
                 onCommit()
               },
               onEvent: async (line) => {
-                if (/response_headers/.test(String(line))) return
                 line = restoreToolNamesInSSELine(line, attemptMeta?.toolNames || {})
                 if (personaHideTokens) line = hidePersonaUsageInSseLine(line, personaHideTokens, cacheTtl)
-                keepalive.observeLine(line)
                 if (protocol === 'anthropic.messages') {
-                  streamTracker?.observe(line)
-                  if (!res.headersSent) writeSSEHeaders(res)
-                  const outbound = anthropicSseErrorRemapper ? anthropicSseErrorRemapper.remapLine(line) : line
-                  res.write(String(outbound).endsWith('\n') ? String(outbound) : String(outbound) + '\n')
+                  for (const frame of anthropicFrames.push(line)) writeAnthropicFrame(frame, keepalive)
                   return
                 }
+                if (
+                  parseSseDataLine(line)?.type === 'response_headers' ||
+                  String(line).trim() === 'event: response_headers'
+                )
+                  return
+                keepalive.observeLine(line)
                 const writeChunks = (chunks) => {
                   if (!chunks.length) return
                   if (!res.headersSent) writeSSEHeaders(res)
@@ -2132,6 +2148,10 @@ export function createHandleProtocol(deps) {
           apiKeyStore.release(managedKey)
         } catch {}
       }
+    }
+
+    if (result?.ok && anthropicFrames) {
+      for (const frame of anthropicFrames.push('')) writeAnthropicFrame(frame)
     }
 
     if (result?.responseSent) return
