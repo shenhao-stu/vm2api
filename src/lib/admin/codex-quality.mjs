@@ -214,12 +214,19 @@ export class CodexQualityMonitor {
       if (this.revision !== revision || this.stopped || identity(this.project, vm.id) !== state.account) continue
       const current = getVm(this.project, vm.id)
       if (qualityOff(current) !== paused) continue
+      const finished = this.now()
+      const next = nextQualityState(state, result, paused, finished)
+      // Eligibility gates dispatch and recovery. An already verified answer remains
+      // evidence even if a customer takes a seat while this probe is finishing.
       if (
-        ['correct', 'wrong'].includes(result) &&
-        !eligibleQualitySlot(current, this.project, MODEL, this.quotaPolicy(), this.now())
-      )
-        result = 'skipped'
-      const next = nextQualityState(state, result, paused, this.now())
+        next.action === 'recover' &&
+        !eligibleQualitySlot(current, this.project, MODEL, this.quotaPolicy(), finished)
+      ) {
+        next.action = null
+        next.wrong = state.wrong
+        next.first_pass = finished
+        next.due = finished + 10 * MINUTE
+      }
       if (next.action) setCodexQualityPause(this.project, vm.id, next.action === 'pause')
       const { action, ...saved } = next
       this.save(vm.id, {

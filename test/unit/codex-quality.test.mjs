@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { CodexQualityMonitor, judgeQuality, nextQualityState } from '../../src/lib/admin/codex-quality.mjs'
+import { tryAcquireOpenAISlot } from '../../src/lib/pool/openai-account-runtime.mjs'
 import { readBody } from '../../src/lib/http/respond.mjs'
 import { getVm, setScheduleOff, markUnschedulable, setCodexQualityPause } from '../../src/lib/vm/vm-registry.mjs'
 import { runCodexKernelHop } from '../../src/lib/protocol/handle-codex.mjs'
@@ -74,8 +75,22 @@ test('serial round consumes uncertain attempts, respects holds and only owns its
       return result
     },
   }
+  // Another request joins after the answer has been dispatched. Preserve its verdict.
+  let concurrentLease
+  t.after(() => concurrentLease?.release())
+  const originalMeasure = options.measure
+  options.measure = async () => {
+    const outcome = await originalMeasure()
+    concurrentLease = tryAcquireOpenAISlot(id, { concurrency: 10 })
+    assert.ok(concurrentLease)
+    return outcome
+  }
   const monitor = new CodexQualityMonitor(options)
   await monitor.run(true)
+  assert.equal(monitor.snapshot().items[0].result, 'wrong')
+  concurrentLease.release()
+  options.measure = originalMeasure
+  monitor.measure = originalMeasure
   await monitor.run(true)
   assert.equal(calls, 2)
   assert.equal(getVm(root, id).schedule_off_reason, 'quality_probe_failed')
