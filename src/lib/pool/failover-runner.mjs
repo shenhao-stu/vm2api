@@ -586,6 +586,7 @@ export class FailoverRunner {
     signal,
     applyAttempt,
     callAttempt,
+    beforeAttempt = null,
     onAttempt = null,
     pinVmId = null,
     familyKey = null,
@@ -812,6 +813,18 @@ export class FailoverRunner {
         if (executions > 0) budget.noteHop(selected.accountId, selected.vmId, executions)
       }
       try {
+        const blocked = beforeAttempt?.(selected)
+        if (blocked) {
+          this.attemptsRepo?.complete?.(requestId, attemptNo, {
+            upstreamStatus: null,
+            errorScope: 'request',
+            action: 'stop',
+            downstreamCommitted: false,
+            terminalState: blocked.finalState,
+            latencyMs: Date.now() - attemptStarted,
+          })
+          return { ...blocked, ...attribution() }
+        }
         const repairKey = searchRepairKey(stickyKey, model, selected)
         const hint = this.searchRepairs.get(repairKey)
         if (hint && hint.expiresAt <= Date.now()) this.searchRepairs.delete(repairKey)
@@ -859,6 +872,17 @@ export class FailoverRunner {
           },
         })
         noteHop(result)
+        if (result?.preDispatchRejection) {
+          this.attemptsRepo?.complete?.(requestId, attemptNo, {
+            upstreamStatus: null,
+            errorScope: 'request',
+            action: 'stop',
+            downstreamCommitted: false,
+            terminalState: result.finalState,
+            latencyMs: Date.now() - attemptStarted,
+          })
+          return { ...result, ...attribution() }
+        }
         if (result) result.committed = result.committed || committed
         if (signal?.aborted || isClientCancelledResult(result)) {
           this.attemptsRepo?.complete?.(requestId, attemptNo, {

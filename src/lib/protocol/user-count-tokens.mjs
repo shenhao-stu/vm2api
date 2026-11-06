@@ -17,6 +17,7 @@ import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
+import { isClaudeProSlot, proSessionProtection, proTargetScope } from './pro-session-protection.mjs'
 import { inboundBodyLimit, readRoutingConfigFile } from '../core/config.mjs'
 import {
   detectProxiedOfficialCcFromRouting,
@@ -285,7 +286,15 @@ export async function handleUserCountTokens(req, res, deps) {
     const err = claudeCodeOnlyError()
     return json(res, err.status, err.body)
   }
-  const gate = await blockCountTokensBeforeHop(req, parsed.body, deps)
+  const proSession =
+    detectInboundPlatform(parsed.body.model).platform === 'anthropic'
+      ? proSessionProtection(req, inbound, parsed.body, deps)
+      : null
+  const initialBlock = proSession?.beforeDispatch()
+  const scope = initialBlock ? proTargetScope(req, deps) : 'none'
+  if (scope === 'pro') return json(res, initialBlock.status, initialBlock.body)
+  const deferred = scope === 'mixed'
+  const gate = deferred ? null : await blockCountTokensBeforeHop(req, parsed.body, deps)
   if (gate?.error) return json(res, gate.error.status, gate.error.body)
   const peeked = await peekCurrentAccount({
     poolScheduler: typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler,
@@ -296,7 +305,10 @@ export async function handleUserCountTokens(req, res, deps) {
     usersRepo: deps.apiKeyStore?.users || null,
   })
   if (!peeked.ok) return sendPoolFail(res, json, peeked)
-  if (gate.wait) {
+  const protection = isClaudeProSlot(peeked.vm) ? proSession : null
+  const blocked = protection?.beforeDispatch()
+  if (blocked) return json(res, blocked.status, blocked.body)
+  if (deferred || gate.wait) {
     const again = await blockCountTokensBeforeHop(req, parsed.body, {
       ...deps,
       account: scopeAccountFromVm(peeked.vm, findAccount(deps.accountQuota, peeked.vm)?.unified),
@@ -316,6 +328,8 @@ export async function handleUserCountTokens(req, res, deps) {
     })
     return json(res, 200, buildUsageView(listed, source))
   }
+  const atDispatch = protection?.beforeDispatch()
+  if (atDispatch) return json(res, atDispatch.status, atDispatch.body)
   const hop = await (deps.countTokensViaWorker || countTokensViaWorker)(peeked.exec, {
     body: parsed.body,
     headers: {
@@ -325,6 +339,7 @@ export async function handleUserCountTokens(req, res, deps) {
     },
     timeoutMs: 45000,
   })
+  if (!hop.transportError && hop.upstreamExecutions !== 0) protection?.observeUpstream(hop)
   if (!hop.ok) {
     const status = hop.status && hop.status >= 400 ? hop.status : 502
     // Upstream limit / overload: same mapping and Retry-After as Messages.

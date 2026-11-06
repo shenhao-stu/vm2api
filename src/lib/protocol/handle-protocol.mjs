@@ -20,6 +20,7 @@ import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { jevScopeWaits, readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
+import { isClaudeProSlot, proSessionProtection, proTargetScope } from './pro-session-protection.mjs'
 import {
   toClaudeMessages,
   isClientStream,
@@ -545,8 +546,8 @@ export function createHandleProtocol(deps) {
     }
   }
 
-  function rememberRefusal({ inbound, body, headers, result, logBag, requestId }) {
-    if (!refusalEnabled()) return
+  function rememberRefusal({ inbound, body, headers, result, logBag, requestId, sessionIsolated = false }) {
+    if (sessionIsolated || !refusalEnabled()) return
     const contentRefusal = isUpstreamRefusal(result, logBag)
     const timed = result?.policy?.rememberRefusal === true
     if (!contentRefusal && !timed) return
@@ -590,6 +591,7 @@ export function createHandleProtocol(deps) {
     requestContext = null,
     routing = {},
     noGoFallback = false,
+    proSession = null,
   }) {
     const assembler = createClaudeMessageAssembler()
     const workerResult = await dispatchStreamInference({
@@ -608,6 +610,9 @@ export function createHandleProtocol(deps) {
       requestContext,
       slotWaitMs: candidate.slotWaitMs,
       noGoFallback,
+      beforeDispatch: proSession?.beforeDispatch,
+      observeUpstream: proSession?.observeUpstream,
+      waitForStopReason: proSession?.waitForStopReason,
       ensureCredential: (exec) => ensureWorkerCredential(exec),
       onEvent: async (line) => {
         if (/response_headers/.test(String(line))) return
@@ -619,6 +624,17 @@ export function createHandleProtocol(deps) {
       workerResult.body = restoreToolNames(workerResult.body, toolNames)
     }
     return acceptAssistantHop(workerResult)
+  }
+
+  function rejectQuarantined(res, logBag, result) {
+    stats.errors++
+    logBag.attempt_count = result.attemptCount || 0
+    logBag.error_code = result.body.error.code
+    logBag.error_message = result.body.error.message
+    logBag.final_state = result.finalState
+    logBag.via = 'pro-session-quarantine'
+    if (!res.headersSent) return json(res, result.status, result.body)
+    if (!res.writableEnded) res.end(buildAnthropicSseError(result.body.error))
   }
 
   function bindRequestLog(req, res, logCtx, logBag) {
@@ -935,7 +951,29 @@ export function createHandleProtocol(deps) {
         return json(res, 200, mock)
       }
     }
-    if (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res })) {
+    const poolModel =
+      platform.platform === 'anthropic' && inferenceBackend !== 'api' && protocol !== 'openai.responses'
+        ? validateOfficialModel(ctx.body?.model)
+        : null
+    const convertClaude = (body) =>
+      toClaudeMessages(protocol, body, {
+        rewrite: cfg.rewrite.enabled || String(req.headers['x-kin-rewrite'] || '') === '1',
+        model_map: false,
+        strict_passthrough: String(req.headers['x-kin-strict-passthrough'] || '') === '1',
+      })
+    const poolConverted =
+      poolModel?.ok && protocol !== 'anthropic.messages' ? convertClaude({ ...ctx.body, model: poolModel.model }) : null
+    const proSession = poolModel?.ok
+      ? proSessionProtection(req, inbound, poolConverted?.claude || ctx.body, deps)
+      : null
+    const initialBlock = proSession?.beforeDispatch()
+    const targetScope = initialBlock ? proTargetScope(req, deps, keyScope) : 'none'
+    if (targetScope === 'pro') return rejectQuarantined(res, logBag, initialBlock)
+    const deferIntercept = targetScope === 'mixed'
+    if (
+      !deferIntercept &&
+      (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res }))
+    ) {
       return
     }
     if (gatewayTurn) return serveHostedGateway(req, res, protocol, ctx.body, logBag)
@@ -1024,7 +1062,7 @@ export function createHandleProtocol(deps) {
       )
     }
     if (inferenceBackend !== 'api') {
-      const modelCheck = validateOfficialModel(ctx.body?.model)
+      const modelCheck = poolModel || validateOfficialModel(ctx.body?.model)
       if (!modelCheck.ok) {
         stats.errors++
         logBag.attempt_count = 0
@@ -1038,13 +1076,7 @@ export function createHandleProtocol(deps) {
       ctx.body = { ...ctx.body, model: modelCheck.model }
     }
 
-    const hdrRewrite = String(req.headers['x-kin-rewrite'] || '') === '1'
-    const rewriteEnabled = cfg.rewrite.enabled || hdrRewrite
-    const converted = toClaudeMessages(protocol, ctx.body, {
-      rewrite: rewriteEnabled,
-      model_map: false,
-      strict_passthrough: String(req.headers['x-kin-strict-passthrough'] || '') === '1',
-    })
+    const converted = poolConverted || convertClaude(ctx.body)
     stats.requests++
     stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
     if (converted.mode === 'passthrough') stats.passthrough++
@@ -1095,6 +1127,7 @@ export function createHandleProtocol(deps) {
     }
 
     if (
+      !deferIntercept &&
       !apiPassthrough &&
       (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res }))
     ) {
@@ -1464,6 +1497,7 @@ export function createHandleProtocol(deps) {
         stream: upstreamStream,
         deliveryMode,
         signal: clientAbort.signal,
+        beforeAttempt: (selected) => (isClaudeProSlot(selected.vm) ? proSession?.beforeDispatch() : null),
         applyAttempt: async (body, selected, extra = {}) => {
           // Only this account's own thinking replays as thinking. Another
           // account's signature, or one with no record, goes out as text.
@@ -1476,7 +1510,7 @@ export function createHandleProtocol(deps) {
               thinking_owner: { account_id: selected.accountId, kept, converted, dropped, unknown },
             }
           }
-          if (claudeScopePending()) {
+          if (deferIntercept || claudeScopePending()) {
             const blocked = await applyProtocolIntercept({
               req,
               inbound,
@@ -1684,6 +1718,7 @@ export function createHandleProtocol(deps) {
           return { body: prepared.body, meta: { toolNames: prepared.toolNames, sessionId: attemptSessionId } }
         },
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
+          const protection = isClaudeProSlot(candidate.vm) ? proSession : null
           if (!clientStream) {
             return streamAndAssembleClaudeMessage({
               candidate,
@@ -1701,6 +1736,7 @@ export function createHandleProtocol(deps) {
               want1m,
               routing: getRouting(),
               noGoFallback: !!pinVmId,
+              proSession: protection,
             })
           }
           let state
@@ -1746,6 +1782,9 @@ export function createHandleProtocol(deps) {
               routing: getRouting(),
               slotWaitMs: candidate.slotWaitMs,
               noGoFallback: !!pinVmId,
+              beforeDispatch: protection?.beforeDispatch,
+              observeUpstream: protection?.observeUpstream,
+              waitForStopReason: protection?.waitForStopReason,
               ensureCredential: (exec) => ensureWorkerCredential(exec),
               onCommit: () => {
                 if (protocol === 'anthropic.messages' && !res.headersSent) writeSSEHeaders(res)
@@ -1800,6 +1839,7 @@ export function createHandleProtocol(deps) {
     }
 
     if (result?.responseSent) return
+    if (result?.preDispatchRejection) return rejectQuarantined(res, logBag, result)
 
     result = acceptAssistantHop(result)
     if (result?.finalState === 'verified' && logBag.cache_prefix_key) {
@@ -1830,7 +1870,16 @@ export function createHandleProtocol(deps) {
       logBag.error_code = logBag.error_code || 'content_filter_refusal'
       logBag.error_message = logBag.error_message || 'upstream stop_reason=refusal'
     }
-    rememberRefusal({ inbound, body: ctx.body, headers: req.headers, result, logBag, requestId: logCtx.request_id })
+    const sessionIsolated = proSession?.recorded() === true
+    rememberRefusal({
+      inbound,
+      body: ctx.body,
+      headers: req.headers,
+      result,
+      logBag,
+      requestId: logCtx.request_id,
+      sessionIsolated,
+    })
 
     if (result?.accountId) {
       try {
@@ -1893,7 +1942,15 @@ export function createHandleProtocol(deps) {
           res.write(buildAnthropicSseError(mapped.body?.error || {}))
         }
       }
-      rememberRefusal({ inbound, body: ctx.body, headers: req.headers, result, logBag, requestId: logCtx.request_id })
+      rememberRefusal({
+        inbound,
+        body: ctx.body,
+        headers: req.headers,
+        result,
+        logBag,
+        requestId: logCtx.request_id,
+        sessionIsolated,
+      })
       return res.end()
     }
 

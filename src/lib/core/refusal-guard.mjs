@@ -18,6 +18,7 @@ export const REFUSAL_GUARD_SETTING = 'refusal_guard_enabled'
 export const REFUSAL_SIMILARITY_SETTING = 'refusal_similarity_enabled'
 export const REFUSAL_SIMILARITY_VALUE_SETTING = 'refusal_similarity'
 export const REFUSAL_DEVICE_BLOCK_SETTING = 'refusal_device_block_enabled'
+export const REFUSAL_SESSION_QUARANTINE_SETTING = 'pro_session_quarantine_enabled'
 export const REFUSAL_SIMILARITY_CHOICES = Object.freeze([80, 85, 90, 95])
 
 export function isRefusalGuardEnabled(readSetting) {
@@ -167,6 +168,10 @@ function flagOn(value) {
   return !(value === false || value === 0 || value === '0' || value === 'false')
 }
 
+export function isProSessionQuarantineEnabled(readSetting) {
+  return typeof readSetting !== 'function' || flagOn(readSetting(REFUSAL_SESSION_QUARANTINE_SETTING, true))
+}
+
 /** Panel policy. Missing settings stay on, with similarity at 90. */
 export function refusalGuardPolicy(readSetting) {
   const read = typeof readSetting === 'function' ? readSetting : () => undefined
@@ -177,6 +182,7 @@ export function refusalGuardPolicy(readSetting) {
     similarity_enabled: flagOn(read(REFUSAL_SIMILARITY_SETTING, true)),
     similarity,
     device_block_enabled: flagOn(read(REFUSAL_DEVICE_BLOCK_SETTING, true)),
+    session_quarantine_enabled: isProSessionQuarantineEnabled(read),
   }
 }
 
@@ -195,6 +201,9 @@ export function applyRefusalGuardPatch(settings, body = {}) {
   if (Object.hasOwn(body, 'device_block_enabled') && typeof body.device_block_enabled !== 'boolean') {
     problems.push('device_block_enabled 必须是布尔')
   }
+  if (Object.hasOwn(body, 'session_quarantine_enabled') && typeof body.session_quarantine_enabled !== 'boolean') {
+    problems.push('session_quarantine_enabled 必须是布尔')
+  }
   if (Object.hasOwn(body, 'similarity') && normalizeRefusalSimilarity(body.similarity) == null) {
     problems.push('similarity 只能是 80、85、90、95')
   }
@@ -203,6 +212,9 @@ export function applyRefusalGuardPatch(settings, body = {}) {
   if (typeof body.similarity_enabled === 'boolean') settings.set(REFUSAL_SIMILARITY_SETTING, body.similarity_enabled)
   if (typeof body.device_block_enabled === 'boolean') {
     settings.set(REFUSAL_DEVICE_BLOCK_SETTING, body.device_block_enabled)
+  }
+  if (typeof body.session_quarantine_enabled === 'boolean') {
+    settings.set(REFUSAL_SESSION_QUARANTINE_SETTING, body.session_quarantine_enabled)
   }
   if (Object.hasOwn(body, 'similarity')) {
     settings.set(REFUSAL_SIMILARITY_VALUE_SETTING, normalizeRefusalSimilarity(body.similarity))

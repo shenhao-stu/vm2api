@@ -119,6 +119,25 @@ export function RefusalSettings() {
 
   return (
     <div className='space-y-8 p-4'>
+      {typeof data.session_quarantine_enabled === 'boolean' && (
+        <Group title='Claude Pro 会话保护'>
+          <ToggleList>
+            <ToggleItem
+              label='隔离被官方拒绝的会话'
+              desc='Anthropic 拒绝请求后，在本地拦截原会话的 Continue。请在新会话中输入新问题。'
+            >
+              <Switch
+                aria-label='Claude Pro 拒绝后隔离会话'
+                checked={data.session_quarantine_enabled}
+                disabled={save.isPending}
+                onCheckedChange={(v) =>
+                  save.mutate({ session_quarantine_enabled: v })
+                }
+              />
+            </ToggleItem>
+          </ToggleList>
+        </Group>
+      )}
       <Group
         title='何时拦截'
         hint='上游拒答过的正文记成指纹。精确命中直接 503；近似只比较用户正文，短于 512 字不做。改动立即生效。'

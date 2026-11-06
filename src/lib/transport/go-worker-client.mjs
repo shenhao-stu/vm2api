@@ -630,6 +630,8 @@ export async function streamGoWorker({
   signal,
   deliveryMode = 'realtime',
   onEvent,
+  observeUpstream,
+  waitForStopReason,
   onCommit,
   want1m = false,
   cacheTtl = null,
@@ -772,6 +774,8 @@ export async function streamGoWorker({
     let sseModel = null
     let sseStop = null
     let sseRateHeaders = {}
+    let holdTerminal = false
+    let terminalLine = null
     const assembler = createClaudeMessageAssembler()
     const pendingLines = []
     const takeSseEvent = () => {
@@ -793,6 +797,12 @@ export async function streamGoWorker({
       pendingLines.length = 0
     }
     const emitLine = async (line) => {
+      if (holdTerminal) {
+        // One terminal data line (or its final delimiter for a multiline event).
+        // Later worker metadata isn't part of the client Messages stream.
+        terminalLine ??= line
+        return
+      }
       if (!committed) {
         pendingLines.push(line)
         return
@@ -802,11 +812,15 @@ export async function streamGoWorker({
     const observeSseEvent = (event) => {
       if (!event) return event
       if (ttftMs == null && isFirstTokenEvent(event)) ttftMs = Date.now() - startedAt
+      observeUpstream?.(event)
       if (event.type === 'response_headers' && event.headers && typeof event.headers === 'object') {
         sseRateHeaders = { ...sseRateHeaders, ...event.headers }
       }
       if (event.type === 'error') lastError = event
-      if (event.type === 'message_stop') sawMessageStop = true
+      if (event.type === 'message_stop') {
+        sawMessageStop = true
+        holdTerminal ||= !sseStop && !lastError && waitForStopReason?.() === true
+      }
       if (event.type === 'message_start') rememberThreadTurn(event.message?.id, prepared.thread)
       const evUsage = usageFromSseEvent(event)
       if (evUsage) sseUsage = mergeUsage(sseUsage, evUsage)
@@ -814,6 +828,29 @@ export async function streamGoWorker({
       const stop = event.message?.stop_reason || event.delta?.stop_reason
       if (stop) sseStop = stop
       return event
+    }
+    const receiveLine = async (line) => {
+      applyClaudeSSELineToMessage(line, assembler)
+      if (line.startsWith('data:')) {
+        const piece = line.slice(5).trim()
+        if (piece && piece !== '[DONE]') {
+          dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
+          const event = observeSseEvent(takeSseEvent())
+          if (isDownstreamCommitEvent(event)) await flushCommit()
+        }
+      } else if (line === '') {
+        if (dataBuf) {
+          const event = takeSseEvent()
+          dataBuf = ''
+          observeSseEvent(event)
+          if (isDownstreamCommitEvent(event)) await flushCommit()
+        }
+      } else if (dataBuf && !line.startsWith('event:') && !line.startsWith(':')) {
+        dataBuf = `${dataBuf}\n${line}`
+        const event = observeSseEvent(takeSseEvent())
+        if (isDownstreamCommitEvent(event)) await flushCommit()
+      }
+      await emitLine(line)
     }
     const firstByteMs = Math.max(0, Number(timeoutMs) || 0)
     const idleMs = Math.max(0, Number(idleTimeoutMs) || 0)
@@ -845,33 +882,10 @@ export async function streamGoWorker({
         while ((newline = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, newline).replace(/\r$/, '')
           buffer = buffer.slice(newline + 1)
-          applyClaudeSSELineToMessage(line, assembler)
-          if (line.startsWith('data:')) {
-            const piece = line.slice(5).trim()
-            if (piece && piece !== '[DONE]') {
-              dataBuf = dataBuf ? `${dataBuf}\n${piece}` : piece
-              const event = observeSseEvent(takeSseEvent())
-              if (isDownstreamCommitEvent(event)) await flushCommit()
-            }
-          } else if (line === '') {
-            if (dataBuf) {
-              const event = takeSseEvent()
-              dataBuf = ''
-              observeSseEvent(event)
-              if (isDownstreamCommitEvent(event)) await flushCommit()
-            }
-          } else if (dataBuf && !line.startsWith('event:') && !line.startsWith(':')) {
-            dataBuf = `${dataBuf}\n${line}`
-            const event = observeSseEvent(takeSseEvent())
-            if (isDownstreamCommitEvent(event)) await flushCommit()
-          }
-          await emitLine(line)
+          await receiveLine(line)
         }
       }
-      if (buffer) {
-        applyClaudeSSELineToMessage(buffer, assembler)
-        await emitLine(buffer)
-      }
+      if (buffer) await receiveLine(buffer)
       if (dataBuf) {
         const event = observeSseEvent(takeSseEvent())
         if (isDownstreamCommitEvent(event)) await flushCommit()
@@ -880,8 +894,14 @@ export async function streamGoWorker({
       const meta = streamMetaFromHeaders({ ...headers, ...trailers })
       const assembled = assembler.message
       const stopReason = meta.stopReason || sseStop || assembled?.stop_reason || null
+      if (holdTerminal) observeUpstream?.({ status: response.statusCode, stopReason, body: lastError || assembled })
       const complete = !lastError && isCompleteAssistantMessage({ body: assembled, stopReason, sawMessageStop })
       if (!committed && complete) await flushCommit()
+      if (holdTerminal && terminalLine !== null) {
+        holdTerminal = false
+        await emitLine(terminalLine)
+        if (terminalLine) await emitLine('')
+      }
       const terminalState = complete ? 'verified' : 'incomplete'
       const rateHeaders = mergeRateLimitHeaders({ ...sseRateHeaders, ...headers, ...trailers })
       return restoreUncommittedHop({

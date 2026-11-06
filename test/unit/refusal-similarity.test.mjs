@@ -159,6 +159,7 @@ test('panel policy defaults on at 90 and rejects an unknown threshold', () => {
     similarity_enabled: true,
     similarity: 90,
     device_block_enabled: true,
+    session_quarantine_enabled: true,
   })
   const settings = new Map()
   const store = {
@@ -175,8 +176,25 @@ test('panel policy defaults on at 90 and rejects an unknown threshold', () => {
       similarity_enabled: false,
       similarity: 85,
       device_block_enabled: true,
+      session_quarantine_enabled: true,
     },
   )
+})
+
+test('Pro session quarantine has its own default and boolean switch', () => {
+  const values = new Map()
+  const read = (key, fallback) => (values.has(key) ? values.get(key) : fallback)
+  const store = { set: (key, value) => values.set(key, value) }
+  assert.equal(applyRefusalGuardPatch(store, { enabled: false }).ok, true)
+  assert.equal(refusalGuardPolicy(read).session_quarantine_enabled, true)
+
+  assert.equal(applyRefusalGuardPatch(store, { enabled: true, session_quarantine_enabled: 'false' }).ok, false)
+  assert.equal(refusalGuardPolicy(read).enabled, false)
+  assert.equal(applyRefusalGuardPatch(store, { session_quarantine_enabled: false }).ok, true)
+  assert.equal(refusalGuardPolicy(read).session_quarantine_enabled, false)
+  assert.equal(applyRefusalGuardPatch(store, { session_quarantine_enabled: true }).ok, true)
+  assert.equal(refusalGuardPolicy(read).enabled, false)
+  assert.equal(refusalGuardPolicy(read).session_quarantine_enabled, true)
 })
 
 test('turning similarity or device block off skips that check', () => {
