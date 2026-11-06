@@ -404,9 +404,10 @@ export function resolveOutboundSessionId(callerSession, opts = {}) {
   const boundVmId = String(opts.boundVmId || '').trim()
   const vmId = String(opts.vmId || '').trim()
   const sameVm = Boolean(boundVmId && vmId && boundVmId === vmId)
-  if (boundSessionId && sameVm) return boundSessionId
-
   const accountId = String(opts.accountId || '').trim()
+  const sameAccount = !opts.boundAccountId || opts.boundAccountId === accountId
+  if (boundSessionId && sameVm && (!opts.scopeToSlot || sameAccount)) return boundSessionId
+
   const discriminator =
     opts.clientDiscriminator != null
       ? String(opts.clientDiscriminator)
@@ -418,7 +419,8 @@ export function resolveOutboundSessionId(callerSession, opts = {}) {
   const firstUserIdentity = String(opts.firstUserIdentity || '')
   const identity = caller || buildStableSessionSeed(accountId, discriminator, firstUserIdentity)
   if (caller || stableSessionMaterial(accountId, discriminator, firstUserIdentity)) {
-    return rebuildOutboundSession({ identity, epoch: opts.epoch ?? 'pending' })
+    const seed = opts.scopeToSlot && vmId ? JSON.stringify([vmId, accountId, identity]) : identity
+    return rebuildOutboundSession({ identity: seed, epoch: opts.epoch ?? 'pending' })
   }
   return crypto.randomUUID()
 }
