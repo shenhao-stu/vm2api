@@ -1028,3 +1028,18 @@ test('a dispatched but unconfirmed recovery waits a full quiet period after rest
   assert.equal(restarted.progress.total, 0)
   await restarted.stop()
 })
+
+test('a pending GPT measurement cannot change scheduling after the slot becomes Claude', async (t) => {
+  const f = fixture(t, {
+    runTest: async (id) => {
+      const file = path.join(f.root, 'vms', id + '.json')
+      const vm = JSON.parse(fs.readFileSync(file))
+      atomicWriteJson(file, { ...vm, platform: 'anthropic', family: 'claude', codex_kernel: false })
+      return { ok: true, status: 200, stop_reason: 'completed', text: '0', vm_id: id }
+    },
+  })
+  f.runner.saveConfig({ ...f.runner.snapshot().config, failure_threshold: 1 })
+  await f.runner.runNow()
+  assert.equal(getVm(f.root, 'vm-a').schedulable, true)
+  assert.notEqual(getVm(f.root, 'vm-a').schedule_off, true)
+})

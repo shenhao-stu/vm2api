@@ -1,3 +1,4 @@
+import { accountIdOf } from './lib/pool/pool-scheduler.mjs'
 import { loopbackMeasurement } from './lib/admin/codex-quality.mjs'
 import { QualityProbeRunner } from './lib/admin/quality-probe.mjs'
 /**
@@ -35,7 +36,7 @@ import { createCliNodeGuard } from './lib/vm/cli-node-guard.mjs'
 
 import { createSlotBridgeHealer, powerOnSlot, reviveDownSlots } from './lib/vm/slot-recovery.mjs'
 import { createUsageProbeMonitor, normalizeUsageProbeConfig } from './lib/oauth/usage-probe-monitor.mjs'
-import { createCatalogMonitor } from './lib/admin/catalog-monitor.mjs'
+import { claudeCatalogBusy, createCatalogMonitor } from './lib/admin/catalog-monitor.mjs'
 import { normalizeOfficialCcConfig } from './lib/oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './lib/admin/panel-live-credentials.mjs'
 import { normalizeHealthProbeConfig, createHealthProbeMonitor, HEALTH_REAL_HEADER } from './lib/admin/health-probe.mjs'
@@ -118,6 +119,7 @@ import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
 import { corsHeadersForRequest } from './lib/http/cors.mjs'
 import { isConsoleEntry, tryServeWebDist } from './lib/http/web-dist.mjs'
 import { publicBasePath } from './lib/http/public-base-path.mjs'
+import { createGracefulShutdown } from './lib/http/graceful-shutdown.mjs'
 import { createRoutingRuntime } from './lib/admin/routing-runtime.mjs'
 import { createImportCommit } from './lib/oauth/import-commit.mjs'
 import { createHandleProtocol } from './lib/protocol/handle-protocol.mjs'
@@ -538,7 +540,7 @@ const vmTestSchedule = new VmTestScheduleRunner({
 const guardedQuality = process.env.VM2API_CODEX_QUALITY === '1'
 const qualityProbe = new QualityProbeRunner({
   projectRoot: cfg.paths.project,
-  isOwner: () => !_shuttingDown,
+  isOwner: () => !gracefulShutdown.isShuttingDown(),
   getQuotaPolicy: () => routingConfig.codex?.quota,
   guarded: guardedQuality,
   runTest: guardedQuality
@@ -616,6 +618,7 @@ usageProbeMonitor = createUsageProbeMonitor({
 })
 catalogMonitor = createCatalogMonitor({
   projectRoot: cfg.paths.project,
+  isClaudeBusy: (vm) => claudeCatalogBusy(poolScheduler, vm.id, accountIdOf(vm, cfg.paths.project)),
   codexCatalogVersion: () => routingConfig.codex?.catalog_client_version || 'auto',
   log: (event) => console.log(JSON.stringify(event)),
 })
@@ -645,7 +648,7 @@ backupService.onBeforeRestore(async () => {
   requestLog.stopCleanupScheduler()
   await requestLog.waitForCleanup()
   return () => {
-    if (!_shuttingDown) {
+    if (!gracefulShutdown.isShuttingDown()) {
       requestLog.startCleanupScheduler()
       qualityProbe.start()
     }
@@ -1119,6 +1122,63 @@ const handlePanel = createPanelHandler({
   slotShell,
 })
 
+let backgroundDrain
+const gracefulShutdown = createGracefulShutdown({
+  beforeDrain: async () => {
+    requestLog.stopCleanupScheduler()
+    backgroundDrain = Promise.allSettled([requestLog.waitForCleanup(), qualityProbe.stop()])
+    installJevUsageRecorder(null)
+    try {
+      vmTestSchedule.stop()
+    } catch {}
+    try {
+      backupService.stopScheduler()
+    } catch {}
+    try {
+      proxyPool.stopScheduler()
+    } catch {}
+    try {
+      healthMonitor?.stop?.()
+    } catch {}
+    try {
+      credentialRefreshMonitor?.stop?.()
+    } catch {}
+    try {
+      kernelWatchdog?.stop?.()
+    } catch {}
+    try {
+      cliNodeGuard?.stop?.()
+    } catch {}
+    try {
+      usageProbeMonitor?.stop?.()
+    } catch {}
+    try {
+      catalogMonitor?.stop?.()
+    } catch {}
+    try {
+      notifyMonitor?.stop?.()
+    } catch {}
+  },
+  afterDrain: async () => {
+    await backgroundDrain
+    protocolRuntime.dispose()
+    proxyExitGuard.stop()
+    await proxySubscriptions.close()
+    try {
+      stopVmWatch()
+    } catch {}
+    try {
+      stopAllRustKernels()
+    } catch {}
+    try {
+      await clusterManager.stop()
+    } catch {}
+    try {
+      closeDatabase()
+    } catch {}
+  },
+})
+
 const server = http.createServer(async (req, res) => {
   try {
     res.req = req
@@ -1132,6 +1192,20 @@ const server = http.createServer(async (req, res) => {
       return json(res, 400, { error: { message: 'Invalid URL', type: 'invalid_request' } })
     }
     const p = url.pathname
+    if (gracefulShutdown.isShuttingDown()) {
+      res.setHeader('Connection', 'close')
+      if (p === '/health' || p === '/healthz') {
+        return json(res, 503, { status: 'shutting_down' })
+      }
+      return json(res, 503, {
+        error: {
+          type: 'overloaded_error',
+          code: 'server_shutting_down',
+          message: 'Gateway is shutting down; retry shortly',
+        },
+      })
+    }
+    gracefulShutdown.trackRequest(req, res)
 
     if (isTelemetryPath(p)) {
       const { status, body } = telemetryIngressResponse(p, cfg.telemetry_ingress_policy)
@@ -1213,10 +1287,11 @@ const server = http.createServer(async (req, res) => {
       })
     }
 
-    if (req.method === 'GET' && p === '/v1/models') {
+    if (req.method === 'GET' && (p === '/v1/models' || p === '/models')) {
       if (!requireAuth(req, res)) return
+      const groupType = keyScopeFromRequest(req).group_type
       if (resolveInferenceBackend(req) === 'api') {
-        return json(res, 200, withoutFableModels(apiScheduler.catalog()))
+        return json(res, 200, withoutFableModels(apiScheduler.catalog({ groupType })))
       }
       const result = isGatewayOnlyRecord(req.apiKeyRecord)
         ? { object: 'list', data: [] }
@@ -1307,12 +1382,16 @@ const server = http.createServer(async (req, res) => {
     }
   }
 })
-
 server.on('upgrade', (req, socket, head) => {
+  if (gracefulShutdown.isShuttingDown()) {
+    socket.destroy()
+    return
+  }
   if (responsesWs.handleUpgrade(req, socket, head)) return
   if (clusterRoutes.handleUpgrade(req, socket, head)) return
   if (!slotShell.handleUpgrade(req, socket, head)) socket.destroy()
 })
+gracefulShutdown.setServer(server)
 
 server.on('clientError', (err, socket) => {
   try {
@@ -1362,73 +1441,9 @@ fs.writeFileSync(path.join(cfg.paths.root, 'config', 'gateway-v2.public.json'), 
 process.on('uncaughtException', (e) => console.error('[uncaught]', e))
 process.on('unhandledRejection', (e) => console.error('[unhandled]', e))
 
-// Graceful shutdown: stop schedulers/watchers, close the DB (WAL checkpoint).
-let _shuttingDown = false
-async function shutdown(signal) {
-  if (_shuttingDown) return
-  _shuttingDown = true
-  protocolRuntime.dispose()
-  installJevUsageRecorder(null)
-  console.log(`[shutdown] ${signal} — closing`)
-  try {
-    requestLog.stopCleanupScheduler()
-    await requestLog.waitForCleanup()
-  } catch {
-    console.warn('[request-log] cleanup failed during shutdown')
-  }
-  try {
-    vmTestSchedule.stop()
-    await qualityProbe.stop()
-  } catch {}
-  try {
-    backupService.stopScheduler()
-  } catch {}
-  try {
-    proxyExitGuard.stop()
-    proxyPool.stopScheduler()
-    await proxySubscriptions.close()
-  } catch {}
-  try {
-    healthMonitor?.stop?.()
-  } catch {}
-  try {
-    credentialRefreshMonitor?.stop?.()
-  } catch {}
-  try {
-    kernelWatchdog?.stop?.()
-  } catch {}
-  try {
-    cliNodeGuard?.stop?.()
-  } catch {}
-  try {
-    usageProbeMonitor?.stop?.()
-  } catch {}
-  try {
-    catalogMonitor?.stop?.()
-  } catch {}
-
-  try {
-    notifyMonitor?.stop?.()
-  } catch {}
-  try {
-    stopVmWatch()
-  } catch {}
-  try {
-    stopAllRustKernels()
-  } catch {}
-  try {
-    clusterManager.stop()
-  } catch {}
-  try {
-    server.close(() => {})
-  } catch {}
-  try {
-    closeDatabase()
-  } catch {}
-  process.exit(0)
-}
-process.on('SIGTERM', () => shutdown('SIGTERM'))
-process.on('SIGINT', () => shutdown('SIGINT'))
+// Graceful shutdown on termination signals (Issue #376).
+process.on('SIGTERM', () => gracefulShutdown.shutdown('SIGTERM'))
+process.on('SIGINT', () => gracefulShutdown.shutdown('SIGINT'))
 
 if (process.env.KIN_CRS_MOCK !== '1') {
   syncLocalSlotRestartPolicies(listVms(cfg.paths.project))

@@ -117,6 +117,7 @@ import { authorizePanelRoute, mePayload, panelIdentity } from './panel-acl.mjs'
 import {
   denyIfUserCannotDeleteVm,
   denyIfUserMissesKey,
+  panelOwnsKey,
   denyIfUserMissesProxy,
   denyIfUserMissesVm,
   userMissesVmId,
@@ -522,10 +523,19 @@ function syncInstalledKernels(args) {
   return run
 }
 
-async function runKernelSync({ project, routingConfig, body = {}, refreshCluster = refreshClusterSlotPayloads }) {
+async function runKernelSync({
+  project,
+  routingConfig,
+  body = {},
+  refreshCluster = refreshClusterSlotPayloads,
+  restartKernel = restartRustKernel,
+}) {
   const all = listVms(project)
   const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null
-  const selected = wanted ? all.filter((vm) => wanted.has(vm.id)) : all
+  // Panel summaries omit private runtime state, including a previously failed restart.
+  const selected = (wanted ? all.filter((vm) => wanted.has(vm.id)) : all)
+    .map((vm) => getVm(project, vm.id))
+    .filter(Boolean)
   // Local slots bind the new binaries. Cluster slots bake the same kernel, CLIs
   // and OAuth helpers into a content-hashed image, then recreate onto it.
   const localVms = selected.filter((vm) => !slotHost(vm).bakedKernel)
@@ -545,7 +555,7 @@ async function runKernelSync({ project, routingConfig, body = {}, refreshCluster
       if (resolveInferenceEngine(vm, routingConfig) !== 'rust') continue
       writeKernelConfig(project, vm, { routing: routingConfig, timezone: vm.timezone })
       const exec = slotExec(project, vm)
-      item.kernel = await restartRustKernel(exec).catch((e) => ({
+      item.kernel = await restartKernel(exec).catch((e) => ({
         ok: false,
         error: String(e?.message || e).slice(0, 200),
       }))
@@ -886,11 +896,10 @@ export function createPanelHandler(ctx) {
 
   function normalizePanelApiKeyInput(body = {}, req) {
     const normalized = { ...body }
+    normalized.user_id = req.apiKeyKind === 'master' ? null : normalizeOwnerId(req.panelUserId)
     if (panelIdentity(req).role !== 'admin') {
-      delete normalized.user_id
       delete normalized.group_id
       delete normalized.vm_pool_id
-      delete normalized.openai_endpoint_id
     }
     const hasRequestQuota = Object.prototype.hasOwnProperty.call(body, 'quota_requests')
     const hasLegacyQuota = Object.prototype.hasOwnProperty.call(body, 'quota')
@@ -1625,18 +1634,13 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'GET' && p === '/api/panel/api-keys') {
         const snap = apiKeyStore.snapshot()
-        if (panelIdentity(req).role === 'user') {
-          const mine = (snap.keys || []).filter(
-            (k) => normalizeOwnerId(k.user_id) === normalizeOwnerId(req.panelUserId),
-          )
-          return json(res, 200, {
-            ok: true,
-            total: mine.length,
-            active: mine.filter((k) => k.status === 'active').length,
-            keys: mine,
-          })
-        }
-        return json(res, 200, { ok: true, ...snap })
+        const mine = (snap.keys || []).filter((key) => panelOwnsKey(req, key))
+        return json(res, 200, {
+          ok: true,
+          total: mine.length,
+          active: mine.filter((k) => k.status === 'active').length,
+          keys: mine,
+        })
       }
       if (req.method === 'GET' && /^\/api\/panel\/api-keys\/[^/]+\/stats$/.test(p)) {
         const id = p.split('/')[4]
@@ -1662,15 +1666,22 @@ export function createPanelHandler(ctx) {
           })
         }
         const input = normalizePanelApiKeyInput(body, req)
+        if (!input.user_id && req.apiKeyKind !== 'master') {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'key_owner_required', message: 'API key owner is required' },
+          })
+        }
         try {
           const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
-          const scope = normalizeKeyScope(scopeInput, { gatewayOnly: body?.category === 'hybrid' })
+          const isApi = body?.category === 'api'
+          const scope = normalizeKeyScope(scopeInput, { isApi, gatewayOnly: body?.category === 'hybrid' })
           const pools = vmPoolsFor(apiKeyStore.db)
           if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-          else assertVmScope(keyScopeVms(req), scope)
+          else if (!isApi) assertVmScope(keyScopeVms(req), scope)
           const defaultConc = Number(
             ctx.routingConfig?.concurrency?.default_key_concurrency ??
               ctx.routingConfig?.concurrency?.default_max_per_account ??
@@ -1681,8 +1692,7 @@ export function createPanelHandler(ctx) {
             key: body?.key || body?.custom_key || undefined,
             category: body?.category,
             openai_endpoint_id: body?.openai_endpoint_id,
-            user_id:
-              panelIdentity(req).role === 'user' ? req.panelUserId || null : body?.user_id || req.panelUserId || null,
+            user_id: input.user_id,
             group_id: input.group_id,
             group_type: scope.group_type,
             allowed_vms: scope.allowed_vms,
@@ -1745,12 +1755,14 @@ export function createPanelHandler(ctx) {
               ok: false,
               error: { code: 'key_scope_forbidden', message: '只有管理员可以修改托管网关密钥范围' },
             })
+          const isApi = (body?.category ?? currentRec?.category) === 'api'
           const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
           const scope = normalizeKeyScope(scopeInput, {
             partial: true,
+            isApi,
             current: currentRec,
             gatewayOnly: (body?.category ?? currentRec?.category) === 'hybrid',
           })
@@ -1760,7 +1772,7 @@ export function createPanelHandler(ctx) {
             }
             const pools = vmPoolsFor(apiKeyStore.db)
             if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-            else assertVmScope(keyScopeVms(req), scope)
+            else if (!isApi) assertVmScope(keyScopeVms(req), scope)
             input.group_type = scope.group_type
             input.allowed_vms = scope.allowed_vms
             input.vm_pool_id = scope.vm_pool_id
@@ -1836,7 +1848,7 @@ export function createPanelHandler(ctx) {
           const result = await fetchUpstreamModels({
             cfg,
             kind: body?.kind,
-            protocol: body?.protocol,
+            protocol: body?.protocol || saved?.protocol,
             base_url: body?.base_url || saved?.base_url,
             api_key: body?.api_key || saved?.api_key,
             proxy_url: proxyUrl,
@@ -1893,6 +1905,7 @@ export function createPanelHandler(ctx) {
               proxy_id: String(body?.proxy_id || '').trim(),
             })
           }
+          if (Array.isArray(body?.fetched_models)) apiEndpointStore.mergeFetchedModels(id, body.fetched_models)
           apiScheduler.reload(apiEndpointStore.listRaw())
           const saved = apiEndpointStore.getRaw(id) || rec
           return json(res, 200, { ok: true, item: publicEndpointView(saved) })
@@ -1971,7 +1984,7 @@ export function createPanelHandler(ctx) {
         const item = publicEndpointView(ep)?.api_key_entries?.find((k) => k.id === kid)
         return json(res, 200, { ok: true, item })
       }
-      if (req.method === 'POST' && p === '/api/panel/anthropic/messages') {
+      if (req.method === 'POST' && /^\/api\/panel\/(?:api|anthropic)\/messages$/.test(p)) {
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
         try {
           const result = await runAnthropicConsole({
@@ -2568,6 +2581,7 @@ export function createPanelHandler(ctx) {
           routingConfig: ctx.routingConfig,
           body,
           refreshCluster,
+          restartKernel: ctx.kernelPolicyOps?.restartRustKernel || ctx.restartRustKernel,
         })
         return json(res, report.ok ? 200 : 400, panel.ok(report))
       }
@@ -3274,7 +3288,9 @@ export function createPanelHandler(ctx) {
             return json(res, 200, panel.ok(ctx.qualityProbe.saveConfig(body)))
           }
           if (p === '/api/panel/quality-probe/run' && req.method === 'POST') {
-            void ctx.qualityProbe.runNow({ manual: true }).catch(() => console.warn('[quality-probe] manual round failed'))
+            void ctx.qualityProbe
+              .runNow({ manual: true })
+              .catch(() => console.warn('[quality-probe] manual round failed'))
             return json(res, 202, panel.ok(ctx.qualityProbe.snapshot()))
           }
           return json(res, 405, { ok: false, error: { message: 'method not allowed' } })

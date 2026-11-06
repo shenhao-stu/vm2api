@@ -1,3 +1,5 @@
+import { listVmRecordFiles } from '../vm/vm-file.mjs'
+import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 /**
  * Keeps price and model catalogs current without a manual click:
  * - models.dev price snapshot (boot + daily);
@@ -8,7 +10,7 @@
 import path from 'node:path'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { runSlotOauth } from '../transport/slot-oauth.mjs'
-import { getVm, listVms, vmHasClaudeCredential } from '../vm/vm-registry.mjs'
+import { getVm, vmHasClaudeCredential } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { vmHasProxyPath } from '../oauth/credential-refresh-monitor.mjs'
 import { seedModelCatalog } from '../protocol/models.mjs'
@@ -21,7 +23,7 @@ const MODELS_DEV_EVERY_MS = 24 * 3600_000
 const UPSTREAM_EVERY_MS = 6 * 3600_000
 export const GPT_CATALOG_EVERY_MS = UPSTREAM_EVERY_MS
 const BOOT_DELAY_MS = 5_000
-const HARD_DOWN = new Set(['stopped', 'dead', 'error', 'disabled'])
+const HARD_DOWN = new Set(['stopped', 'dead', 'error', 'disabled', 'paused'])
 // Plan tiers see different model sets (Fable is Max-only); a few accounts cover the union.
 const CLAUDE_ACCOUNTS_PER_SYNC = 3
 
@@ -44,23 +46,50 @@ function syncStatus(status, { added = [], error = null } = {}) {
   return { at: new Date().toISOString(), status, added, error }
 }
 
-// listVms strips credentials; the exec needs the raw record's OAuth block.
-function claudeCatalogTargets(projectRoot) {
-  return listVms(projectRoot)
-    .filter((vm) => vm?.id && !isCodexVm(vm) && !HARD_DOWN.has(String(vm.status || '').toLowerCase()))
-    .map((vm) => getVm(projectRoot, vm.id))
-    .filter((vm) => vm && vmHasClaudeCredential(vm) && vmHasProxyPath(vm))
+function cooldownInEffect(value, now) {
+  const numeric = Number(value)
+  const until = Number.isFinite(numeric) ? numeric : Date.parse(value)
+  return until > now
+}
+
+/** Background metadata never takes a half-open probe or an inference lease. */
+export function claudeCatalogBusy(scheduler, vmId, accountId, now = Date.now()) {
+  if (!scheduler || scheduler.queuedTotal() || scheduler.vmInflight.get(vmId) || scheduler.inflight.get(accountId))
+    return true
+  const circuit = scheduler.unitCircuit?.view(accountId, now)
+  if (circuit && circuit.state !== 'closed') return true
+  return cooldownInEffect(scheduler.runtimeRepo?.get(accountId)?.cooldown_until, now)
 }
 
 /** Live Claude catalog → model_policy. */
-export async function syncClaudeCatalog({ projectRoot, runOauth = runSlotOauth } = {}) {
-  const targets = claudeCatalogTargets(projectRoot)
-  if (!targets.length) return writeCatalogSync('claude', syncStatus('skipped', { error: 'no_claude_slot' }))
+export async function syncClaudeCatalog({ projectRoot, runOauth = runSlotOauth, isBusy = () => false } = {}) {
+  const records = listVmRecordFiles(path.join(projectRoot, 'vms'))
   const ids = new Set()
   let successes = 0
   let lastError = null
-  for (const vm of targets) {
-    if (successes >= CLAUDE_ACCOUNTS_PER_SYNC) break
+  let attempts = 0
+  for (const name of records) {
+    if (successes >= CLAUDE_ACCOUNTS_PER_SYNC || attempts >= 6) break
+    const vm = getVm(projectRoot, name.slice(0, -5))
+    const now = Date.now()
+    if (
+      !vm ||
+      isCodexVm(vm) ||
+      HARD_DOWN.has(String(vm.status || '').toLowerCase()) ||
+      vm.schedulable === false ||
+      vm.schedule_off ||
+      vm.unschedulable ||
+      vm.schedule_hold ||
+      [vm.cooldown_until, vm.claude?.temp_unschedulable_until, vm.temp_unschedulable_until].some((until) =>
+        cooldownInEffect(until, now),
+      ) ||
+      !evaluateActiveHours(activeHoursOf(vm), now, vm.timezone).active ||
+      !vmHasClaudeCredential(vm) ||
+      !vmHasProxyPath(vm) ||
+      isBusy(vm)
+    )
+      continue
+    attempts++
     const exec = { vmId: vm.id, homeDir: path.join(projectRoot, 'vms', vm.id, 'cli-home'), oauth: vm.claude, vm }
     const res = await runOauth(exec, 'models', { timeoutMs: 30_000 })
     const list = Array.isArray(res?.body?.data) ? res.body.data : null
@@ -71,6 +100,7 @@ export async function syncClaudeCatalog({ projectRoot, runOauth = runSlotOauth }
     successes++
     for (const row of list) if (row?.id) ids.add(String(row.id))
   }
+  if (!attempts) return writeCatalogSync('claude', syncStatus('skipped', { error: 'no_idle_claude_slot' }))
   if (!successes) return writeCatalogSync('claude', syncStatus('error', { error: lastError || 'models_failed' }))
   const { added } = syncWorkerModelsIntoPolicy([...ids], {
     displayNameOf: (id) => modelsDevMeta('anthropic', id)?.name,
@@ -108,6 +138,7 @@ export function createCatalogMonitor({
   codexCatalogVersion = () => 'auto',
   log = () => {},
   jobs = {},
+  isClaudeBusy = () => false,
   clock = { setTimeout, clearTimeout, setInterval, clearInterval },
 } = {}) {
   const timers = []
@@ -135,7 +166,10 @@ export function createCatalogMonitor({
     }
   }
   const modelsDev = guard('models.dev', jobs.modelsDev || (() => syncModelsDev()))
-  const claude = guard('claude-catalog', jobs.claude || (() => syncClaudeCatalog({ projectRoot })))
+  const claude = guard(
+    'claude-catalog',
+    jobs.claude || (() => syncClaudeCatalog({ projectRoot, isBusy: isClaudeBusy })),
+  )
   const gpt = guard(
     'gpt-catalog',
     jobs.gpt ||

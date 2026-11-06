@@ -140,12 +140,15 @@ export function KeyLimitsDialog({
   const gateway = gateways.find(
     (endpoint) => endpoint.id === draft.openai_endpoint_id
   )
+  const isApi = draft.category === 'api'
   const listed = vmsInGroup(vms || [], draft.group_type)
-  const scopeBlocked = gpt
+  const scopeBlocked = isApi
     ? false
-    : draft.group_type === 'pool'
-      ? !draft.vm_pool_id
-      : draft.group_type !== 'all' && draft.allowed_vms.length === 0
+    : gpt
+      ? false
+      : draft.group_type === 'pool'
+        ? !draft.vm_pool_id
+        : draft.group_type !== 'all' && draft.allowed_vms.length === 0
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -346,7 +349,7 @@ export function KeyLimitsDialog({
                     {!claudeScope ? (
                       <SelectItem value='all'>all · 全局可调度</SelectItem>
                     ) : null}
-                    {pools ? (
+                    {pools && !isApi ? (
                       <SelectItem value='pool'>账号池</SelectItem>
                     ) : null}
                     <SelectItem value='anthropic'>
@@ -358,7 +361,7 @@ export function KeyLimitsDialog({
                   </SelectContent>
                 </Select>
               </Field>
-              {draft.group_type === 'pool' ? (
+              {isApi ? null : draft.group_type === 'pool' ? (
                 <Field label='账号池'>
                   <Select
                     value={draft.vm_pool_id || ''}

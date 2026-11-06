@@ -9,7 +9,7 @@ import {
 
 const draft: KeyLimitsDraft = {
   name: ' ops ',
-  category: 'api',
+  category: 'oauth',
   max_concurrency: 4,
   quota_requests: 12,
   quota_usd: 3.5,
@@ -23,7 +23,7 @@ describe('API key limit payload', () => {
   it('keeps request and USD quotas separate', () => {
     expect(keyLimitsPayload(draft, 'create')).toEqual({
       name: 'ops',
-      category: 'api',
+      category: 'oauth',
       max_concurrency: 4,
       quota_requests: 12,
       quota_usd: 3.5,
@@ -36,7 +36,7 @@ describe('API key limit payload', () => {
 
   it('sends category only for admins', () => {
     expect(keyLimitsPayload(draft, 'create', { isAdmin: true }).category).toBe(
-      'api'
+      'oauth'
     )
     expect(
       keyLimitsPayload(draft, 'create', { isAdmin: false })
@@ -67,8 +67,21 @@ describe('API key limit payload', () => {
       allowed_vms: [],
     })
     expect(() =>
-      keyLimitsPayload({ ...draft, allowed_vms: [] }, 'create')
+      keyLimitsPayload(
+        { ...draft, category: 'oauth', allowed_vms: [] },
+        'create'
+      )
     ).toThrow('至少选择一台 VM')
+    expect(
+      keyLimitsPayload(
+        { ...draft, category: 'api', group_type: 'openai', allowed_vms: [] },
+        'create'
+      )
+    ).toMatchObject({
+      category: 'api',
+      group_type: 'openai',
+      allowed_vms: [],
+    })
   })
 
   it('handles vm_pool_id for admin and strips it for non-admin', () => {
@@ -330,4 +343,17 @@ it('switching to Claude selects pool scheduling instead of a single-request key 
     selectKeyService(keyLimitsDraft(null, false, 'gpt'), 'claude')
       .max_concurrency
   ).toBe(0)
+})
+
+it('API keys scope protocol groups without VM or pool ownership', () => {
+  expect(
+    keyLimitsPayload(
+      { ...draft, category: 'api', vm_pool_id: 'pool_12345678' },
+      'create'
+    )
+  ).toMatchObject({
+    group_type: 'anthropic',
+    allowed_vms: [],
+    vm_pool_id: null,
+  })
 })

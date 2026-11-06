@@ -19,6 +19,7 @@ import {
 } from '../core/errors.mjs'
 import { hasRefreshPresence, readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
+import { kernelFaults } from '../transport/rust-kernel-client.mjs'
 import { resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { AttemptCoordinator } from './unit-decision.mjs'
 import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
@@ -27,6 +28,29 @@ import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
 const REPAIR_HOP_WAIT_MS = 30_000
 const SEARCH_REPAIR_IDLE_MS = 60 * 60 * 1000
 const SEARCH_REPAIR_LIMIT = 512
+
+const SILENT_TIMEOUT_WINDOW_MS = 10 * 60_000
+
+export const vmTimeoutTracker = {
+  counts: new Map(),
+  recordTimeout(vmId, threshold = 3, now = Date.now()) {
+    if (!vmId) return false
+    for (const [id, entry] of this.counts) {
+      if (now - entry.firstAt >= SILENT_TIMEOUT_WINDOW_MS) this.counts.delete(id)
+    }
+    const entry = this.counts.get(vmId) || { count: 0, firstAt: now }
+    entry.count += 1
+    this.counts.set(vmId, entry)
+    return entry.count >= threshold
+  },
+  recordSuccess(vmId) {
+    if (vmId) this.counts.delete(vmId)
+  },
+  reset(vmId) {
+    if (vmId) this.counts.delete(vmId)
+    else this.counts.clear()
+  },
+}
 
 const DEFAULTS = {
   max_account_switches: 10,
@@ -491,10 +515,37 @@ export class FailoverRunner {
   noteUnitHealth(selected, policy, result) {
     if (verifiedSuccess(result)) selected?.egressLease?.success()
     const circuit = this.scheduler?.unitCircuit
-    if (!circuit || !selected?.accountId) return
-    if (policy?.circuit) circuit.recordFailure(selected.accountId)
-    else if (verifiedSuccess(result)) circuit.recordSuccess(selected.accountId)
-    else circuit.releaseProbe?.(selected.accountId)
+    if (circuit && selected?.accountId) {
+      if (policy?.circuit) circuit.recordFailure(selected.accountId)
+      else if (verifiedSuccess(result)) circuit.recordSuccess(selected.accountId)
+      else circuit.releaseProbe?.(selected.accountId)
+    }
+
+    const vmId = selected?.vmId
+    if (vmId) {
+      if (verifiedSuccess(result)) {
+        vmTimeoutTracker.recordSuccess(vmId)
+      } else {
+        const upstreamTimeout =
+          ['worker_timeout', 'provider_timeout'].includes(policy?.reason) ||
+          Number(result?.upstream_status || result?.status) === 504
+        const delivered =
+          result?.committed ||
+          Number(result?.usage?.output_tokens) > 0 ||
+          result?.ttft_ms != null ||
+          result?.meta?.ttft_ms != null
+        if (result?.status !== 499 && !isClientCancelledResult(result) && upstreamTimeout && !delivered) {
+          const tripped = vmTimeoutTracker.recordTimeout(vmId, 3)
+          if (tripped) {
+            const fault = `consecutive_timeouts: VM ${vmId} had 3 consecutive silent inference timeouts`
+            console.error(`[vm-circuit] ${fault}; marking kernel fault to prevent routing`)
+            kernelFaults.set(vmId, fault)
+          }
+        } else if (delivered || (!isClientCancelledResult(result) && result?.status !== 499)) {
+          vmTimeoutTracker.recordSuccess(vmId)
+        }
+      }
+    }
   }
 
   /**

@@ -143,6 +143,7 @@ export function keyLimitsPayload(
     quota_usd: nonNegative(draft.quota_usd, 'USD 额度'),
     rpm: nonNegative(draft.rpm, 'RPM'),
   }
+  const isApi = draft.category === 'api'
   // API 直连不经过槽位，只有管理员可以设置
   if (isAdmin) {
     body.category = draft.category
@@ -161,6 +162,10 @@ export function keyLimitsPayload(
     body.group_type = 'openai'
     body.allowed_vms = []
     body.vm_pool_id = null
+  } else if (isApi) {
+    body.group_type = groupTypeOf(draft.group_type)
+    body.allowed_vms = []
+    if (isAdmin) body.vm_pool_id = null
   } else if (isAdmin && draft.group_type === 'pool') {
     const vm_pool_id = String(draft.vm_pool_id || '').trim()
     if (!vm_pool_id) throw new Error('选择一个账号池')

@@ -1,7 +1,9 @@
+import path from 'node:path'
+import { listVmRecordFiles } from '../vm/vm-file.mjs'
 import { legacyQualityState } from './codex-quality.mjs'
 import { createHash, randomUUID } from 'node:crypto'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { getVm, listVms, setScheduleOff, summarizeVm } from '../vm/vm-registry.mjs'
+import { getVm, setScheduleOff, summarizeVm } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { readCodexAccounts, enrichCodexAccountIdentity } from '../vm/codex-slot.mjs'
 import { orderCodexSessionSlots } from '../pool/codex-slot-pool.mjs'
@@ -20,6 +22,13 @@ export const QUALITY_RECOVERY_RETRY_MS = 24 * 60 * 60_000
 export const QUALITY_RECOVERY_CONFIRM_MS = 10 * 60_000
 /** Per-account journal bound. Entries are codes and timestamps only. */
 const RECOVERY_HISTORY_LIMIT = 20
+
+// Read slot records only. Summarizing the mixed fleet opens credentials and computes quota for unrelated requests.
+function codexRecords(project) {
+  return listVmRecordFiles(path.join(project, 'vms'))
+    .map((name) => getVm(project, name.slice(0, -5)))
+    .filter((vm) => vm && isCodexVm(vm))
+}
 
 const emptyResult = () => ({
   consecutive_wrong: 0,
@@ -117,7 +126,7 @@ export class QualityProbeRunner {
     }
   }
 
-  read() {
+  read({ recover = false } = {}) {
     const stored = this.settings().get(QUALITY_PROBE_KEY) ?? this.importPreviousSettings()
     const saved = stored && typeof stored === 'object' ? stored : {}
     let config = { ...DEFAULT_QUALITY_PROBE_CONFIG }
@@ -134,7 +143,7 @@ export class QualityProbeRunner {
       config,
     }
     // Legacy pauses (and a stage left behind by a crash) get a schedule once.
-    if (this.isOwner() && this.migrateRecovery(merged)) this.settings().set(QUALITY_PROBE_KEY, merged)
+    if (recover && this.isOwner() && this.migrateRecovery(merged)) this.settings().set(QUALITY_PROBE_KEY, merged)
     return merged
   }
 
@@ -147,7 +156,7 @@ export class QualityProbeRunner {
     const config = normalizeQualityProbeConfig({ enabled: mode !== 'manual', interval_minutes: interval })
     const states = {}
     let next = 0
-    for (const vm of listVms(this.projectRoot).filter(isCodexVm)) {
+    for (const vm of codexRecords(this.projectRoot)) {
       const prior = legacyQualityState(this.projectRoot, vm.id, store.get('codex_quality_v1:' + vm.id))
       if (!prior) continue
       states[vm.id] = { ...emptyResult(), ...prior, account_identity: accountIdentity(this.projectRoot, vm.id) }
@@ -167,7 +176,7 @@ export class QualityProbeRunner {
     const now = this.now()
     let changed = false
     const paused = new Set()
-    for (const vm of listVms(this.projectRoot).filter(isCodexVm)) {
+    for (const vm of codexRecords(this.projectRoot)) {
       if (!isQualityPause(vm)) continue
       paused.add(vm.id)
       if (this.probing.has(vm.id)) continue
@@ -234,7 +243,7 @@ export class QualityProbeRunner {
   }
 
   snapshot() {
-    const saved = this.read()
+    const saved = this.read({ recover: true })
     return {
       mode: !saved.config.enabled
         ? 'manual'
@@ -247,28 +256,26 @@ export class QualityProbeRunner {
       running: this.progress.running,
       config: saved.config,
       progress: { ...this.progress, active_vm_ids: [...this.progress.active_vm_ids] },
-      items: listVms(this.projectRoot)
-        .filter(isCodexVm)
-        .map((vm) => {
-          const identity = accountIdentity(this.projectRoot, vm.id)
-          const state = saved.states[vm.id]?.account_identity === identity ? { ...saved.states[vm.id] } : emptyResult()
-          state.recovery_history = Array.isArray(state.recovery_history)
-            ? state.recovery_history.map((row) => ({ ...row }))
-            : []
-          delete state.account_identity
-          return {
-            vm_id: vm.id,
-            vm_name: vm.name || null,
-            ...state,
-            paused: isQualityPause(vm),
-            result: state.last_result,
-            wrong: state.consecutive_wrong,
-            due: parseMs(state.recovery_next_at),
-            first_pass: parseMs(state.recovery_first_pass_at),
-            last_at: parseMs(state.last_test_at),
-            request_id: state.last_request_id || null,
-          }
-        }),
+      items: codexRecords(this.projectRoot).map((vm) => {
+        const identity = accountIdentity(this.projectRoot, vm.id)
+        const state = saved.states[vm.id]?.account_identity === identity ? { ...saved.states[vm.id] } : emptyResult()
+        state.recovery_history = Array.isArray(state.recovery_history)
+          ? state.recovery_history.map((row) => ({ ...row }))
+          : []
+        delete state.account_identity
+        return {
+          vm_id: vm.id,
+          vm_name: vm.name || null,
+          ...state,
+          paused: isQualityPause(vm),
+          result: state.last_result,
+          wrong: state.consecutive_wrong,
+          due: parseMs(state.recovery_next_at),
+          first_pass: parseMs(state.recovery_first_pass_at),
+          last_at: parseMs(state.last_test_at),
+          request_id: state.last_request_id || null,
+        }
+      }),
     }
   }
 
@@ -284,8 +291,7 @@ export class QualityProbeRunner {
     if (changedQuestion) {
       const now = this.now()
       const paused = new Set(
-        listVms(this.projectRoot)
-          .filter(isCodexVm)
+        codexRecords(this.projectRoot)
           .filter(isQualityPause)
           .map((vm) => vm.id),
       )
@@ -327,6 +333,7 @@ export class QualityProbeRunner {
   }
 
   resetAccount(vmId) {
+    if (!isCodexVm(getVm(this.projectRoot, vmId))) return
     const saved = this.read()
     const identity = accountIdentity(this.projectRoot, vmId)
     const previous = saved.states[vmId]
@@ -378,7 +385,7 @@ export class QualityProbeRunner {
     this.wake = null
     this.progress.next_run_at = null
     if (!this.started || this.stopping || !this.isOwner() || this.running) return
-    const saved = this.read()
+    const saved = this.read({ recover: true })
     if (!saved.config.enabled) return
     const now = this.now()
     const normal =
@@ -410,7 +417,7 @@ export class QualityProbeRunner {
   /** Earliest scheduled recovery among the accounts that are quality paused right now. */
   nextRecoveryAt(saved) {
     let earliest = null
-    for (const vm of listVms(this.projectRoot).filter(isCodexVm)) {
+    for (const vm of codexRecords(this.projectRoot)) {
       if (!isQualityPause(vm)) continue
       const at = parseMs(this.stateFor(vm.id, saved).recovery_next_at)
       if (at == null) continue
@@ -454,11 +461,11 @@ export class QualityProbeRunner {
   }
 
   async runRound({ recoveryOnly = false } = {}) {
-    const saved = this.read()
+    const saved = this.read({ recover: true })
     const { config } = saved
     const revision = this.revision
     const started = this.now()
-    const accounts = listVms(this.projectRoot).filter(isCodexVm)
+    const accounts = codexRecords(this.projectRoot)
     // A recovery wake only ever re-tests a due quality pause: no healthy account,
     // and the normal cadence keeps its own deadline.
     const queue = accounts
@@ -522,6 +529,10 @@ export class QualityProbeRunner {
 
   async probeAccount(vmId, config, live, recovery) {
     const vm = getVm(this.projectRoot, vmId)
+    if (!vm || !isCodexVm(vm)) {
+      this.progress.completed++
+      return
+    }
     const identity = accountIdentity(this.projectRoot, vmId)
     if (this.guarded && !recovery && config.enabled) {
       const previous = parseMs(this.stateFor(vmId).last_dispatched_at)
@@ -548,9 +559,7 @@ export class QualityProbeRunner {
       try {
         const result = await this.measure(vmId, config)
         if (!live()) return
-        const current = accountIdentity(this.projectRoot, vmId)
-        if (current !== identity) this.resetAccount(vmId)
-        else this.record(vmId, result, config, current, { recovery: true })
+        this.settleMeasurement(vmId, result, config, identity, true)
         this.progress.completed++
       } finally {
         this.probing.delete(vmId)
@@ -570,13 +579,18 @@ export class QualityProbeRunner {
     try {
       const result = await this.measure(vmId, config)
       if (!live()) return
-      const current = accountIdentity(this.projectRoot, vmId)
-      if (current !== identity) this.resetAccount(vmId)
-      else this.record(vmId, result, config, current)
+      this.settleMeasurement(vmId, result, config, identity, false)
       this.progress.completed++
     } finally {
       this.unmarkActive(vmId)
     }
+  }
+
+  settleMeasurement(vmId, result, config, identity, recovery) {
+    const vm = getVm(this.projectRoot, vmId)
+    if (!vm || !isCodexVm(vm) || readCodexAccounts(this.projectRoot, vmId).length > 1) return
+    if (accountIdentity(this.projectRoot, vmId) !== identity) this.resetAccount(vmId)
+    else this.record(vmId, result, config, identity, { recovery })
   }
 
   /** One pinned answer, judged. Authentication recovery belongs to the owner, not this test. */

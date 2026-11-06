@@ -28,6 +28,7 @@ import { resolveInferenceEngine } from '../vm/slot-engine.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { dockerRequest } from '../cluster/docker-remote.mjs'
 import { clusterManager, vmNodeId } from '../cluster/placement.mjs'
+import { vmTimeoutTracker } from '../pool/failover-runner.mjs'
 
 /** A failed observation is not evidence of a dead container. Use the slot's own host, including KVM runners. */
 export async function observeWatchdogContainer(
@@ -246,7 +247,10 @@ export function createKernelWatchdog({
     if (!rustKernelNeedsRestart(current)) {
       // Healthy again after a fault means someone fixed it: start a fresh budget.
       // Plain recovery keeps past attempts so a crash loop stays bounded by the window.
-      if (kernelFaults.delete(vm.id)) restarts.delete(vm.id)
+      if (kernelFaults.delete(vm.id)) {
+        restarts.delete(vm.id)
+        vmTimeoutTracker?.reset?.(vm.id)
+      }
       // Config convergence, not a failure: outside the restart budget.
       if (kernelSlotMismatch(exec)) {
         const observed = await observeRuntime(vm)
@@ -358,6 +362,7 @@ export function createKernelWatchdog({
     reset(vmId) {
       const faulted = kernelFaults.delete(vmId)
       restarts.delete(vmId)
+      vmTimeoutTracker?.reset?.(vmId)
       return { faulted }
     },
     restartsInWindow(vmId) {

@@ -85,3 +85,15 @@ test('only explicitly GPT-scoped managed keys bypass the legacy gateway bucket',
     assert.equal(usesGatewayRateLimit(record), true)
   }
 })
+
+test('api category allows anthropic and openai groups without VMs', () => {
+  const anthropic = normalizeKeyScope({ group_type: 'anthropic', allowed_vms: [], category: 'api' })
+  assert.deepEqual(anthropic, { group_type: 'anthropic', allowed_vms: [], vm_pool_id: null })
+
+  const openai = normalizeKeyScope({ group_type: 'openai', allowed_vms: [] }, { isApi: true })
+  assert.deepEqual(openai, { group_type: 'openai', allowed_vms: [], vm_pool_id: null })
+
+  const current = { group_type: 'all', allowed_vms: '[]', category: 'api' }
+  const patched = normalizeKeyScope({ group_type: 'openai' }, { partial: true, current })
+  assert.deepEqual(patched, { group_type: 'openai', allowed_vms: [], vm_pool_id: null })
+})
