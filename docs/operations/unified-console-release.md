@@ -1,6 +1,6 @@
 # Unified console release
 
-Build from `web` with `pnpm run build:unified -- --base=/native-console/`.
+Build from `web` with `npm run build:unified -- --base=/native-console/`.
 The default `build` target intentionally supports a standalone controller only.
 Before publishing the shared console, require `dist/controllers.json` to contain
 `{"controllers":["main","codex"]}`. Publish immutable assets before atomically
