@@ -8,6 +8,8 @@ not fields accepted from an HTTP client. No files, sessions or grants are mutate
 from dataclasses import dataclass
 import hashlib
 
+from native_paid_sibling import PaidSibling, proven_sibling
+
 
 @dataclass(frozen=True)
 class Identity:
@@ -29,6 +31,8 @@ class Channel:
     pending_ids: frozenset[str] = frozenset()
     history_controls: dict | None = None
     history_pending: dict | None = None
+    paid_input: str | None = None
+    sibling: PaidSibling | None = None
 
 
 @dataclass(frozen=True)
@@ -52,6 +56,7 @@ class Decision:
     logical_key: str
     request_sha256: str
     channel_key: str | None = None
+    sibling: PaidSibling | None = None
 
 
 def logical_key(tenant, session_id):
@@ -148,6 +153,22 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
     # It also rejects missing/duplicate results, rather than dropping them to fit.
     native.initial_request(body, allow_history_import=True)
     identity = request_identity(scope, body, native)
+    # Consume/unknown/inflight above are global to the authenticated scope. Only
+    # then choose a transcript. Both sides of a witnessed split retain their own
+    # native directory and immutable paid grants, including after restart.
+    dialogue = [m for m in messages if m['role'] != 'system']
+    siblings = [c for c in channels if c.sibling]
+    matches = [c for c in siblings if c.sibling.matches(dialogue, native.signature)]
+    if len(matches) > 1:
+        return reject('native_channel_ambiguous')
+    if matches:
+        match = matches[0]
+        if match.identity != identity or (match.status == 'prepared' and
+                                          match.sibling.first_request != request_sha):
+            return reject('history_prefix_mismatch')
+        channels = (match,)
+    else:
+        channels = tuple(c for c in channels if not c.sibling)
     same_anchor = [c for c in channels
                    if c.identity.anchor_sha256 == identity.anchor_sha256]
     boundaries = {}
@@ -158,6 +179,21 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
                 messages, length, channel.history_sha256, channel.history_controls,
                 channel.history_pending if channel.status == 'awaiting_tools' else None)
         except native.ContractError as error:
+            if (str(error) == 'history_prefix_mismatch' and allow_history_import
+                    and not matches and len(same_anchor) == 1 and channel.identity == identity
+                    and not any(c.pending_ids for c in snapshot.channels if c.key != channel.key)
+                    and not any(c.sibling.parent == channel.key and
+                                c.sibling.paid_input == channel.paid_input for c in siblings)):
+                sibling = proven_sibling(channel, messages, request_sha, native.signature)
+                if sibling:
+                    if snapshot.memory_pressure:
+                        return reject('native_memory_pressure')
+                    if check_capacity and snapshot.resident_total >= snapshot.capacity:
+                        return reject('native_session_capacity')
+                    key = sibling.key(native.signature)
+                    if any(c.key == key for c in snapshot.channels):
+                        return reject('native_channel_collision')
+                    return Decision('create', 'verified_paid_sibling', scope, request_sha, key, sibling)
             return reject(str(error))
         if prefix >= len(messages):
             return reject("history_prefix_mismatch")
@@ -178,6 +214,15 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
             if (not channel.pending_ids or not tail or tail[0]["role"] != "user"
                     or len(ids) != len(set(ids)) or set(ids) != channel.pending_ids):
                 return reject("native_session_incomplete_no_replay")
+    # The displaced parent and its own child can each finish their tools.
+    # An unrelated outstanding exchange still prevents creating/switching channels.
+    for other in snapshot.channels:
+        if other in channels or not other.pending_ids:
+            continue
+        related = selected and ((selected.sibling and selected.sibling.parent == other.key)
+                                or (other.sibling and other.sibling.parent == selected.key))
+        if not related:
+            return reject('native_pending_tools_no_branch')
     if selected is None and not allow_history_import and any(
             m["role"] == "assistant" for m in messages):
         return reject("native_session_history_not_imported")

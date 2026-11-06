@@ -90,3 +90,9 @@ Afterwards check the health endpoint, listener, effective systemd properties and
 unchanged daemon/container start times. Never clear an auth or exit latch to
 repair a tunnel. The reconnect policy is transport-only and cannot replay model
 requests.
+
+### Divergent responses to one paid input
+
+If a caller finishes a different tool exchange after a paid tool response, retain the original channel, pending tool IDs, receipt and transcript. To open a separate transcript, the Relay verifies the complete prior input hash, the original paid response checkpoint, the alternate tool results and one fresh user tail under the same authenticated scope. It imports the caller-provided history and dispatches only that tail. Both transcripts share consumption checks and the account's concurrency limit.
+
+Back up the configuration-channel registry together with its session directories. Once a registry contains a `paid_sibling` record, roll back to a version that understands it, or keep that Relay out of scheduling until it can read both histories. Keep all caller grants, consumed records and pending witnesses.

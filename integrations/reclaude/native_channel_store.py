@@ -4,10 +4,12 @@ import fcntl
 import hashlib
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import native_bridge_session as native
 from native_history_boundary import control_record, pending_record
+from native_paid_sibling import PaidSibling
 from native_channel_policy import Channel, Identity, Snapshot, request_identity
 
 
@@ -81,13 +83,42 @@ class ChannelStore:
             raise native.ContractError('native_channel_evidence_unknown')
         return value
 
-    def register(self, logical, key, body):
+    def register(self, logical, key, body, sibling=None):
         document = self.document(logical)
         if document is None or key in document['channels']:
             raise native.ContractError('native_channel_evidence_unknown')
         identity = asdict(request_identity(logical, body, native))
+        if sibling:
+            identity['paid_sibling'] = sibling.serialize()
         document['channels'][key] = identity
         write_json(self.directory / (logical + '.json'), document)
+
+    def prepare_sibling(self, decision, body, factory, recover):
+        """Publish membership last; a failed preparation cannot poison the parent's registry."""
+        logical, key = decision.logical_key, decision.channel_key
+        target = self.root / key
+        if target.exists():
+            # The atomic directory move may have succeeded before a process exit.
+            # Only an attached, never-dispatched prepared directory can finish publication.
+            marker = {'version': 1, 'logical': logical, 'channel': key}
+            if (target.is_symlink() or read_json(target / '.configuration-channel.json') != marker
+                    or read_json(target / 'continuation.json').get('status') != 'prepared'
+                    or any((target / 'caller-grants').glob('*.json'))
+                    or any((target / 'dispatch').glob('*.json')) or recover is None):
+                raise native.ContractError('native_channel_evidence_unknown')
+            session = recover(target, body)
+        else:
+            with tempfile.TemporaryDirectory(prefix='.prepare-sibling-', dir=self.root) as staging:
+                initial = Path(staging) / key
+                session = factory(initial, body)
+                session.checkpoint('prepared')
+                self.attach(session, logical)
+                os.rename(initial, target)
+                session.directory = target
+                sync_directory(self.root)
+        self.attach(session, logical)
+        self.register(logical, key, body, decision.sibling)
+        return session
 
     def attach(self, session, logical):
         if session.budget_options:
@@ -107,6 +138,7 @@ class ChannelStore:
             return None
         channels, consumed = [], set()
         complete, unknown = True, False
+        paid = {}
         for key, raw_identity in document['channels'].items():
             if (len(key) != 64 or any(c not in '0123456789abcdef' for c in key)
                     or raw_identity.get('logical_key') != logical):
@@ -128,6 +160,7 @@ class ChannelStore:
             if (pending_witness is None and session is not None and session.history
                     and status == 'awaiting_tools'):
                 pending_witness = pending_record(native.history_shape(session.history))
+            paid_input = None
             pending = frozenset(getattr(session, 'pending_ids', ()))
             # A nonresident tool wait cannot be branched: the existing native
             # recover() still verifies the exact result set on its own path.
@@ -161,9 +194,18 @@ class ChannelStore:
                         and state.get('history_sha256') == claim.get('history_sha256')):
                     pending = frozenset(claim.get('pending_ids', ()))
                 record = directory / 'dispatch' / (grant_id + '.consumed.json')
-                if (claim.get('state') != 'complete' or not record.is_file()
-                        or read_json(record).get('id') != grant_id):
+                receipt = read_json(record) if record.is_file() else {}
+                if claim.get('state') != 'complete' or receipt.get('id') != grant_id:
                     unknown = True
+                elif (claim.get('pending_ids') and isinstance(claim.get('terminal_usage'), dict)
+                      and all(type(claim['terminal_usage'].get(k)) is int and claim['terminal_usage'][k] >= 0
+                              for k in ('input_tokens', 'output_tokens'))):
+                    paid[(key, request)] = claim.get('history_sha256')
+                    if (status == 'awaiting_tools' and request == state.get('request_sha256')
+                            and claim.get('history_sha256') == history_sha and claim.get('history_length') == length
+                            and frozenset(claim['pending_ids']) == pending and state.get('history_pending_sha256')
+                            and receipt.get('session_id') == state.get('native_id')):
+                        paid_input = request
             grant_path = directory / 'dispatch/grant.json'
             if grant_path.exists() and read_json(grant_path).get('id') not in known_grants:
                 complete = False
@@ -179,13 +221,24 @@ class ChannelStore:
                          or history_sha != native.signature(native.history_shape(session.history)))):
                 complete = False
             try:
-                identity = Identity(**raw_identity)
+                fields = dict(raw_identity)
+                marker = fields.pop('paid_sibling', None)
+                sibling = PaidSibling(**marker) if marker is not None else None
+                identity = Identity(**fields)
+                if sibling and not sibling.valid(key, native.signature):
+                    raise ValueError('invalid paid sibling')
             except (TypeError, ValueError):
                 raise native.ContractError('native_channel_evidence_unknown') from None
             channels.append(Channel(key, identity, status, length, history_sha,
                                     resident=entry is not None, busy=bool(entry and entry.busy),
                                     pending_ids=pending, history_controls=controls,
-                                    history_pending=pending_witness))
+                                    history_pending=pending_witness, paid_input=paid_input, sibling=sibling))
+        parents = {c.key: c.identity for c in channels if not c.sibling}
+        for channel in channels:
+            sibling = channel.sibling
+            if sibling and (parents.get(sibling.parent) != channel.identity or
+                            paid.get((sibling.parent, sibling.paid_input)) != sibling.paid_history):
+                raise native.ContractError('native_channel_evidence_unknown')
         return Snapshot(logical, tuple(channels), frozenset(consumed), complete,
                         len(entries), capacity, unknown_dispatch=unknown,
                         stopped=stopped, memory_pressure=pressure)

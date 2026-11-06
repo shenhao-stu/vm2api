@@ -181,6 +181,7 @@ class SessionPool:
         # The reaper handles expiry; hot requests need not wait for other CLIs.
         while True:
             retiring = None
+            decision = None
             with self.lock:
                 if self.stopped:
                     raise ContractError("native_pool_stopped")
@@ -216,13 +217,14 @@ class SessionPool:
                         raise ContractError("native_memory_pressure" if pressure
                                             else "native_session_capacity")
                 elif entry is None and retiring is None:
-                    if self.channel_store is not None and not existing:
-                        self.channel_store.register(logical, key, body)
-                    session = (self.recover if existing else self.factory)(
-                        self.root / key, body
-                    )
-                    if self.channel_store is not None and self.channel_store.document(logical) is not None:
-                        self.channel_store.attach(session, logical)
+                    if decision and decision.sibling:
+                        session = self.channel_store.prepare_sibling(decision, body, self.factory, self.recover)
+                    else:
+                        if self.channel_store is not None and not existing:
+                            self.channel_store.register(logical, key, body)
+                        session = (self.recover if existing else self.factory)(self.root / key, body)
+                        if self.channel_store is not None and self.channel_store.document(logical) is not None:
+                            self.channel_store.attach(session, logical)
                     entry = self.entries[key] = Entry(session, self.clock())
                 if retiring is None:
                     entry.busy = True
