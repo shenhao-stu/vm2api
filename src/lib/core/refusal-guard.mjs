@@ -18,6 +18,8 @@ export { REFUSAL_GUARD_MESSAGE }
 export const REFUSAL_GUARD_SETTING = 'refusal_guard_enabled'
 export const REFUSAL_SIMILARITY_SETTING = 'refusal_similarity_enabled'
 export const REFUSAL_SIMILARITY_VALUE_SETTING = 'refusal_similarity'
+const SESSION_ISOLATION_GENERATION = 'refusal_session_isolation_generation'
+export const REFUSAL_SESSION_ISOLATION_SETTING = 'refusal_session_isolation_enabled'
 export const REFUSAL_DEVICE_BLOCK_SETTING = 'refusal_device_block_enabled'
 export const REFUSAL_SIMILARITY_CHOICES = Object.freeze([80, 85, 90, 95])
 
@@ -186,6 +188,13 @@ function flagOn(value) {
   return !(value === false || value === 0 || value === '0' || value === 'false')
 }
 
+export function readSessionIsolationPolicy(read) {
+  return {
+    enabled: flagOn(read(REFUSAL_SESSION_ISOLATION_SETTING, true)),
+    generation: Number(read(SESSION_ISOLATION_GENERATION, 0)),
+  }
+}
+
 /** Panel policy. Missing settings stay on, with similarity at 90. */
 export function refusalGuardPolicy(readSetting) {
   const read = typeof readSetting === 'function' ? readSetting : () => undefined
@@ -193,6 +202,7 @@ export function refusalGuardPolicy(readSetting) {
   const similarity = REFUSAL_SIMILARITY_CHOICES.includes(Number(raw)) ? Number(raw) : 90
   return {
     enabled: isRefusalGuardEnabled(readSetting),
+    session_isolation_enabled: flagOn(read(REFUSAL_SESSION_ISOLATION_SETTING, true)),
     similarity_enabled: flagOn(read(REFUSAL_SIMILARITY_SETTING, true)),
     similarity,
     device_block_enabled: flagOn(read(REFUSAL_DEVICE_BLOCK_SETTING, true)),
@@ -208,6 +218,9 @@ export function normalizeRefusalSimilarity(value) {
 export function applyRefusalGuardPatch(settings, body = {}) {
   const problems = []
   if (Object.hasOwn(body, 'enabled') && typeof body.enabled !== 'boolean') problems.push('enabled 必须是布尔')
+  if (Object.hasOwn(body, 'session_isolation_enabled') && typeof body.session_isolation_enabled !== 'boolean') {
+    problems.push('session_isolation_enabled 必须是布尔')
+  }
   if (Object.hasOwn(body, 'similarity_enabled') && typeof body.similarity_enabled !== 'boolean') {
     problems.push('similarity_enabled 必须是布尔')
   }
@@ -219,6 +232,13 @@ export function applyRefusalGuardPatch(settings, body = {}) {
   }
   if (problems.length) return { ok: false, problems }
   if (typeof body.enabled === 'boolean') settings.set(REFUSAL_GUARD_SETTING, body.enabled)
+  if (typeof body.session_isolation_enabled === 'boolean') {
+    const previous = readSessionIsolationPolicy((key, fallback) => settings.get(key, fallback))
+    if (previous.enabled !== body.session_isolation_enabled) {
+      settings.set(SESSION_ISOLATION_GENERATION, previous.generation + 1)
+      settings.set(REFUSAL_SESSION_ISOLATION_SETTING, body.session_isolation_enabled)
+    }
+  }
   if (typeof body.similarity_enabled === 'boolean') settings.set(REFUSAL_SIMILARITY_SETTING, body.similarity_enabled)
   if (typeof body.device_block_enabled === 'boolean') {
     settings.set(REFUSAL_DEVICE_BLOCK_SETTING, body.device_block_enabled)

@@ -1037,7 +1037,7 @@ export class UsageLogsRepo {
     const block = `(
       COALESCE(error_code, '') = 'policy_blocked'
       OR COALESCE(via, '') IN ('hard-regex', 'jev', 'distill-detect', 'refusal-guard')
-      OR COALESCE(final_state, '') IN ('policy_blocked', 'distill_blocked', 'refusal_guard', 'refusal_similar', 'refusal_device')
+      OR COALESCE(final_state, '') IN ('policy_blocked', 'distill_blocked', 'refusal_guard', 'refusal_similar', 'refusal_device', 'refusal_session_isolated')
     )`
     const inference = `path IN ('/v1/messages', '/v1/responses', '/v1/chat/completions')`
     const row = this.db

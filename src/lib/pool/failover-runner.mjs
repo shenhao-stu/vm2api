@@ -951,6 +951,16 @@ export class FailoverRunner {
                 stickyBound: attemptStickyBound,
               })
             : clone(attemptBody)
+        if (prepared?.localDenial) {
+          this.attemptsRepo?.complete?.(requestId, attemptNo, {
+            errorScope: 'request',
+            action: 'stop',
+            terminalState: 'local_rejection',
+            latencyMs: Date.now() - attemptStarted,
+          })
+          releaseStickySlots()
+          return { ok: false, localDenial: prepared.localDenial, ...attribution() }
+        }
         const wrappedAttempt =
           prepared &&
           typeof prepared === 'object' &&

@@ -765,7 +765,7 @@ function stripBillingText(text) {
   return String(text || '').replace(/^[ \t]*x-anthropic-billing-header:[^\n]*(?:\n|$)/gim, '')
 }
 
-function stripCallerBilling(body) {
+export function stripCallerBilling(body) {
   if (!body || typeof body !== 'object' || body.system == null) return body
   const keep = (block) => {
     const raw = typeof block === 'string' ? block : block?.text

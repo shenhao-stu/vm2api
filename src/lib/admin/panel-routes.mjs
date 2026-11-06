@@ -200,7 +200,7 @@ import { GATEWAY_CAPABILITIES } from '../vm/execution-context.mjs'
 import { withVmLock, atomicWriteJson, isValidVmId, invalidateVmSlotReadCache } from '../vm/vm-file.mjs'
 import { snapshotDatabaseMetrics } from '../db/database-metrics.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
-import { getDb, getDbPath } from '../db/database.mjs'
+import { getDb, getDbPath, withTransaction } from '../db/database.mjs'
 import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
 import {
   readLocalVersion,
@@ -5568,7 +5568,12 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'PUT' && p === '/api/panel/refusal-guards') {
         const body = await readBody(req, 8 * 1024).catch(() => ({}))
-        const patched = applyRefusalGuardPatch(new SettingsRepo(), body || {})
+        const settings = new SettingsRepo()
+        const patched = withTransaction(settings.db, () => {
+          const update = applyRefusalGuardPatch(settings, body || {})
+          if (update.ok && body?.session_isolation_enabled === false) settings.db.exec('DELETE FROM refused_sessions')
+          return update
+        })
         if (!patched.ok) {
           return json(res, 400, {
             ok: false,
