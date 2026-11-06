@@ -1,0 +1,190 @@
+"""Pure configuration-channel selection; never dispatches.
+
+The caller must hold SessionPool.lock through selection and Entry.busy reservation.
+Snapshots are trusted projections of that pool and its durable dispatch evidence,
+not fields accepted from an HTTP client. No files, sessions or grants are mutated.
+"""
+
+from dataclasses import dataclass
+import hashlib
+
+
+@dataclass(frozen=True)
+class Identity:
+    logical_key: str
+    model: str
+    system_sha256: str
+    anchor_sha256: str
+
+
+@dataclass(frozen=True)
+class Channel:
+    key: str
+    identity: Identity
+    status: str
+    history_length: int
+    history_sha256: str
+    resident: bool = True
+    busy: bool = False
+    pending_ids: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    logical_key: str
+    channels: tuple[Channel, ...]
+    consumed: frozenset[str]
+    evidence_complete: bool
+    resident_total: int
+    capacity: int = 10
+    unknown_dispatch: bool = False
+    inflight: bool = False
+    stopped: bool = False
+    memory_pressure: bool = False
+
+
+@dataclass(frozen=True)
+class Decision:
+    action: str
+    code: str
+    logical_key: str
+    request_sha256: str
+    channel_key: str | None = None
+
+
+def logical_key(tenant, session_id):
+    """Exactly the existing pool key; only authenticated tenant is permitted."""
+    if not isinstance(tenant, str) or not tenant or "\0" in tenant:
+        raise ValueError("invalid_trusted_tenant")
+    return hashlib.sha256((tenant + "\0" + session_id).encode()).hexdigest()
+
+
+def request_identity(scope, body, native):
+    """Use the bridge's normalization; mutable controls and tools are not keys."""
+    messages = native.history_shape(body["messages"])
+    anchor = next(m for m in messages if m["role"] == "user")
+    return Identity(scope, body["model"], native.signature(native.initial_system(body)),
+                    native.signature(anchor))
+
+
+def consistent_snapshot(snapshot, native):
+    def digest(value):
+        return isinstance(value, str) and len(value) == 64 and all(
+            c in "0123456789abcdef" for c in value)
+
+    if (type(snapshot.channels) is not tuple or type(snapshot.consumed) is not frozenset
+            or any(type(flag) is not bool for flag in (
+                snapshot.evidence_complete, snapshot.unknown_dispatch, snapshot.inflight,
+                snapshot.stopped, snapshot.memory_pressure))
+            or not digest(snapshot.logical_key) or not all(digest(s) for s in snapshot.consumed)
+            or any(type(c) is not Channel or type(c.identity) is not Identity
+                   for c in snapshot.channels)):
+        return False
+    if snapshot.resident_total < sum(c.resident is True for c in snapshot.channels):
+        return False
+    for channel in snapshot.channels:
+        if (type(channel.busy) is not bool or type(channel.resident) is not bool
+                or type(channel.pending_ids) is not frozenset
+                or type(channel.history_length) is not int or channel.history_length < 0
+                or not all(digest(s) for s in (channel.key, channel.history_sha256,
+                    channel.identity.logical_key, channel.identity.system_sha256,
+                    channel.identity.anchor_sha256))):
+            return False
+        if channel.status == "prepared" and (channel.history_length != 0 or channel.pending_ids
+                or channel.history_sha256 != native.signature([])):
+            return False
+        if channel.status in {"idle", "awaiting_tools"} and channel.history_length == 0:
+            return False
+        if ((channel.status == "awaiting_tools" and not channel.pending_ids)
+                or (channel.status == "idle" and channel.pending_ids)):
+            return False
+    return True
+
+
+def select_channel(tenant, body, snapshot, *, native, session_identity,
+                   allow_history_import=False, check_capacity=True):
+    """Choose an existing directory, a new directory, or a rejection.
+
+    Native validators remain authoritative and may raise ContractError. A create
+    decision is NOT permission to replay: the normal factory/import/once path must
+    still run, with only the final caller tail eligible for its existing grant.
+    """
+    native.native_options(body)
+    scope = logical_key(tenant, session_identity(body))
+    messages = native.history_shape(body["messages"])
+    request_sha = native.signature(messages)
+
+    def reject(code):
+        return Decision("reject", code, scope, request_sha)
+
+    if (type(snapshot.capacity) is not int or not 1 <= snapshot.capacity <= 10
+            or type(snapshot.resident_total) is not int or snapshot.resident_total < 0):
+        raise ValueError("invalid_native_pool_limits")
+    if not consistent_snapshot(snapshot, native):
+        return reject("native_session_evidence_unknown")
+    if snapshot.logical_key != scope:
+        return reject("session_scope_mismatch")
+    if snapshot.stopped:
+        return reject("native_pool_stopped")
+    if not snapshot.evidence_complete or snapshot.unknown_dispatch:
+        return reject("native_session_evidence_unknown")
+    channels = snapshot.channels
+    if (any(c.identity.logical_key != scope for c in channels)
+            or len({c.key for c in channels}) != len(channels)):
+        return reject("session_scope_mismatch")
+    if snapshot.inflight or any(c.busy or c.status in {"in_flight", "closing"}
+                               for c in channels):
+        return reject("session_busy")
+    if any(c.status == "failed" for c in channels):
+        return reject("native_session_failed_no_replay")
+    if any(c.status not in {"prepared", "idle", "awaiting_tools"} for c in channels):
+        return reject("native_session_incomplete_no_replay")
+    if request_sha in snapshot.consumed:
+        return reject("request_already_consumed")
+
+    # This validates the entire caller tool graph without importing or executing it.
+    # It also rejects missing/duplicate results, rather than dropping them to fit.
+    native.initial_request(body, allow_history_import=True)
+    identity = request_identity(scope, body, native)
+    same_anchor = [c for c in channels
+                   if c.identity.anchor_sha256 == identity.anchor_sha256]
+    for channel in same_anchor:
+        length = channel.history_length
+        if (type(length) is not int or length < 0
+                or length >= len(messages)
+                or native.signature(messages[:length]) != channel.history_sha256):
+            return reject("history_prefix_mismatch")
+    exact = [c for c in channels if c.identity == identity]
+    if len(exact) > 1:
+        return reject("native_channel_ambiguous")
+    selected = exact[0] if exact else None
+    # A pending native tool exchange cannot move to another channel/model. It may
+    # resume only on the original channel, with the exact original tool results.
+    for channel in channels:
+        if channel.status == "awaiting_tools" or channel.pending_ids:
+            if channel is not selected:
+                return reject("native_pending_tools_no_branch")
+            tail = [m for m in messages[channel.history_length:] if m["role"] != "system"]
+            ids = [b["tool_use_id"] for b in tail[0]["content"]
+                   if b["type"] == "tool_result"] if tail else []
+            if (not channel.pending_ids or not tail or tail[0]["role"] != "user"
+                    or len(ids) != len(set(ids)) or set(ids) != channel.pending_ids):
+                return reject("native_session_incomplete_no_replay")
+    if selected is None and not allow_history_import and any(
+            m["role"] == "assistant" for m in messages):
+        return reject("native_session_history_not_imported")
+    if snapshot.memory_pressure:
+        return reject("native_memory_pressure")
+    if (check_capacity and (selected is None or not selected.resident)
+            and snapshot.resident_total >= snapshot.capacity):
+        return reject("native_session_capacity")
+    if selected:
+        return Decision("reuse", "verified_existing_channel", scope, request_sha, selected.key)
+    # The first channel retains the legacy pathname. Additional channels do not
+    # become separate pools, accounts, credentials or budgets.
+    key = scope if not channels else native.signature(
+        ["native-config-channel-v1", scope, identity.model,
+         identity.system_sha256, identity.anchor_sha256])
+    if any(c.key == key for c in channels):
+        return reject("native_channel_collision")
+    return Decision("create", "validated_new_channel", scope, request_sha, key)

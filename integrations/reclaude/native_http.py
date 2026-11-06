@@ -44,6 +44,7 @@ class NativeServer(RelayServer):
         memory_high_bytes=0,
         memory_current_file=Path("/sys/fs/cgroup/memory.current"),
         allow_history_import=False,
+        configuration_channels=False,
     ):
         if type(memory_high_bytes) is not int or memory_high_bytes < 0:
             raise ValueError("invalid_memory_high_bytes")
@@ -72,6 +73,7 @@ class NativeServer(RelayServer):
             prepared_idle_seconds=prepared_idle_seconds,
             under_pressure=lambda: memory_pressure(memory_current_file, memory_high_bytes),
             allow_history_import=allow_history_import,
+            configuration_channels=configuration_channels,
         )
         self.memory_high_bytes = memory_high_bytes
         self.maintenance_error = None
@@ -482,7 +484,10 @@ def main():
     p.add_argument("--prepared-idle-seconds", type=float, default=120)
     p.add_argument("--memory-high-bytes", type=int, default=0)
     p.add_argument("--memory-current-file", type=Path, default=Path("/sys/fs/cgroup/memory.current"))
+    p.add_argument("--configuration-channels", action="store_true")
     args = p.parse_args()
+    if args.configuration_channels and args.session_budget_usd is not None:
+        p.error("configuration channels require an account budget, not a per-CLI session budget")
     limits = Limits(models=tuple(args.model), concurrency=args.concurrency,
                     body_bytes=args.max_body_mib * 1024 * 1024)
     health = NativeHealth(args.home, args.binding)
@@ -545,6 +550,7 @@ def main():
         memory_high_bytes=args.memory_high_bytes,
         memory_current_file=args.memory_current_file,
         allow_history_import=args.allow_history_import,
+        configuration_channels=args.configuration_channels,
     )
 
     def stop(*_):
@@ -564,6 +570,7 @@ def main():
                 "prepared_idle_seconds": server.pool.prepared_idle_seconds,
                 "memory_high_bytes": args.memory_high_bytes,
                 "history_import_enabled": args.allow_history_import,
+                "configuration_channels_enabled": args.configuration_channels,
             }
         )
     )
