@@ -417,11 +417,11 @@ def history_shape(messages):
     return [message_shape(message) for message in messages]
 
 
-def frozen_history_prefix(messages, length, history_sha, controls=None):
+def frozen_history_prefix(messages, length, history_sha, controls=None, pending=None):
     try:
         shaped = history_shape(messages)
         history, prefix = boundary.frozen_prefix(shaped, length, history_sha,
-                                                signature, controls)
+                                                signature, controls, pending)
         if prefix == length and history == shaped[:length]:
             history = messages[:length]
         return history, prefix
@@ -432,6 +432,13 @@ def frozen_history_prefix(messages, length, history_sha, controls=None):
 def checkpoint_controls(directory, state):
     try:
         return boundary.read_controls(directory, state)
+    except boundary.BoundaryError as error:
+        raise ContractError(str(error)) from None
+
+
+def checkpoint_pending(directory, state):
+    try:
+        return boundary.read_pending(directory, state)
     except boundary.BoundaryError as error:
         raise ContractError(str(error)) from None
 
@@ -714,7 +721,7 @@ class Session:
             raise ContractError("session_configuration_changed")
         history, prefix = frozen_history_prefix(
             body['messages'], state['history_length'], state['history_sha256'],
-            checkpoint_controls(self.directory, state))
+            checkpoint_controls(self.directory, state), checkpoint_pending(self.directory, state))
         self.native_id = str(uuid.UUID(state["native_id"]))
         self.resume_uuid = str(uuid.UUID(state["assistant_uuid"]))
         self.resume_message_id = state.get("message_id")
@@ -783,6 +790,9 @@ class Session:
                 try:
                     controls_sha = boundary.write_controls(
                         self.directory, history_shape(self.history), state['history_sha256'])
+                    if status == 'awaiting_tools':
+                        state['history_pending_sha256'] = boundary.write_pending(
+                            self.directory, history_shape(self.history), state['history_sha256'])
                 except boundary.BoundaryError as error:
                     raise ContractError(str(error)) from None
                 if controls_sha is not None:
@@ -828,7 +838,9 @@ class Session:
         messages = body['messages']
         prefix = self.history_prefix(messages)
         tail = [m for m in messages[prefix:] if m['role'] != 'system']
-        if len(tail) <= 1 and not self.structured_checkpoint:
+        normalized = (bool(self.pending_ids) and history_shape(self.history)[-1]
+                      != history_shape(messages)[prefix - 1])
+        if len(tail) <= 1 and not self.structured_checkpoint and not normalized:
             return None
         if self.history_profile is None:
             raise ContractError('unsupported_history_tail')
@@ -836,7 +848,29 @@ class Session:
 
     def history_prefix(self, messages):
         try:
-            return boundary.prefix_boundary(history_shape(self.history), history_shape(messages))
+            return boundary.prefix_boundary(history_shape(self.history), history_shape(messages),
+                                            allow_pending=bool(self.pending_ids))
+        except boundary.BoundaryError as error:
+            raise ContractError(str(error)) from None
+
+    def record_pending_adoption(self, body):
+        if not self.pending_ids:
+            return
+        prefix = self.history_prefix(body['messages'])
+        previous = history_shape(self.history)[-1]
+        current = history_shape(body['messages'])[prefix - 1]
+        if previous == current:
+            return
+        record = {'version': 1, 'channel': self.directory.name,
+                  'request_sha256': self.caller_request_sha,
+                  'history_length': len(self.history),
+                  'history_sha256': signature(history_shape(self.history)),
+                  'original_assistant_sha256': signature(previous),
+                  'caller_assistant_sha256': signature(current)}
+        try:
+            record['history_pending_sha256'] = boundary.write_pending(
+                self.directory, history_shape(self.history), record['history_sha256'])
+            boundary.write_witness(self.directory, self.caller_request_sha, record, 'adoptions')
         except boundary.BoundaryError as error:
             raise ContractError(str(error)) from None
 
@@ -1285,6 +1319,8 @@ class Session:
             if request_signature in self.seen:
                 raise ContractError("request_already_consumed")
             advanced = self.continuation_import(body)
+            if advanced is not None:
+                self.record_pending_adoption(body)
             if not self.history or advanced is not None:
                 imported, blocks = advanced or initial_request(body, self.history_profile is not None)
                 mutation_started = True

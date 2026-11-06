@@ -66,10 +66,10 @@ class ToolPauseTests(unittest.TestCase):
 
     def test_pending_checkpoint_without_tool_calls_does_not_restore(self):
         self.session.history[-1]['content'] = [{'type': 'text', 'text': 'finished'}]
-        self.session.checkpoint('awaiting_tools', 'paid-request', 'msg_paid')
-        body = {**self.follow, 'messages': self.session.history + self.follow['messages'][-1:]}
-        with self.assertRaisesRegex(ContractError, 'incomplete_no_replay'):
-            Session(self.path, ['unused'], {}, body, restore=True)
+        saved = (self.path / 'continuation.json').read_bytes()
+        with self.assertRaisesRegex(ContractError, 'native_history_pending_unavailable'):
+            self.session.checkpoint('awaiting_tools', 'paid-request', 'msg_paid')
+        self.assertEqual((self.path / 'continuation.json').read_bytes(), saved)
 
 
 if __name__ == '__main__':

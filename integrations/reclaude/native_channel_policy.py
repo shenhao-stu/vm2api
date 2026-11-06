@@ -28,6 +28,7 @@ class Channel:
     busy: bool = False
     pending_ids: frozenset[str] = frozenset()
     history_controls: dict | None = None
+    history_pending: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -154,7 +155,8 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
         length = channel.history_length
         try:
             _, prefix = native.frozen_history_prefix(
-                messages, length, channel.history_sha256, channel.history_controls)
+                messages, length, channel.history_sha256, channel.history_controls,
+                channel.history_pending if channel.status == 'awaiting_tools' else None)
         except native.ContractError as error:
             return reject(str(error))
         if prefix >= len(messages):

@@ -6,7 +6,8 @@ import unittest
 
 from native_bridge_session import history_shape, signature
 from native_history_boundary import (BoundaryError, control_record, frozen_prefix,
-                                     prefix_boundary, read_controls, write_controls)
+                                     prefix_boundary, read_controls, write_controls,
+                                     pending_record, read_pending, write_pending)
 
 
 class BoundaryTests(unittest.TestCase):
@@ -84,6 +85,48 @@ class BoundaryTests(unittest.TestCase):
             path.unlink()
             with self.assertRaises(BoundaryError):
                 read_controls(root, state)
+
+    def test_pending_witness_proves_original_boundary_before_accepting_input_update(self):
+        incoming = copy.deepcopy(self.history + self.tail)
+        incoming[5]['content'][0]['input'] = {'path': 'caller-normalized.txt'}
+        original = copy.deepcopy(incoming)
+        record = pending_record(self.history)
+        restored, prefix = frozen_prefix(incoming, len(self.history), signature(self.history),
+                                        signature, control_record(self.history), record)
+        self.assertEqual(restored, self.history)
+        self.assertEqual(prefix, len(self.history))
+        self.assertEqual(incoming, original)
+        for witness in (None, {**record, 'assistant': incoming[5]}):
+            with self.assertRaises(BoundaryError):
+                frozen_prefix(incoming, len(self.history), signature(self.history),
+                              signature, control_record(self.history), witness)
+        incoming[0]['content'][0]['text'] = 'changed earlier dialogue'
+        with self.assertRaises(BoundaryError):
+            frozen_prefix(incoming, len(self.history), signature(self.history),
+                          signature, control_record(self.history), record)
+
+    def test_pending_witness_is_private_immutable_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            digest = signature(self.history)
+            sha = write_pending(root, self.history, digest)
+            state = {'status': 'awaiting_tools', 'history_length': len(self.history),
+                     'history_sha256': digest, 'history_pending_sha256': sha}
+            path = root / 'history-pending' / (digest + '.json')
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(read_pending(root, state), pending_record(self.history))
+            for bad in ({**state, 'status': 'idle'}, {**state, 'history_pending_sha256': '0' * 64}):
+                with self.assertRaises(BoundaryError):
+                    read_pending(root, bad)
+            path.write_text('{}')
+            with self.assertRaises(BoundaryError):
+                read_pending(root, state)
+            with self.assertRaises(BoundaryError):
+                write_pending(root, self.history, digest)
+            path.unlink()
+            with self.assertRaises(BoundaryError):
+                read_pending(root, state)
 
 
 if __name__ == '__main__':

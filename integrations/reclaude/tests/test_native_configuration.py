@@ -91,7 +91,7 @@ class ConfigurationCompatibilityTests(unittest.TestCase):
         self.assertEqual((self.path / 'continuation.json').read_bytes(), saved)
 
     def test_checkpoint_tracks_latest_actual_native_assistant(self):
-        self.checkpoint()
+        self.checkpoint(pending=True)
         first = self.session.resume_uuid
         latest = str(uuid.uuid4())
         self.session.assistants['next_message'] = latest

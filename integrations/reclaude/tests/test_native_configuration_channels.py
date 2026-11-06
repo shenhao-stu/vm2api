@@ -103,6 +103,79 @@ class ChannelTests(unittest.TestCase):
             self.assertEqual(history_shape(imported), history_shape(history))
         self.assertEqual(aux.history, aux_history)
 
+    def test_caller_normalized_pending_input_imports_only_its_result_after_restart(self):
+        body = {**self.body, 'tools': [{'name': 'Bash', 'input_schema': {'type': 'object'}}]}
+        assistant = [{'type': 'thinking', 'thinking': 'synthetic', 'signature': 'exact'},
+                     {'type': 'tool_use', 'id': 'owned_bash', 'name': 'Bash',
+                      'input': {'command': 'cd /owned/project && printf ready', 'timeout': 1000}}]
+        with self.pool.lease('tenant-a', body) as session:
+            history = self.completed(session, body, assistant, pending=('owned_bash',))
+            original = session.directory
+        following = {**body, 'messages': history + [{'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': 'owned_bash', 'content': 'ready'}]}]}
+        following['messages'][-2]['content'][-1]['input']['command'] = 'printf ready'
+        for recovered in (False, True):
+            if recovered:
+                self.pool.close()
+                self.pool = self.new_pool()
+            with self.pool.lease('tenant-a', following) as active:
+                self.assertEqual(active.directory, original)
+                imported, tail = active.continuation_import(following)
+                self.assertEqual(imported[-1]['content'][-1]['input']['command'], 'printf ready')
+                self.assertEqual(tail, history_shape(following['messages'])[-1]['content'])
+                self.assertEqual(len(list((original / 'dispatch').glob('*.consumed.json'))), 1)
+                self.assertEqual(active.history[-1]['content'][-1]['input']['command'],
+                                 'cd /owned/project && printf ready')
+        original_claim = next((original / 'caller-grants').glob('*.json'))
+        original_bytes = original_claim.read_bytes()
+        with self.pool.lease('tenant-a', following) as active:
+            active.caller_request_sha = signature(history_shape(following['messages']))
+            active.record_pending_adoption(following)
+            variant = copy.deepcopy(following)
+            variant['messages'][-2]['content'][-1]['input']['command'] = 'another reported input'
+            with self.assertRaisesRegex(ContractError, 'session_busy'):
+                with self.pool.lease('tenant-a', variant):
+                    self.fail('two reports cannot advance one pending boundary')
+            settled = self.completed(active, following)
+        self.assertEqual(original_claim.read_bytes(), original_bytes)
+        claim = read_json(original / 'caller-grants' / (active.caller_request_sha + '.json'))
+        self.assertIn('history_adoption_sha256', claim)
+        for consumed in (following, variant):
+            with self.assertRaises(ContractError):
+                with self.pool.lease('tenant-a', consumed):
+                    self.fail('old pending boundary was already consumed')
+        changed = {**body, 'messages': settled + [{'role': 'user', 'content': 'continue'}]}
+        changed['messages'][1]['content'][-1]['input']['command'] = 'changed settled input'
+        with self.assertRaisesRegex(ContractError, 'history_prefix_mismatch'):
+            with self.pool.lease('tenant-a', changed):
+                self.fail('settled history may not be normalized')
+        adoption = next((original / 'history-adoptions').glob('*.json'))
+        adoption.write_text('{}')
+        with self.assertRaisesRegex(ContractError, 'evidence_unknown'):
+            with self.pool.lease('tenant-a', {**body, 'messages': settled + [
+                    {'role': 'user', 'content': 'fresh'}]}):
+                self.fail('damaged adoption must fail closed')
+
+    def test_pending_input_compatibility_does_not_accept_other_history_changes(self):
+        content = [{'type': 'tool_use', 'id': 'owned_tool', 'name': 'Read', 'input': {'path': 'old'}}]
+        with self.pool.lease('tenant-a', self.body) as session:
+            history = self.completed(session, self.body, content, pending=('owned_tool',))
+        follow = {**self.body, 'messages': history + [{'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': 'owned_tool', 'content': 'result'}]}]}
+        for change in ('user', 'id', 'name', 'text', 'result'):
+            changed = copy.deepcopy(follow)
+            if change == 'user':
+                changed['messages'][0]['content'] = 'changed owner input'
+            elif change == 'text':
+                changed['messages'][-2]['content'].append({'type': 'text', 'text': 'injected'})
+            elif change == 'result':
+                changed['messages'][-1]['content'][0]['tool_use_id'] = 'different_tool'
+            else:
+                changed['messages'][-2]['content'][0][change] = 'different'
+            with self.subTest(change=change), self.assertRaises(ContractError):
+                with self.pool.lease('tenant-a', changed) as active:
+                    active.continuation_import(changed)
+
     def test_claim_precedes_publish_and_unknown_blocks_other_model(self):
         with self.pool.lease('tenant-a', self.body) as session:
             session.caller_request_sha = signature(history_shape(self.body['messages']))

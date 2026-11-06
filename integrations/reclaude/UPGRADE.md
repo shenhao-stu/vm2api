@@ -50,6 +50,30 @@ Successful canary responses establish compatibility for the tested cases, not
 permanent authorization stability or transparent support for every Messages
 parameter. Keep the supported subset and runtime version explicit.
 
+## Caller-reported pending tool inputs
+
+Claude Code can update a tool's input before executing it, such as removing a
+redundant working-directory prefix from Bash. This is a caller-owned report,
+not a server assertion that two arbitrary commands are semantically equivalent.
+Only the final `awaiting_tools` assistant permits input changes; its block order,
+IDs, names, text, thinking/signatures and every settled history message stay exact.
+The new result set must still match every pending ID without duplicates.
+
+`history-pending` stores the original assistant privately before publishing its
+checkpoint. Recovery authenticates the complete original history hash using that
+witness. The existing transcript importer carries the caller's reported context
+and dispatches only the new tail. `history-adoptions` records both assistant
+digests, the original boundary and the full caller-request digest; the new grant
+claim binds that record. Preserve both directories alongside caller-grants and
+consumed evidence. Missing or corrupt evidence fails closed.
+
+Include `tests/offline_pending_input.py` with an unmodified CLI and outbound
+networking disabled. Verify that historical tools do not execute again, the
+provider sees exactly one new request per turn, and final usage remains intact.
+Legacy pending checkpoints need a separately verified original native SSE/UUID
+witness; never derive the old assistant from the current caller's changed input.
+Do not erase a session or dispatch an old paid request to recover a prefix error.
+
 ## Independent SSH transport recovery
 
 Verify the private HTTP listener as well as the native worker. A worker can be

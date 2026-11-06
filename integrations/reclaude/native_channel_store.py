@@ -1,12 +1,13 @@
 """Durable configuration channels within one authenticated logical session."""
 from dataclasses import asdict
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
 
 import native_bridge_session as native
-from native_history_boundary import control_record
+from native_history_boundary import control_record, pending_record
 from native_channel_policy import Channel, Identity, Snapshot, request_identity
 
 
@@ -121,8 +122,12 @@ class ChannelStore:
             length = state.get('history_length', 0)
             history_sha = state.get('history_sha256', native.signature([]))
             controls = native.checkpoint_controls(directory, state)
+            pending_witness = native.checkpoint_pending(directory, state)
             if controls is None and session is not None and session.history:
                 controls = control_record(native.history_shape(session.history))
+            if (pending_witness is None and session is not None and session.history
+                    and status == 'awaiting_tools'):
+                pending_witness = pending_record(native.history_shape(session.history))
             pending = frozenset(getattr(session, 'pending_ids', ()))
             # A nonresident tool wait cannot be branched: the existing native
             # recover() still verifies the exact result set on its own path.
@@ -135,6 +140,17 @@ class ChannelStore:
                         or claim.get('request_sha256') != request):
                     raise native.ContractError('native_channel_evidence_unknown')
                 consumed.add(request)
+                adoption_sha = claim.get('history_adoption_sha256')
+                if adoption_sha is not None:
+                    adoption = directory / 'history-adoptions' / (request + '.json')
+                    value = read_json(adoption)
+                    if (value.get('channel') != key or value.get('request_sha256') != request
+                            or hashlib.sha256(adoption.read_bytes()).hexdigest() != adoption_sha):
+                        raise native.ContractError('native_channel_evidence_unknown')
+                    witness = native.checkpoint_pending(directory, {**value, 'status': 'awaiting_tools'})
+                    if (witness is None or native.signature(witness['assistant'])
+                            != value.get('original_assistant_sha256')):
+                        raise native.ContractError('native_channel_evidence_unknown')
                 grant_id = claim.get('grant_id')
                 if (not isinstance(grant_id, str) or len(grant_id) != 36
                         or any(c not in '0123456789abcdef-' for c in grant_id)):
@@ -168,7 +184,8 @@ class ChannelStore:
                 raise native.ContractError('native_channel_evidence_unknown') from None
             channels.append(Channel(key, identity, status, length, history_sha,
                                     resident=entry is not None, busy=bool(entry and entry.busy),
-                                    pending_ids=pending, history_controls=controls))
+                                    pending_ids=pending, history_controls=controls,
+                                    history_pending=pending_witness))
         return Snapshot(logical, tuple(channels), frozenset(consumed), complete,
                         len(entries), capacity, unknown_dispatch=unknown,
                         stopped=stopped, memory_pressure=pressure)
@@ -177,9 +194,15 @@ class ChannelStore:
         directory = session.directory / 'caller-grants'
         durable_directory(directory)
         path = directory / (request_sha + '.json')
+        claim = {'request_sha256': request_sha, 'grant_id': grant_id, 'state': 'claimed'}
+        adoption = session.directory / 'history-adoptions' / (request_sha + '.json')
+        if adoption.exists():
+            value = read_json(adoption)
+            if value.get('channel') != session.directory.name or value.get('request_sha256') != request_sha:
+                raise native.ContractError('native_channel_evidence_unknown')
+            claim['history_adoption_sha256'] = hashlib.sha256(adoption.read_bytes()).hexdigest()
         try:
-            write_json(path, {'request_sha256': request_sha, 'grant_id': grant_id,
-                             'state': 'claimed'}, exclusive=True)
+            write_json(path, claim, exclusive=True)
         except FileExistsError:
             raise native.ContractError('request_already_consumed') from None
 
