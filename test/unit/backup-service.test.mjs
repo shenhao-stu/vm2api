@@ -164,6 +164,25 @@ test('restore fails when stores cannot rebind to the reopened database', async (
   assert.doesNotThrow(() => getDb().prepare('SELECT 1').get())
 })
 
+test('restore pauses asynchronous maintenance before rebinding and resumes on success or failure', async () => {
+  const rec = await svc.createBackup({ kind: 'manual' })
+  for (const failRebind of [false, true]) {
+    const events = []
+    svc.onBeforeRestore(async () => {
+      events.push('pause')
+      await new Promise(setImmediate)
+      return () => events.push('resume')
+    })
+    svc.onRestored(() => {
+      events.push('rebind')
+      if (failRebind) throw new Error('synthetic rebind failure')
+    })
+    if (failRebind) await assert.rejects(svc.restoreBackup(rec.id), /synthetic rebind failure/)
+    else await svc.restoreBackup(rec.id)
+    assert.deepEqual(events, ['pause', 'rebind', 'resume'])
+  }
+})
+
 test('restore rebuilds vm files from DB mirror for db-only path', async () => {
   seedVm('vm-b2')
   initVmDbSync(root, { watch: false })

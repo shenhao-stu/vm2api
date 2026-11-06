@@ -19,6 +19,7 @@ import { syncCodexCatalog } from './vm-test-chat.mjs'
 export const CATALOG_SYNC_KEY = 'model_catalog_sync'
 const MODELS_DEV_EVERY_MS = 24 * 3600_000
 const UPSTREAM_EVERY_MS = 6 * 3600_000
+export const GPT_CATALOG_EVERY_MS = UPSTREAM_EVERY_MS
 const BOOT_DELAY_MS = 5_000
 const HARD_DOWN = new Set(['stopped', 'dead', 'error', 'disabled'])
 // Plan tiers see different model sets (Fable is Max-only); a few accounts cover the union.
@@ -78,62 +79,100 @@ export async function syncClaudeCatalog({ projectRoot, runOauth = runSlotOauth }
   return writeCatalogSync('claude', syncStatus('ok', { added }))
 }
 
-/** Live ChatGPT Codex catalog → gpt_model_policy. Timers never rotate OAuth; the panel button may. */
-export async function syncGptCatalog({ projectRoot, vmId = '', catalogClientVersion = 'auto', rotate = false } = {}) {
-  const result = await syncCodexCatalog({ projectRoot, vmId, rotate, catalogClientVersion })
-  if (!result.ok) {
-    const skipped = result.error === 'no_codex_slot' || result.error === 'proxy_required'
-    writeCatalogSync('codex', syncStatus(skipped ? 'skipped' : 'error', { error: result.error }))
-    return result
+/** Read-only by default, including the monitor and the model discovery button. */
+export async function syncGptCatalog(opts = {}) {
+  const result = await syncCodexCatalog({ ...opts, rotate: opts.rotate === true })
+  const skipped = result.error === 'no_codex_slot' || result.error === 'proxy_required'
+  const status = syncStatus(result.ok ? 'ok' : skipped ? 'skipped' : 'error', {
+    added: result.added || [],
+    error: result.ok ? null : result.error,
+  })
+  for (const key of [
+    'synced',
+    'catalog_version',
+    'attempted_accounts',
+    'successful_accounts',
+    'failed_accounts',
+    'partial',
+  ]) {
+    if (result[key] != null) status[key] = result[key]
   }
-  writeCatalogSync('codex', syncStatus('ok', { added: result.added || [] }))
+  status.interval_sec = GPT_CATALOG_EVERY_MS / 1000
+  writeCatalogSync('codex', status)
   return result
 }
 
-/**
- * @param {{ projectRoot: string, codexCatalogVersion?: () => string, log?: (event: object) => void }} opts
- */
-export function createCatalogMonitor({ projectRoot, codexCatalogVersion = () => 'auto', log = () => {} } = {}) {
+/** Independent, single-flight jobs: a stalled Claude/price request never delays GPT discovery. */
+export function createCatalogMonitor({
+  projectRoot,
+  codexCatalogVersion = () => 'auto',
+  log = () => {},
+  jobs = {},
+  clock = { setTimeout, clearTimeout, setInterval, clearInterval },
+} = {}) {
   const timers = []
   let running = false
-  const guard = (name, fn) => async () => {
-    try {
-      const out = await fn()
-      log({ event: 'catalog-sync', job: name, status: out?.status ?? (out?.ok === false ? 'error' : 'ok') })
-    } catch (error) {
-      log({ event: 'catalog-sync', job: name, status: 'error', error: String(error?.message || error) })
+  const guard = (name, fn) => {
+    let inflight = null
+    return () => {
+      if (!running) return Promise.resolve()
+      if (inflight) return inflight
+      inflight = Promise.resolve()
+        .then(() => (running ? fn() : undefined))
+        .then((out) => {
+          if (out) log({ event: 'catalog-sync', job: name, status: out.status ?? (out.ok === false ? 'error' : 'ok') })
+          return out
+        })
+        .catch(() => {
+          // Upstream errors are codes in sync status. Never log a raw request,
+          // credential-bearing URL, or exception from a transport adapter.
+          log({ event: 'catalog-sync', job: name, status: 'error', error: 'catalog_sync_failed' })
+        })
+        .finally(() => {
+          inflight = null
+        })
+      return inflight
     }
   }
-  const modelsDev = guard('models.dev', () => syncModelsDev())
-  const upstream = guard('upstream', async () => {
-    const claude = await syncClaudeCatalog({ projectRoot })
-    await syncGptCatalog({ projectRoot, catalogClientVersion: codexCatalogVersion() })
-    return claude
-  })
-
+  const modelsDev = guard('models.dev', jobs.modelsDev || (() => syncModelsDev()))
+  const claude = guard('claude-catalog', jobs.claude || (() => syncClaudeCatalog({ projectRoot })))
+  const gpt = guard(
+    'gpt-catalog',
+    jobs.gpt ||
+      (() =>
+        syncGptCatalog({
+          projectRoot,
+          catalogClientVersion: codexCatalogVersion(),
+          rotate: false,
+        })),
+  )
   return {
     start() {
       if (running) return
       running = true
-      const boot = setTimeout(() => {
-        void modelsDev().then(upstream)
+      const boot = clock.setTimeout(() => {
+        if (!running) return
+        void modelsDev()
+        void claude()
+        void gpt()
       }, BOOT_DELAY_MS)
       boot.unref?.()
       timers.push(boot)
       for (const [fn, ms] of [
         [modelsDev, MODELS_DEV_EVERY_MS],
-        [upstream, UPSTREAM_EVERY_MS],
+        [claude, UPSTREAM_EVERY_MS],
+        [gpt, GPT_CATALOG_EVERY_MS],
       ]) {
-        const t = setInterval(() => void fn(), ms)
-        t.unref?.()
-        timers.push(t)
+        const timer = clock.setInterval(() => void fn(), ms)
+        timer.unref?.()
+        timers.push(timer)
       }
     },
     stop() {
       running = false
-      for (const t of timers.splice(0)) {
-        clearTimeout(t)
-        clearInterval(t)
+      for (const timer of timers.splice(0)) {
+        clock.clearTimeout(timer)
+        clock.clearInterval(timer)
       }
     },
   }

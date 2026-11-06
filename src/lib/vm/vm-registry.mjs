@@ -546,25 +546,15 @@ function writeSchedule(projectRoot, id, mutate) {
 }
 
 /** 调度关 / 调度开 by the operator. Turning on also clears 不可调度. */
-export function setScheduleOff(projectRoot, id, off, { reason = null, preserveStatus = true } = {}) {
-  return writeSchedule(projectRoot, id, (vm) => applyScheduleOff(vm, off, { reason, preserveStatus }))
-}
-
-/** Only the quality monitor owns this pause. Never clear an auth, manual or proxy restriction. */
-export function setCodexQualityPause(projectRoot, id, off) {
-  return writeSchedule(projectRoot, id, (vm) => {
-    if (!isCodexVm(vm) || vm.unschedulable || vm.schedule_hold) return false
-    if (off) {
-      if (vm.schedule_off || vm.schedulable === false) return false
-      applyScheduleOff(vm, true, { reason: 'quality_probe_failed' })
-    } else {
-      if (!vm.schedule_off || vm.schedule_off_reason !== 'quality_probe_failed') return false
-      delete vm.schedule_off
-      delete vm.schedule_off_reason
-      vm.schedule_updated_at = vm.updated_at = new Date().toISOString()
-      deriveScheduleFields(vm)
-    }
-  })
+export function setScheduleOff(
+  projectRoot,
+  id,
+  off,
+  { reason = null, preserveStatus = true, preserveUnschedulable = false } = {},
+) {
+  return writeSchedule(projectRoot, id, (vm) =>
+    applyScheduleOff(vm, off, { reason, preserveStatus, preserveUnschedulable }),
+  )
 }
 
 /** A deterministic failure: the slot stays out until an operator action clears it. */

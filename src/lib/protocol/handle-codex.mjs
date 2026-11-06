@@ -11,7 +11,14 @@ import { isProtocolWarmup } from './responses-ws.mjs'
 import { semanticStatusForStreamError } from './stream-error-status.mjs'
 import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { isClientStream, fromClaudeToOpenAIChat, fromClaudeToOpenAICompletions } from './convert.mjs'
-import { getVm, listVms, markUnschedulable, persistCodexUsage, persistCodexImageUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
+import {
+  getVm,
+  listVms,
+  markUnschedulable,
+  persistCodexUsage,
+  persistCodexImageUsage,
+  syncCodexQuotaSchedule,
+} from '../vm/vm-registry.mjs'
 import { isValidVmId, listVmRecordFiles, readJsonCached } from '../vm/vm-file.mjs'
 import { isCodexProtocolAllowed, isCodexVm, normalizeCodexRouting } from './codex-route.mjs'
 import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
@@ -39,6 +46,7 @@ import { streamCodexKernel } from '../transport/codex-kernel-client.mjs'
 import {
   codexKernelRequestOptions,
   ensureCodexKernel,
+  invalidateCodexKernelHealth,
   writeCodexKernelConfig,
 } from '../transport/codex-kernel-supervisor.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
@@ -771,7 +779,21 @@ export async function handleCodexProtocol({
   // Chat→Responses conversion can surface a session key the raw inbound lacked.
   if (!logBag.session_id) logBag.session_id = sessionIdForLog(callerSession)
   const firstUserIdentity = firstUserIdentityFromCodex(converted.body)
-  const hop = ops.streamCodexKernel || streamCodexKernel
+  const transportHop = ops.streamCodexKernel || streamCodexKernel
+  const invalidateHealth = ops.invalidateCodexKernelHealth || invalidateCodexKernelHealth
+  // Invalidate per raw hop, including the silent retry inside runCodexKernelHop.
+  // A later successful retry must not hide a failed transport from the cache.
+  const hop = async (args) => {
+    try {
+      const result = await transportHop(args)
+      if (result?.transportError || result?.transport_retried || isRetryableCodexTransport(result))
+        invalidateHealth(args.exec?.vmId)
+      return result
+    } catch (error) {
+      if (!args.signal?.aborted) invalidateHealth(args.exec?.vmId)
+      throw error
+    }
+  }
   const writeCfg = ops.writeCodexKernelConfig || writeCodexKernelConfig
   const ensure = ops.ensureCodexKernel || ensureCodexKernel
   const anthropicSse = protocol === 'anthropic.messages' ? createAnthropicSseState() : null

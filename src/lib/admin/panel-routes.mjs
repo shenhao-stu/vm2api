@@ -1,3 +1,4 @@
+import { QUALITY_PROBE_PAUSE_REASON } from './quality-probe.mjs'
 import { handleProxyExitGuard } from './proxy-exit-guard-manager.mjs'
 import { getProxyExitGuardPolicy, getProxyExitGuardState } from '../vm/proxy-exit-guard.mjs'
 import { handleProxySubscriptions } from './proxy-subscription-routes.mjs'
@@ -3188,22 +3189,6 @@ export function createPanelHandler(ctx) {
         return await handleVmTestSchedule(req, res, p.split('/')[4])
       }
 
-      if (ctx.codexQuality && (p === '/api/panel/quality-probe' || p === '/api/panel/quality-probe/run')) {
-        if (panelIdentity(req).role !== 'admin') return json(res, 403, { error: { code: 'admin_required' } })
-        if (p.endsWith('/run') && req.method === 'POST') {
-          const round = ctx.codexQuality.run(true)
-          if (!round) return json(res, 409, { error: { code: 'quality_probe_busy' } })
-          void round.catch(() => console.warn('[codex-quality] manual round failed'))
-          return json(res, 202, ctx.codexQuality.snapshot())
-        }
-        if (!p.endsWith('/run') && req.method === 'GET') return json(res, 200, ctx.codexQuality.snapshot())
-        if (!p.endsWith('/run') && req.method === 'PUT') {
-          const body = await readBody(req, 1024)
-          if (!['manual', 'daily', 'hourly'].includes(body?.mode)) return json(res, 400, { error: { code: 'invalid_quality_mode' } })
-          return json(res, 200, ctx.codexQuality.configure(body.mode))
-        }
-        return json(res, 405, { error: { code: 'method_not_allowed' } })
-      }
       if (req.method === 'GET' && p === '/api/panel/test-schedule/default') {
         return await handleVmTestScheduleDefault(req, res)
       }
@@ -3278,6 +3263,29 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok({ restored: restored.length }))
       }
 
+      if (p === '/api/panel/quality-probe' || p === '/api/panel/quality-probe/run') {
+        if (panelIdentity(req).role !== 'admin')
+          return json(res, 403, { ok: false, error: { message: '仅管理员可操作' } })
+        try {
+          if (p === '/api/panel/quality-probe' && req.method === 'GET')
+            return json(res, 200, panel.ok(ctx.qualityProbe.snapshot()))
+          if (p === '/api/panel/quality-probe' && req.method === 'PUT') {
+            const body = await readBody(req, 96 * 1024)
+            return json(res, 200, panel.ok(ctx.qualityProbe.saveConfig(body)))
+          }
+          if (p === '/api/panel/quality-probe/run' && req.method === 'POST') {
+            void ctx.qualityProbe.runNow({ manual: true }).catch(() => console.warn('[quality-probe] manual round failed'))
+            return json(res, 202, panel.ok(ctx.qualityProbe.snapshot()))
+          }
+          return json(res, 405, { ok: false, error: { message: 'method not allowed' } })
+        } catch (error) {
+          return json(res, error.status || 400, {
+            ok: false,
+            error: { code: error.code || 'invalid_quality_probe_request', message: error.message },
+          })
+        }
+      }
+
       // POST /api/panel/vms/:id/schedulable — sub2api-style schedule toggle
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/schedulable$/.test(p)) {
         const id = p.split('/')[4]
@@ -3295,6 +3303,12 @@ export function createPanelHandler(ctx) {
           return json(res, 400, { ok: false, error: { message: 'schedulable required' } })
         }
         const currentVm = getVm(cfg.paths.project, id)
+        if (body.expected_reason != null && body.expected_reason !== currentVm?.schedule_disabled_reason) {
+          return json(res, 409, {
+            ok: false,
+            error: { code: 'schedule_state_changed', message: '账号暂停原因已变化，请刷新后再操作' },
+          })
+        }
         const credentialFailure =
           /oauth_revoked|oauth_invalid_grant|invalid_grant|refresh_token_missing|token has been revoked/i.test(
             `${currentVm?.claude?.refresh_error || ''} ${currentVm?.schedule_disabled_reason || ''}`,
@@ -3306,7 +3320,13 @@ export function createPanelHandler(ctx) {
           })
         }
         const reason = body.schedulable ? null : body.reason || 'disabled'
-        const summary = setScheduleOff(cfg.paths.project, id, !body.schedulable, { reason, preserveStatus: true })
+        const qualityPaused = currentVm?.schedule_disabled_reason === QUALITY_PROBE_PAUSE_REASON
+        const summary = setScheduleOff(cfg.paths.project, id, !body.schedulable, {
+          reason,
+          preserveStatus: true,
+          preserveUnschedulable: qualityPaused,
+        })
+        if (body.schedulable && isCodexVm(currentVm)) ctx.qualityProbe?.resetAccount(id)
         return json(
           res,
           200,
@@ -5362,7 +5382,7 @@ export function createPanelHandler(ctx) {
         const result = await syncGptCatalog({
           projectRoot: cfg.paths.project,
           vmId: body?.vm_id || body?.vmId || url.searchParams.get('vm_id') || '',
-          rotate: true,
+          rotate: body?.rotate === true,
           catalogClientVersion:
             body?.catalog_client_version ||
             body?.catalogClientVersion ||

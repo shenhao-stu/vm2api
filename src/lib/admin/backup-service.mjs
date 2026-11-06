@@ -74,6 +74,7 @@ export class BackupService {
     this._timer = null
     this._bootTimer = null
     this._rebindStores = null // set via onRestored()
+    this._beforeRestore = null
   }
 
   _repo() {
@@ -96,6 +97,11 @@ export class BackupService {
   /** Register the callback that re-binds stores to the new DB after restore. */
   onRestored(fn) {
     this._rebindStores = typeof fn === 'function' ? fn : null
+  }
+
+  /** Pause asynchronous DB maintenance before restore; return a resume callback. */
+  onBeforeRestore(fn) {
+    this._beforeRestore = typeof fn === 'function' ? fn : null
   }
 
   // ---------- schedule config ----------
@@ -278,7 +284,9 @@ export class BackupService {
 
     this.isRestoring = true
     let tmp = null
+    let resumeMaintenance = null
     try {
+      if (this._beforeRestore) resumeMaintenance = await this._beforeRestore()
       // 0. safety net snapshot of the current state
       const pre = await this.createBackup({ kind: 'pre_restore', note: `before restore of ${rec.id}` })
 
@@ -392,6 +400,7 @@ export class BackupService {
           fs.rmSync(tmp, { recursive: true, force: true })
         } catch {}
       }
+      if (typeof resumeMaintenance === 'function') await resumeMaintenance()
     }
   }
 

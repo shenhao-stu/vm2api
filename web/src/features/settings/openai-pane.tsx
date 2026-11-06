@@ -7,6 +7,7 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { SettingRow } from '@/components/setting-row'
 import { OpenaiQuotaSection } from './openai-quota-section'
+import { QualityProbePane } from './quality-probe-pane'
 import { ChipGroup, PaneSection } from './scheduler-controls'
 
 type Block = Record<string, unknown>
@@ -329,6 +330,7 @@ export function OpenaiPane({
           </div>
         </div>
       </PaneSection>
+      <QualityProbePane />
     </div>
   )
 }
