@@ -454,3 +454,18 @@ For a fresh instruction, retain the local conversation and let the shared pool
 choose an available account. If the original session remains held, Claude Code
 supports `claude --resume <session-id> --fork-session` to carry the local
 history into a new session. Inspect any pending tool's actual outcome first.
+
+### Background requests and completed conversation branches
+
+Claude Code may send an auxiliary request (for example an away summary) using
+the main conversation ID, model and system prompt. Its result is not necessarily
+part of the next caller transcript. A completed auxiliary turn must not make the
+main conversation permanently fail `history_prefix_mismatch`.
+
+When an idle channel diverges, the selector checks at most eight recent completed
+end-turn receipts. Only an exact, hash-verified shared prefix with new caller input
+can create an independent native transcript. The original checkpoint and consumed
+grants stay immutable; only the new final turn is dispatched. Tool graphs still
+require complete result sets, and pending, unknown, failed or cross-tenant scopes
+cannot escape their existing guards. This does not use prompt wording to identify
+background work and does not treat a retry as a new request.

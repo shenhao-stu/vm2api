@@ -5,6 +5,14 @@ from native_history_boundary import BoundaryError, frozen_prefix
 
 
 @dataclass(frozen=True)
+class CompletedBoundary:
+    request_sha256: str
+    history_sha256: str
+    length: int
+    controls: dict | None = None
+
+
+@dataclass(frozen=True)
 class PaidSibling:
     parent: str
     paid_input: str
@@ -13,10 +21,14 @@ class PaidSibling:
     alternate_assistant: str
     first_request: str
     user_blocks: int = 0
+    completed_length: int = 0
 
     def key(self, signature):
         fields = [self.parent, self.paid_input, self.paid_history,
                   self.assistant_offset, self.alternate_assistant, self.first_request]
+        if self.completed_length:
+            return signature(['paid-completed-branch-v1', *fields,
+                              self.user_blocks, self.completed_length])
         return signature(['paid-user-extension-v1', *fields, self.user_blocks]
                          if self.user_blocks else ['paid-sibling-v1', *fields])
 
@@ -34,6 +46,8 @@ class PaidSibling:
         value = asdict(self)
         if not self.user_blocks:
             value.pop('user_blocks')
+        if not self.completed_length:
+            value.pop('completed_length')
         return value
 
     def valid(self, channel, signature):
@@ -43,6 +57,8 @@ class PaidSibling:
                     and not set(v) - set("0123456789abcdef") for v in digests)
                 and type(self.assistant_offset) is int and self.assistant_offset >= 1
                 and type(self.user_blocks) is int and self.user_blocks >= 0
+                and type(self.completed_length) is int and self.completed_length >= 0
+                and (not self.completed_length or self.user_blocks > 0)
                 and self.parent != channel and self.key(signature) == channel)
 
 
@@ -146,4 +162,32 @@ def proven_user_extension(channel, messages, request_sha, signature):
                 and tool_ids(previous) == channel.pending_ids):
             return PaidSibling(channel.key, channel.paid_input, channel.history_sha256,
                                count - 1, signature(anchor), request_sha, len(content))
+    return None
+
+
+def proven_completed_branch(channel, messages, request_sha, signature):
+    """Fork after a witnessed end-turn; never overwrite the paid side transcript."""
+    if channel.status != 'idle' or channel.pending_ids:
+        return None
+    for completed in channel.completed:
+        if not 1 < completed.length < channel.history_length:
+            continue
+        try:
+            _, split = frozen_prefix(messages, completed.length, completed.history_sha256,
+                                     signature, completed.controls)
+        except BoundaryError:
+            continue
+        if split >= len(messages):
+            continue
+        anchor = messages[split]
+        # A finished exchange has no outstanding tools. This is caller-owned new
+        # input, not a replay of the old assistant or an orphaned tool result.
+        if (anchor['role'] != 'user' or not anchor['content']
+                or any(b['type'] == 'tool_result' for b in anchor['content'])
+                or not any(b['type'] in {'image', 'document'} or
+                           b['type'] == 'text' and b['text'].strip() for b in anchor['content'])):
+            continue
+        return PaidSibling(channel.key, completed.request_sha256, completed.history_sha256,
+                           sum(m['role'] != 'system' for m in messages[:split]),
+                           signature(anchor), request_sha, len(anchor['content']), completed.length)
     return None

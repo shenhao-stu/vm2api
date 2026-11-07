@@ -8,8 +8,8 @@ import tempfile
 from pathlib import Path
 
 import native_bridge_session as native
-from native_history_boundary import control_record, pending_record
-from native_paid_sibling import PaidSibling
+from native_history_boundary import BoundaryError, control_record, pending_record, validate_record
+from native_paid_sibling import CompletedBoundary, PaidSibling
 from native_channel_policy import Channel, Identity, Snapshot, request_identity
 
 
@@ -161,6 +161,7 @@ class ChannelStore:
                     and status == 'awaiting_tools'):
                 pending_witness = pending_record(native.history_shape(session.history))
             paid_input = None
+            completed = []
             pending = frozenset(getattr(session, 'pending_ids', ()))
             # A nonresident tool wait cannot be branched: the existing native
             # recover() still verifies the exact result set on its own path.
@@ -197,10 +198,12 @@ class ChannelStore:
                 receipt = read_json(record) if record.is_file() else {}
                 if claim.get('state') != 'complete' or receipt.get('id') != grant_id:
                     unknown = True
-                elif (claim.get('pending_ids') and isinstance(claim.get('terminal_usage'), dict)
+                elif (isinstance(claim.get('terminal_usage'), dict)
                       and all(type(claim['terminal_usage'].get(k)) is int and claim['terminal_usage'][k] >= 0
                               for k in ('input_tokens', 'output_tokens'))):
                     paid[(key, request)] = claim.get('history_sha256')
+                    if claim.get('pending_ids') == [] and type(claim.get('history_length')) is int:
+                        completed.append(claim)
                     if (status == 'awaiting_tools' and request == state.get('request_sha256')
                             and claim.get('history_sha256') == history_sha and claim.get('history_length') == length
                             and frozenset(claim['pending_ids']) == pending and state.get('history_pending_sha256')
@@ -229,10 +232,25 @@ class ChannelStore:
                     raise ValueError('invalid paid sibling')
             except (TypeError, ValueError):
                 raise native.ContractError('native_channel_evidence_unknown') from None
+            boundaries = []
+            for claim in sorted(completed, key=lambda c: c['history_length'], reverse=True)[:8]:
+                digest, count = claim['history_sha256'], claim['history_length']
+                if (not isinstance(digest, str) or len(digest) != 64
+                        or set(digest) - set('0123456789abcdef') or count < 2):
+                    raise native.ContractError('native_channel_evidence_unknown')
+                witness = directory / 'history-controls' / (digest + '.json')
+                record = read_json(witness) if witness.exists() else None
+                if record is not None:
+                    try:
+                        validate_record(record, count)
+                    except BoundaryError:
+                        raise native.ContractError('native_channel_evidence_unknown') from None
+                boundaries.append(CompletedBoundary(claim['request_sha256'], digest, count, record))
             channels.append(Channel(key, identity, status, length, history_sha,
                                     resident=entry is not None, busy=bool(entry and entry.busy),
                                     pending_ids=pending, history_controls=controls,
-                                    history_pending=pending_witness, paid_input=paid_input, sibling=sibling))
+                                    history_pending=pending_witness, paid_input=paid_input, sibling=sibling,
+                                    completed=tuple(boundaries)))
         parents = {c.key: c.identity for c in channels}
         for channel in channels:
             sibling = channel.sibling

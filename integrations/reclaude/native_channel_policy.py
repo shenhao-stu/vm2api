@@ -8,7 +8,8 @@ not fields accepted from an HTTP client. No files, sessions or grants are mutate
 from dataclasses import dataclass
 import hashlib
 
-from native_paid_sibling import PaidSibling, proven_sibling, proven_user_extension, related_channels
+from native_paid_sibling import (CompletedBoundary, PaidSibling, proven_completed_branch,
+                                 proven_sibling, proven_user_extension, related_channels)
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,7 @@ class Channel:
     history_pending: dict | None = None
     paid_input: str | None = None
     sibling: PaidSibling | None = None
+    completed: tuple[CompletedBoundary, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,11 @@ def consistent_snapshot(snapshot, native):
                 or not all(digest(s) for s in (channel.key, channel.history_sha256,
                     channel.identity.logical_key, channel.identity.system_sha256,
                     channel.identity.anchor_sha256))):
+            return False
+        if (type(channel.completed) is not tuple or len(channel.completed) > 8
+                or any(type(c) is not CompletedBoundary or type(c.length) is not int
+                       or c.length < 2 or not digest(c.request_sha256)
+                       or not digest(c.history_sha256) for c in channel.completed)):
             return False
         if channel.status == "prepared" and (channel.history_length != 0 or channel.pending_ids
                 or channel.history_sha256 != native.signature([])):
@@ -192,7 +199,8 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
                     and not any(c.sibling.parent == channel.key and
                                 c.sibling.paid_input == channel.paid_input for c in siblings)):
                 sibling = (proven_sibling(channel, messages, request_sha, native.signature)
-                           or proven_user_extension(channel, messages, request_sha, native.signature))
+                           or proven_user_extension(channel, messages, request_sha, native.signature)
+                           or proven_completed_branch(channel, messages, request_sha, native.signature))
                 if sibling:
                     if snapshot.memory_pressure:
                         return reject('native_memory_pressure')
