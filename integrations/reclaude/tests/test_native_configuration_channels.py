@@ -161,15 +161,22 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(original_claim.read_bytes(), original_bytes)
         claim = read_json(original / 'caller-grants' / (active.caller_request_sha + '.json'))
         self.assertIn('history_adoption_sha256', claim)
-        for consumed in (following, variant):
+        trailing = {**variant, 'messages': variant['messages'] + [
+            {'role': 'system', 'content': 'new trailing control'}]}
+        for consumed in (following, variant, trailing):
             with self.assertRaises(ContractError):
                 with self.pool.lease('tenant-a', consumed):
                     self.fail('old pending boundary was already consumed')
         changed = {**body, 'messages': settled + [{'role': 'user', 'content': 'continue'}]}
         changed['messages'][1]['content'][-1]['input']['command'] = 'changed settled input'
-        with self.assertRaisesRegex(ContractError, 'history_prefix_mismatch'):
-            with self.pool.lease('tenant-a', changed):
-                self.fail('settled history may not be normalized')
+        with self.pool.lease('tenant-a', changed) as branch:
+            self.assertNotEqual(branch.directory, original)
+            self.assertFalse(branch.history)
+        self.pool.close()
+        self.pool = self.new_pool()
+        with self.assertRaisesRegex(ContractError, 'already_consumed'):
+            with self.pool.lease('tenant-a', variant):
+                self.fail('settled tool IDs cannot be replayed after restart')
         adoption = next((original / 'history-adoptions').glob('*.json'))
         adoption.write_text('{}')
         with self.assertRaisesRegex(ContractError, 'evidence_unknown'):

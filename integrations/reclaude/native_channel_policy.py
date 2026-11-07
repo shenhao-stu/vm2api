@@ -49,6 +49,7 @@ class Snapshot:
     inflight: bool = False
     stopped: bool = False
     memory_pressure: bool = False
+    issued_tool_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,8 @@ def consistent_snapshot(snapshot, native):
             c in "0123456789abcdef" for c in value)
 
     if (type(snapshot.channels) is not tuple or type(snapshot.consumed) is not frozenset
+            or type(snapshot.issued_tool_ids) is not frozenset
+            or any(not isinstance(t, str) or not t for t in snapshot.issued_tool_ids)
             or any(type(flag) is not bool for flag in (
                 snapshot.evidence_complete, snapshot.unknown_dispatch, snapshot.inflight,
                 snapshot.stopped, snapshot.memory_pressure))
@@ -166,6 +169,50 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
     # It also rejects missing/duplicate results, rather than dropping them to fit.
     native.initial_request(body, allow_history_import=True)
     identity = request_identity(scope, body, native)
+    if all(c.status in {'prepared', 'idle'} and not c.pending_ids for c in channels):
+        # A finished transcript is reusable context, not authority over the
+        # caller's history. Rewinds/edits create a new native transcript; old
+        # paid inputs remain covered by the scope-wide deduplication above.
+        final_user = next(m for m in reversed(messages) if m['role'] != 'system')
+        final_results = {b['tool_use_id'] for b in final_user['content']
+                         if b['type'] == 'tool_result'}
+        if final_results & snapshot.issued_tool_ids:
+            return reject('request_already_consumed')
+        compatible = []
+        for channel in channels:
+            if channel.identity != identity or (channel.status == 'prepared'
+                    and channel.sibling and channel.sibling.first_request != request_sha):
+                continue
+            try:
+                _, prefix = native.frozen_history_prefix(
+                    messages, channel.history_length, channel.history_sha256,
+                    channel.history_controls)
+            except native.ContractError as error:
+                if str(error) != 'history_prefix_mismatch':
+                    return reject(str(error))
+                continue
+            if prefix < len(messages):
+                compatible.append((prefix, channel))
+        compatible.sort(key=lambda match: match[0], reverse=True)
+        if len(compatible) > 1 and compatible[0][0] == compatible[1][0]:
+            return reject('native_channel_ambiguous')
+        selected = compatible[0][1] if compatible else None
+        if not selected and not allow_history_import and any(
+                m['role'] == 'assistant' for m in messages):
+            return reject('native_session_history_not_imported')
+        if snapshot.memory_pressure:
+            return reject('native_memory_pressure')
+        if (check_capacity and (selected is None or not selected.resident)
+                and snapshot.resident_total >= snapshot.capacity):
+            return reject('native_session_capacity')
+        if selected:
+            return Decision('reuse', 'verified_existing_channel', scope, request_sha, selected.key)
+        key = scope if not channels and not retired else native.signature([
+            'native-caller-history-v1', scope, identity.model, identity.system_sha256,
+            identity.anchor_sha256, request_sha, sorted(retired)])
+        if any(c.key == key for c in snapshot.channels):
+            return reject('native_channel_collision')
+        return Decision('create', 'validated_caller_history', scope, request_sha, key)
     # Consume/unknown/inflight above are global to the authenticated scope. Only
     # then choose a transcript. Both sides of a witnessed split retain their own
     # native directory and immutable paid grants, including after restart.

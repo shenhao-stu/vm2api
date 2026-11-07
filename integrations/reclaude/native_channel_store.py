@@ -141,7 +141,7 @@ class ChannelStore:
         document = self.document(logical)
         if document is None:
             return None
-        channels, consumed = [], set()
+        channels, consumed, issued_tools = [], set(), set()
         complete, unknown = True, False
         paid = {}
         for key, raw_identity in document['channels'].items():
@@ -212,6 +212,10 @@ class ChannelStore:
                       and all(type(claim['terminal_usage'].get(k)) is int and claim['terminal_usage'][k] >= 0
                               for k in ('input_tokens', 'output_tokens'))):
                     paid[(key, request)] = claim.get('history_sha256')
+                    tool_ids = claim.get('pending_ids', [])
+                    if not isinstance(tool_ids, list) or any(not isinstance(t, str) or not t for t in tool_ids):
+                        raise native.ContractError('native_channel_evidence_unknown')
+                    issued_tools.update(tool_ids)
                     if claim.get('pending_ids') == [] and type(claim.get('history_length')) is int:
                         completed.append(claim)
                     if (status == 'awaiting_tools' and request == state.get('request_sha256')
@@ -269,7 +273,8 @@ class ChannelStore:
                 raise native.ContractError('native_channel_evidence_unknown')
         return Snapshot(logical, tuple(channels), frozenset(consumed), complete,
                         len(entries), capacity, unknown_dispatch=unknown,
-                        stopped=stopped, memory_pressure=pressure)
+                        stopped=stopped, memory_pressure=pressure,
+                        issued_tool_ids=frozenset(issued_tools))
 
     def bind(self, session, request_sha, grant_id):
         directory = session.directory / 'caller-grants'

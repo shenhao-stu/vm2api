@@ -67,12 +67,15 @@ class CompletedBranchTests(unittest.TestCase):
             self.bill_one_turn(second, following)
         self.assertEqual(len(list((self.pool.root / '.configuration-channels').glob('*.json'))), 1)
 
-    def test_history_edit_cannot_fabricate_a_completed_boundary(self):
+    def test_history_edit_gets_a_new_transcript_without_changing_paid_evidence(self):
         changed = copy.deepcopy(self.follow)
         changed['messages'][1] = assistant('edited paid answer')
-        with self.assertRaisesRegex(ContractError, 'history_prefix_mismatch'):
-            with self.pool.lease('tenant', changed):
-                self.fail('unproven prefix')
+        original = evidence(self.parent)
+        with self.pool.lease('tenant', changed) as child:
+            self.assertNotEqual(child.directory, self.parent)
+            self.assertFalse(child.history)
+            self.bill_one_turn(child, changed)
+        self.assertEqual(evidence(self.parent), original)
 
     def test_missing_terminal_receipt_blocks_branch(self):
         claim = read_json(next((self.parent / 'caller-grants').glob('*.json')))
