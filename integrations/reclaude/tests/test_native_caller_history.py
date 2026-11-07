@@ -54,7 +54,7 @@ class CallerHistoryTests(unittest.TestCase):
                 self.assertEqual(restored.directory, expected)
                 self.assertEqual(history_shape(restored.history), history_shape(history))
 
-    def test_pending_tools_and_invalid_graph_cannot_be_rebased(self):
+    def test_pending_tools_preserve_ownership_but_do_not_block_new_context(self):
         original, _, full, changed = self.branches()
         malformed = copy.deepcopy(changed)
         malformed['messages'][-1]['content'] = [{'type': 'tool_result', 'tool_use_id': 'unowned', 'content': 'bad'}]
@@ -64,8 +64,9 @@ class CallerHistoryTests(unittest.TestCase):
         with self.pool.lease('tenant-a', tool_body) as active:
             self.completed(active, tool_body, [{'type': 'tool_use', 'id': 'pending',
                                                 'name': 'Read', 'input': {}}], ['pending'])
-        with self.assertRaises(ContractError):
-            with self.pool.lease('tenant-a', changed): pass
+        before = active.directory
+        with self.pool.lease('tenant-a', changed) as branch:
+            self.assertNotEqual(branch.directory, before)
 
     def test_other_authenticated_tenant_cannot_reuse_native_context(self):
         original, _, _, changed = self.branches()

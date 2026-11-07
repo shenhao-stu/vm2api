@@ -88,7 +88,7 @@ class PaidSiblingFailureTests(unittest.TestCase):
             self.assertEqual(child.directory.name, read_json(child.directory / '.configuration-channel.json')['channel'])
             self.assertEqual(list((child.directory / 'caller-grants').glob('*.json')), [])
 
-    def test_child_pending_keeps_unrelated_third_channel_out_and_both_sides_recover(self):
+    def test_child_pending_allows_independent_context_and_both_sides_recover(self):
         h = self.fixture
         with h.pool.lease('tenant-a', self.child_turn) as child:
             child_key = child.directory.name
@@ -98,10 +98,9 @@ class PaidSiblingFailureTests(unittest.TestCase):
             self.assertEqual(parent.directory.name, self.parent_key)
             parent_history = h.completed(parent, self.parent_turn)
         unrelated = {**self.body, 'model': 'sonnet', 'messages': [{'role': 'user', 'content': 'Independent task'}]}
-        with self.assertRaisesRegex(ContractError, 'native_pending_tools_no_branch'):
-            with h.pool.lease('tenant-a', unrelated):
-                self.fail('third channel while a sibling was pending')
-        self.assertEqual(len(h.pool.channel_store.document(self.parent_key)['channels']), 2)
+        with h.pool.lease('tenant-a', unrelated) as independent:
+            self.assertNotIn(independent.directory.name, {child_key, self.parent_key})
+        self.assertEqual(len(h.pool.channel_store.document(self.parent_key)['channels']), 3)
         self.restart()
         with h.pool.lease('tenant-a', {**self.body, 'messages': [*history, tool_result('childPending')]}) as child:
             self.assertEqual(child.directory.name, child_key)
@@ -115,7 +114,11 @@ class PaidSiblingFailureTests(unittest.TestCase):
             key = child.directory.name
         path = store.directory / (self.parent_key + '.json')
         document = read_json(path)
-        document['channels'][key]['paid_sibling']['first_request'] = '0' * 64
+        document['channels'][key]['paid_sibling'] = {
+            'parent': self.parent_key, 'paid_input': '0' * 64, 'paid_history': '0' * 64,
+            'alternate_assistant': '0' * 64, 'assistant_offset': 0, 'user_blocks': 0,
+            'first_request': '0' * 64}
+
         write_json(path, document)
         self.restart()
         with self.assertRaisesRegex(ContractError, 'native_channel_evidence_unknown'):

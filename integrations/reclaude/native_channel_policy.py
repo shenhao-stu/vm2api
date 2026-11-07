@@ -8,8 +8,7 @@ not fields accepted from an HTTP client. No files, sessions or grants are mutate
 from dataclasses import dataclass
 import hashlib
 
-from native_paid_sibling import (CompletedBoundary, PaidSibling, proven_completed_branch,
-                                 proven_sibling, proven_user_extension, related_channels)
+from native_paid_sibling import CompletedBoundary, PaidSibling
 
 
 @dataclass(frozen=True)
@@ -169,15 +168,19 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
     # It also rejects missing/duplicate results, rather than dropping them to fit.
     native.initial_request(body, allow_history_import=True)
     identity = request_identity(scope, body, native)
-    if all(c.status in {'prepared', 'idle'} and not c.pending_ids for c in channels):
-        # A finished transcript is reusable context, not authority over the
-        # caller's history. Rewinds/edits create a new native transcript; old
-        # paid inputs remain covered by the scope-wide deduplication above.
-        final_user = next(m for m in reversed(messages) if m['role'] != 'system')
-        final_results = {b['tool_use_id'] for b in final_user['content']
-                         if b['type'] == 'tool_result'}
-        if final_results & snapshot.issued_tool_ids:
+    final_user = next(m for m in reversed(messages) if m['role'] != 'system')
+    final_results = {b['tool_use_id'] for b in final_user['content']
+                     if b['type'] == 'tool_result'}
+    meaningful = [b for b in final_user['content']
+                  if b['type'] != 'text' or b['text'].strip()]
+    if meaningful != final_user['content']:
+        normalized = [({**m, 'content': meaningful} if m is final_user else m) for m in messages]
+        if native.signature(normalized) in snapshot.consumed:
             return reject('request_already_consumed')
+    if not (final_results & snapshot.issued_tool_ids):
+        # A verified tool-use terminal is also a completed upstream turn. Its
+        # pending client tools do not own unrelated caller history. Only results
+        # for our own issued tools need the strict owner path below.
         compatible = []
         for channel in channels:
             if channel.identity != identity or (channel.status == 'prepared'
@@ -186,7 +189,8 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
             try:
                 _, prefix = native.frozen_history_prefix(
                     messages, channel.history_length, channel.history_sha256,
-                    channel.history_controls)
+                    channel.history_controls,
+                    channel.history_pending if channel.status == 'awaiting_tools' else None)
             except native.ContractError as error:
                 if str(error) != 'history_prefix_mismatch':
                     return reject(str(error))
@@ -213,103 +217,28 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
         if any(c.key == key for c in snapshot.channels):
             return reject('native_channel_collision')
         return Decision('create', 'validated_caller_history', scope, request_sha, key)
-    # Consume/unknown/inflight above are global to the authenticated scope. Only
-    # then choose a transcript. Both sides of a witnessed split retain their own
-    # native directory and immutable paid grants, including after restart.
-    dialogue = [m for m in messages if m['role'] != 'system']
-    siblings = [c for c in channels if c.sibling]
-    matches = [c for c in siblings if c.sibling.matches(dialogue, native.signature)]
-    matches.sort(key=lambda c: (c.sibling.assistant_offset, c.sibling.user_blocks), reverse=True)
-    if len(matches) > 1 and (matches[0].sibling.assistant_offset, matches[0].sibling.user_blocks) == (
-            matches[1].sibling.assistant_offset, matches[1].sibling.user_blocks):
+    owners = [c for c in channels if final_results & c.pending_ids]
+    if not owners:
+        return reject('request_already_consumed')
+    if len(owners) != 1:
         return reject('native_channel_ambiguous')
-    if matches:
-        match = matches[0]
-        if match.identity != identity or (match.status == 'prepared' and
-                                          match.sibling.first_request != request_sha):
-            return reject('history_prefix_mismatch')
-        channels = (match,)
-    else:
-        channels = tuple(c for c in channels if not c.sibling)
-    pending = [c for c in channels if c.identity == identity and c.pending_ids]
-    if len(pending) > 1:
-        return reject('native_channel_ambiguous')
-    if pending:
-        channels = tuple(pending)
-    same_anchor = [c for c in channels
-                   if c.identity.anchor_sha256 == identity.anchor_sha256]
-    boundaries = {}
-    for channel in same_anchor:
-        length = channel.history_length
-        try:
-            _, prefix = native.frozen_history_prefix(
-                messages, length, channel.history_sha256, channel.history_controls,
-                channel.history_pending if channel.status == 'awaiting_tools' else None)
-        except native.ContractError as error:
-            if (str(error) == 'history_prefix_mismatch' and allow_history_import
-                    and len(same_anchor) == 1 and channel.identity == identity
-                    and not any(c.pending_ids for c in snapshot.channels
-                                if not related_channels(snapshot.channels, c.key, channel.key))
-                    and not any(c.sibling.parent == channel.key and
-                                c.sibling.paid_input == channel.paid_input for c in siblings)):
-                sibling = (proven_sibling(channel, messages, request_sha, native.signature)
-                           or proven_user_extension(channel, messages, request_sha, native.signature)
-                           or proven_completed_branch(channel, messages, request_sha, native.signature))
-                if sibling:
-                    if snapshot.memory_pressure:
-                        return reject('native_memory_pressure')
-                    if check_capacity and snapshot.resident_total >= snapshot.capacity:
-                        return reject('native_session_capacity')
-                    key = sibling.key(native.signature)
-                    if any(c.key == key for c in snapshot.channels):
-                        return reject('native_channel_collision')
-                    return Decision('create', 'verified_paid_sibling', scope, request_sha, key, sibling)
-            return reject(str(error))
-        if prefix >= len(messages):
-            return reject("history_prefix_mismatch")
-        boundaries[channel.key] = prefix
-    exact = [c for c in channels if c.identity == identity]
-    if len(exact) > 1:
-        return reject("native_channel_ambiguous")
-    selected = exact[0] if exact else None
-    # A pending native tool exchange cannot move to another channel/model. It may
-    # resume only on the original channel, with the exact original tool results.
-    for channel in channels:
-        if channel.status == "awaiting_tools" or channel.pending_ids:
-            if channel is not selected:
-                return reject("native_pending_tools_no_branch")
-            tail = [m for m in messages[boundaries[channel.key]:] if m["role"] != "system"]
-            ids = [b["tool_use_id"] for b in tail[0]["content"]
-                   if b["type"] == "tool_result"] if tail else []
-            if (not channel.pending_ids or not tail or tail[0]["role"] != "user"
-                    or len(ids) != len(set(ids)) or set(ids) != channel.pending_ids):
-                return reject("native_session_incomplete_no_replay")
-    # The displaced parent and its own child can each finish their tools.
-    # An unrelated outstanding exchange still prevents creating/switching channels.
-    for other in snapshot.channels:
-        if other in channels or not other.pending_ids:
-            continue
-        related = selected and related_channels(snapshot.channels, selected.key, other.key)
-        if not related:
-            return reject('native_pending_tools_no_branch')
-    if selected is None and not allow_history_import and any(
-            m["role"] == "assistant" for m in messages):
-        return reject("native_session_history_not_imported")
+    selected = owners[0]
+    if selected.identity != identity:
+        return reject('native_pending_tools_no_branch')
+    try:
+        _, prefix = native.frozen_history_prefix(
+            messages, selected.history_length, selected.history_sha256,
+            selected.history_controls, selected.history_pending)
+    except native.ContractError as error:
+        return reject(str(error))
+    tail = [m for m in messages[prefix:] if m['role'] != 'system']
+    ids = [b['tool_use_id'] for b in tail[0]['content']
+           if b['type'] == 'tool_result'] if tail else []
+    if (not tail or tail[0]['role'] != 'user' or len(ids) != len(set(ids))
+            or set(ids) != selected.pending_ids):
+        return reject('native_session_incomplete_no_replay')
     if snapshot.memory_pressure:
-        return reject("native_memory_pressure")
-    if (check_capacity and (selected is None or not selected.resident)
-            and snapshot.resident_total >= snapshot.capacity):
-        return reject("native_session_capacity")
-    if selected:
-        return Decision("reuse", "verified_existing_channel", scope, request_sha, selected.key)
-    # The first channel retains the legacy pathname. Additional channels do not
-    # become separate pools, accounts, credentials or budgets.
-    key = scope if not channels else native.signature(
-        ["native-config-channel-v1", scope, identity.model,
-         identity.system_sha256, identity.anchor_sha256])
-    if retired:
-        key = native.signature(['native-quota-generation-v1', scope, identity.model,
-                                identity.system_sha256, identity.anchor_sha256, sorted(retired)])
-    if any(c.key == key for c in channels):
-        return reject("native_channel_collision")
-    return Decision("create", "validated_new_channel", scope, request_sha, key)
+        return reject('native_memory_pressure')
+    if check_capacity and not selected.resident and snapshot.resident_total >= snapshot.capacity:
+        return reject('native_session_capacity')
+    return Decision('reuse', 'verified_existing_channel', scope, request_sha, selected.key)

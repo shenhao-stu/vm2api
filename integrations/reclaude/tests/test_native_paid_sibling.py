@@ -131,18 +131,19 @@ class PaidSiblingTests(unittest.TestCase):
             if path.name != 'continuation.json':
                 self.assertEqual((self.parent / path).read_bytes(), data)
 
-    def test_changed_old_input_incomplete_graph_and_result_only_tail_are_rejected(self):
+    def test_external_history_edits_and_results_are_context_but_invalid_graph_is_rejected(self):
         before = evidence(self.parent)
         changed = copy.deepcopy(self.alternate)
         changed['messages'][2]['content'] = 'modified earlier input'
         incomplete = copy.deepcopy(self.alternate)
         incomplete['messages'][4]['content'] = [result('foreign_tool')]
-        no_tail = {**self.alternate, 'messages': self.alternate['messages'][:-2]}
-        for label, bad in [('changed earlier input', changed), ('wrong result', incomplete), ('no new turn', no_tail)]:
-            with self.subTest(label=label):
-                self.refused(bad)
+        self.refused(incomplete)
+        result_tail = {**self.alternate, 'messages': self.alternate['messages'][:-2]}
+        for valid in (changed, result_tail):
+            with self.pool.lease('tenant-a', valid) as active:
+                self.assertNotEqual(active.directory, self.parent)
+                self.bill_one_turn(active, valid)
         self.assertEqual(evidence(self.parent), before)
-        self.assertEqual(len([p for p in self.parent.parent.iterdir() if p.is_dir() and not p.name.startswith('.')]), 1)
 
     def test_unknown_prior_charge_cannot_start_a_sibling(self):
         next((self.parent / 'dispatch').glob('*.consumed.json')).unlink()
@@ -192,13 +193,16 @@ class PaidSiblingTests(unittest.TestCase):
         for old in (self.body, self.alternate, extended):
             self.refused(old)
 
-    def test_user_extension_needs_new_text_and_exact_prior_paid_input(self):
+    def test_blank_extension_is_not_a_new_turn_but_caller_edit_is(self):
         changed = self.extension(self.body)
         changed['messages'][0] = user('different old input')
-        bad = [self.extension(self.body, ''), self.extension(self.body, '  '), changed]
+        bad = [self.extension(self.body, ''), self.extension(self.body, '  ')]
         for body in bad:
             with self.subTest(body=body['messages'][-1]):
                 self.refused(body)
+        with self.pool.lease('tenant-a', changed) as active:
+            self.assertNotEqual(active.directory, self.parent)
+            self.bill_one_turn(active, changed)
 
     def test_merged_tool_results_continue_and_new_system_controls_retain_their_semantics(self):
         body = {**self.body, 'metadata': {'user_id': str(uuid.uuid4())}, 'messages': [

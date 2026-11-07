@@ -472,6 +472,23 @@ state before sending a canary. An HTTP success from a general account update can
 ignore a field it does not support. A canary must belong only to its temporary
 group until admission succeeds. Removing its key/group must preserve usage rows.
 
+## Caller history and refusal boundaries
+
+A verified `tool_use` terminal completes the upstream turn even while the client
+is still running tools. It must not reserve all subsequent history for that
+native transcript. Compatible prefixes reuse their original CLI; other valid
+caller histories start an isolated transcript and dispatch only the final user
+input. Results for tools issued by this Relay still require their original owner.
+Consumed requests, unknown terminals and in-flight turns never become retries.
+Old sibling checkpoints remain readable without rewriting their paid receipts.
+
+This compatibility policy does not authorize retrying an official refusal.
+When a shared scheduler can switch between Pro and Relay, it must isolate an
+officially refused conversation across those destinations, using authenticated
+caller identity. The Pro-only gateway guard is not a cross-service guard.
+The first refusal retains its real terminal usage; later blocked requests must
+have zero model dispatch and must not be reported as history compatibility errors.
+
 ## Tests
 
 Main VM console status, bounded logs and native Relay start/stop are described in
