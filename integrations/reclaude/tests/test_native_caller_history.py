@@ -72,3 +72,23 @@ class CallerHistoryTests(unittest.TestCase):
         with self.pool.lease('tenant-b', changed) as other:
             self.assertNotEqual(other.directory, original.directory)
             self.assertEqual(other.history, [])
+
+    def test_each_branch_owns_its_pending_tools_after_restart(self):
+        original, _, full, changed = self.branches()
+        with self.pool.lease('tenant-a', changed) as child:
+            alternate = self.completed(child, changed)
+            child_path = child.directory
+        for index, (history, expected) in enumerate(((alternate, child_path), (full, original.directory))):
+            tool_id = 'branch_tool_' + str(index)
+            ask = {**self.body, 'messages': history + [{'role': 'user', 'content': 'use a tool'}]}
+            with self.pool.lease('tenant-a', ask) as active:
+                self.assertEqual(active.directory, expected)
+                pending = self.completed(active, ask, [{'type': 'tool_use', 'id': tool_id,
+                    'name': 'Read', 'input': {}}], [tool_id])
+            self.pool.close()
+            self.pool = self.new_pool()
+            result = {**self.body, 'messages': pending + [{'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': tool_id, 'content': 'owned result'}]}]}
+            with self.pool.lease('tenant-a', result) as active:
+                self.assertEqual(active.directory, expected)
+                self.completed(active, result)

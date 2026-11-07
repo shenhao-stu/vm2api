@@ -231,6 +231,11 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
         channels = (match,)
     else:
         channels = tuple(c for c in channels if not c.sibling)
+    pending = [c for c in channels if c.identity == identity and c.pending_ids]
+    if len(pending) > 1:
+        return reject('native_channel_ambiguous')
+    if pending:
+        channels = tuple(pending)
     same_anchor = [c for c in channels
                    if c.identity.anchor_sha256 == identity.anchor_sha256]
     boundaries = {}
