@@ -62,8 +62,6 @@ def rejection_proof(directory, now):
         if log.is_symlink() or log.stat().st_size > 2 * 1024 * 1024:
             return None
         events = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
-        if sum(e.get('type') == 'result' for e in events) != 1:
-            return None
         reset = terminal_reset(events, native_id, receipt.get('at_ms'), now)
         if reset is None:
             return None

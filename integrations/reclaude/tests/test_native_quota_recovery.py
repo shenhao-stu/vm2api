@@ -55,6 +55,14 @@ class QuotaRecoveryTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             with self.f.pool.lease('tenant',self.follow):self.fail('legacy ambiguity')
 
+    def test_multiple_terminals_cannot_become_zero_use_proof(self):
+        prior=copy.deepcopy(self.events[-1])
+        prior.update(is_error=False,api_error=None,api_error_status=None,total_cost_usd=.1)
+        prior['usage']['input_tokens']=100
+        self.events.insert(0,prior);self.save_log()
+        with self.assertRaises(ContractError):
+            with self.f.pool.lease('tenant',self.follow):self.fail('ambiguous terminal window')
+
     def test_unknown_other_claim_and_tenant_cannot_use_rejection(self):
         paid=next(p for p in (self.path/'caller-grants').glob('*.json')if p!=self.claim)
         saved=paid.read_bytes();c=read_json(paid);c['state']='claimed';write_json(paid,c)

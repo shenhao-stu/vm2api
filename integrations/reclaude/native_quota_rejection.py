@@ -9,7 +9,7 @@ def terminal_reset(events, native_id, at_ms, now):
     assistants = [e for e in events if e.get('type') == 'assistant']
     results = [e for e in events if e.get('type') == 'result']
     limits = [e for e in events if e.get('type') == 'rate_limit_event']
-    if len(assistants) != 1 or not results or len(limits) != 1:
+    if len(assistants) != 1 or len(results) != 1 or len(limits) != 1:
         return None
     assistant, result = assistants[0], results[-1]
     if any(e.get('session_id') != native_id for e in (assistant, result, limits[0])):
