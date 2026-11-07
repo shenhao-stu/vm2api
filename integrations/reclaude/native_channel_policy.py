@@ -153,6 +153,8 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
     if snapshot.inflight or any(c.busy or c.status in {"in_flight", "closing"}
                                for c in channels):
         return reject("session_busy")
+    retired = tuple(c.key for c in channels if c.status == 'quota_rejected')
+    channels = tuple(c for c in channels if c.status != 'quota_rejected')
     if any(c.status == "failed" for c in channels):
         return reject("native_session_failed_no_replay")
     if any(c.status not in {"prepared", "idle", "awaiting_tools"} for c in channels):
@@ -253,6 +255,9 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
     key = scope if not channels else native.signature(
         ["native-config-channel-v1", scope, identity.model,
          identity.system_sha256, identity.anchor_sha256])
+    if retired:
+        key = native.signature(['native-quota-generation-v1', scope, identity.model,
+                                identity.system_sha256, identity.anchor_sha256, sorted(retired)])
     if any(c.key == key for c in channels):
         return reject("native_channel_collision")
     return Decision("create", "validated_new_channel", scope, request_sha, key)

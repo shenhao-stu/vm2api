@@ -679,6 +679,19 @@ class NativeHTTPTests(unittest.TestCase):
         self.assertTrue((self.root / "auth-latch.json").exists())
         self.assertFalse(self.created)
 
+    def test_session_guard_errors_are_terminal_without_account_failover(self):
+        codes = ('native_pending_tools_no_branch', 'native_session_evidence_unknown',
+                 'native_channel_evidence_unknown', 'native_channel_ambiguous',
+                 'native_channel_collision', 'native_session_failed_no_replay')
+        for code in codes:
+            with self.subTest(code=code), patch.object(self.server.pool, 'lease',
+                                                      side_effect=ContractError(code)):
+                status, raw = self.request()
+                self.assertEqual(status, 400)
+                self.assertIn(code.encode(), raw)
+                self.assertFalse(self.created)
+                self.assertEqual(self.audit()[-1]['attempts'], 0)
+
     def test_disconnect_drains_terminal_and_keeps_one_lease(self):
         self.release = threading.Event()
         raw = json.dumps(self.body(stream=True)).encode()
@@ -708,6 +721,8 @@ class NativeHTTPTests(unittest.TestCase):
         self.assertTrue(row["complete"])
         self.assertEqual(row["status"], 499)
         self.assertEqual(row["usage"]["output_tokens"], 5)
+        self.assertFalse(self.created[0].failed, "a drained terminal must retain its checkpoint")
+        self.assertTrue(self.created[0].closed)
 
 
 if __name__ == "__main__":

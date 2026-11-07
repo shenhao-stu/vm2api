@@ -5,12 +5,14 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import native_bridge_session as native
 from native_history_boundary import BoundaryError, control_record, pending_record, validate_record
 from native_paid_sibling import CompletedBoundary, PaidSibling
 from native_channel_policy import Channel, Identity, Snapshot, request_identity
+from native_quota_rejection import rejected_request
 
 
 def sync_directory(path):
@@ -93,9 +95,12 @@ class ChannelStore:
         document['channels'][key] = identity
         write_json(self.directory / (logical + '.json'), document)
 
-    def prepare_sibling(self, decision, body, factory, recover):
+    def prepare_channel(self, decision, body, factory, recover):
         """Publish membership last; a failed preparation cannot poison the parent's registry."""
         logical, key = decision.logical_key, decision.channel_key
+        registry = self.directory / (logical + '.json')
+        if not registry.exists():
+            write_json(registry, {'version': 1, 'logical': logical, 'channels': {}}, exclusive=True)
         target = self.root / key
         if target.exists():
             # The atomic directory move may have succeeded before a process exit.
@@ -108,7 +113,7 @@ class ChannelStore:
                 raise native.ContractError('native_channel_evidence_unknown')
             session = recover(target, body)
         else:
-            with tempfile.TemporaryDirectory(prefix='.prepare-sibling-', dir=self.root) as staging:
+            with tempfile.TemporaryDirectory(prefix='.prepare-channel-', dir=self.root) as staging:
                 initial = Path(staging) / key
                 session = factory(initial, body)
                 session.checkpoint('prepared')
@@ -166,14 +171,17 @@ class ChannelStore:
             # A nonresident tool wait cannot be branched: the existing native
             # recover() still verifies the exact result set on its own path.
             claims = directory / 'caller-grants'
+            claim_values = {path.stem: read_json(path) for path in claims.glob('*.json')}
+            rejected = rejected_request(directory, state, claim_values, time.time()) if status == 'failed' else None
+            if rejected:
+                status = 'quota_rejected'
             known_grants = set()
-            for path in claims.glob('*.json'):
-                claim = read_json(path)
-                request = path.stem
+            for request, claim in claim_values.items():
                 if (len(request) != 64 or any(c not in '0123456789abcdef' for c in request)
                         or claim.get('request_sha256') != request):
                     raise native.ContractError('native_channel_evidence_unknown')
-                consumed.add(request)
+                if request != rejected:
+                    consumed.add(request)
                 adoption_sha = claim.get('history_adoption_sha256')
                 if adoption_sha is not None:
                     adoption = directory / 'history-adoptions' / (request + '.json')
@@ -196,6 +204,8 @@ class ChannelStore:
                     pending = frozenset(claim.get('pending_ids', ()))
                 record = directory / 'dispatch' / (grant_id + '.consumed.json')
                 receipt = read_json(record) if record.is_file() else {}
+                if request == rejected:
+                    continue
                 if claim.get('state') != 'complete' or receipt.get('id') != grant_id:
                     unknown = True
                 elif (isinstance(claim.get('terminal_usage'), dict)
@@ -219,7 +229,7 @@ class ChannelStore:
                     complete = False
             if status == 'prepared' and (records or known_grants):
                 complete = False
-            if (session is not None and session.history
+            if (status != 'quota_rejected' and session is not None and session.history
                     and (length != len(session.history)
                          or history_sha != native.signature(native.history_shape(session.history)))):
                 complete = False
@@ -266,6 +276,11 @@ class ChannelStore:
         durable_directory(directory)
         path = directory / (request_sha + '.json')
         claim = {'request_sha256': request_sha, 'grant_id': grant_id, 'state': 'claimed'}
+        log = session.directory / 'stdout.private.jsonl'
+        if log.is_symlink():
+            raise native.ContractError('native_channel_evidence_unknown')
+        claim.update(stdout_offset=log.stat().st_size if log.exists() else 0,
+                     native_id=session.native_id)
         adoption = session.directory / 'history-adoptions' / (request_sha + '.json')
         if adoption.exists():
             value = read_json(adoption)

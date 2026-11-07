@@ -222,8 +222,14 @@ class SessionPool:
                         initial_request(body, allow_history_import=True)
                         if retire_rejected_legacy(self.root / key):
                             existing = False
-                    if decision and decision.sibling:
-                        session = self.channel_store.prepare_sibling(decision, body, self.factory, self.recover)
+                            snapshot = self.channel_store.snapshot(logical, self.entries, self.capacity)
+                            decision = select_channel(
+                                tenant, body, snapshot, native=native, session_identity=session_identity,
+                                allow_history_import=True, check_capacity=False)
+                            if decision.action == 'reject':
+                                raise ContractError(decision.code)
+                    if decision and decision.action == 'create':
+                        session = self.channel_store.prepare_channel(decision, body, self.factory, self.recover)
                     else:
                         if self.channel_store is not None and not existing:
                             self.channel_store.register(logical, key, body)

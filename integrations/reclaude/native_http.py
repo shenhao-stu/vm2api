@@ -158,6 +158,26 @@ def consumed_gateway_status(receipts):
         return None
 
 
+def failure_status(error, code, expired=False):
+    """Conversation evidence failures must not invite another account to retry."""
+    if isinstance(error, Rejection):
+        return error.status
+    if code in {'session_busy', 'native_session_capacity', 'native_memory_pressure', 'native_rate_limit'}:
+        return 429
+    if (code.endswith('_no_replay') or code in {
+        'request_already_consumed', 'history_prefix_mismatch', 'session_configuration_changed',
+        'native_session_recovery_unavailable', 'native_session_history_not_imported',
+        'native_session_evidence_unknown', 'native_channel_evidence_unknown',
+        'native_pending_tools_no_branch', 'native_channel_ambiguous', 'native_channel_collision',
+    }):
+        return 400
+    if expired:
+        return 504
+    if 'not_ready' in code:
+        return 503
+    return 400 if isinstance(error, RequestRejected) or not code.startswith('native_') else 502
+
+
 class NativeHandler(RelayHandler):
     def send_json(self, status, body):
         if not getattr(self, "request_body_read", False):
@@ -358,7 +378,9 @@ class NativeHandler(RelayHandler):
                     disconnected = True
             record["status"] = 499 if disconnected else 200
             if disconnected:
-                session.failed = True
+                # The generator has committed its genuine terminal checkpoint.
+                # Retire the transport, retaining history and consumed grants.
+                session.suspended = True
                 session.close(graceful=True)
         except Exception as exc:
             if session and not isinstance(exc, RequestRejected):
@@ -380,38 +402,7 @@ class NativeHandler(RelayHandler):
                 record["upstream_error"] = error_details
             if code == "unsupported_thinking_configuration" and isinstance(body, dict):
                 record["thinking"] = safe_thinking_summary(body.get("thinking"))
-            status = (
-                exc.status
-                if isinstance(exc, Rejection)
-                else (
-                    429
-                    if code in {"session_busy", "native_session_capacity", "native_memory_pressure", "native_rate_limit"}
-                    else (
-                        400
-                        if code
-                        in {
-                            "native_session_expired_no_replay",
-                            "native_session_failed_no_replay",
-                            "native_session_incomplete_no_replay",
-                            "native_session_recovery_unavailable",
-                            "native_session_history_not_imported",
-                            "history_prefix_mismatch",
-                            "session_configuration_changed",
-                            "request_already_consumed",
-                            "native_request_consumed_no_replay",
-                        }
-                        else (
-                            504
-                            if expired.is_set()
-                            else (
-                                503
-                                if "not_ready" in code
-                                else 502 if code.startswith("native_") else 400
-                            )
-                        )
-                    )
-                )
-            )
+            status = failure_status(exc, code, expired.is_set())
             consumed = (
                 set((session.directory / "dispatch").glob("*.consumed.json")) - before
                 if session else set()

@@ -486,3 +486,26 @@ grants stay immutable; only the new final turn is dispatched. Tool graphs still
 require complete result sets, and pending, unknown, failed or cross-tenant scopes
 cannot escape their existing guards. This does not use prompt wording to identify
 background work and does not treat a retry as a new request.
+
+### Durable session failure boundaries
+
+A completed native terminal and an HTTP delivery failure are different states.
+The HTTP worker drains the native terminal for accounting after a client disconnect,
+then retires the transport without invalidating the committed conversation. Partial
+or unknown outcomes still fail closed; the same paid input is never dispatched again.
+Conversation evidence errors and pending-tool channel conflicts return 400 rather
+than a retryable upstream 502. Capacity and readiness retain their existing 429/503.
+
+New channels use the same prepare-then-publish operation as paid history branches.
+A factory error leaves no registered conversation. An unpublished prepared directory
+can finish registration after restart only when it contains no grant or consumed record.
+
+Every new caller grant records its native session ID and stdout boundary before
+publication. A failed indexed channel is eligible for a new generation only when the
+bounded output after that boundary, the matching consumed grant and the native
+terminal prove a quota rejection with all four token counters and cost equal to zero,
+and its official reset has passed. The old channel and receipts remain immutable;
+all earlier paid hashes remain in the logical session's deduplication set. The next
+authenticated caller supplies the history to import; no background retry is scheduled.
+Missing offsets, incomplete terminals, unknown dispatches and nonzero usage never
+qualify. Pending tool results remain bound to their verified channel/configuration.

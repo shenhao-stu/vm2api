@@ -1185,6 +1185,7 @@ class Session:
 
     def read_output(self):
         rate_limit_info = None
+        rate_limit_error = None
         try:
             with self.process.stdout as stream, (
                 self.directory / "stdout.private.jsonl"
@@ -1209,7 +1210,10 @@ class Session:
                         error = (NativeRateLimit(self.model, rate_limit_info)
                                  if event.get("error") == "rate_limit"
                                  else ContractError("native_api_error"))
-                        self.events.put(error)
+                        if isinstance(error, NativeRateLimit):
+                            rate_limit_error = error
+                        else:
+                            self.events.put(error)
                     elif event.get("type") == "assistant" and event.get("uuid"):
                         with self.assistant_ready:
                             self.last_native_message_id = event["message"]["id"]
@@ -1223,12 +1227,17 @@ class Session:
                             self.result = event
                             self.result_message_id = self.last_native_message_id
                             self.control_ready.notify_all()
-                        if event.get("is_error"):
+                        if rate_limit_error is not None:
+                            self.events.put(rate_limit_error)
+                            rate_limit_error = None
+                        elif event.get("is_error"):
                             self.events.put(ContractError("native_cli_error"))
                         # Keep native stream input open for the next genuine user turn.
         except Exception as exc:
             self.events.put(ContractError(type(exc).__name__))
         finally:
+            if rate_limit_error is not None:
+                self.events.put(rate_limit_error)
             self.events.put(None)
             with self.control_ready:
                 self.control_ready.notify_all()

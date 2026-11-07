@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import time
 
+from native_quota_rejection import terminal_reset
+
 
 def file_hashes(directory):
     paths = list(islice(directory.rglob('*'), 129))
@@ -60,32 +62,10 @@ def rejection_proof(directory, now):
         if log.is_symlink() or log.stat().st_size > 2 * 1024 * 1024:
             return None
         events = [json.loads(line) for line in log.read_text().splitlines() if line.strip()]
-        if any(e.get('type') == 'stream_event' for e in events):
+        if sum(e.get('type') == 'result' for e in events) != 1:
             return None
-        assistants = [e for e in events if e.get('type') == 'assistant']
-        results = [e for e in events if e.get('type') == 'result']
-        limits = [e for e in events if e.get('type') == 'rate_limit_event']
-        if len(assistants) != 1 or len(results) != 1 or len(limits) != 1:
-            return None
-        if any(e.get('session_id') != native_id for e in assistants + results + limits):
-            return None
-        assistant, result = assistants[0], results[0]
-        if (assistant.get('error') != 'rate_limit' or assistant.get('api_error_status') != 429
-                or assistant.get('api_error') != 'usage_limit_reached'
-                or result.get('is_error') is not True or result.get('api_error_status') != 429
-                or result.get('api_error') != 'usage_limit_reached'
-                or result.get('terminal_reason') != 'api_error' or result.get('modelUsage') != {}
-                or type(result.get('total_cost_usd')) not in (int, float) or result['total_cost_usd'] != 0):
-            return None
-        usage = result.get('usage', {})
-        if any(type(usage.get(k)) is not int or usage[k] != 0 for k in
-               ('input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')):
-            return None
-        limit = limits[0].get('rate_limit_info', {})
-        reset = limit.get('resetsAt')
-        if (limit.get('status') != 'rejected' or type(reset) is not int
-                or type(receipt.get('at_ms')) is not int
-                or not 0 < receipt['at_ms'] / 1000 < reset <= now):
+        reset = terminal_reset(events, native_id, receipt.get('at_ms'), now)
+        if reset is None:
             return None
         return {'version': 1, 'disposition': 'terminal_429_zero_usage', 'native_id': native_id,
                 'grant_id': grant_id, 'reset_at': reset, 'files': file_hashes(directory)}

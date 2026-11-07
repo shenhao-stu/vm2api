@@ -34,6 +34,25 @@ class NativeRateLimitTests(unittest.TestCase):
                 error = NativeRateLimit('model', info)
                 self.assertEqual(error.details, {'upstream_type':'rate_limit_error','model':'model'})
 
+    def test_quota_error_retains_late_native_terminal_before_closing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child = root / 'fixture.py'
+            child.write_text(CHILD.replace("import json, sys", "import json, sys, time").replace(
+                "print(json.dumps({'type':'result'", "time.sleep(.15)\n        print(json.dumps({'type':'result'"))
+            body = {'model':'claude-sonnet-5-5', 'max_tokens':16,
+                    'messages':[{'role':'user','content':'fresh fixture'}]}
+            session = Session(root/'session', [sys.executable,str(child)],
+                              {'PATH':os.environ['PATH']}, body, timeout=3)
+            try:
+                with self.assertRaises(NativeRateLimit):
+                    list(session.request(body))
+                events=[json.loads(line) for line in (session.directory/'stdout.private.jsonl').read_text().splitlines()]
+                self.assertTrue(any(e.get('type')=='result' for e in events))
+                self.assertTrue(session.failed, 'unproved minimal result is still not recoverable')
+            finally:
+                session.close()
+
     def test_native_weekly_limit_keeps_model_and_reset(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
