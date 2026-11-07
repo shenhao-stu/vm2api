@@ -387,8 +387,8 @@ def fresh_prompt(messages):
         if m["role"] == "user"
         for b in native_blocks(m.get("content"))
     ]
-    if any(b.get("type") != "text" for b in blocks):
-        raise ContractError("prototype_only_accepts_initial_text")
+    if any(b.get("type") not in {"text", "image", "document"} for b in blocks):
+        raise ContractError("unsupported_initial_user_content")
     return blocks
 
 
@@ -1398,7 +1398,7 @@ class Session:
                             "content": content,
                             "isError": bool(block.get("is_error", False)),
                         }
-                elif any(b.get("type") != "text" for b in blocks):
+                elif any(b.get("type") not in {"text", "image", "document"} for b in blocks):
                     raise ContractError("unexpected_tool_result_or_nontext_followup")
                 context_blocks = [
                     b for m in tail if m.get('role') == 'system' for b in text_blocks(m["content"])
