@@ -217,6 +217,11 @@ class SessionPool:
                         raise ContractError("native_memory_pressure" if pressure
                                             else "native_session_capacity")
                 elif entry is None and retiring is None:
+                    if existing and self.channel_store is not None and snapshot is None and self.allow_history_import:
+                        from native_rejected_legacy import retire_rejected_legacy
+                        initial_request(body, allow_history_import=True)
+                        if retire_rejected_legacy(self.root / key):
+                            existing = False
                     if decision and decision.sibling:
                         session = self.channel_store.prepare_sibling(decision, body, self.factory, self.recover)
                     else:

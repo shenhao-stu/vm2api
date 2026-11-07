@@ -184,6 +184,23 @@ exclusive-create and 0600. Existing failed, in-flight or awaiting-tools state
 cannot be overwritten by an import. Changing an existing session's history or
 immutable configuration still fails, even with this option enabled.
 
+One narrowly proved legacy exception is a first request explicitly rejected for
+quota before any model usage. With configuration channels and history import
+enabled, an unindexed failed directory may be retired only after its recorded
+reset: one consumed grant, one upstream attempt, no denied extra dispatch, no
+stream events, and matching native assistant/result HTTP 429 records with zero
+tokens, empty model usage and zero cost. Indexed channels, missing evidence,
+multiple attempts and any generated usage remain blocked.
+
+Under the existing pool lock, the original directory is atomically retained in
+`.rejected-legacy/<scope>/<proof-sha>/session`, with a digest manifest beside it.
+Native `latest` log symlinks are recorded without following their targets; receipt
+symlinks are rejected. Only a subsequent authenticated caller request can create
+the replacement CLI through the normal history-import path. There is no automatic
+request retry, credential change, paid receipt deletion or account failover. Keep
+the archive with the pool during backups; it records an uncharged rejection,
+not a successful model turn or an assertion that the current quota is available.
+
 Text-only mid-conversation system messages keep their system role and position.
 They follow a user turn (including tool results) and precede an assistant or end
 the input. Historical system turns use the CLI's persisted system attachment;
