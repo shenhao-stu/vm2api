@@ -84,7 +84,8 @@ try:
     with pool.lease('tenant-a', visual) as child:
         assert child.directory == child_path
         wire = run(child, visual)
-        assert any(b.get('type') == 'image' for m in wire['messages'] for b in m['content'])
+        assert any(isinstance(b, dict) and b.get('type') == 'image'
+                   for m in wire['messages'] for b in m['content'])
         history = copy.deepcopy(child.history)
     doc = {**base, 'messages': history + [{'role': 'user', 'content': [{'type': 'document',
         'source': {'type': 'text', 'media_type': 'text/plain', 'data': 'SYNTHETIC_DOCUMENT'}}]}]}
