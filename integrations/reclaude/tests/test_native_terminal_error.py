@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import test_native_configuration_channels as fixtures
 from native_bridge_session import ContractError, history_shape, signature
 from native_channel_store import read_json, write_json
+from native_terminal_error import failed_request
 from test_native_paid_sibling import user
 
 
@@ -75,6 +76,19 @@ class TerminalErrorTests(unittest.TestCase):
             log.write_text(''.join(json.dumps(e)+'\n' for e in changed))
             with self.subTest(change=change), self.assertRaisesRegex(ContractError, 'evidence_unknown'):
                 with self.pool.lease('tenant-a', {**self.body, 'messages': [user('new')]}): pass
+
+    def test_resident_process_counter_is_not_the_current_request_attempt_count(self):
+        active, _ = self.failed()
+        claims={p.stem:read_json(p) for p in (active.directory/'caller-grants').glob('*.json')}
+        request=next(iter(claims))
+        claims.update({('a'*64): {'grant_id': 'older-grant-a'}, ('b'*64): {'grant_id': 'older-grant-b'}})
+        final=active.directory/'dispatch/final.safe.json'
+        write_json(final, {'upstream_attempts': 3, 'denied': 0})
+        state=read_json(active.directory/'continuation.json')
+        self.assertEqual(failed_request(active.directory, state, claims), request)
+        for attempts in (0, 4, True):
+            write_json(final, {'upstream_attempts': attempts, 'denied': 0})
+            self.assertIsNone(failed_request(active.directory, state, claims))
 
     def test_reader_keeps_terminal_usage_and_never_emits_success_stop(self):
         with self.pool.lease('tenant-a', self.body) as active:

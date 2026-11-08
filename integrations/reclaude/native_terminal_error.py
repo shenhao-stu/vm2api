@@ -55,9 +55,12 @@ def failed_request(directory, state, claims):
         final = read(directory / 'dispatch/final.safe.json')
         if (receipt.get('id') != grant_id or receipt.get('session_id') != native_id
                 or receipt.get('model') != grant.get('model')
-                or type(final.get('upstream_attempts')) is not int or final['upstream_attempts'] != 1
+                or type(final.get('upstream_attempts')) is not int
+                or not 1 <= final['upstream_attempts'] <= len(claims)
                 or type(final.get('denied')) is not int or final['denied'] != 0):
             return None
+        # Gate counters span the resident CLI lifetime. The unique consumed
+        # grant and this claim's stdout offset identify the current turn.
         log = directory / 'stdout.private.jsonl'
         if log.is_symlink() or not 0 < log.stat().st_size - offset <= 2 * 1024 * 1024:
             return None
