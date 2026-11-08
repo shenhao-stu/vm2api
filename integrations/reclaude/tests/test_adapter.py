@@ -395,7 +395,8 @@ class AdapterTests(unittest.TestCase):
                 finally:
                     left.close()
         with serve(StalledRelay(), limits=a.Limits(request_seconds=.15)) as s:
-            with self.assertRaises((http.client.RemoteDisconnected, ConnectionError)):
+            # The deadline can close the client before headers or during the error body.
+            with self.assertRaises((http.client.RemoteDisconnected, http.client.IncompleteRead, ConnectionError)):
                 post(s)
             self.assertTrue(s.completed.wait(1))
             self.assertEqual(s.records[0]['error'], 'request_deadline')
