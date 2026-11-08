@@ -75,3 +75,36 @@ test('quality exit requires two matching replies and never learns a changed addr
   }
   assert.equal(binding.ip, '192.0.2.8')
 })
+
+test('verified account safety observations survive a model downgrade without voting on the answer', () => {
+  const out = attributedAnswer(
+    { ...body, model: 'gpt-6-luna', safety_buffering: true },
+    { ...receipt, upstream_model: 'gpt-6-luna', model_mismatch: true },
+    id,
+    model,
+  )
+  assert.equal(out.ok, false)
+  assert.equal(out.vm_id, id)
+  assert.equal(out.debug.safety_buffering, true)
+  assert.equal(out.debug.upstream_model, 'gpt-6-luna')
+  assert.equal(out.text, undefined)
+  const other = attributedAnswer({ ...body, safety_buffering: true }, { ...receipt, vm_id: 'other' }, id, model)
+  assert.equal(other.debug, undefined, 'other accounts must not contribute a signal')
+})
+
+test('quality configuration is bounded and never substituted for the observed safety flag', () => {
+  const out = attributedAnswer(
+    {
+      ...body,
+      safety_buffering_enabled: 'true',
+      safety_buffering_faster_model: 'gpt-6-luna',
+      safety_buffering: 'true',
+    },
+    receipt,
+    id,
+    model,
+  )
+  assert.equal(out.debug.safety_buffering, null)
+  assert.equal(out.debug.safety_buffering_enabled, 'true')
+  assert.equal(out.debug.safety_buffering_faster_model, 'gpt-6-luna')
+})

@@ -558,3 +558,28 @@ test('completed snapshots recover unregistered function and custom calls in ever
   }
   assert.equal(frames.find((frame) => frame.type === 'message_delta').delta.stop_reason, 'tool_use')
 })
+
+test('Codex aggregation retains strict safety signals and only the two configuration headers', () => {
+  const event = (value) => 'data: ' + JSON.stringify(value) + '\n\n'
+  const result = assembleCodexBodyFromSse([
+    event({
+      type: 'codex.response.metadata',
+      headers: {
+        'X-Codex-Safety-Buffering-Enabled': 'true',
+        'x-codex-safety-buffering-faster-model': 'gpt-6-luna',
+        authorization: 'never-export',
+        'set-cookie': 'never-export',
+      },
+    }),
+    event({ type: 'response.created', safety_buffering: true }),
+    event({ type: 'response.completed', response: { status: 'completed', safety_buffering: false } }),
+  ])
+  assert.equal(result.safety_buffering, true, 'a later false does not erase an observed true')
+  assert.equal(result.safety_buffering_enabled, 'true')
+  assert.equal(result.safety_buffering_faster_model, 'gpt-6-luna')
+  assert.equal(JSON.stringify(result).includes('never-export'), false)
+  const unknown = assembleCodexBodyFromSse([
+    event({ type: 'response.completed', response: { safety_buffering: 'true' } }),
+  ])
+  assert.equal(unknown.safety_buffering, undefined)
+})

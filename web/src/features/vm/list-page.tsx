@@ -49,6 +49,7 @@ import {
   type VmKindFilter,
   type VmSortKey,
 } from '@/features/vm/vm-table'
+import { CodexQualityCard } from './codex-quality-card'
 
 const SORT_CHIPS = [
   ['status', '状态'],
@@ -207,6 +208,11 @@ export function VmListPage() {
         error={vmsQ.error}
         skeleton={<VmListSkeleton />}
       >
+        {me.data?.role === 'admin' &&
+          vms.length > 0 &&
+          vms.every(
+            (vm) => vm.platform === 'openai' || vm.family === 'codex'
+          ) && <CodexQualityCard />}
         <FleetPulse
           className='mb-3'
           vms={scoped}

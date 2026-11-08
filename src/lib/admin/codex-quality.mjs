@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { observeCodexSafety } from '../protocol/codex-safety.mjs'
 import { readCodexAccounts } from '../vm/codex-slot.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 import { checkQualityExit, qualityExitBinding } from '../pool/codex-quality-exit.mjs'
@@ -26,16 +27,27 @@ export function legacyQualityState(project, vmId, stored) {
 
 // A bare answer can vote only after the gateway attributed a single completed attempt.
 export function attributedAnswer(body, receipt, vmId, model) {
-  const verified =
+  const attributed =
     receipt?.vm_id === vmId &&
     receipt.model === model &&
     receipt.attempt_count === 1 &&
     receipt.final_state === 'verified' &&
-    !receipt.model_mismatch &&
-    (!receipt.upstream_model || receipt.upstream_model === model) &&
-    body?.status === 'completed' &&
-    (!body.model || body.model === model)
-  if (!verified) return { ok: false, status: 502 }
+    body?.status === 'completed'
+  if (!attributed) return { ok: false, status: 502 }
+  const debug = {
+    hit_vm: vmId,
+    upstream_model: body.model || receipt.upstream_model || null,
+    safety_buffering: null,
+    safety_buffering_enabled: null,
+    safety_buffering_faster_model: null,
+    ...observeCodexSafety({}, body),
+  }
+  if (
+    receipt.model_mismatch ||
+    (receipt.upstream_model && receipt.upstream_model !== model) ||
+    (body.model && body.model !== model)
+  )
+    return { ok: false, status: 502, vm_id: vmId, debug }
   const text = (Array.isArray(body.output) ? body.output : [])
     .filter((item) => item?.type === 'message' && item.role === 'assistant')
     .flatMap((item) => item.content || [])
@@ -48,11 +60,7 @@ export function attributedAnswer(body, receipt, vmId, model) {
     vm_id: vmId,
     stop_reason: body.status,
     text,
-    debug: {
-      hit_vm: vmId,
-      upstream_model: receipt.upstream_model,
-      safety_buffering: typeof body.safety_buffering === 'boolean' ? body.safety_buffering : null,
-    },
+    debug,
   }
 }
 

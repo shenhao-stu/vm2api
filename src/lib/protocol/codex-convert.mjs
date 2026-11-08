@@ -3,6 +3,7 @@
  * Native openai.responses bodies pass through after identity strip.
  * Request/usage shapes follow codex-proxy-rs (system→developer, extract_usage).
  */
+import { observeCodexSafety } from './codex-safety.mjs'
 import { extractOpenaiUsage, openaiAnthropicUsageFromExtract, openaiChatUsageFromExtract } from './openai-usage.mjs'
 import { resolveGptFastAlias } from './gpt-model-policy.mjs'
 
@@ -706,6 +707,7 @@ export function responsesSseToAnthropicEvents(line, state = createAnthropicSseSt
 
 export function assembleCodexBodyFromSse(chunks = [], fallback = {}) {
   let response = fallback.response || fallback
+  let safety = observeCodexSafety({}, fallback)
   let usage = response.usage || {}
   const state = createChatSseState()
   const deltas = []
@@ -713,6 +715,7 @@ export function assembleCodexBodyFromSse(chunks = [], fallback = {}) {
   for (const line of chunks) {
     const event = parseSseData(line).event
     if (!event) continue
+    safety = observeCodexSafety(safety, event)
     if (event.response) response = { ...response, ...event.response }
     if (event.response?.usage || event.usage) usage = event.response?.usage || event.usage
     if (event.type === 'response.output_text.delta') deltas.push(event.delta || '')
@@ -764,7 +767,14 @@ export function assembleCodexBodyFromSse(chunks = [], fallback = {}) {
     if (text || !output.length)
       output.unshift({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] })
   }
-  return { ...response, output, usage }
+  // Do not preserve a non-boolean upstream value as a safety observation.
+  const {
+    safety_buffering: _flag,
+    safety_buffering_enabled: _enabled,
+    safety_buffering_faster_model: _faster,
+    ...body
+  } = response
+  return { ...body, ...safety, output, usage }
 }
 
 /** Conversion errors a client should see as a structured 502, not a crash. */

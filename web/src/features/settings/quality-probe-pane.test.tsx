@@ -73,7 +73,7 @@ async function mount() {
 
 it('reports uncertainty and the rest deadline without scheduling a probe on mount', async () => {
   const node = await mount()
-  expect(node.textContent).toContain('安全缓冲：未知')
+  expect(node.textContent).toContain('未知 · 未提供')
   expect(node.textContent).toContain('静置后复测')
   expect(node.textContent).toContain('不能证明模型身份')
   const run = [...node.querySelectorAll('button')].find(

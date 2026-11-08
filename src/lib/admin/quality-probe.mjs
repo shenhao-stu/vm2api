@@ -254,6 +254,7 @@ export class QualityProbeRunner {
             : 'custom',
       model: saved.config.model,
       running: this.progress.running,
+      manual_run_allowed: this.guarded || saved.config.enabled,
       config: saved.config,
       progress: { ...this.progress, active_vm_ids: [...this.progress.active_vm_ids] },
       items: codexRecords(this.projectRoot).map((vm) => {
