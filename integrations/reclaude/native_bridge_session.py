@@ -1488,7 +1488,8 @@ class Session:
                             buffered.append(converted)
                         if event.get("type") != "message_stop":
                             continue
-                        converted_events = self.structured_events(turn, buffered, buffer_bytes)
+                        converted_events = (buffered if turn.message.get('stop_reason') == 'refusal'
+                                            else self.structured_events(turn, buffered, buffer_bytes))
                     else:
                         converted_events = [converted]
                     if event.get("type") == "message_stop":

@@ -12,6 +12,10 @@ class RefusalTerminalTests(unittest.TestCase):
     tearDown = fixtures.ChannelTests.tearDown
     new_pool = fixtures.ChannelTests.new_pool
 
+    def test_schema_request_preserves_refusal_instead_of_demanding_schema_output(self):
+        self.body['output_config'] = {'format': {'type': 'json_schema', 'schema': {'type': 'object'}}}
+        self.test_empty_refusal_keeps_usage_and_isolates_scope_without_resume_uuid()
+
     def test_empty_refusal_keeps_usage_and_isolates_scope_without_resume_uuid(self):
         with self.pool.lease('tenant-a', self.body) as session:
             session.prepare = lambda: None
