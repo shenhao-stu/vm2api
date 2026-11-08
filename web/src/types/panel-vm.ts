@@ -308,6 +308,13 @@ export type Vm = {
   chatgpt_subscription_active_until?: string | null
   /** Plan label fallback from OAuth `id_token` when `plan_type` from usage is absent. */
   chatgpt_plan_type?: string | null
+  /** Official remaining usage credits, separate from reset vouchers and USD cost. */
+  codex_credits?: {
+    has_credits?: boolean
+    unlimited?: boolean
+    balance?: string | number | null
+    fetched_at?: string | null
+  } | null
   reset_credits?: {
     available_count?: number
     credits?: Array<{ expires_at?: string }>

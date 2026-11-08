@@ -113,7 +113,7 @@ export function OpenaiQuotaActions({
         size='sm'
         variant={compact ? 'ghost' : 'outline'}
         disabled={busy}
-        title='查询上游额度与重置券次数'
+        title='查询官方额度、剩余积分与重置券次数'
         className={
           compact
             ? 'h-6 gap-1 px-1.5 text-[11px] text-muted-foreground'
@@ -126,7 +126,7 @@ export function OpenaiQuotaActions({
         />
         {queryQuota.isPending
           ? '查询中'
-          : `券查询${credits ? ` ${available}` : ''}`}
+          : `额度查询${credits ? ` · 券 ${available}` : ''}`}
       </Button>
       <Button
         size='sm'

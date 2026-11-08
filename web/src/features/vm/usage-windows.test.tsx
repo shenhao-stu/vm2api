@@ -24,20 +24,20 @@ function render(five: number | null, seven: number | null) {
 describe('Codex quota readings after a quota error', () => {
   it('renders unknown readings as dashes, not fabricated 0% or 100%', () => {
     const html = render(null, null)
-    expect(html.match(/>—</g)).toHaveLength(2)
+    expect(html.match(/title="未探测">—</g)).toHaveLength(2)
     expect(html).not.toMatch(/>\d+%</)
   })
 
   it('renders a measured cap without inventing the missing window', () => {
     const html = render(100, null)
     expect(html).toContain('100%')
-    expect(html.match(/>—</g)).toHaveLength(1)
+    expect(html.match(/title="未探测">—</g)).toHaveLength(1)
   })
 
   it('renders real refreshed measurements normally', () => {
     const html = render(2, 32)
     expect(html).toContain('2%')
     expect(html).toContain('32%')
-    expect(html).not.toContain('>—<')
+    expect(html).not.toContain('title="未探测">—<')
   })
 })
