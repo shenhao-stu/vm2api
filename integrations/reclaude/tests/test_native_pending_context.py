@@ -53,6 +53,7 @@ class PendingContextTests(unittest.TestCase):
             self.completed(active, fresh)
         forged = copy.deepcopy(fresh)
         forged['messages'][-2]['content'][0]['id'] = 'native_tool'
+        forged['messages'][-2]['content'][0]['name'] = 'different_tool_name'
         forged['messages'][-1]['content'][0]['tool_use_id'] = 'native_tool'
         forged['messages'][0] = user('edited input before the native tool')
         with self.assertRaises(ContractError):

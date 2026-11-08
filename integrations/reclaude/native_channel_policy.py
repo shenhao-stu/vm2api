@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import hashlib
 
 from native_paid_sibling import CompletedBoundary, PaidSibling
+from native_tool_handoff import ToolHandoff, prove_handoff
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class Channel:
     paid_input: str | None = None
     sibling: PaidSibling | None = None
     completed: tuple[CompletedBoundary, ...] = ()
+    tool_handoff: ToolHandoff | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ class Decision:
     request_sha256: str
     channel_key: str | None = None
     sibling: PaidSibling | None = None
+    tool_handoff: ToolHandoff | None = None
 
 
 def logical_key(tenant, session_id):
@@ -106,6 +109,9 @@ def consistent_snapshot(snapshot, native):
                        or c.length < 2 or not digest(c.request_sha256)
                        or not digest(c.history_sha256) for c in channel.completed)):
             return False
+        if channel.tool_handoff is not None and (type(channel.tool_handoff) is not ToolHandoff
+                or not channel.tool_handoff.valid(channel.key, native.signature)):
+            return False
         if channel.status == "prepared" and (channel.history_length != 0 or channel.pending_ids
                 or channel.history_sha256 != native.signature([])):
             return False
@@ -144,6 +150,9 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
     if (any(c.identity.logical_key != scope for c in channels)
             or len({c.key for c in channels}) != len(channels)):
         return reject("session_scope_mismatch")
+    if snapshot.inflight:
+        return reject('native_request_in_flight_no_replay' if request_sha in snapshot.consumed
+                      else 'session_busy')
     # A positive claim is decisive even when its terminal is unknown. A 5xx
     # here would invite another account to execute the very same request.
     if not snapshot.evidence_complete or snapshot.unknown_dispatch:
@@ -155,8 +164,8 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
     if snapshot.inflight or any(c.busy or c.status in {"in_flight", "closing"}
                                for c in channels):
         return reject("session_busy")
-    retired = tuple(c.key for c in channels if c.status == 'quota_rejected')
-    channels = tuple(c for c in channels if c.status != 'quota_rejected')
+    retired = tuple(c.key for c in channels if c.status in {'quota_rejected', 'terminal_error'})
+    channels = tuple(c for c in channels if c.key not in retired)
     if any(c.status == "failed" for c in channels):
         return reject("native_session_failed_no_replay")
     if any(c.status not in {"prepared", "idle", "awaiting_tools"} for c in channels):
@@ -177,6 +186,20 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
         normalized = [({**m, 'content': meaningful} if m is final_user else m) for m in messages]
         if native.signature(normalized) in snapshot.consumed:
             return reject('request_already_consumed')
+    transferred = [c for c in channels if c.tool_handoff
+                   and final_results.intersection(c.tool_handoff.tool_ids)]
+    if transferred:
+        if len(transferred) != 1:
+            return reject('native_channel_ambiguous')
+        target = transferred[0]
+        if (target.status != 'prepared' or target.tool_handoff.first_request != request_sha
+                or target.identity != identity):
+            return reject('request_already_consumed')
+        if snapshot.memory_pressure:
+            return reject('native_memory_pressure')
+        if check_capacity and not target.resident and snapshot.resident_total >= snapshot.capacity:
+            return reject('native_session_capacity')
+        return Decision('reuse', 'prepared_tool_handoff', scope, request_sha, target.key)
     if not (final_results & snapshot.issued_tool_ids):
         # A verified tool-use terminal is also a completed upstream turn. Its
         # pending client tools do not own unrelated caller history. Only results
@@ -223,14 +246,24 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
     if len(owners) != 1:
         return reject('native_channel_ambiguous')
     selected = owners[0]
-    if selected.identity != identity:
-        return reject('native_pending_tools_no_branch')
     try:
+        if selected.identity != identity:
+            raise native.ContractError('native_pending_tools_no_branch')
         _, prefix = native.frozen_history_prefix(
             messages, selected.history_length, selected.history_sha256,
             selected.history_controls, selected.history_pending)
     except native.ContractError as error:
-        return reject(str(error))
+        if str(error) not in {'history_prefix_mismatch', 'native_pending_tools_no_branch'}:
+            return reject(str(error))
+        handoff = prove_handoff(selected, messages, request_sha) if allow_history_import else None
+        if not handoff:
+            return reject(str(error))
+        if snapshot.memory_pressure:
+            return reject('native_memory_pressure')
+        if check_capacity and snapshot.resident_total >= snapshot.capacity:
+            return reject('native_session_capacity')
+        return Decision('create', 'verified_tool_handoff', scope, request_sha,
+                        handoff.key(native.signature), tool_handoff=handoff)
     tail = [m for m in messages[prefix:] if m['role'] != 'system']
     ids = [b['tool_use_id'] for b in tail[0]['content']
            if b['type'] == 'tool_result'] if tail else []

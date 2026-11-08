@@ -1186,6 +1186,7 @@ class Session:
     def read_output(self):
         rate_limit_info = None
         rate_limit_error = None
+        api_error = None
         try:
             with self.process.stdout as stream, (
                 self.directory / "stdout.private.jsonl"
@@ -1201,7 +1202,8 @@ class Session:
                                 self.initialize_response = response
                                 self.control_ready.notify_all()
                     elif event.get("type") == "stream_event":
-                        self.events.put(event["event"])
+                        if not (api_error and event['event'].get('type') == 'message_stop'):
+                            self.events.put(event["event"])
                     elif event.get("type") == "rate_limit_event":
                         rate_limit_info = event.get("rate_limit_info")
                     elif event.get("type") == "assistant" and (
@@ -1213,7 +1215,9 @@ class Session:
                         if isinstance(error, NativeRateLimit):
                             rate_limit_error = error
                         else:
-                            self.events.put(error)
+                            # The CLI reports this before the real usage delta and
+                            # result. Drain that terminal instead of killing it early.
+                            api_error = error
                     elif event.get("type") == "assistant" and event.get("uuid"):
                         with self.assistant_ready:
                             self.last_native_message_id = event["message"]["id"]
@@ -1230,6 +1234,9 @@ class Session:
                         if rate_limit_error is not None:
                             self.events.put(rate_limit_error)
                             rate_limit_error = None
+                        elif api_error is not None:
+                            self.events.put(api_error)
+                            api_error = None
                         elif event.get("is_error"):
                             self.events.put(ContractError("native_cli_error"))
                         # Keep native stream input open for the next genuine user turn.
@@ -1238,6 +1245,8 @@ class Session:
         finally:
             if rate_limit_error is not None:
                 self.events.put(rate_limit_error)
+            if api_error is not None:
+                self.events.put(api_error)
             self.events.put(None)
             with self.control_ready:
                 self.control_ready.notify_all()
@@ -1462,6 +1471,8 @@ class Session:
                         self.close()
                         if isinstance(event, NativeRateLimit):
                             raise event
+                        if isinstance(event, ContractError) and str(event) == 'native_api_error':
+                            raise ContractError('native_upstream_error_no_replay')
                         raise ContractError("native_stream_incomplete")
                     if structured and event.get("type") != "message_start":
                         buffer_bytes += len(json.dumps(event).encode())

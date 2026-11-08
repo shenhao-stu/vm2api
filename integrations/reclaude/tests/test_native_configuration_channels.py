@@ -184,19 +184,15 @@ class ChannelTests(unittest.TestCase):
                     {'role': 'user', 'content': 'fresh'}]}):
                 self.fail('damaged adoption must fail closed')
 
-    def test_pending_input_compatibility_does_not_accept_other_history_changes(self):
+    def test_pending_tool_identity_changes_are_rejected(self):
         content = [{'type': 'tool_use', 'id': 'owned_tool', 'name': 'Read', 'input': {'path': 'old'}}]
         with self.pool.lease('tenant-a', self.body) as session:
             history = self.completed(session, self.body, content, pending=('owned_tool',))
         follow = {**self.body, 'messages': history + [{'role': 'user', 'content': [
             {'type': 'tool_result', 'tool_use_id': 'owned_tool', 'content': 'result'}]}]}
-        for change in ('user', 'id', 'name', 'text', 'result'):
+        for change in ('id', 'name', 'result'):
             changed = copy.deepcopy(follow)
-            if change == 'user':
-                changed['messages'][0]['content'] = 'changed owner input'
-            elif change == 'text':
-                changed['messages'][-2]['content'].append({'type': 'text', 'text': 'injected'})
-            elif change == 'result':
+            if change == 'result':
                 changed['messages'][-1]['content'][0]['tool_use_id'] = 'different_tool'
             else:
                 changed['messages'][-2]['content'][0][change] = 'different'
@@ -267,7 +263,7 @@ class ChannelTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, 'already_running'):
             self.new_pool()
 
-    def test_pending_tool_cannot_migrate_and_recovers_exact_result(self):
+    def test_unchanged_pending_tool_recovers_exact_result(self):
         tool = {'name': 'Read', 'input_schema': {'type': 'object'}}
         body = {**self.body, 'tools': [tool]}
         with self.pool.lease('tenant-a', body) as session:
@@ -275,9 +271,6 @@ class ChannelTests(unittest.TestCase):
             history = self.completed(session, body, content, ['call_exact'])
         follow = {**body, 'messages': history + [{'role': 'user', 'content': [
             {'type': 'tool_result', 'tool_use_id': 'call_exact', 'content': 'complete tool result'}]}]}
-        with self.assertRaisesRegex(ContractError, 'pending_tools'):
-            with self.pool.lease('tenant-a', {**follow, 'model': 'sonnet'}):
-                pass
         self.pool.close(); self.pool = self.new_pool()
         with self.pool.lease('tenant-a', follow) as recovered:
             self.assertEqual(recovered.pending_ids, {'call_exact'})

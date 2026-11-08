@@ -13,6 +13,8 @@ from native_history_boundary import BoundaryError, control_record, pending_recor
 from native_paid_sibling import CompletedBoundary, PaidSibling
 from native_channel_policy import Channel, Identity, Snapshot, request_identity
 from native_quota_rejection import rejected_request
+from native_tool_handoff import ToolHandoff
+from native_terminal_error import failed_request
 
 
 def sync_directory(path):
@@ -85,13 +87,15 @@ class ChannelStore:
             raise native.ContractError('native_channel_evidence_unknown')
         return value
 
-    def register(self, logical, key, body, sibling=None):
+    def register(self, logical, key, body, sibling=None, tool_handoff=None):
         document = self.document(logical)
         if document is None or key in document['channels']:
             raise native.ContractError('native_channel_evidence_unknown')
         identity = asdict(request_identity(logical, body, native))
         if sibling:
             identity['paid_sibling'] = sibling.serialize()
+        if tool_handoff:
+            identity['tool_handoff'] = asdict(tool_handoff)
         document['channels'][key] = identity
         write_json(self.directory / (logical + '.json'), document)
 
@@ -122,7 +126,7 @@ class ChannelStore:
                 session.directory = target
                 sync_directory(self.root)
         self.attach(session, logical)
-        self.register(logical, key, body, decision.sibling)
+        self.register(logical, key, body, decision.sibling, decision.tool_handoff)
         return session
 
     def attach(self, session, logical):
@@ -173,8 +177,11 @@ class ChannelStore:
             claims = directory / 'caller-grants'
             claim_values = {path.stem: read_json(path) for path in claims.glob('*.json')}
             rejected = rejected_request(directory, state, claim_values, time.time()) if status == 'failed' else None
+            terminal_error = failed_request(directory, state, claim_values) if status == 'failed' else None
             if rejected:
                 status = 'quota_rejected'
+            elif terminal_error:
+                status = 'terminal_error'
             known_grants = set()
             for request, claim in claim_values.items():
                 if (len(request) != 64 or any(c not in '0123456789abcdef' for c in request)
@@ -204,7 +211,7 @@ class ChannelStore:
                     pending = frozenset(claim.get('pending_ids', ()))
                 record = directory / 'dispatch' / (grant_id + '.consumed.json')
                 receipt = read_json(record) if record.is_file() else {}
-                if request == rejected:
+                if request in {rejected, terminal_error}:
                     continue
                 if claim.get('state') != 'complete' or receipt.get('id') != grant_id:
                     unknown = True
@@ -233,7 +240,7 @@ class ChannelStore:
                     complete = False
             if status == 'prepared' and (records or known_grants):
                 complete = False
-            if (status != 'quota_rejected' and session is not None and session.history
+            if (status not in {'quota_rejected', 'terminal_error'} and session is not None and session.history
                     and (length != len(session.history)
                          or history_sha != native.signature(native.history_shape(session.history)))):
                 complete = False
@@ -241,10 +248,15 @@ class ChannelStore:
                 fields = dict(raw_identity)
                 marker = fields.pop('paid_sibling', None)
                 sibling = PaidSibling(**marker) if marker is not None else None
+                transfer = fields.pop('tool_handoff', None)
+                tool_handoff = (ToolHandoff(**{**transfer, 'tool_ids': tuple(transfer['tool_ids'])})
+                                if transfer is not None else None)
                 identity = Identity(**fields)
                 if sibling and not sibling.valid(key, native.signature):
                     raise ValueError('invalid paid sibling')
-            except (TypeError, ValueError):
+                if tool_handoff and not tool_handoff.valid(key, native.signature):
+                    raise ValueError('invalid tool handoff')
+            except (KeyError, TypeError, ValueError):
                 raise native.ContractError('native_channel_evidence_unknown') from None
             boundaries = []
             for claim in sorted(completed, key=lambda c: c['history_length'], reverse=True)[:8]:
@@ -264,15 +276,21 @@ class ChannelStore:
                                     resident=entry is not None, busy=bool(entry and entry.busy),
                                     pending_ids=pending, history_controls=controls,
                                     history_pending=pending_witness, paid_input=paid_input, sibling=sibling,
-                                    completed=tuple(boundaries)))
+                                    completed=tuple(boundaries), tool_handoff=tool_handoff))
         parents = {c.key: c.identity for c in channels}
         for channel in channels:
             sibling = channel.sibling
             if sibling and (parents.get(sibling.parent) != channel.identity or
                             paid.get((sibling.parent, sibling.paid_input)) != sibling.paid_history):
                 raise native.ContractError('native_channel_evidence_unknown')
+            transfer = channel.tool_handoff
+            if transfer and (transfer.parent not in parents
+                    or parents[transfer.parent].logical_key != logical
+                    or paid.get((transfer.parent, transfer.paid_input)) != transfer.paid_history):
+                raise native.ContractError('native_channel_evidence_unknown')
         return Snapshot(logical, tuple(channels), frozenset(consumed), complete,
                         len(entries), capacity, unknown_dispatch=unknown,
+                        inflight=any(c.busy for c in channels),
                         stopped=stopped, memory_pressure=pressure,
                         issued_tool_ids=frozenset(issued_tools))
 

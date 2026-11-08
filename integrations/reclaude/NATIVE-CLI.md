@@ -509,3 +509,23 @@ all earlier paid hashes remain in the logical session's deduplication set. The n
 authenticated caller supplies the history to import; no background retry is scheduled.
 Missing offsets, incomplete terminals, unknown dispatches and nonzero usage never
 qualify. Pending tool results remain bound to their verified channel/configuration.
+
+### Pending tool handoff and terminal errors
+
+A completed native tool response owns a unique set of tool results within the
+trusted account/session scope; it does not own every later caller configuration.
+If a caller changes model, system text or earlier history while returning those
+results, validate its complete tool graph and the original paid tool IDs/names,
+then import the caller's history into a separate native channel. Persist the
+handoff before admission, so one pending boundary cannot be consumed again via
+another model, edited result or worker restart. The original transcript and grant
+remain unchanged. Unchanged compatible history keeps the resident CLI path.
+
+A native `server_error` can precede its usage delta and terminal result. Drain
+those events without emitting a success stop, and retain the actual delta usage;
+assistant/result placeholders are not accounting values. A read-only, single-grant
+proof of the complete native error terminal permits a subsequent new request to
+use a fresh channel. The old request stays consumed. Missing or mixed terminal
+proof and official policy refusals remain blocked. A live in-flight claim is
+reported separately from crashed/unknown evidence; an identical in-flight request
+cannot be retried on another account.
