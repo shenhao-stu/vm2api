@@ -529,3 +529,11 @@ use a fresh channel. The old request stays consumed. Missing or mixed terminal
 proof and official policy refusals remain blocked. A live in-flight claim is
 reported separately from crashed/unknown evidence; an identical in-flight request
 cannot be retried on another account.
+
+A native `stop_reason: refusal` is a valid terminal even when it has no resumable
+assistant UUID. Preserve the original SSE terminal and usage, mark its consumed
+claim `policy_refused`, and retire that CLI. The authenticated logical session
+then rejects continuation with `upstream_policy_refused_no_replay`, including a
+model change. Other tenants and sessions remain independent. Never turn a
+provider refusal into a history mismatch, an implicit retry, or a new resume
+point; historical uncertain claims still remain blocked.

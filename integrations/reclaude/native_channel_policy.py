@@ -150,6 +150,8 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
     if (any(c.identity.logical_key != scope for c in channels)
             or len({c.key for c in channels}) != len(channels)):
         return reject("session_scope_mismatch")
+    if any(c.status == 'policy_refused' for c in channels):
+        return reject('upstream_policy_refused_no_replay')
     if snapshot.inflight:
         return reject('native_request_in_flight_no_replay' if request_sha in snapshot.consumed
                       else 'session_busy')

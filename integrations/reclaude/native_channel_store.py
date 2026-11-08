@@ -211,6 +211,10 @@ class ChannelStore:
                     pending = frozenset(claim.get('pending_ids', ()))
                 record = directory / 'dispatch' / (grant_id + '.consumed.json')
                 receipt = read_json(record) if record.is_file() else {}
+                if (claim.get('state') == 'policy_refused' and receipt.get('id') == grant_id
+                        and valid_usage(claim.get('terminal_usage'))):
+                    status = 'policy_refused'
+                    continue
                 if request in {rejected, terminal_error}:
                     continue
                 if claim.get('state') != 'complete' or receipt.get('id') != grant_id:
@@ -240,7 +244,7 @@ class ChannelStore:
                     complete = False
             if status == 'prepared' and (records or known_grants):
                 complete = False
-            if (status not in {'quota_rejected', 'terminal_error'} and session is not None and session.history
+            if (status not in {'quota_rejected', 'terminal_error', 'policy_refused'} and session is not None and session.history
                     and (length != len(session.history)
                          or history_sha != native.signature(native.history_shape(session.history)))):
                 complete = False
@@ -315,20 +319,34 @@ class ChannelStore:
         except FileExistsError:
             raise native.ContractError('request_already_consumed') from None
 
-    def complete(self, session, request_sha, usage):
+    def terminal_claim(self, session, request_sha, usage):
         path = session.directory / 'caller-grants' / (request_sha + '.json')
         claim = read_json(path)
-        state = read_json(session.directory / 'continuation.json')
         consumed = session.directory / 'dispatch' / (claim['grant_id'] + '.consumed.json')
-        if (not isinstance(usage, dict)
-                or any(type(usage.get(k)) is not int or usage[k] < 0
-                       for k in ('input_tokens', 'output_tokens'))
+        if (not valid_usage(usage)
                 or claim.get('state') != 'claimed' or not consumed.is_file()
-                or read_json(consumed).get('id') != claim['grant_id']
-                or state.get('status') not in {'idle', 'awaiting_tools'}
+                or claim.get('request_sha256') != request_sha
+                or claim.get('native_id') != session.native_id
+                or read_json(consumed).get('id') != claim['grant_id']):
+            raise native.ContractError('native_channel_evidence_unknown')
+        return path, claim
+
+    def refuse(self, session, request_sha, usage):
+        path, claim = self.terminal_claim(session, request_sha, usage)
+        write_json(path, {**claim, 'state': 'policy_refused', 'terminal_usage': usage})
+
+    def complete(self, session, request_sha, usage):
+        path, claim = self.terminal_claim(session, request_sha, usage)
+        state = read_json(session.directory / 'continuation.json')
+        if (state.get('status') not in {'idle', 'awaiting_tools'}
                 or state.get('request_sha256') != request_sha):
             raise native.ContractError('native_channel_evidence_unknown')
         claim.update(state='complete', terminal_usage=usage,
                      history_sha256=state['history_sha256'],
                      history_length=state['history_length'], pending_ids=sorted(session.pending_ids))
         write_json(path, claim)
+
+
+def valid_usage(usage):
+    return isinstance(usage, dict) and all(type(usage.get(k)) is int and usage[k] >= 0
+                                         for k in ('input_tokens', 'output_tokens'))

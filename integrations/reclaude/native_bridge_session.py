@@ -1496,6 +1496,16 @@ class Session:
                             self.failed = True
                             self.close()
                             raise ContractError("native_stop_without_terminal_reason")
+                        if turn.message['stop_reason'] == 'refusal':
+                            # A refusal may have no assistant UUID. Preserve its
+                            # terminal usage, but never create a resume point.
+                            self.failed = True
+                            self.close()
+                            if self.channel_store is not None:
+                                self.channel_store.refuse(self, request_signature,
+                                                          copy.deepcopy(turn.message.get('usage', {})))
+                            yield from converted_events
+                            return
                         self.history.append(
                             {"role": "assistant", "content": turn.message["content"]}
                         )
