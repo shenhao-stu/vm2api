@@ -1,6 +1,6 @@
 import { createProSessionQuarantine } from '../core/pro-session-quarantine.mjs'
 import { keyAllowsVm, keyScopeFromRequest } from '../admin/key-scope.mjs'
-import { isApiKeyMode } from '../oauth/credential-mode.mjs'
+import { credentialModeOfVm, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { listVms } from '../vm/vm-registry.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
@@ -30,12 +30,7 @@ export function quarantinedResult(unavailable = false) {
 }
 
 export function isClaudeSubscriptionSlot(vm) {
-  return (
-    !!vm &&
-    !isCodexVm(vm) &&
-    !isApiKeyMode(vm.claude?.mode || vm.credential_mode) &&
-    ['pro', 'max'].includes(String(vm.claude?.account_tier || vm.account_tier || '').toLowerCase())
-  )
+  return !!vm && !isCodexVm(vm) && !isApiKeyMode(credentialModeOfVm(vm))
 }
 
 export function proSessionProtection(req, inbound, body, deps) {

@@ -8,6 +8,17 @@ import {
   resolveUsageWindows,
 } from '../../src/lib/protocol/user-count-tokens.mjs'
 import { createUsageCache } from '../../src/lib/oauth/usage-cache.mjs'
+import { createDatabase } from '../../src/lib/db/database.mjs'
+import { ProSessionQuarantineRepo } from '../../src/lib/db/repos/pro-session-quarantine-repo.mjs'
+
+function sessionProtection(t) {
+  const db = createDatabase({ dbPath: ':memory:' })
+  t.after(() => db.close())
+  return {
+    settings: { get: (_key, fallback) => fallback },
+    proSessionQuarantineRepo: new ProSessionQuarantineRepo(db),
+  }
+}
 
 function jsonCapture() {
   const calls = []
@@ -46,7 +57,7 @@ test('buildUsageView converts Extra ratio to percent_used', () => {
   assert.equal(view.source, 'extra')
 })
 
-test('oauth count_tokens returns usage without hopping official count_tokens', async () => {
+test('oauth count_tokens returns usage without hopping official count_tokens', async (t) => {
   const cap = jsonCapture()
   let hopped = false
   const unified = {
@@ -60,6 +71,7 @@ test('oauth count_tokens returns usage without hopping official count_tokens', a
     {},
     {
       json: cap.json,
+      ...sessionProtection(t),
       requireAuth: () => true,
       readBody: async () => ({ model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] }),
       cfg: { limits: { max_body_bytes: 1024 } },
@@ -87,13 +99,14 @@ test('oauth count_tokens returns usage without hopping official count_tokens', a
   assert.equal(cap.calls[0].body.input_tokens, undefined)
 })
 
-test('setup-token count_tokens hops and returns input_tokens', async () => {
+test('setup-token count_tokens hops and returns input_tokens', async (t) => {
   const cap = jsonCapture()
   await handleUserCountTokens(
     {},
     {},
     {
       json: cap.json,
+      ...sessionProtection(t),
       requireAuth: () => true,
       readBody: async () => ({ model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] }),
       cfg: { limits: { max_body_bytes: 1024 } },
@@ -118,7 +131,7 @@ test('setup-token count_tokens hops and returns input_tokens', async () => {
   assert.equal(cap.calls[0].body.five_hour, undefined)
 })
 
-test('a platform-scoped key cannot count tokens on the other platform and peeks only its VMs', async () => {
+test('a platform-scoped key cannot count tokens on the other platform and peeks only its VMs', async (t) => {
   const scopedReq = (group_type) => ({
     apiKeyKind: 'managed',
     apiKeyRecord: { group_type, allowed_vms: '["vm-02"]' },
@@ -127,6 +140,7 @@ test('a platform-scoped key cannot count tokens on the other platform and peeks 
   const seen = []
   const deps = {
     json: cap.json,
+    ...sessionProtection(t),
     requireAuth: () => true,
     readBody: async () => ({ model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] }),
     cfg: { limits: { max_body_bytes: 1024 } },

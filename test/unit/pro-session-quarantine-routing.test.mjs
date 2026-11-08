@@ -103,12 +103,10 @@ async function fixture(
   return { ...h, options, devices, guards, receipts, db }
 }
 
-for (const [tier, stream] of [
-  ['pro', false],
-  ['pro', true],
-  ['max', false],
-  ['max', true],
-]) {
+for (const [tier, stream] of ['pro', 'max', 'ultra', 'future-plan', ''].flatMap((tier) => [
+  [tier, false],
+  [tier, true],
+])) {
   test(`${tier} upstream refusal isolates a Continue before a second dispatch, stream=${stream}`, async (t) => {
     const h = await fixture(t, { tier })
     const first = await h.send(request(original, stream))
@@ -279,12 +277,10 @@ test('SQLite write loss retains real refusal usage and the fallback blocks the n
   assert.equal(h.receipts.length, 1)
 })
 
-for (const [tier, category] of [
-  ['pro', 'oauth'],
-  ['pro', 'api'],
-  ['max', 'oauth'],
-  ['max', 'api'],
-]) {
+for (const [tier, category] of ['pro', 'max', 'ultra', 'future-plan', ''].flatMap((tier) => [
+  [tier, 'oauth'],
+  [tier, 'api'],
+])) {
   test(`count_tokens on actual ${tier} cannot dispatch an isolated context for key category=${category}`, async (t) => {
     const h = await fixture(t, { tier })
     await h.send(request(original, false))
@@ -377,12 +373,11 @@ test('a mixed pool resolves the actual slot before a pre-existing legacy exact m
   assert.equal(h.captured.length, 2)
 })
 
-test('subscription protection excludes native relay API credentials, Codex and unknown tiers', () => {
+test('subscription protection excludes native relay API credentials and Codex', () => {
   for (const vm of [
     { claude: { mode: 'apikey', account_tier: 'max' } },
     { claude: { mode: 'console', account_tier: 'pro' } },
     { platform: 'openai', claude: { mode: 'oauth', account_tier: 'max' } },
-    { claude: { mode: 'oauth', account_tier: 'enterprise' } },
     null,
   ])
     assert.equal(isClaudeSubscriptionSlot(vm), false)
