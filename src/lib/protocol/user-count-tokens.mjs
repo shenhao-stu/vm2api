@@ -17,7 +17,7 @@ import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
-import { isClaudeProSlot, proSessionProtection, proTargetScope } from './pro-session-protection.mjs'
+import { isClaudeSubscriptionSlot, proSessionProtection, proTargetScope } from './pro-session-protection.mjs'
 import { inboundBodyLimit, readRoutingConfigFile } from '../core/config.mjs'
 import {
   detectProxiedOfficialCcFromRouting,
@@ -305,7 +305,7 @@ export async function handleUserCountTokens(req, res, deps) {
     usersRepo: deps.apiKeyStore?.users || null,
   })
   if (!peeked.ok) return sendPoolFail(res, json, peeked)
-  const protection = isClaudeProSlot(peeked.vm) ? proSession : null
+  const protection = isClaudeSubscriptionSlot(peeked.vm) ? proSession : null
   const blocked = protection?.beforeDispatch()
   if (blocked) return json(res, blocked.status, blocked.body)
   if (deferred || gate.wait) {

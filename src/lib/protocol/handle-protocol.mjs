@@ -20,7 +20,7 @@ import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { jevScopeWaits, readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
-import { isClaudeProSlot, proSessionProtection, proTargetScope } from './pro-session-protection.mjs'
+import { isClaudeSubscriptionSlot, proSessionProtection, proTargetScope } from './pro-session-protection.mjs'
 import {
   toClaudeMessages,
   isClientStream,
@@ -1497,7 +1497,7 @@ export function createHandleProtocol(deps) {
         stream: upstreamStream,
         deliveryMode,
         signal: clientAbort.signal,
-        beforeAttempt: (selected) => (isClaudeProSlot(selected.vm) ? proSession?.beforeDispatch() : null),
+        beforeAttempt: (selected) => (isClaudeSubscriptionSlot(selected.vm) ? proSession?.beforeDispatch() : null),
         applyAttempt: async (body, selected, extra = {}) => {
           // Only this account's own thinking replays as thinking. Another
           // account's signature, or one with no record, goes out as text.
@@ -1718,7 +1718,7 @@ export function createHandleProtocol(deps) {
           return { body: prepared.body, meta: { toolNames: prepared.toolNames, sessionId: attemptSessionId } }
         },
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
-          const protection = isClaudeProSlot(candidate.vm) ? proSession : null
+          const protection = isClaudeSubscriptionSlot(candidate.vm) ? proSession : null
           if (!clientStream) {
             return streamAndAssembleClaudeMessage({
               candidate,

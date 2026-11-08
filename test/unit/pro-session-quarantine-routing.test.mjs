@@ -6,6 +6,7 @@ import { RefusalDeviceBlocksRepo } from '../../src/lib/db/repos/refusal-device-b
 import { RefusalGuardsRepo } from '../../src/lib/db/repos/refusal-guards-repo.mjs'
 import { ProSessionQuarantineRepo } from '../../src/lib/db/repos/pro-session-quarantine-repo.mjs'
 import { handleUserCountTokens } from '../../src/lib/protocol/user-count-tokens.mjs'
+import { isClaudeSubscriptionSlot } from '../../src/lib/protocol/pro-session-protection.mjs'
 import { refusalFingerprint } from '../../src/lib/core/refusal-guard.mjs'
 
 const device = 'synthetic-test-device'
@@ -102,9 +103,14 @@ async function fixture(
   return { ...h, options, devices, guards, receipts, db }
 }
 
-for (const stream of [false, true]) {
-  test(`Pro upstream refusal isolates a Continue before a second dispatch, stream=${stream}`, async (t) => {
-    const h = await fixture(t)
+for (const [tier, stream] of [
+  ['pro', false],
+  ['pro', true],
+  ['max', false],
+  ['max', true],
+]) {
+  test(`${tier} upstream refusal isolates a Continue before a second dispatch, stream=${stream}`, async (t) => {
+    const h = await fixture(t, { tier })
     const first = await h.send(request(original, stream))
     assert.equal(first.status, 200, first.text)
     assert.match(first.text, /refusal/)
@@ -221,7 +227,7 @@ test('a Continue already waiting for a slot sees the refusal before the first SS
 
 for (const [tier, enabled] of [
   ['pro', false],
-  ['max', true],
+  ['max', false],
 ]) {
   test(`legacy device refusal policy is preserved for tier=${tier}, enabled=${enabled}`, async (t) => {
     const h = await fixture(t, { tier, enabled })
@@ -235,7 +241,7 @@ for (const [tier, enabled] of [
   })
 }
 
-test('an unreadable guard stops only Pro dispatch before the kernel or metering', async (t) => {
+test('an unreadable guard stops subscription dispatch before the kernel or metering', async (t) => {
   const h = await fixture(t, {
     makeQuarantineRepo: () => ({
       has() {
@@ -273,9 +279,14 @@ test('SQLite write loss retains real refusal usage and the fallback blocks the n
   assert.equal(h.receipts.length, 1)
 })
 
-for (const category of ['oauth', 'api']) {
-  test(`count_tokens on actual Pro cannot dispatch an isolated context for key category=${category}`, async (t) => {
-    const h = await fixture(t)
+for (const [tier, category] of [
+  ['pro', 'oauth'],
+  ['pro', 'api'],
+  ['max', 'oauth'],
+  ['max', 'api'],
+]) {
+  test(`count_tokens on actual ${tier} cannot dispatch an isolated context for key category=${category}`, async (t) => {
+    const h = await fixture(t, { tier })
     await h.send(request(original, false))
     let countCalls = 0
     const result = await handleUserCountTokens(
@@ -292,7 +303,7 @@ for (const category of ['oauth', 'api']) {
         poolScheduler: {
           peekAccount: async () => ({
             ok: true,
-            vm: { id: 'fixture', claude: { mode: 'setup-token', account_tier: 'pro' } },
+            vm: { id: 'fixture', claude: { mode: 'setup-token', account_tier: tier } },
           }),
         },
         countTokensViaWorker: async () => {
@@ -328,11 +339,11 @@ test('an official Pro refusal cannot blacklist matching user text from another a
 })
 
 test('a mixed pool resolves the actual slot before a pre-existing legacy exact match can block a device', async (t) => {
-  const max = { id: 'max-fixture', claude: { mode: 'oauth', account_tier: 'max' } }
+  const apiSlot = { id: 'api-fixture', claude: { mode: 'apikey', account_tier: 'max' } }
   let selected = false
   const h = await fixture(t, {
-    otherVms: [max],
-    selectVm: (vm, n) => (n >= 3 ? max : vm),
+    otherVms: [apiSlot],
+    selectVm: (vm, n) => (n >= 3 ? apiSlot : vm),
     beforeSelect: (n) => {
       selected = n > 1
     },
@@ -360,8 +371,19 @@ test('a mixed pool resolves the actual slot before a pre-existing legacy exact m
   const legacy = await h.send(request(original, false))
   assert.equal(legacy.status, 200)
   for (const fingerprint of fingerprints) h.guards.remember({ fingerprint })
-  const blockedMax = await h.send(request(original, false))
-  assert.equal(JSON.parse(blockedMax.text).error.code, 'refusal_guard')
+  const blockedApi = await h.send(request(original, false))
+  assert.equal(JSON.parse(blockedApi.text).error.code, 'refusal_guard')
   assert.ok(h.devices.get(device))
   assert.equal(h.captured.length, 2)
+})
+
+test('subscription protection excludes native relay API credentials, Codex and unknown tiers', () => {
+  for (const vm of [
+    { claude: { mode: 'apikey', account_tier: 'max' } },
+    { claude: { mode: 'console', account_tier: 'pro' } },
+    { platform: 'openai', claude: { mode: 'oauth', account_tier: 'max' } },
+    { claude: { mode: 'oauth', account_tier: 'enterprise' } },
+    null,
+  ])
+    assert.equal(isClaudeSubscriptionSlot(vm), false)
 })

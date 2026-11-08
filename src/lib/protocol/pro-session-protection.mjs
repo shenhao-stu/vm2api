@@ -29,12 +29,12 @@ export function quarantinedResult(unavailable = false) {
   }
 }
 
-export function isClaudeProSlot(vm) {
+export function isClaudeSubscriptionSlot(vm) {
   return (
     !!vm &&
     !isCodexVm(vm) &&
     !isApiKeyMode(vm.claude?.mode || vm.credential_mode) &&
-    String(vm.claude?.account_tier || vm.account_tier || '').toLowerCase() === 'pro'
+    ['pro', 'max'].includes(String(vm.claude?.account_tier || vm.account_tier || '').toLowerCase())
   )
 }
 
@@ -79,7 +79,7 @@ export function proSessionProtection(req, inbound, body, deps) {
 }
 
 // Only scan membership on a positive lookup. Mixed pools must defer the
-// decision until selection so an unrelated Max or API slot keeps its policy.
+// decision until selection so an unrelated API slot keeps its policy.
 export function proTargetScope(req, deps, scope = keyScopeFromRequest(req)) {
   if (!deps.cfg?.paths?.project) return 'none'
   const rawPin = String(req.headers?.['x-kin-vm'] || '').trim()
@@ -87,6 +87,6 @@ export function proTargetScope(req, deps, scope = keyScopeFromRequest(req)) {
   const candidates = listVms(deps.cfg.paths.project).filter(
     (vm) => !isCodexVm(vm) && (!pin || vm.id === pin) && keyAllowsVm(scope, vm),
   )
-  if (!candidates.some(isClaudeProSlot)) return 'none'
-  return candidates.every(isClaudeProSlot) ? 'pro' : 'mixed'
+  if (!candidates.some(isClaudeSubscriptionSlot)) return 'none'
+  return candidates.every(isClaudeSubscriptionSlot) ? 'pro' : 'mixed'
 }
