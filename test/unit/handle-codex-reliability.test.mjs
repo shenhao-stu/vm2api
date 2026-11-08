@@ -225,3 +225,19 @@ for (const [name, cfg, routing, expected] of [
     assert.equal(fx.res.statusCode, 200)
   })
 }
+
+test('oversized input is an actionable local rejection with no account dispatch', async (t) => {
+  let hops = 0
+  const { args, res } = fixture(t, {
+    body: { input: [{ role: 'user', content: 'x'.repeat(15_991_800) }] },
+    hop: async () => { hops++; throw new Error('must not dispatch') },
+  })
+  await handleCodexProtocol(args)
+  assert.equal(hops, 0)
+  assert.equal(res.statusCode, 400)
+  assert.equal(res.body.error.code, 'input_string_too_long')
+  assert.equal(res.body.error.param, 'input[0].content')
+  assert.match(res.body.error.message, /10485760/)
+  assert.equal(args.logBag.final_state, 'rejected')
+  assert.equal(args.logBag.attempt_count, 0)
+})

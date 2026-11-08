@@ -740,11 +740,14 @@ export async function handleCodexProtocol({
       converted: false,
     })
     logBag.error_code = converted.code
+    logBag.final_state = 'rejected'
+    logBag.attempt_count = 0
     return json(res, 400, {
       error: {
         type: 'invalid_request_error',
         code: converted.code,
-        message: 'request could not be converted to Codex Responses',
+        message: converted.message || 'request could not be converted to Codex Responses',
+        ...(converted.param ? { param: converted.param } : {}),
       },
     })
   }

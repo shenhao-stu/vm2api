@@ -359,7 +359,7 @@ export function anthropicToCodexResponses(body = {}) {
   })
 }
 
-export function toCodexResponses(protocol, body, convert = {}) {
+function convertCodexResponses(protocol, body, convert = {}) {
   const stripped = stripCodexIdentity(body)
   const fast = normalizeFastAliasBody(stripped)
   if (!fast.ok) return fast
@@ -381,6 +381,46 @@ export function toCodexResponses(protocol, body, convert = {}) {
     return { ok: true, body: stripUnsupportedCodexFields(anthropicToCodexResponses(normalized)), converted: true }
   }
   return { ok: false, code: 'protocol_not_allowed' }
+}
+
+// Observed upstream per-text limit; it is independent of the gateway upload limit.
+const MAX_CODEX_TEXT_CHARACTERS = 10_485_760
+function exceedsTextLimit(text) {
+  if (typeof text !== 'string' || text.length <= MAX_CODEX_TEXT_CHARACTERS) return false
+  let length = 0
+  for (let i = 0; i < text.length; i++) {
+    if (++length > MAX_CODEX_TEXT_CHARACTERS) return true
+    if (text.codePointAt(i) > 0xffff) i++
+  }
+  return false
+}
+
+function oversizedInputText(input) {
+  if (!Array.isArray(input)) return null
+  for (let i = 0; i < input.length; i++) {
+    const content = input[i]?.content
+    if (exceedsTextLimit(content)) return `input[${i}].content`
+    if (!Array.isArray(content)) continue
+    for (let j = 0; j < content.length; j++) {
+      const part = content[j]
+      if (['input_text', 'output_text'].includes(part?.type) && exceedsTextLimit(part.text))
+        return `input[${i}].content[${j}].text`
+    }
+  }
+  return null
+}
+
+export function toCodexResponses(protocol, body, convert = {}) {
+  const result = convertCodexResponses(protocol, body, convert)
+  if (!result.ok) return result
+  const param = oversizedInputText(result.body.input)
+  if (!param) return result
+  return {
+    ok: false,
+    code: 'input_string_too_long',
+    param,
+    message: `${param} exceeds the upstream limit of ${MAX_CODEX_TEXT_CHARACTERS} characters per text field. Reduce the input before retrying; this request was not sent upstream.`,
+  }
 }
 
 export function createChatSseState(id = 'codex') {

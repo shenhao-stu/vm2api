@@ -583,3 +583,33 @@ test('Codex aggregation retains strict safety signals and only the two configura
   ])
   assert.equal(unknown.safety_buffering, undefined)
 })
+
+// The upstream validates a single text field independently of the HTTP body size.
+test('oversized Responses message text is rejected without changing caller history', () => {
+  const text = 'x'.repeat(10_485_761)
+  const body = { model: 'gpt-6.1-sol', input: [{ role: 'user', content: text }] }
+  const result = toCodexResponses('openai.responses', body)
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'input_string_too_long')
+  assert.equal(result.param, 'input[0].content')
+  assert.match(result.message, /10485760/)
+  assert.equal(body.input[0].content, text)
+})
+
+test('text limit follows converted input and counts Unicode characters without truncation', () => {
+  const large = 'x'.repeat(10_485_761)
+  for (const [protocol, body, param] of [
+    ['openai.responses', { input: large }, 'input[0].content[0].text'],
+    ['openai.responses', { input: [{ role: 'user', content: [{ type: 'input_text', text: large }] }] }, 'input[0].content[0].text'],
+    ['openai.chat', { messages: [{ role: 'user', content: large }] }, 'input[0].content[0].text'],
+  ]) {
+    const result = toCodexResponses(protocol, { model: 'gpt-6.1-sol', ...body })
+    assert.equal(result.ok, false)
+    assert.equal(result.param, param)
+  }
+  for (const text of ['x'.repeat(10_485_760), '😀'.repeat(5_242_881)]) {
+    const result = toCodexResponses('openai.responses', { model: 'gpt-6.1-sol', input: [{ role: 'user', content: text }] })
+    assert.equal(result.ok, true)
+    assert.equal(result.body.input[0].content, text)
+  }
+})
