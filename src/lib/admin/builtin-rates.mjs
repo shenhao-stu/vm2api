@@ -63,9 +63,7 @@ function openaiFrom(std, extra = {}) {
 const ANTHROPIC = {
   'claude-fable-5': claude(10, 50, 1, 12.5, 20),
   'claude-fable-5-1': claude(10, 50, 0.25, 12.5, 20),
-  'claude-fable-5-2': claude(8, 40, 0.2, 10, 16, {
-    modes: { fast: tokenPrice(16, 80, 0.4, 20, 32) },
-  }),
+  'claude-fable-5-2': claude(8, 40, 0.2, 10, 16),
   'claude-mythos-5': claude(10, 50, 1, 12.5, 20),
   'claude-mythos-5-1': claude(10, 50, 0.25, 12.5, 20),
   'claude-opus-5-5': claude(4, 20, 0.2, 5, 8, {
