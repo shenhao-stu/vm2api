@@ -27,6 +27,22 @@ independent probes confirm their existing fixed exit addresses; never clear
 previous safety latches or revive retired accounts. Preserve the existing CLI,
 kernel, ReClaude services, Codex service, account state and billing ledger.
 
+## Recovery verification
+
+Rearming an exit guard does not start its stopped worker. Use the native start
+operation, wait for diagnosis, and only then restore the corresponding downstream
+account. Verify the account identity, key scope, model policy and concurrency
+against the pre-maintenance snapshot. Read back uncertain actions; never replay
+an ambiguous start or dispatch.
+
+A remote slot start can recopy bundled auxiliary binaries even when its existing
+egress helper remains running. Record both the running executable hash and the
+on-disk artifact hash before maintenance, then compare both after starting. A
+successful guard probe alone does not prove an earlier DNS fix was preserved.
+Restore a reviewed slot-specific artifact atomically if it was overwritten; do
+not replace a shared CLI/kernel or restart unrelated helpers. Preserve these pins
+in future recovery procedures as well as the gateway image manifest.
+
 ## Separate nonstreaming transport limitation
 
 A JSON whitespace keepalive commits HTTP 200 before the final response is known.
