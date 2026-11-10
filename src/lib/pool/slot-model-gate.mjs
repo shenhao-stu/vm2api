@@ -1,4 +1,5 @@
 import { inferClaudeTier } from './claude-tier.mjs'
+import { fablePromotionActive, isFable52 } from '../protocol/fable-promotion.mjs'
 import { isFableModel } from './upstream-error-policy.mjs'
 import { getModelEntry, getPolicyCatalogIds, resolvePolicyModelId } from '../protocol/model-policy.mjs'
 import { getGptPolicyCatalogIds, listImageToolModels, resolveGptFastAlias } from '../protocol/gpt-model-policy.mjs'
@@ -33,6 +34,7 @@ function keysIntersect(left, right) {
   for (const a of left) {
     for (const b of right) {
       if (a === b) return true
+      if (isFable52(a) !== isFable52(b)) continue
       // The corrected 5-1 id must not widen a Fable 5 allowlist (or vice versa).
       const fable51 = /^claude-fable-5(?:-1|\.1)(?:-|$)/
       if (fable51.test(a) !== fable51.test(b)) continue
@@ -130,7 +132,7 @@ export function resolveSlotTier(vm, account = null) {
   ).key
 }
 
-export function slotAllowsModel({ vm, account = null, model } = {}) {
+export function slotAllowsModel({ vm, account = null, model, now = Date.now() } = {}) {
   const requestedModel = String(model || '').trim()
   const fast = resolveGptFastAlias(requestedModel)
   if (fast.kind === 'unavailable') return { ok: false, reason: 'model_fast_unavailable' }
@@ -143,8 +145,11 @@ export function slotAllowsModel({ vm, account = null, model } = {}) {
   }
   const canonical = resolvePolicyModelId(modelKey) || modelKey
   const deniedUntil = Number(account?.unified?.model_denied_until?.[canonical]) || 0
-  if (deniedUntil > Date.now()) return { ok: false, reason: 'model_not_supported' }
-  if (isFableModel(modelKey) && resolveSlotTier(vm, account) !== 'max') {
+  if (deniedUntil > now) return { ok: false, reason: 'model_not_supported' }
+  const promotion = isFable52(canonical) && fablePromotionActive(now)
+  if (isFable52(canonical) && !promotion) return { ok: false, reason: 'model_disabled' }
+  const tier = resolveSlotTier(vm, account)
+  if (isFableModel(canonical) && tier !== 'max' && !(tier === 'pro' && promotion)) {
     return { ok: false, reason: 'fable_requires_max' }
   }
   const allowed = normalizeAllowedModels(vm?.policy?.allowed_models)

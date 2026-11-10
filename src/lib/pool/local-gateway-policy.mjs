@@ -3,7 +3,7 @@ import { detectInboundPlatform } from '../protocol/platform-detect.mjs'
 import { slotAllowsModel } from './slot-model-gate.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { parseAllowedVms } from '../admin/key-scope.mjs'
-import { isGatewayOnlyRecord, withoutFableModels, isFableModel } from '../protocol/hosted-model-policy.mjs'
+import { isGatewayOnlyRecord, filterHostedModels, isFableModel } from '../protocol/hosted-model-policy.mjs'
 
 export function gatewayError(code, message, status = 400) {
   return Object.assign(new Error(message), { code, status })
@@ -111,7 +111,7 @@ export function hybridModelCatalog(nativeCatalog, endpoint, { nativeVms = [], re
           }).ok,
       ),
   )
-  return withoutFableModels({
+  return filterHostedModels({
     object: 'list',
     data: [...native, ...gatewayModels(endpoint)],
     source: isGatewayOnlyRecord(record) ? 'local_gateway' : 'hybrid',

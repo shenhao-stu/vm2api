@@ -87,6 +87,12 @@ export type ModelPolicy = {
 }
 
 export type PolicyPayload = {
+  temporary_access?: {
+    model: string
+    starts_at: string
+    ends_at: string
+    active: boolean
+  }
   policy?: ModelPolicy
   models?: ModelEntry[]
   effective?: { id: string }[]

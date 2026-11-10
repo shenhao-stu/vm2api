@@ -56,7 +56,7 @@ import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from './lib/pool/api-scheduler.mjs'
 import { resolveInferenceBackend } from './lib/pool/api-protocol.mjs'
 import { assertHybridKeyScope, hybridModelCatalog, isHybridKey } from './lib/pool/local-gateway-policy.mjs'
-import { isGatewayOnlyRecord, withoutFableModels } from './lib/protocol/hosted-model-policy.mjs'
+import { isGatewayOnlyRecord, filterHostedModels } from './lib/protocol/hosted-model-policy.mjs'
 import { bootApiKernel, apiKernelPaths, apiKernelSnapshot } from './lib/transport/api-kernel-client.mjs'
 import { PanelUserStore } from './lib/admin/panel-users.mjs'
 import { RequestLogStore } from './lib/admin/request-log.mjs'
@@ -1291,11 +1291,11 @@ const server = http.createServer(async (req, res) => {
       if (!requireAuth(req, res)) return
       const groupType = keyScopeFromRequest(req).group_type
       if (resolveInferenceBackend(req) === 'api') {
-        return json(res, 200, withoutFableModels(apiScheduler.catalog({ groupType })))
+        return json(res, 200, filterHostedModels(apiScheduler.catalog({ groupType })))
       }
       const result = isGatewayOnlyRecord(req.apiKeyRecord)
         ? { object: 'list', data: [] }
-        : withoutFableModels(await fetchWorkerModels({ groupType: keyScopeFromRequest(req).group_type }))
+        : filterHostedModels(await fetchWorkerModels({ groupType: keyScopeFromRequest(req).group_type }))
       if (isHybridKey(req)) {
         assertHybridKeyScope(req.apiKeyRecord)
         const scope = keyScopeFromRequest(req)

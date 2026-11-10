@@ -9,6 +9,7 @@
  */
 
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { FABLE_52_ID, fablePromotionActive, isFable52 } from './fable-promotion.mjs'
 import {
   CONTEXT_1M_BETA,
   DEFAULT_CONTEXT_1M_WHITELIST,
@@ -378,6 +379,22 @@ export function seedDefaultPolicy() {
     aliases: [FABLE_51_LEGACY_ID],
   })
 
+  add(FABLE_52_ID, {
+    display_name: 'Fable 5.2',
+    family: 'fable',
+    sort: 42,
+    capabilities: CAP_ADAPTIVE_ONLY,
+    betas: { pass_context_1m: false },
+    params: {
+      max_tokens_default: 32000,
+      max_tokens_cap: 128000,
+      on_adaptive: 'passthrough',
+      on_enabled: 'convert_to_adaptive',
+      default_effort: 'high',
+    },
+    aliases: ['claude-fable-5.2'],
+  })
+
   add('auto', {
     display_name: 'Auto',
     family: 'auto',
@@ -491,7 +508,7 @@ export function normalizePolicy(raw) {
   ]
   if ('id' in models[OPUS_55_ID]) models[OPUS_55_ID].id = OPUS_55_ID
   for (const [id, cfg] of Object.entries(models)) {
-    if (cfg.params?.on_enabled === 'convert_to_adaptive' && id !== OPUS_55_ID) {
+    if (cfg.params?.on_enabled === 'convert_to_adaptive' && id !== OPUS_55_ID && id !== FABLE_52_ID) {
       cfg.params = { ...cfg.params, on_enabled: 'passthrough' }
     }
     if (typeof cfg.betas?.pass_context_1m !== 'boolean') {
@@ -724,7 +741,8 @@ export function getModelEntry(modelId = '') {
 }
 
 export function isModelEnabled(modelId = '') {
-  return getModelEntry(modelId).enabled !== false
+  const entry = getModelEntry(modelId)
+  return entry.enabled !== false && (!isFable52(entry.id) || fablePromotionActive())
 }
 
 export function getCapabilities(modelId = '') {
@@ -881,8 +899,13 @@ export function applyModelRequestRules(body = {}) {
     return applyHaiku55Thinking(body)
   }
   const opus55 = isOpus55Model(body.model)
-  if (!opus55 && canonical !== SONNET_55_ID) return body
-  if (canonical === OPUS_55_ID || canonical === SONNET_55_ID) body.model = canonical
+  if (!opus55 && canonical !== SONNET_55_ID && canonical !== FABLE_52_ID) return body
+  if (canonical === OPUS_55_ID || canonical === SONNET_55_ID || canonical === FABLE_52_ID) body.model = canonical
+  if (canonical === FABLE_52_ID) {
+    delete body.temperature
+    delete body.top_p
+    delete body.top_k
+  }
   if (body.thinking && typeof body.thinking === 'object') {
     const type = String(body.thinking.type || '').toLowerCase()
     if (type === 'disabled' || type === 'enabled' || body.thinking.budget_tokens != null) {
@@ -949,7 +972,7 @@ export function unofficialMimicryBetaHeader(modelId = '') {
 export function getPolicyCatalogIds({ enabledOnly = false } = {}) {
   if (!loaded) loadModelPolicy()
   return Object.entries(policy.models || {})
-    .filter(([id, cfg]) => isCatalogModelId(id) && (!enabledOnly || cfg.enabled !== false))
+    .filter(([id]) => isCatalogModelId(id) && (!enabledOnly || isModelEnabled(id)))
     .map(([id]) => id)
 }
 

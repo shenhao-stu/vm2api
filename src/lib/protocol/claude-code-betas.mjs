@@ -31,12 +31,14 @@ export const BETA_DANGEROUS_TOOL_USE = 'dangerous-tool-use-2026-09-03'
 export const BETA_INLINE_TOOLS = 'inline-tools-2026-09-15'
 
 const PER_TURN_MODELS = {
+  'claude-fable-5-2': true,
   'claude-haiku-5-5': true,
   'claude-sonnet-5-5': true,
   'claude-opus-5-5': true,
   'claude-fable-5-1': true,
 }
 const MID_TOOL_CHANGE_MODELS = {
+  'claude-fable-5-2': true,
   'claude-haiku-5-5': true,
   'claude-sonnet-5-5': true,
   'claude-opus-4-8': true,
@@ -52,6 +54,7 @@ const FAST_MODE_MODELS = {
   'claude-opus-5-5': true,
 }
 const MID_OUTPUT_CONFIG_MODELS = {
+  'claude-fable-5-2': true,
   'claude-haiku-5-5': true,
   'claude-sonnet-5-5': true,
   'claude-opus-5': true,

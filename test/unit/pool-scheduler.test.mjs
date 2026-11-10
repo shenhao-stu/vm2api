@@ -3349,3 +3349,37 @@ test('final admission rejects a remote health failure observed after candidate s
   assert.equal(pool.reserve(candidate), null)
   assert.equal(pool.inflight.get(candidate.accountId) || 0, 0)
 })
+
+test('promotional Pro Fable keeps one concurrency, queues tools, and frees cancelled waiters', async (t) => {
+  t.mock.method(Date, 'now', () => Date.parse('2026-11-10T00:00:00Z'))
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.unlinkSync(path.join(root, 'vms', 'vm-02.json'))
+  writeTier(root, 'vm-01', 'pro')
+  const file = path.join(root, 'vms', 'vm-01.json')
+  const vm = JSON.parse(fs.readFileSync(file))
+  vm.policy.maxConcurrency = 1
+  fs.writeFileSync(file, JSON.stringify(vm))
+  const pool = scheduler(root, {
+    stickyRouter: { resolve: () => ({ vmId: 'vm-01', accountId: 'account-1' }), unbind() {} },
+  })
+  pool.config.fallback_wait_timeout_ms = 1000
+  pool.config.sticky_wait_timeout_ms = 1000
+  const model = 'claude-fable-5-2'
+  const held = await pool.selectAndReserve({ model, allowWait: false })
+  assert.equal(held.ok, true)
+  assert.equal(pool.inflight.get('account-1'), 1)
+  const controller = new AbortController()
+  const pending = pool.selectAndReserve({ model, stickyKey: 'fable-tools', signal: controller.signal })
+  setImmediate(() => controller.abort())
+  await pending.catch((error) => assert.match(error.name + error.message, /abort|cancel/i))
+  assert.equal(pool.inflight.get('account-1'), 1)
+  const continuation = pool.selectAndReserve({ model, stickyKey: 'fable-tools' })
+  setImmediate(() => held.release())
+  const selected = await continuation
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-01')
+  assert.equal(pool.inflight.get('account-1'), 1)
+  selected.release()
+  assert.equal(pool.inflight.get('account-1') || 0, 0)
+})

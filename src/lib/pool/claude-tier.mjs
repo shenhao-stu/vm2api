@@ -10,7 +10,7 @@ function quotaView(vm = {}, quota = {}) {
   }
 }
 
-/** Official /usage listing a Fable model, or a real 7d_oi window, is Max. */
+/** Fable usage is an entitlement signal; promotions can also grant it to Pro. */
 export function hasClaudeFableUsage(vm = {}, quota = {}) {
   const q = quotaView(vm, quota)
   if (q.usage_has_fable != null) return q.usage_has_fable === true
@@ -28,15 +28,13 @@ export function hasClaudeFableUsage(vm = {}, quota = {}) {
   return !isInventedFableWindow(fb, q)
 }
 
-/**
- * Claude-only: official /usage 有 Fable 模型或真实 7d_oi=Max。
- * 落盘 pro / Fable hop 拒绝不能盖掉 usage 里的 Fable。
- * Shared by the panel and the pool picker so they cannot drift.
- */
+/** Explicit Pro must survive temporary Fable access, including refusal-guard scoping. */
 export function inferClaudeTier(vm = {}, quota = {}) {
   const hasToken = !!(vm.has_token || vm.has_access)
   if (!hasToken) return { key: 'none', label: null }
   const q = quotaView(vm, quota)
+  if ([vm.account_tier, quota.account_tier].some((tier) => String(tier || '').toLowerCase() === 'pro'))
+    return { key: 'pro', label: 'Pro' }
   if (q.usage_has_fable === false) return { key: 'pro', label: 'Pro' }
   const stored = String(vm.account_tier || quota.account_tier || '').toLowerCase()
   if (hasClaudeFableUsage(vm, quota) || stored === 'max') {

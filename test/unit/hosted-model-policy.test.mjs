@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { hostedModelDenial, isFableModel, withoutFableModels } from '../../src/lib/protocol/hosted-model-policy.mjs'
+import { hostedModelDenial, isFableModel, filterHostedModels } from '../../src/lib/protocol/hosted-model-policy.mjs'
 import { getModelPolicy } from '../../src/lib/protocol/model-policy.mjs'
 import { ApiScheduler } from '../../src/lib/pool/api-scheduler.mjs'
 import { handleUserCountTokens } from '../../src/lib/protocol/user-count-tokens.mjs'
@@ -16,7 +16,7 @@ test('Fable policy rejects literal, provider-prefixed and configured aliases in 
       assert.equal(hostedModelDenial(null, id).code, 'model_disabled')
     }
     assert.equal(isFableModel('claude-sonnet-4-6'), false)
-    assert.deepEqual(withoutFableModels({ data: [{ id: 'claude-hidden-family' }, { id: 'gpt-6.1-sol' }] }).data, [
+    assert.deepEqual(filterHostedModels({ data: [{ id: 'claude-hidden-family' }, { id: 'gpt-6.1-sol' }] }).data, [
       { id: 'gpt-6.1-sol' },
     ])
   } finally {

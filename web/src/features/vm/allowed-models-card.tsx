@@ -62,8 +62,8 @@ function allowedListOf(vm: Vm): string[] | null {
   return Array.isArray(a) && a.length ? a : null
 }
 
-function isChecked(vm: Vm, id: string) {
-  if (isFableId(id) && claudeTier(vm).key === 'pro') return false
+function isChecked(vm: Vm, id: string, locked: boolean) {
+  if (locked) return false
   const allowed = allowedListOf(vm)
   if (!allowed) return true
   return allowed.some((a) => matchesAllowedModel(id, a))
@@ -81,7 +81,17 @@ export function AllowedModelsCard({ vm }: { vm: Vm }) {
   const policy = useQuery({
     ...modelPolicyQueryOptions(gpt ? 'openai' : 'anthropic'),
     enabled: canEdit,
+    refetchInterval: 30_000,
   })
+  const offer = policy.data?.temporary_access
+  const locked = (id: string) =>
+    pro &&
+    isFableId(id) &&
+    !(
+      offer?.active &&
+      offer.model === id &&
+      Date.now() < Date.parse(offer.ends_at)
+    )
   const items = [
     ...catalogForVm(catalogFrom(policy.data), vm),
     ...(gpt
@@ -115,18 +125,16 @@ export function AllowedModelsCard({ vm }: { vm: Vm }) {
       next = items
         .map((m) => m.id)
         .filter((mid) => {
-          if (pro && isFableId(mid)) return false
+          if (locked(mid)) return false
           if (mid === id) return checked
           return true
         })
     } else {
       next = toggleAllowedModel(current, id, checked)
-      if (pro) next = next.filter((a) => !isFableId(a))
+      next = next.filter((a) => !locked(a))
     }
     // selecting everything is the same as inheriting — store null, not a full list
-    const expected = items
-      .filter((m) => !(pro && isFableId(m.id)))
-      .map((m) => m.id)
+    const expected = items.filter((m) => !locked(m.id)).map((m) => m.id)
     const covers =
       expected.length &&
       expected.every((mid) => next.some((a) => matchesAllowedModel(mid, a)))
@@ -145,7 +153,11 @@ export function AllowedModelsCard({ vm }: { vm: Vm }) {
               ? '未限制，继承 GPT 模型矩阵'
               : '未限制，继承全局模型矩阵'
             : '仅下列模型可打入此凭证'}
-          {pro && !gpt ? ' · Pro 账号无 Fable' : ''}
+          {pro && !gpt
+            ? offer?.active
+              ? ` · Fable 5.2 限时开放至 ${new Date(offer.ends_at).toLocaleString()}，到期自动关闭`
+              : ' · Pro 账号的 Fable 已禁用'
+            : ''}
         </p>
         {!canEdit ? (
           inherit ? null : (
@@ -158,14 +170,14 @@ export function AllowedModelsCard({ vm }: { vm: Vm }) {
         ) : items.length ? (
           <div className='flex flex-wrap gap-x-4 gap-y-2'>
             {items.map((m) => {
-              const locked = pro && isFableId(m.id)
+              const disabled = locked(m.id)
               const id = `slot-model-${m.id}`
               return (
                 <div key={m.id} className='flex items-center gap-2'>
                   <Checkbox
                     id={id}
-                    checked={isChecked(vm, m.id)}
-                    disabled={locked || !canEdit || save.isPending}
+                    checked={isChecked(vm, m.id, disabled)}
+                    disabled={disabled || !canEdit || save.isPending}
                     onCheckedChange={(v) => toggle(m.id, v === true)}
                   />
                   <Label

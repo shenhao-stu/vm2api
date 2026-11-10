@@ -81,6 +81,12 @@ import { listOfficialModels, seedModelCatalog } from '../protocol/models.mjs'
 import { jevUsageStorageErrors } from '../protocol/jev-usage.mjs'
 import { getModelPolicy, saveModelPolicy, resetModelPolicy, listPolicyModels } from '../protocol/model-policy.mjs'
 import {
+  FABLE_52_ID,
+  FABLE_PROMOTION_START,
+  FABLE_PROMOTION_END,
+  fablePromotionActive,
+} from '../protocol/fable-promotion.mjs'
+import {
   getGptModelPolicy,
   listGptPolicyModels,
   listImageToolModels,
@@ -5267,6 +5273,12 @@ export function createPanelHandler(ctx) {
             models: listPolicyModels(),
             effective: listOfficialModels(),
             platform: 'anthropic',
+            temporary_access: {
+              model: FABLE_52_ID,
+              starts_at: new Date(FABLE_PROMOTION_START).toISOString(),
+              ends_at: new Date(FABLE_PROMOTION_END).toISOString(),
+              active: fablePromotionActive(),
+            },
           }),
         )
       }

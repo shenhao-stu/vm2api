@@ -36,6 +36,7 @@ import { unitCircuit } from './unit-circuit.mjs'
 import { isSlotProxyDesynced, readWorkerProxyEndpoint, readWorkerEgressMode } from '../vm/vm-runtime.mjs'
 import { splitBlocksModel } from './weekly-split.mjs'
 import { slotAllowsModel } from './slot-model-gate.mjs'
+import { fablePromotionActive, isFable52 } from '../protocol/fable-promotion.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { detectInboundPlatform } from '../protocol/platform-detect.mjs'
 import { resolveCredentialScheduleLevel } from './credential-weight.mjs'
@@ -232,7 +233,8 @@ function byVmHas(candidates, vmId) {
 function emptyPoolFailure(model, candidates, now = Date.now()) {
   const quota = candidates?.quotaRejections || []
   if (quota.length && !candidates.otherRejections) return quotaPoolFailure(quota, now)
-  if (isFableModel(model)) return { reason: 'fable_requires_max', retry_after_ms: null }
+  if (isFableModel(model) && !(isFable52(model) && fablePromotionActive(now)))
+    return { reason: isFable52(model) ? 'model_disabled' : 'fable_requires_max', retry_after_ms: null }
   if ((candidates?.rejections?.quota_guard_request_too_large || 0) > 0) {
     return { reason: 'quota_guard_request_too_large', retry_after_ms: null }
   }

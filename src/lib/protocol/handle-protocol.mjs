@@ -2177,10 +2177,11 @@ export function createHandleProtocol(deps) {
 
     if (result?.localDenial) {
       const { status, body } = result.localDenial
+      const modelDenied = body.error.code === 'model_disabled'
       stats.errors++
       Object.assign(logBag, {
-        via: 'refusal-guard',
-        final_state: status === 403 ? 'refusal_session_isolated' : 'rejected',
+        via: modelDenied ? 'model-policy' : 'refusal-guard',
+        final_state: status === 403 && !modelDenied ? 'refusal_session_isolated' : 'rejected',
         error_code: body.error.code,
         error_message: body.error.message,
         attempt_count: result.attemptCount,

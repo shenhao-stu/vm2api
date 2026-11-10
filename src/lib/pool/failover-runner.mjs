@@ -1,3 +1,5 @@
+import { hostedFableDenial } from '../protocol/hosted-model-policy.mjs'
+import { isFable52 } from '../protocol/fable-promotion.mjs'
 import {
   classifyUpstreamResult,
   isFableModel,
@@ -891,6 +893,14 @@ export class FailoverRunner {
           ...attribution(),
         }
       }
+      if (!selected?.ok && selected?.reason === 'model_disabled') {
+        return {
+          ok: false,
+          status: 403,
+          body: { type: 'error', error: { type: 'permission_error', ...hostedFableDenial(model) } },
+          ...attribution(),
+        }
+      }
       if (!selected?.ok) {
         const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
         if (selected.reason === 'pool_egress_unavailable') return { ...exhausted, ...attribution() }
@@ -979,6 +989,25 @@ export class FailoverRunner {
               replaceSession: !!attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId,
             },
           )
+        }
+        // Recheck after queueing and async preparation; never dispatch an expired offer.
+        const promotionDenial = (isFable52(model) || isFable52(body?.model)) && hostedFableDenial(body?.model || model)
+        if (promotionDenial) {
+          this.attemptsRepo?.complete?.(requestId, attemptNo, {
+            errorScope: 'request',
+            action: 'stop',
+            terminalState: 'local_rejection',
+            latencyMs: Date.now() - attemptStarted,
+          })
+          releaseStickySlots()
+          return {
+            ok: false,
+            localDenial: {
+              status: 403,
+              body: { type: 'error', error: { type: 'permission_error', ...promotionDenial } },
+            },
+            ...attribution(),
+          }
         }
         dispatched = true
         result = await callAttempt({

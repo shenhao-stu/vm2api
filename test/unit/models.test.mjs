@@ -1,3 +1,4 @@
+import { fablePromotionActive } from '../../src/lib/protocol/fable-promotion.mjs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
@@ -104,7 +105,7 @@ test('seed catalog matches the console model-policy matrix including opus-5', ()
   assert.equal(validateOfficialModel('claude-fable-5-1').model, 'claude-fable-5-1')
   assert.equal(validateOfficialModel('claude-fable-5.1').model, 'claude-fable-5-1')
   assert.equal(validateOfficialModel('anthropic/claude-fable-5.1').model, 'claude-fable-5-1')
-  assert.equal(validateOfficialModel('fable').model, 'claude-fable-5-1')
+  assert.equal(validateOfficialModel('fable').model, fablePromotionActive() ? 'claude-fable-5-2' : 'claude-fable-5-1')
   assert.equal(validateOfficialModel('claude-fable-5.1[1m]').model, 'claude-fable-5-1')
   assert.equal(validateOfficialModel('claude-fable-5.1[1m]').want1m, true)
   clearModelsCache()

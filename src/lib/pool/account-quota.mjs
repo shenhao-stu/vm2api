@@ -754,7 +754,7 @@ export class AccountQuota {
     const oi = (account === undefined ? this.repo.get(accountId) : account)?.unified?.['7d_oi']
     if (!oi) return false
     const status = String(oi.status || '').toLowerCase()
-    if (status !== 'rejected' && status !== 'rate_limited') return false
+    if (status !== 'rejected' && status !== 'rate_limited' && !(Number(oi.utilization) >= 1)) return false
     const resetMs = parseResetMs(oi.reset)
     if (Number.isFinite(resetMs) && resetMs <= now) return false
     return true
