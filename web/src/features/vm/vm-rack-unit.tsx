@@ -6,6 +6,7 @@ import { fmtNum, fmtUsd } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { slotCredentialLabel } from '@/lib/vm-kind'
 import { vmCostLedger } from '@/lib/vm-usage'
+import { CodexCreditBalance } from '@/features/vm/codex-credit-balance'
 import { RISK_SOLID, riskFg, riskLevel } from '@/features/vm/usage-meter'
 import {
   BLADE_STATE_CLASS,
@@ -144,6 +145,7 @@ export const VmUnit = memo(function VmUnit({
           </span>
         </span>
       ) : null}
+      <CodexCreditBalance vm={vm} now={now} className='col-span-2' />
       <div className='hairline-t col-span-2 mt-0.5 flex items-center gap-1 pt-1 text-[10.5px] text-muted-foreground'>
         <VmSeats vm={vm} compact />
         <BladeControls vm={vm} />

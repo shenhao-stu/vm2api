@@ -23,6 +23,7 @@ import {
 import { vmTotalCost, vmTotalTokens } from '@/lib/vm-usage'
 import { StatusMark } from '@/components/status-mark'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
+import { CodexCreditBalance } from '@/features/vm/codex-credit-balance'
 import { runtimeTypeLabel, runtimeTypeOf } from '@/features/vm/machine-spec'
 import {
   SchedulableSwitch,
@@ -469,6 +470,7 @@ export const VmBlade = memo(function VmBlade({
       ) : state === 'unprobed' ? (
         <div className='grid min-w-0 content-start gap-1.5'>
           <BladeCallout vm={vm} accounts={accounts} state={state} />
+          <CodexCreditBalance vm={vm} now={now} />
           <QuotaRow vm={vm} now={now} />
         </div>
       ) : (

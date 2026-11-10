@@ -165,6 +165,7 @@ describe('vmWindows', () => {
   it('adds Fable only on Max, after 5H and 7D', () => {
     const max = vmWindows(
       vm({
+        subscription_type: 'max',
         usage_has_fable: true,
         utilization_7d_oi: 0.3,
         reset_7d_oi: '2099-01-01T00:00:00Z',
@@ -172,9 +173,11 @@ describe('vmWindows', () => {
     )
     expect(max.map((w) => w.key)).toEqual(['5h', '7d', 'fable'])
     expect(max[2].pct).toBe(30)
-    expect(vmWindows(vm({ usage_has_fable: false })).map((w) => w.key)).toEqual(
-      ['5h', '7d']
-    )
+    expect(
+      vmWindows(vm({ subscription_type: 'pro', usage_has_fable: false })).map(
+        (w) => w.key
+      )
+    ).toEqual(['5h', '7d'])
   })
 
   it('reports an unprobed or tokenless window as null, not 0%', () => {
