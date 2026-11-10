@@ -11,7 +11,11 @@ additional requirement, including pinned diagnostic traffic and queued requests.
 
 Plan identity comes from the account's explicit OAuth profile, independently of
 which models appear in usage. Temporary Fable access must never relabel Pro as
-Max. The Fable allowance is its separate `seven_day_overage_included` window;
+Max. Account and organization IDs fence delayed identity updates; importing a
+new account does not inherit the previous account's subscription. The console
+model editor uses the same pure promotion policy as native dispatch, including
+a fresh deadline check at save time. Cards, details and the pool overview share
+the measured Fable window reader; unknown usage remains unknown. The Fable allowance is its separate `seven_day_overage_included` window;
 50% of the aggregate weekly meter is not an exhaustion test.
 
 Use the existing native reset-credit endpoints. The optional maintenance job
