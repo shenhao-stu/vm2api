@@ -1880,6 +1880,47 @@ test('session queue timeout defaults to 15 minutes and reloads over the default'
   assert.equal(runner.config.session_queue_timeout_ms, 0)
 })
 
+for (const slowHop of [false, true]) {
+  test(`initial admission does not spend retry time, while a ${slowHop ? 'slow' : 'fast'} failed hop does`, async (t) => {
+    t.mock.timers.enable({ apis: ['Date'], now: 10_000 })
+    const scheduler = new Scheduler([candidate(1), candidate(2)])
+    const select = scheduler.selectAndReserve.bind(scheduler)
+    const deadlines = []
+    scheduler.selectAndReserve = async (args) => {
+      deadlines.push({ deadline: args.deadline, capacityDeadline: args.capacityDeadline })
+      if (deadlines.length === 1) t.mock.timers.tick(200)
+      return select(args)
+    }
+    const runner = new FailoverRunner({
+      scheduler,
+      config: { total_retry_deadline_ms: 100, session_queue_timeout_ms: 1000 },
+    })
+    let calls = 0
+    const result = await runner.run({
+      requestId: 'admission-retry',
+      model: 'claude-test',
+      seatKey: 'seat:admission-retry',
+      canonicalBody: { model: 'claude-test' },
+      callAttempt: () => {
+        if (++calls > 1) return success()
+        t.mock.timers.tick(slowHop ? 101 : 1)
+        return {
+          ok: false,
+          status: 529,
+          upstreamExecutions: 0,
+          terminalState: 'rejected',
+          body: { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } },
+        }
+      },
+    })
+    assert.equal(deadlines[0].deadline, 11_000)
+    assert.equal(deadlines[0].capacityDeadline, 11_000)
+    assert.equal(calls, slowHop ? 1 : 2)
+    assert.equal(result.ok, !slowHop)
+    if (!slowHop) assert.deepEqual(deadlines[1], { deadline: 10_300, capacityDeadline: null })
+  })
+}
+
 test('a same-session waiter times out without starting or overlapping the holder', async () => {
   const scheduler = new Scheduler([candidate(1)])
   const runner = new FailoverRunner({ scheduler, config: { session_queue_timeout_ms: 40 } })

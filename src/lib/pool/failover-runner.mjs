@@ -58,9 +58,8 @@ const DEFAULTS = {
   max_account_switches: 10,
   max_total_attempts: 12,
   total_retry_deadline_ms: 120000,
-  // Same-session serialization waits out the previous turn. Cap a wedged tail
-  // so the queue cannot sit forever. 0 disables the cap. Long enough that a
-  // normal generation still runs serially; keepalive covers the Cloudflare wait.
+  // Bound both session serialization and initial seat admission. Neither wait
+  // spends the upstream retry budget. 0 disables this queue timeout.
   session_queue_timeout_ms: 900_000,
   delivery_mode: 'realtime',
   max_same_account_retries: 1,
@@ -682,14 +681,17 @@ export class FailoverRunner {
     if (!this.scheduler) throw new Error('FailoverRunner requires a scheduler')
     if (typeof callAttempt !== 'function') throw new Error('FailoverRunner requires callAttempt')
     const startedAt = Date.now()
+    const retryMs = Number(this.config.total_retry_deadline_ms || 120000)
     const budget = new AttemptCoordinator({
       maxSameUnitRetries: Number(this.config.max_same_account_retries ?? 1),
       maxUnitSwitches: Number(this.config.max_account_switches ?? 10),
       maxTotalAttempts: Number(this.config.max_total_attempts ?? 12),
-      deadlineMs: Number(this.config.total_retry_deadline_ms || 120000),
+      deadlineMs: retryMs,
       startedAt,
     })
-    const deadline = budget.deadline
+    let admitted = !seatKey || !!pinVmId || skipSessionSeat
+    const queueMs = Number(this.config.session_queue_timeout_ms)
+    const admissionDeadline = queueMs > 0 ? startedAt + queueMs : Number.POSITIVE_INFINITY
     const excluded = budget.excluded
     // Accounts left only because the kernel had no free slot; their pins stay.
     const spilled = budget.spilled
@@ -807,6 +809,7 @@ export class FailoverRunner {
 
     for (;;) {
       const attemptNo = ++attemptSerial
+      const deadline = admitted ? budget.deadline : admissionDeadline
       if (signal?.aborted || isClientCancelledResult(lastResult)) {
         return { ...clientCancelledResult(lastResult || {}), via: 'pool-failover', ...attribution() }
       }
@@ -835,6 +838,7 @@ export class FailoverRunner {
           spilled,
           signal,
           deadline: repairPending ? Math.max(deadline, Date.now() + REPAIR_HOP_WAIT_MS) : deadline,
+          capacityDeadline: admitted ? null : admissionDeadline,
           pinVmId,
           familyVmId,
           deviceVmId: currentDeviceVmId,
@@ -905,6 +909,10 @@ export class FailoverRunner {
         const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
         if (selected.reason === 'pool_egress_unavailable') return { ...exhausted, ...attribution() }
         return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
+      }
+      if (!admitted) {
+        admitted = true
+        budget.deadline = Date.now() + retryMs
       }
       repairPending = false
       snapshotPins()

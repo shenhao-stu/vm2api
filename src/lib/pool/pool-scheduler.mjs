@@ -681,6 +681,7 @@ export class PoolScheduler extends EventEmitter {
     avoid = null,
     signal,
     deadline = null,
+    capacityDeadline = null,
     allowWait = true,
     familyVmId = null,
     deviceVmId = null,
@@ -691,6 +692,7 @@ export class PoolScheduler extends EventEmitter {
   } = {}) {
     const startedAt = Date.now()
     const failoverDeadline = Number(deadline) || Number.POSITIVE_INFINITY
+    const queueUntil = (timeoutMs) => Math.min(failoverDeadline, capacityDeadline ?? Date.now() + timeoutMs)
     const familyVm = familyVmId ? String(familyVmId).trim() : ''
     const machineKey = String(deviceKey || '').trim()
     const deviceVmOf = () => this.machineHome(machineKey) || String(deviceVmId || '').trim()
@@ -765,7 +767,7 @@ export class PoolScheduler extends EventEmitter {
         // A full home is still a candidate, so that wait keeps its sticky clock.
         if (ticket?.kind === 'seat' && ticket.vmId && !byVm.has(ticket.vmId)) {
           this.planner.toGlobal(ticket)
-          ticket.deadline = Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms)
+          ticket.deadline = queueUntil(this.config.fallback_wait_timeout_ms)
         }
         let seat = this.planner.seatOf(seatKey)
         if (seat) {
@@ -805,7 +807,8 @@ export class PoolScheduler extends EventEmitter {
               kind: 'conc',
               vmId: seat.vmId,
               candidates: byVm,
-              deadline: Math.min(failoverDeadline, now + this.config.sticky_wait_timeout_ms),
+              deadline: queueUntil(this.config.sticky_wait_timeout_ms),
+              capacityDeadline,
             })
           } else if (ticket.kind !== 'conc' || ticket.vmId !== seat.vmId) {
             this.planner.place(ticket, { kind: 'conc', vmId: seat.vmId })
@@ -854,6 +857,7 @@ export class PoolScheduler extends EventEmitter {
                   kind: 'seat',
                   vmId: home.vmId,
                   candidates: byVm,
+                  capacityDeadline,
 
                   stickyUntil:
                     sticky.vmId === home.vmId
@@ -866,12 +870,13 @@ export class PoolScheduler extends EventEmitter {
                   kind: 'global',
                   vmId: null,
                   candidates: byVm,
-                  deadline: Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms),
+                  deadline: queueUntil(this.config.fallback_wait_timeout_ms),
+                  capacityDeadline,
                 })
           } else if (ticket.kind === 'conc') {
             // Its seat moved away: wait for a new seat on the same terms as a new device.
             this.planner.place(ticket, { kind: 'global', vmId: null })
-            ticket.deadline = Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms)
+            ticket.deadline = queueUntil(this.config.fallback_wait_timeout_ms)
           }
           for (const vmId of ticket.vmId ? [ticket.vmId] : byVm.keys()) this.planner.pump(vmId)
         }
@@ -883,7 +888,7 @@ export class PoolScheduler extends EventEmitter {
         if (after >= ticket.deadline) return fail('pool_queue_timeout')
         if (ticket.kind === 'seat' && after >= ticket.stickyUntil) {
           this.planner.toGlobal(ticket)
-          ticket.deadline = Math.min(failoverDeadline, after + this.config.fallback_wait_timeout_ms)
+          ticket.deadline = queueUntil(this.config.fallback_wait_timeout_ms)
           continue
         }
       }
@@ -990,7 +995,7 @@ export class PoolScheduler extends EventEmitter {
     }
   }
 
-  enqueueTicket({ seatKey, kind, vmId, candidates, deadline, stickyUntil = null }) {
+  enqueueTicket({ seatKey, kind, vmId, candidates, deadline, stickyUntil = null, capacityDeadline = null }) {
     if (this.queuedTotal() >= this.config.queue_max) throw this.queueFullError([...candidates.keys()])
     const ticket = {
       seatKey,
@@ -999,6 +1004,7 @@ export class PoolScheduler extends EventEmitter {
       candidates,
       deadline,
       stickyUntil,
+      capacityDeadline,
 
       enqueuedAt: Date.now(),
       queued: false,

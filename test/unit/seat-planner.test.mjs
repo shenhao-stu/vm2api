@@ -105,6 +105,128 @@ const seat = (pool, session, extra = {}) =>
 /** Planner key for a platform-scope session seat. */
 const planned = (session) => `platform|seat:sess:${session}`
 
+test('a bound tool continuation queues beyond the retry budget without moving accounts', async (t) => {
+  const pool = setup(
+    t,
+    [
+      { id: 'vm-01', policy: { sessionSlots: 10, maxConcurrency: 1 } },
+      { id: 'vm-02', policy: { sessionSlots: 10, maxConcurrency: 1 } },
+    ],
+    { sticky: 30 },
+  )
+  const sticky = new StickyRouter({ dataDir: pool.projectRoot, config: { sticky: { enabled: true } } })
+  pool.stickyRouter = sticky
+  t.after(() => sticky.db?.close?.())
+  const stickyKey = sticky.canonicalSessionKey('long-tools')
+  const first = await seat(pool, 'long-tools', { stickyKey })
+  sticky.bind(stickyKey, { accountId: first.accountId, vmId: first.vmId, sessionId: 'original-tool-session' })
+  first.release()
+  const blocker = await seat(pool, 'long-generation', { deviceVmId: first.vmId })
+  t.after(() => blocker.release())
+  const runner = new FailoverRunner({
+    scheduler: pool,
+    stickyRouter: sticky,
+    config: { total_retry_deadline_ms: 50, session_queue_timeout_ms: 2000 },
+  })
+  const body = {
+    model: MODEL,
+    messages: [
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'x'.repeat(600 * 1024) }] },
+    ],
+  }
+  const seen = []
+  const run = () =>
+    runner.run({
+      requestId: `long-tools-${seen.length}`,
+      model: MODEL,
+      stickyKey,
+      seatKey: 'seat:sess:long-tools',
+      canonicalBody: body,
+      callAttempt: async ({ candidate, body: actual }) => {
+        assert.deepEqual(actual, body)
+        assert.equal(pool.inflight.get(candidate.accountId), 1)
+        seen.push(candidate.vmId)
+        return {
+          ok: true,
+          status: 200,
+          terminalState: 'verified',
+          body: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+          },
+        }
+      },
+    })
+  const waiting = run()
+  await waitFor(() => pool.planner.pending() === 1)
+  await new Promise((resolve) => setTimeout(resolve, 150))
+  blocker.release()
+  const result = await waiting
+  assert.equal(result.ok, true, JSON.stringify(result.body?.error))
+  assert.equal((await run()).ok, true)
+  assert.deepEqual(seen, [first.vmId, first.vmId])
+  assert.equal(sticky.resolve(stickyKey).sessionId, 'original-tool-session')
+  assert.equal(pool.queuedTotal(), 0)
+  assert.ok([...pool.inflight.values()].every((n) => n === 0))
+})
+
+for (const kind of ['global', 'held']) {
+  test(`initial ${kind} capacity wait keeps its queue deadline and releases cancellation`, async (t) => {
+    const pool = setup(t, [{ id: 'vm-01', policy: { sessionSlots: 10, maxConcurrency: 1 } }], {
+      sticky: 20,
+      fallback: 20,
+    })
+    const holder = await seat(pool, 'holder')
+    t.after(() => holder.release())
+    const deadline = Date.now() + 2000
+    const controller = new AbortController()
+    const session = kind === 'held' ? 'holder' : 'next'
+    const waiting = seat(pool, session, { deadline, capacityDeadline: deadline, signal: controller.signal })
+    const cancelled = assert.rejects(waiting, { code: 'selection_cancelled' })
+    await waitFor(() => pool.planner.pending() === 1)
+    await new Promise((resolve) => setTimeout(resolve, 65))
+    assert.equal(pool.planner.pending(), 1)
+    assert.equal(pool.inflight.get(holder.accountId), 1)
+    controller.abort()
+    await cancelled
+    holder.release()
+    assert.equal(pool.queuedTotal(), 0)
+    assert.ok([...pool.inflight.values()].every((n) => n === 0))
+  })
+}
+
+test('a global waiter rehomed behind its session retains the initial capacity deadline', async (t) => {
+  const pool = setup(t, [{ id: 'vm-01', policy: { sessionSlots: 10, maxConcurrency: 1 } }], {
+    sticky: 20,
+    fallback: 20,
+  })
+  const holder = await seat(pool, 'holder')
+  const holds = [holder]
+  t.after(() => holds.forEach((hold) => hold.release?.()))
+  const deadline = Date.now() + 2000
+  const first = seat(pool, 'next', { deadline, capacityDeadline: deadline })
+  await waitFor(() => pool.planner.pending() === 1)
+  const controller = new AbortController()
+  const second = seat(pool, 'next', { deadline, capacityDeadline: deadline, signal: controller.signal })
+  const cancelled = assert.rejects(second, { code: 'selection_cancelled' })
+  await waitFor(() => pool.planner.pending() === 2)
+  holder.release()
+  const granted = await first
+  holds.push(granted)
+  assert.equal(granted.ok, true)
+  await new Promise((resolve) => setTimeout(resolve, 65))
+  assert.equal(pool.planner.pending(), 1)
+  assert.equal(pool.inflight.get(holder.accountId), 1)
+  controller.abort()
+  await cancelled
+  granted.release()
+  assert.equal(pool.queuedTotal(), 0)
+  assert.equal(pool.planner.openCount(holder.vmId), 0)
+  assert.ok([...pool.inflight.values()].every((n) => n === 0))
+})
+
 function perVm(holds) {
   const out = {}
   for (const hold of holds) out[hold.vmId] = (out[hold.vmId] || 0) + 1

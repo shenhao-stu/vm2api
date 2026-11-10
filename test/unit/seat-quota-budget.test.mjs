@@ -72,7 +72,7 @@ function fixture(t, { second = null } = {}) {
 
 async function request(pool, { seatKey = 'seat:fresh', ...options } = {}) {
   let calls = 0
-  const result = await new FailoverRunner({ scheduler: pool }).run({
+  const result = await new FailoverRunner({ scheduler: pool, config: { session_queue_timeout_ms: 1000 } }).run({
     requestId: 'seat-budget-consumer',
     canonicalBody: { model: MODEL, messages: [{ role: 'user', content: 'One plus one?' }] },
     model: MODEL,

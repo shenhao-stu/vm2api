@@ -406,7 +406,7 @@ export class SeatPlanner {
     const deadline = Date.now() + this.stickyWaitMs()
     for (const ticket of moved) {
       this.place(ticket, { kind: 'conc', vmId })
-      ticket.deadline = deadline
+      ticket.deadline = ticket.capacityDeadline ?? deadline
       if (!ticket.granted) ticket.wake?.()
     }
     if (moved.length) this.pump(vmId)
