@@ -3137,3 +3137,25 @@ test('a queued Pro request cannot reserve after the promotion expires', (t) => {
   assert.equal(admitted.reserved, true)
   admitted.release()
 })
+
+test('Fable preserves transport cooldown and exhausted account causes without inventing a Max requirement', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeTier(root, 'vm-01', 'max')
+  writeTier(root, 'vm-02', 'max')
+  const runtimeRepo = new RuntimeRepo()
+  runtimeRepo.upsert({ account_id: 'account-1', vm_id: 'vm-01', overload_until: Date.now() + 30_000 })
+  runtimeRepo.upsert({ account_id: 'account-2', vm_id: 'vm-02', rate_limit_reset_at: Date.now() + 60_000 })
+  const selected = await scheduler(root, { runtimeRepo }).selectAndReserve({
+    model: 'claude-fable-5-2',
+    allowWait: false,
+  })
+  assert.equal(selected.reason, 'pool_overload_cooldown')
+  assert.ok(selected.retry_after_ms > 20_000)
+  const exhausted = await scheduler(root).selectAndReserve({
+    model: 'claude-fable-5-2',
+    excluded: new Set(['account-1', 'account-2']),
+    allowWait: false,
+  })
+  assert.equal(exhausted.reason, 'no_eligible_accounts')
+})

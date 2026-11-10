@@ -194,16 +194,19 @@ function quotaPoolFailure(quota, now = Date.now()) {
 }
 
 /**
- * Nothing eligible. Fable keeps its Max gate; otherwise an upstream cooldown on
+ * Only actual entitlement rejections report a plan gate. An upstream cooldown on
  * the dropped accounts names the cause: any 529 overload cooldown is capacity
  * (529), only 429 rate-limit cooldowns are the provider's limit (429). Without
  * either, nothing will come back by waiting (503) — unless every slot is just
  * inside its operator rest window, whose open time rides along as retry_after.
  */
-function emptyPoolFailure(model, candidates, now = Date.now()) {
+function emptyPoolFailure(candidates, now = Date.now()) {
   const quota = candidates?.quotaRejections || []
   if (quota.length && !candidates.otherRejections) return quotaPoolFailure(quota, now)
-  if (isFableModel(model)) return { reason: 'fable_requires_max', retry_after_ms: null }
+  const planDenied = candidates?.rejections?.fable_requires_max || 0
+  if (planDenied > 0 && planDenied === candidates.otherRejections && !quota.length) {
+    return { reason: 'fable_requires_max', retry_after_ms: null }
+  }
   if ((candidates?.rejections?.quota_guard_request_too_large || 0) > 0) {
     return { reason: 'quota_guard_request_too_large', retry_after_ms: null }
   }
@@ -497,7 +500,7 @@ export class PoolScheduler extends EventEmitter {
       const waitCandidates = reserveMisses.length ? effectiveCandidates : candidates
       const waitAvailable = reserveMisses.length ? effectiveAvailable : available
       if (waitCandidates.length === 0) {
-        const empty = emptyPoolFailure(model, candidates)
+        const empty = emptyPoolFailure(candidates)
         return { ...fail(empty.reason, waitCandidates, waitAvailable), ...empty }
       }
       const waitPool = waitCandidates.filter(
@@ -675,7 +678,7 @@ export class PoolScheduler extends EventEmitter {
             const granted = this.openNewSeat(seatKey, candidates, { avoided, stickyVms })
             if (granted) return finish(granted)
             if (!candidates.length) {
-              const empty = emptyPoolFailure(model, candidates)
+              const empty = emptyPoolFailure(candidates)
               return { ...fail(empty.reason), ...empty }
             }
             if (!allowWait || now >= failoverDeadline) return fail('all_accounts_busy')
@@ -896,7 +899,7 @@ export class PoolScheduler extends EventEmitter {
     // Accounts dropped by an upstream 429 / 529 cooldown; an empty pool reports
     // that cause (pool_rate_limited / pool_overload_cooldown) instead of 503.
     candidates.cooldowns = { rate_limited: null, overloaded: null }
-    candidates.rejections = { quota_guard_request_too_large: 0 }
+    candidates.rejections = { quota_guard_request_too_large: 0, fable_requires_max: 0 }
     candidates.quotaRejections = []
     candidates.otherRejections = 0
     // Soonest working-window open across resting slots; an all-rest pool
@@ -929,6 +932,7 @@ export class PoolScheduler extends EventEmitter {
         const quota = quotaRejection(kind, eligibility.until, now)
         if (quota) candidates.quotaRejections.push(quota)
         else candidates.otherRejections += 1
+        if (kind === 'fable_requires_max') candidates.rejections.fable_requires_max += 1
         if (kind === 'rate_limited' || kind === 'overloaded') {
           const until = Number(eligibility.until) || 0
           const prev = candidates.cooldowns[kind]
@@ -1392,7 +1396,7 @@ export class PoolScheduler extends EventEmitter {
   async peekAccount({ model, stickyKey = null, signal, ownerScope = PLATFORM_SCOPE, keyScope = null } = {}) {
     const candidates = await this.eligibleCandidates({ model, signal, ownerScope, keyScope })
     if (!candidates.length) {
-      const empty = emptyPoolFailure(model, candidates)
+      const empty = emptyPoolFailure(candidates)
       return { ok: false, code: empty.reason, ...empty }
     }
     const bound = stickyKey ? this.stickyRouter?.resolve?.(stickyKey) : null
