@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import { createRoutingRuntime } from '../../src/lib/admin/routing-runtime.mjs'
+import { buildRouting } from '../../src/lib/admin/panel-api.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
 import { mockLocalDockerInspect } from '../helpers/local-docker-inspect.mjs'
 
@@ -438,6 +439,28 @@ function persistHarness(root, routingFile, routingConfig) {
     requestLog: { setConfig() {} },
   })
 }
+
+test('Claude reset opt-in round-trips through live routing without restarting kernels', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-claude-reset-'))
+  const file = path.join(root, 'routing.json')
+  const config = { concurrency: {}, tiers: {} }
+  const view = () => buildRouting({ routingConfig: config, stickyRouter: { stats: () => ({}) } }).data
+  try {
+    const runtime = persistHarness(root, file, config)
+    assert.equal(view().claude_reset.enabled, false)
+    for (const enabled of [true, false]) {
+      const applied = await runtime.persistRoutingPatch({ claude_reset: { enabled } })
+      assert.equal(config.claude_reset.enabled, enabled)
+      assert.equal(view().claude_reset.enabled, enabled)
+      assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).claude_reset.enabled, enabled)
+      assert.equal(applied.kernel_reload, 0)
+      assert.equal(applied.kernel_persona, null)
+      assert.equal(applied.telemetry_sync, null)
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
 
 test('loadRoutingConfig normalizes a missing or invalid vm section', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-vm-load-'))

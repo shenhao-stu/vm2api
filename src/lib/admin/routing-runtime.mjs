@@ -451,6 +451,7 @@ export function createRoutingRuntime(ctx) {
       routingConfig.pool = normalizePoolRouting({ ...(routingConfig.pool || {}), ...body.pool })
     }
     if (body.failover) routingConfig.failover = { ...(routingConfig.failover || {}), ...body.failover }
+    if (body.claude_reset) routingConfig.claude_reset = { enabled: body.claude_reset.enabled === true }
     if (body.inference) {
       routingConfig.inference = normalizeInferenceConfig({
         ...(routingConfig.inference || {}),

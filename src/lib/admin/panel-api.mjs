@@ -1497,6 +1497,7 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     official_cc: normalizeOfficialCcConfig(routingConfig?.official_cc),
     health_probe: normalizeHealthProbeConfig(routingConfig?.health_probe),
     usage_probe: normalizeUsageProbeConfig(routingConfig?.usage_probe),
+    claude_reset: { enabled: routingConfig?.claude_reset?.enabled === true },
     notify: publicNotifyConfig(routingConfig?.notify),
     vm: normalizeVmConfig(routingConfig?.vm),
     telemetry: { upload_interval_seconds: telemetryUploadInterval(routingConfig) },
