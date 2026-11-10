@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
-import { canReuseRemoteEgress, remoteEgressContainer } from '../../src/lib/cluster/remote-slot.mjs'
+import { canReuseRemoteEgress, remoteEgressContainer, remoteDnsEmptyTypes } from '../../src/lib/cluster/remote-slot.mjs'
 
 const base = {
   vmId: 'vm-01',
@@ -52,4 +52,31 @@ test('only a healthy helper with the current digest is kept', () => {
     false,
   )
   assert.equal(canReuseRemoteEgress(null, digest), false)
+})
+
+// IPv4-only guests cannot route AAAA results, but libc still waits for that query.
+test('IPv4-only guest DNS disables AAAA while preserving configured overrides', () => {
+  const configured = Object.freeze([64, 65])
+  assert.deepEqual(remoteDnsEmptyTypes({ ipv6: false }, configured), [64, 65, 28])
+  assert.deepEqual(remoteDnsEmptyTypes({ ipv6: false }), [28])
+  assert.deepEqual(remoteDnsEmptyTypes({ ipv6: false }, [28, 64]), [28, 64])
+  assert.deepEqual(configured, [64, 65])
+})
+
+test('IPv6 enabled or unknown networks retain upstream AAAA resolution', () => {
+  for (const network of [{ ipv6: true }, {}]) {
+    const configured = [64, 65]
+    assert.deepEqual(remoteDnsEmptyTypes(network, configured), [64, 65])
+    assert.notEqual(remoteDnsEmptyTypes(network, configured), configured)
+  }
+})
+
+test('adding the IPv4 DNS override invalidates only the affected helper config', () => {
+  const old = remoteEgressContainer({ ...base, host: { uid: 0, gid: 0 } })
+  const body = JSON.stringify({ ...JSON.parse(base.body), dns_empty_types: remoteDnsEmptyTypes({ ipv6: false }) })
+  const next = remoteEgressContainer({ ...base, body, host: { uid: 0, gid: 0 } })
+  assert.notEqual(next.digest, old.digest)
+  const running = { State: { Running: true }, Config: { Labels: old.spec.Labels } }
+  assert.equal(canReuseRemoteEgress(running, next.digest), false)
+  assert.deepEqual(next.spec.HostConfig, old.spec.HostConfig)
 })

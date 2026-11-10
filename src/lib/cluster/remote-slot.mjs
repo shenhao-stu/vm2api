@@ -387,7 +387,7 @@ async function ensureRemoteNetwork(docker, { name, bridge, masquerade, labels = 
   const subnet = info?.IPAM?.Config?.[0]?.Subnet || ''
   if (!subnet) throw Object.assign(new Error(`egress network ${name} has no subnet`), { code: 'egress_network_failed' })
   const gateway = info.IPAM.Config[0].Gateway || gatewayFromSubnet(subnet)
-  return { name, subnet, gateway, bridge }
+  return { name, subnet, gateway, bridge, ipv6: info.EnableIPv6 }
 }
 
 /**
@@ -458,6 +458,10 @@ export function canReuseRemoteEgress(existing, digest) {
   )
 }
 
+export function remoteDnsEmptyTypes(network, configured = []) {
+  return network.ipv6 === false ? [...new Set([...configured, 28])] : [...configured]
+}
+
 /**
  * Build the VM's exit on the node. px-local = shared masquerading bridge (node's
  * own IP, no process). SOCKS = the slot's own non-masquerading bridge + its
@@ -508,7 +512,7 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
   }
   const dnsUpstream = configuredDnsUpstream()
   if (dnsUpstream) cfg.dns_upstream = dnsUpstream
-  const dnsEmptyTypes = configuredDnsEmptyTypes()
+  const dnsEmptyTypes = remoteDnsEmptyTypes(net, configuredDnsEmptyTypes())
   if (dnsEmptyTypes.length) cfg.dns_empty_types = dnsEmptyTypes
   const body = `${JSON.stringify(cfg, null, 2)}\n`
   // Beside the slot tree, outside every guest bind: the guest never sees the proxy password.

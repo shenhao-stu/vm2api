@@ -83,7 +83,7 @@ func TestDNSEmptyTypesOverride(t *testing.T) {
 	for _, enabled := range []bool{true, false} {
 		cfg := Config{ProxyURL: "socks5h://" + socks.Addr().String(), ListenTCP: "127.0.0.1:0", DNSUpstream: upstream.URL}
 		if enabled {
-			cfg.DNSEmptyTypes = []uint16{64, 65}
+			cfg.DNSEmptyTypes = []uint16{28, 64, 65}
 		}
 		srv, err := New(cfg)
 		if err != nil {
@@ -101,7 +101,7 @@ func TestDNSEmptyTypesOverride(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if enabled && (typ == 64 || typ == 65) {
+			if enabled && (typ == 28 || typ == 64 || typ == 65) {
 				assertEmptyOverride(t, query, reply, dnsmessage.RCodeSuccess)
 				if calls.Load() != before {
 					t.Fatal("overridden query reached upstream")
@@ -181,4 +181,71 @@ func TestDNSEmptyTypesOverUDPAndTCP(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertEmptyOverride(t, query, reply, dnsmessage.RCodeSuccess)
+}
+
+// The bound proxy may silently expire an idle tunnel; close it before reuse.
+func TestDoHClosesIdleProxyConnections(t *testing.T) {
+	socks, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socks.Close()
+	for range 2 {
+		go serveTestSOCKS(t, socks)
+	}
+	var connections atomic.Int32
+	closed := make(chan struct{}, 4)
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		body[2] |= 0x80
+		_, _ = w.Write(body)
+	}))
+	upstream.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connections.Add(1)
+		}
+		if state == http.StateClosed {
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		}
+	}
+	upstream.Start()
+	defer upstream.Close()
+	srv, err := New(Config{ProxyURL: "socks5h://" + socks.Addr().String(), ListenTCP: "127.0.0.1:0", DNSUpstream: upstream.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(srv.http.CloseIdleConnections)
+	resolve := func() {
+		t.Helper()
+		query := overrideQuery(t, 1)
+		reply, err := srv.ResolveDNS(context.Background(), query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		query[2] |= 0x80
+		if !bytes.Equal(reply, query) {
+			t.Fatal("DNS answer changed")
+		}
+	}
+	resolve()
+	resolve()
+	if connections.Load() != 1 {
+		t.Fatal("warm queries should reuse one connection")
+	}
+	select {
+	case <-closed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("idle proxy connection was not retired")
+	}
+	resolve()
+	if connections.Load() != 2 {
+		t.Fatal("query after idle must use a fresh connection")
+	}
 }

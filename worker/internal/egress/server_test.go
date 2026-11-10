@@ -549,7 +549,10 @@ func serveTestSOCKSWithTarget(t *testing.T, ln net.Listener, target func(byte, s
 	}
 	defer up.Close()
 	_, _ = c.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0})
-	go func() { _, _ = io.Copy(up, c) }()
+	go func() {
+		_, _ = io.Copy(up, c)
+		_ = up.(*net.TCPConn).CloseWrite()
+	}()
 	_, _ = io.Copy(c, up)
 }
 

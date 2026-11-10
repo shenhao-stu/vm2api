@@ -132,7 +132,8 @@ func New(cfg Config) (*Server, error) {
 				return nil
 			},
 			Transport: &http.Transport{
-				DialContext: dialer.DialContext,
+				DialContext:     dialer.DialContext,
+				IdleConnTimeout: 20 * time.Second,
 			},
 		},
 	}
