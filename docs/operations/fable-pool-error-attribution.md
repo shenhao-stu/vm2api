@@ -53,3 +53,20 @@ Do not fabricate a successful Message or replay an ambiguous dispatch to hide it
 Disabling keepalives globally also requires checking long successful requests
 against intermediate proxy timeouts. Streaming requests should receive explicit
 error events and must not be mistaken for successful billable completions.
+
+The deployed Sub2API companion change (PR 123, `ace6696db`, build g81) delays
+the first nonstreaming keepalive until 90 seconds after trusted server ingress.
+The deadline is shared across header waits, body waits and account selection;
+later keepalives retain the existing interval. A 30-second synthetic failure
+retains HTTP 429, while a 130-second successful response remains one complete
+JSON document with its original usage. Errors after the first keepalive still
+have the HTTP limitation above. Record nonstreaming failures as nonstreaming in
+Ops, rather than inferring stream mode from an already-committed response.
+
+Post-release acceptance used one fresh Fable 5.2 request through Sub2API to a
+shared Pro account: a valid Message and `end_turn` arrived in 3.43 seconds,
+with one native attempt and matching final usage and a single downstream charge.
+Independent natural streaming requests reached verified terminal states. One
+natural request required an existing worker retry; this is not evidence that
+all intermittent transport errors have been eliminated. Keep exact request and
+attempt evidence private, and do not replay historical billable requests.
