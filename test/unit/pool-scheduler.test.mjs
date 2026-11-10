@@ -3159,3 +3159,86 @@ test('Fable preserves transport cooldown and exhausted account causes without in
   })
   assert.equal(exhausted.reason, 'no_eligible_accounts')
 })
+
+for (const committed of [false, true]) {
+  test(`Fable single-slot connection failure keeps its cause after dispatch (committed=${committed})`, async (t) => {
+    const root = project()
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    fs.unlinkSync(path.join(root, 'vms', 'vm-02.json'))
+    const pool = scheduler(root)
+    const runner = new FailoverRunner({
+      scheduler: pool,
+      config: { max_same_account_retries: 0, same_account_retry_delay_ms: 0 },
+    })
+    let calls = 0
+    const result = await runner.run({
+      requestId: 'fable-connection-failure',
+      canonicalBody: { model: 'claude-fable-5-2', messages: [{ role: 'user', content: 'synthetic' }] },
+      model: 'claude-fable-5-2',
+      callAttempt: () => {
+        calls++
+        return {
+          ok: false,
+          status: 502,
+          committed,
+          terminalState: 'incomplete',
+          body: {
+            type: 'error',
+            error: { type: 'api_error', code: 'upstream_network_error', message: 'Connection error.' },
+          },
+        }
+      },
+    })
+    assert.equal(calls, 1, 'an exhausted single-slot key must not replay the dispatch')
+    assert.equal(result.status, 502)
+    assert.equal(result.body.error.code, 'upstream_network_error')
+    assert.equal(result.finalState, 'incomplete')
+    assert.equal(result.vmId, 'vm-01')
+  })
+}
+
+for (const reason of ['quota_5h_safety', 'quota_7d_safety', 'quota_guard_request_too_large']) {
+  test(`known ${reason} rejects before a remote health hop`, async (t) => {
+    const root = project()
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    let healthCalls = 0
+    const reset = new Date(Date.now() + 3600_000).toISOString()
+    const pool = scheduler(root, {
+      accountQuota: { canAccept: () => ({ ok: false, reason, detail: { reset } }) },
+      workerHealth: async () => {
+        healthCalls++
+        return { ok: true, credential: { has_access: true } }
+      },
+    })
+    const result = await pool.selectAndReserve({ model: 'claude-fable-5-2', allowWait: false })
+    assert.equal(result.ok, false)
+    assert.equal(result.reason, reason)
+    assert.equal(healthCalls, 0, 'a known local rejection must not wait for worker transport')
+  })
+}
+
+test('quota consumed during remote health still prevents reservation', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.unlinkSync(path.join(root, 'vms', 'vm-02.json'))
+  let blocked = false
+  let reservations = 0
+  const gate = () => (blocked ? { ok: false, reason: 'quota_5h_safety' } : { ok: true })
+  const pool = scheduler(root, {
+    accountQuota: {
+      canAccept: gate,
+      tryAcquire: () => {
+        reservations++
+        return gate()
+      },
+    },
+    workerHealth: async () => {
+      blocked = true
+      return { ok: true, credential: { has_access: true } }
+    },
+  })
+  const result = await pool.selectAndReserve({ model: 'claude-fable-5-2', allowWait: false })
+  assert.equal(result.ok, false)
+  assert.equal(reservations, 1)
+  assert.equal(pool.inflight.size, 0)
+})

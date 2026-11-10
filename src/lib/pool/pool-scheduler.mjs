@@ -65,6 +65,7 @@ export const CIRCUIT_OPEN_MIN_MS = 1000
 
 /** A queued request re-reads eligibility this often, so cooldown lifts and new slots reach it. */
 const QUEUE_REFRESH_MS = 2000
+const QUOTA_WAIT_REASONS = new Set(['concurrency_limit', 'rpm_limit', 'quota_band_inflight'])
 
 /** routing.pool defaults. `strategy` only places new seats; see seat-planner.mjs. */
 export const DEFAULT_POOL_ROUTING = Object.freeze({
@@ -1094,6 +1095,13 @@ export class PoolScheduler extends EventEmitter {
       const rest = evaluateActiveHours(activeHoursOf(vm), now, vm.timezone)
       if (!rest.active) return { ok: false, reason: 'rest_period', until: rest.until }
     }
+    // Local rejection needs no remote health hop. reserve() rechecks quota after
+    // health completes, so concurrent usage cannot turn this into an admission bypass.
+    const quotaGate = !pinned && this.accountQuota?.canAccept(accountId, { tier: vmTierOf(vm), quotaRequest })
+    if (quotaGate && !quotaGate.ok && !QUOTA_WAIT_REASONS.has(quotaGate.reason)) {
+      const quota = quotaRejection(quotaGate.reason, quotaGate.detail?.reset, now)
+      return { ok: false, reason: quotaGate.reason || 'quota_gate', ...(quota ? { until: quota.until } : {}) }
+    }
     const workerStatus = await this.getWorkerHealth(this.executionContext(vm, accountId), { signal })
     const cred = evaluateCredentialEligibility({ vm, workerStatus, now })
     if (!cred.ok) return cred
@@ -1163,15 +1171,10 @@ export class PoolScheduler extends EventEmitter {
     }
     let gateZone = null
     if (this.accountQuota && !pinned) {
-      const quotaGate = this.accountQuota.canAccept(accountId, { tier: vmTierOf(vm), quotaRequest })
       if (!quotaGate.ok) {
         if (quotaGate.reason === 'concurrency_limit') markWait('concurrency_limit')
         else if (quotaGate.reason === 'rpm_limit') markWait('rpm_limit', quotaGate.detail?.reset_at)
         else if (quotaGate.reason === 'quota_band_inflight') markWait('quota_band_inflight')
-        else {
-          const quota = quotaRejection(quotaGate.reason, quotaGate.detail?.reset, now)
-          return { ok: false, reason: quotaGate.reason || 'quota_gate', ...(quota ? { until: quota.until } : {}) }
-        }
       }
       gateZone = this.accountQuota.gateZoneOf?.(accountId, { tier: vmTierOf(vm) }) || null
     }
