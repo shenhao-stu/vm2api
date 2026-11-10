@@ -1,3 +1,4 @@
+import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
@@ -40,6 +41,7 @@ function success() {
 
 function harness({ mode = 'rebuild', capacity = 2, agentId = '' } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-summary-'))
+  openDatabase({ dataDir: root })
   const routing = { compatibility: {}, failover: {}, sticky: { enabled: true, outbound_session: mode } }
   const routingFile = path.join(root, 'routing.json')
   fs.writeFileSync(routingFile, JSON.stringify(routing))
@@ -171,7 +173,7 @@ function harness({ mode = 'rebuild', capacity = 2, agentId = '' } = {}) {
       return res
     },
     close() {
-      sticky.db.close()
+      closeDatabase()
       thinkingDb.close()
     },
   }
@@ -342,7 +344,7 @@ test('a short continuation of a bound session waits for its account instead of b
     assert.equal(h.calls.length, 0, 'the bound short continuation must queue on its busy account')
     held.release()
     const response = await short
-    assert.equal(response.statusCode, 200)
+    assert.equal(response.statusCode, 200, JSON.stringify(response.body))
     assert.equal(h.calls[0].candidate.vmId, 'vm-01')
     assert.equal(h.sticky.resolve(stickyKey).vmId, 'vm-01')
   } finally {

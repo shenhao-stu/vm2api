@@ -864,7 +864,7 @@ for (const accounts of [3, 35]) {
         policy: { maxConcurrency: 1, sessionSlots: 10 },
       })),
     )
-    const pool = scheduler(root, { queue_max: 50 })
+    const pool = scheduler(root, { queue_max: 50, sticky: 15_000, fallback: 15_000 })
     const keys = new ApiKeyStore({ dataDir: path.join(root, 'data') })
     const key = keys.create({ name: 'shared', max_concurrency: 0 })
     const held = []
