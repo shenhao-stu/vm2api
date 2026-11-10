@@ -1,7 +1,13 @@
 import type { Vm } from '@/types/panel-vm'
-import { expiresAtToMs, fableUsedOf, fableWeeklyFull } from '@/lib/fable-status'
+import {
+  expiresAtToMs,
+  fableUsedOf,
+  fableWeeklyFull,
+  officialFableUsedOf,
+} from '@/lib/fable-status'
 import { pct, usedPctOf } from '@/lib/format'
 import { accountUsable, claudeTier, fablePlanDenied } from '@/lib/vm-status'
+import { proFablePromotionAllows } from '../../../src/lib/pool/claude-fable-promotion.mjs'
 
 /**
  * 号池三窗口（5h / 7d / Fable）的池级额度聚合。
@@ -13,8 +19,7 @@ import { accountUsable, claudeTier, fablePlanDenied } from '@/lib/vm-status'
  * - 容量按「账号数」计：每张可用凭证贡献 1 个满窗口。
  * - 消耗为各凭证已用比例之和（账号当量）。未探测的凭证计容量、消耗按 0，
  *   在分段图里以虚线空段标出，不冒充「确认可用」。
- * - Fable 容量只含 Max 档且未被拒 Fable 权限、未被 Fable 封禁的凭证——
- *   Pro 号没有 Fable 窗口，计入只会稀释这个数。
+ * - Fable 容量包含 Max，及活动有效且有官方实测窗口的 Pro；拒绝/封禁不计。
  */
 export type PoolQuotaSeg = {
   id: string
@@ -86,7 +91,10 @@ export function windowProbed(vm: Vm, window: '5h' | '7d'): boolean {
   )
 }
 
-export function poolQuota(vms: Vm[]): {
+export function poolQuota(
+  vms: Vm[],
+  now = Date.now()
+): {
   windows: [PoolWindow, PoolWindow, PoolWindow]
   eligible: number
   withToken: number
@@ -113,7 +121,16 @@ export function poolQuota(vms: Vm[]): {
     })
     const fb = vm.fable || {}
     const tier = claudeTier(vm)
-    if (tier.key !== 'max' || fablePlanDenied(fb) || fb.banned) continue
+    const promotional =
+      tier.key === 'pro' &&
+      officialFableUsedOf(vm) != null &&
+      proFablePromotionAllows('claude-fable-5-2', now)
+    if (
+      (tier.key !== 'max' && !promotional) ||
+      fablePlanDenied(fb) ||
+      fb.banned
+    )
+      continue
     const used = fableUsedOf(vm, tier.key)
     const weeklyFull = fableWeeklyFull(vm, tier.key)
     wf.push({

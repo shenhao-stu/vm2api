@@ -176,7 +176,7 @@ export function VmStatusBoard(props: Props) {
   } = props
   const verdict = slotVerdict(vm, kernel, proxy)
   const proxyH = proxyHealthOf(vm, proxy)
-  const fable = fableCardInfo(vm, tierKey, fableCap(dash.data))
+  const fable = fableCardInfo(vm, tierKey, fableCap(dash.data), now)
   const reset5 = acc.reset_5h ?? vm.reset_5h
   const reset7 = acc.reset_7d ?? vm.reset_7d
   const cost5 = money(acc.window_5h_cost ?? vm.window_5h_cost ?? cost.w)

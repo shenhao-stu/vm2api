@@ -1,6 +1,5 @@
 import type { Vm } from '@/types/panel-vm'
-import { expiresAtToMs, fableState } from '@/lib/fable-status'
-import { pct } from '@/lib/format'
+import { fableState, officialFableUsedOf } from '@/lib/fable-status'
 import { cn } from '@/lib/utils'
 import { isCodexVm } from '@/lib/vm-kind'
 import { claudeTier } from '@/lib/vm-status'
@@ -119,22 +118,7 @@ export type FableRow =
 export function fableRow(vm: Vm): FableRow | null {
   if (!vm.has_token || isCodexVm(vm)) return null
   const tier = claudeTier(vm)
-  if (tier.key !== 'max') {
-    const used = vm.utilization_7d_oi
-    // Canonical native OAuth window only: a successful model hop or an old
-    // `fable.utilization` fallback does not establish a promotional allowance.
-    if (
-      vm.usage_has_fable !== true ||
-      typeof used !== 'number' ||
-      !Number.isFinite(used) ||
-      used < 0 ||
-      used > 100 ||
-      !expiresAtToMs(vm.reset_7d_oi)
-    )
-      return null
-    if (vm.fable?.banned) return { kind: 'note', text: '拒' }
-    return { kind: 'bar', pct: pct(used) }
-  }
+  if (tier.key !== 'max' && officialFableUsedOf(vm) == null) return null
   const st = fableState(vm, tier.key)
   if (st.usedPct != null) return { kind: 'bar', pct: st.usedPct }
   if (st.tone.key === 'none') return null

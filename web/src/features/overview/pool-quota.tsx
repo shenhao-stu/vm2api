@@ -146,12 +146,12 @@ function WindowCell({
  * 号池三窗口（5h / 7d / Fable）总额度。容量按「有效凭证」全量计
  * （每张 = 1 个满窗口，含调度关 / 冷却 / 限制中——额度真实存在），
  * 消耗逐凭证相加；无效 / 过期 / revoke 不计入。口径与 KPI「可用账号」
- * 同源（都走 accountUsable，凭证有效=可用）；仅 Fable 窗容量更小——只计 Max 档。
+ * 同源（都走 accountUsable，凭证有效=可用）；Fable 另按真实窗口与活动资格计入。
  * 竖条一凭证一段、按已用降序——风险集中在最左侧，值班扫一眼即得。
  */
 export function PoolQuota({ vms }: { vms: Vm[] }) {
-  const { windows, eligible, withToken } = poolQuota(vms)
   const now = useNow()
+  const { windows, eligible, withToken } = poolQuota(vms, now)
   // 首帧后再放开高度，让分段条从 0 涨到实际用量；数据刷新时同一 transition 平滑跟随。
   const [live, setLive] = useState(false)
   useEffect(() => {

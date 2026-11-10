@@ -1,7 +1,10 @@
 import type { Dashboard } from '@/types/panel-overview'
+import type { Vm } from '@/types/panel-vm'
 import type { StatusTone } from '@/types/status'
 import { fmtCountdown, pct } from '@/lib/format'
+import { isCodexVm } from '@/lib/vm-kind'
 import { fablePlanDenied, windowLimited } from '@/lib/vm-status'
+import { proFablePromotionAllows } from '../../../src/lib/pool/claude-fable-promotion.mjs'
 
 /**
  * Fable 配额子系统的共享状态机。权威参考是 index.html 里的
@@ -108,23 +111,43 @@ export function inventedFableWindow(subject: FableSubject): boolean {
   return norm != null && norm >= 1 && !reset
 }
 
-/** Fable 已用比例（0-100 或 0-1，未归一化，交给 `pct()` 处理）。对齐 `fableUsedOf`。 */
+/** A measured native OAuth window is usage evidence, not a subscription tier. */
+export function officialFableUsedOf(subject: FableSubject): number | null {
+  if (subject.has_token === false || isCodexVm(subject as Vm)) return null
+  const used = subject.utilization_7d_oi
+  if (
+    subject.usage_has_fable !== true ||
+    typeof used !== 'number' ||
+    !Number.isFinite(used) ||
+    used < 0 ||
+    used > 100 ||
+    !expiresAtToMs(subject.reset_7d_oi)
+  )
+    return null
+  return used
+}
+
+/** Fable 已用比例（0-100 或 0-1，未归一化，交给 `pct()` 处理）。 */
 export function fableUsedOf(
   subject: FableSubject,
   tierKey: string
 ): number | null {
   const fb = (subject.fable as Record<string, unknown> | undefined) || {}
+  if (subject.has_token === false || isCodexVm(subject as Vm) || fb.banned)
+    return null
+  const official = officialFableUsedOf(subject)
+  if (official != null) return official
   if (
-    tierKey === 'pro' ||
+    tierKey !== 'max' ||
     fablePlanDenied(fb) ||
     inventedFableWindow(subject)
   ) {
     return null
   }
-  if (subject.utilization_7d_oi != null)
-    return Number(subject.utilization_7d_oi)
-  if (fb.utilization != null) return Number(fb.utilization)
-  return null
+  const value = subject.utilization_7d_oi ?? fb.utilization
+  if (value == null || value === '') return null
+  const used = Number(value)
+  return Number.isFinite(used) && used >= 0 ? used : null
 }
 
 /** 对齐 `fableWeeklyFull`。 */
@@ -132,24 +155,36 @@ export function fableWeeklyFull(
   subject: FableSubject,
   tierKey: string
 ): boolean {
+  if (subject.has_token === false || isCodexVm(subject as Vm)) return false
   const fb = (subject.fable as Record<string, unknown> | undefined) || {}
   const used = fableUsedOf(subject, tierKey)
-  if (windowLimited(subject.status_7d_oi, pct(used))) return true
-  if (used != null) return pct(used) >= 100
-  return Boolean(fb.limited)
+  if (used != null) return windowLimited(subject.status_7d_oi, pct(used))
+  return (
+    tierKey === 'max' &&
+    (windowLimited(subject.status_7d_oi, 0) || Boolean(fb.limited))
+  )
 }
 
 /** 对齐 `fableProbeLabel`。 */
 export function fableProbeLabel(
   subject: FableSubject,
-  tierKey: string
+  tierKey: string,
+  now = Date.now()
 ): string {
   const fb = subject.fable as Record<string, unknown> | undefined
-  if (tierKey === 'pro') return 'Pro 无 Fable'
+  if (subject.has_token === false) return '未授权'
+  if (isCodexVm(subject as Vm)) return '不适用'
+  if (fb?.banned) return '账号拒'
+  if (fableUsedOf(subject, tierKey) != null)
+    return fableWeeklyFull(subject, tierKey) ? '周额度满' : '已探测'
   // 落盘 Max 但 Fable 被拒：套餐没带 Fable 权限，不是 Pro。
   if (fablePlanDenied(fb)) return '无 Fable 权限'
+  if (tierKey === 'pro')
+    return proFablePromotionAllows('claude-fable-5-2', now)
+      ? 'Fable 5.2 活动 · 未探测'
+      : '活动未开放'
+  if (tierKey !== 'max') return '未探测'
   if (!fb) return '未探测'
-  if (fb.banned) return '账号拒'
   if (fableWeeklyFull(subject, tierKey)) return '周额度满'
   if (fb.ok) return '可用'
   const err = String(fb.error || '')
@@ -166,6 +201,15 @@ export function fableState(
   subject: FableSubject,
   tierKey: string
 ): { usedPct: number | null; tone: StatusTone } {
+  if (subject.has_token === false || isCodexVm(subject as Vm))
+    return {
+      usedPct: null,
+      tone: {
+        key: 'none',
+        cls: 'none',
+        text: fableProbeLabel(subject, tierKey),
+      },
+    }
   const fb = subject.fable as Record<string, unknown> | undefined
   if (fb?.banned)
     return { usedPct: null, tone: { key: 'bad', cls: 'bad', text: '拒' } }
@@ -178,13 +222,23 @@ export function fableState(
     }
   }
   if (!fb)
-    return { usedPct: null, tone: { key: 'none', cls: 'none', text: '未探测' } }
+    return {
+      usedPct: null,
+      tone: {
+        key: 'none',
+        cls: 'none',
+        text: fableProbeLabel(subject, tierKey),
+      },
+    }
   if (fableWeeklyFull(subject, tierKey)) {
     return { usedPct: null, tone: { key: 'warn', cls: 'warn', text: '满' } }
   }
-  if (fb.ok)
+  if (fb.ok && tierKey === 'max')
     return { usedPct: null, tone: { key: 'ok', cls: 'ok', text: '可用' } }
-  return { usedPct: null, tone: { key: 'none', cls: 'none', text: '—' } }
+  return {
+    usedPct: null,
+    tone: { key: 'none', cls: 'none', text: fableProbeLabel(subject, tierKey) },
+  }
 }
 
 /** Fable 5h 冷却/占满归一到 0-100，用于卡片小轨道。对齐 `fableUtil`。 */
@@ -338,7 +392,8 @@ export function extraUsageText(ex: unknown): string {
 export function fableCardInfo(
   subject: FableSubject,
   tierKey: string,
-  fableCapValue: number
+  fableCapValue: number,
+  now = Date.now()
 ): {
   usedPct: number | null
   reset: string
@@ -352,6 +407,12 @@ export function fableCardInfo(
   const bits: string[] = [
     `并发 ${num(subject.fable_inflight)}/${num(subject.fable_max) || fableCapValue}`,
   ]
+  if (tierKey === 'pro')
+    bits.unshift(
+      proFablePromotionAllows('claude-fable-5-2', now)
+        ? 'Fable 5.2 活动'
+        : '活动未开放'
+    )
   const coolUntil = num(subject.fable_cooldown_until)
   if (coolUntil && coolUntil > Date.now()) bits.push('冷却中')
   if (fb?.banned) bits.unshift('账号拒')
@@ -360,19 +421,24 @@ export function fableCardInfo(
   if (used != null) {
     return { usedPct: pct(used), reset, bits, badgeText: '', badgeCls: 'ok' }
   }
-  const txt = fableProbeLabel(subject, tierKey)
-  const pro =
-    tierKey === 'pro' || fablePlanDenied(fb) || inventedFableWindow(subject)
-  const badgeCls: 'ok' | 'warn' | 'bad' | 'none' = !fb
-    ? 'none'
-    : pro || fb.banned
-      ? 'bad'
-      : fb.limited
-        ? 'warn'
-        : fb.ok
-          ? 'ok'
-          : 'none'
-  const fullBits = [String(fb?.model || 'claude-fable-5'), ...bits]
+  const txt = fableProbeLabel(subject, tierKey, now)
+  const denied = fablePlanDenied(fb) || inventedFableWindow(subject)
+  const badgeCls: 'ok' | 'warn' | 'bad' | 'none' =
+    subject.has_token === false || isCodexVm(subject as Vm) || !fb
+      ? 'none'
+      : denied || fb.banned
+        ? 'bad'
+        : fb.limited
+          ? 'warn'
+          : fb.ok && tierKey === 'max'
+            ? 'ok'
+            : 'none'
+  const fullBits = [
+    String(
+      fb?.model || (tierKey === 'pro' ? 'claude-fable-5-2' : 'claude-fable-5')
+    ),
+    ...bits,
+  ]
   if (reset) fullBits.push(fmtReset(reset))
   return { usedPct: null, reset, bits: fullBits, badgeText: txt, badgeCls }
 }
