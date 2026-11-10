@@ -312,3 +312,28 @@ test('complete Pro usage replaces stale Max windows in persisted panel data', as
   assert.equal(detail.vm.usage_has_fable, false)
   assert.equal(detail.vm.utilization_7d_oi, null)
 })
+
+for (const mode of ['setup-token', 'oauth']) {
+  test(`usage-only weekly refresh never invokes model entitlement (${mode})`, async (t) => {
+    const f = fixture(t, { mode })
+    let modelCalls = 0
+    const result = await buildProbeOne({
+      ...f.args,
+      accountQuota: f.quota,
+      usageOnly: true,
+      usageCache: usageCache({
+        ok: true,
+        source: 'official-cc-usage',
+        probed_at: new Date().toISOString(),
+        seven_day: { utilization: 0, resets_at: new Date(Date.now() + 7 * 86400000).toISOString() },
+      }),
+      fableProbe: async () => {
+        modelCalls++
+        throw new Error('no model traffic allowed')
+      },
+    })
+    assert.equal(result.data.ok, true)
+    assert.equal(modelCalls, 0)
+    assert.equal(f.quota.repo.get('account-test').unified.fable, undefined)
+  })
+}

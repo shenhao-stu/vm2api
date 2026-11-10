@@ -18,7 +18,7 @@ function project(specs) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-seat-planner-'))
   const vms = path.join(root, 'vms')
   fs.mkdirSync(vms, { recursive: true })
-  specs.forEach(({ id, policy = {}, owner = null }, index) => {
+  specs.forEach(({ id, policy = {}, owner = null, tier = 'max' }, index) => {
     const accountId = `account-${index + 1}`
     const vm = {
       id,
@@ -32,7 +32,7 @@ function project(specs) {
       policy: { maxConcurrency: 4, concurrencyOverride: true, weight: 1, ...policy },
       claude: {
         account_uuid: accountId,
-        account_tier: 'max',
+        account_tier: tier,
         access_token: `access-${accountId}`,
         refresh_token: `refresh-${accountId}`,
         expires_at: Math.floor(Date.now() / 1000) + 3600,
@@ -895,7 +895,7 @@ function gatedQuota(root) {
   })
 }
 
-function gatedSetup(t, specs) {
+function gatedSetup(t, specs, config = {}) {
   const root = project(specs)
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const quota = gatedQuota(root)
@@ -905,7 +905,7 @@ function gatedSetup(t, specs) {
     runtimeRepo: new RuntimeRepo(quota.repo),
     accountQuota: quota,
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
-    config: { seat_grace_ms: 30000 },
+    config: { seat_grace_ms: 30000, ...config },
   })
   pool.config.sticky_wait_timeout_ms = 2000
   pool.config.fallback_wait_timeout_ms = 2000
@@ -1027,3 +1027,66 @@ for (const accounts of [3, 35]) {
     assert.equal(keys.inflight.size, 0)
   })
 }
+
+function setWeekly(quota, id, at, utilization = 0.1) {
+  quota.ingestHeaders(id, {
+    'anthropic-ratelimit-unified-7d-reset': String(Math.floor(at / 1000)),
+    'anthropic-ratelimit-unified-7d-utilization': String(utilization),
+    'anthropic-ratelimit-unified-7d-status': 'allowed',
+  })
+}
+
+test('weekly reset priority preserves tool affinity, single concurrency and queue cancellation', async (t) => {
+  const { pool, quota } = gatedSetup(
+    t,
+    [
+      { id: 'vm-01', tier: 'pro', policy: { priority: 1, sessionSlots: 10, maxConcurrency: 1 } },
+      { id: 'vm-02', tier: 'pro', policy: { priority: 10, sessionSlots: 10, maxConcurrency: 1 } },
+    ],
+    { strategy: 'weekly-reset' },
+  )
+  const now = Date.now()
+  setWeekly(quota, 'account-1', now + 3600000)
+  setWeekly(quota, 'account-2', now + 7200000)
+  const sticky = new StickyRouter({ dataDir: pool.projectRoot, config: { sticky: { enabled: true } } })
+  pool.stickyRouter = sticky
+  t.after(() => sticky.db?.close?.())
+  const stickyKey = sticky.canonicalSessionKey('weekly-tools')
+  const first = await seat(pool, 'weekly-tools', { stickyKey, deviceVmId: 'vm-02' })
+  assert.equal(first.vmId, 'vm-01', 'exact reset beats old manual grade and device-only affinity')
+  sticky.bind(stickyKey, { accountId: first.accountId, vmId: first.vmId, sessionId: 'tool-session' })
+  const second = await seat(pool, 'independent')
+  assert.equal(second.vmId, 'vm-02', 'busy earliest account does not serialize the whole pool')
+  assert.equal(quota.inflight.get(first.accountId), 1)
+  assert.equal(quota.inflight.get(second.accountId), 1)
+  const cancel = new AbortController()
+  const cancelled = seat(pool, 'cancel-global', { signal: cancel.signal })
+  const rejection = assert.rejects(cancelled, { code: 'selection_cancelled' })
+  await waitFor(() => pool.queuedTotal() === 1)
+  cancel.abort()
+  await rejection
+  assert.equal(pool.queuedTotal(), 0)
+  // The earliest weekly window rolls over while a tool conversation is alive.
+  setWeekly(quota, first.accountId, now + 7 * 86400000, 0)
+  const controller = new AbortController()
+  const continuation = seat(pool, 'weekly-tools', { stickyKey, signal: controller.signal })
+  const continued = assert.rejects(continuation, { code: 'selection_cancelled' })
+  await waitFor(() => pool.queuedTotal() === 1)
+  controller.abort()
+  await continued
+  first.release()
+  second.release()
+  const tool = await seat(pool, 'weekly-tools', { stickyKey })
+  assert.equal(tool.vmId, 'vm-01', 'bound tools keep their original account after weekly rollover')
+  tool.release()
+  const fresh = await seat(pool, 'after-rollover', { deviceVmId: 'vm-01' })
+  assert.equal(fresh.vmId, 'vm-02', 'new conversation selects the next reset')
+  fresh.release()
+  assert.equal(pool.queuedTotal(), 0)
+  assert.ok([...quota.inflight.values()].every((n) => n === 0))
+  assert.ok([...pool.inflight.values()].every((n) => n === 0))
+  setWeekly(quota, 'account-2', now + 7200000, 1)
+  const quotaSafe = await seat(pool, 'hard-gate', { allowWait: false })
+  assert.equal(quotaSafe.vmId, 'vm-01', 'weekly preference cannot bypass the quota safety gate')
+  quotaSafe.release()
+})

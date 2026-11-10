@@ -597,6 +597,7 @@ usageProbeMonitor = createUsageProbeMonitor({
   config: routingConfig.usage_probe,
   listTargets: () => listVms(cfg.paths.project),
   accountForVm: accountForUsageProbe,
+  readTarget: (id) => getVm(cfg.paths.project, id),
   isActive: usageProbeActive,
   reconcile: (vm, account) => {
     const id = account?.account_id || vm?.claude?.account_uuid || vm?.account_uuid || vm?.id
@@ -615,7 +616,27 @@ usageProbeMonitor = createUsageProbeMonitor({
       poolScheduler.syncQuotaSchedule(vm, account)
     } catch {}
   },
-  probeOne: (vm) => panel.buildProbeOne({ cfg, accountQuota, id: vm.id, routingConfig }),
+  reserve: (_vm, account) => {
+    const id = account?.account_id
+    if (!id || poolScheduler.queuedTotal() || (accountQuota.inflight.get(id) || 0) > 0) return null
+    accountQuota.acquire(id)
+    return () => accountQuota.release(id)
+  },
+  probeOne: async (vm, { usageOnly = false } = {}) => {
+    const result = await panel.buildProbeOne({
+      cfg,
+      accountQuota,
+      id: vm.id,
+      routingConfig,
+      usageOnly,
+      force: usageOnly,
+    })
+    if (!usageOnly) return result
+    return {
+      ok: result.ok === true && result.data?.ok === true && !result.data?.rate_limited,
+      source: result.data?.source,
+    }
+  },
 })
 const claudeResetAuto = createClaudeResetAuto({
   projectRoot: cfg.paths.project,

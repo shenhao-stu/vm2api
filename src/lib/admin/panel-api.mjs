@@ -1112,6 +1112,7 @@ export async function buildProbeOne({
   usageCache = null,
   hop = true,
   fableProbe = probeFableEntitlement,
+  usageOnly = false,
   routingConfig = {},
 } = {}) {
   const vm = getVm(cfg.paths.project, id)
@@ -1191,11 +1192,13 @@ export async function buildProbeOne({
   const acc = accountQuota.repo.get(accountId)
   const q = quotaFromAccount(acc)
   const storedTier = vm.claude?.account_tier || acc?.unified?.account_tier || q.account_tier || null
-  const includeFable = shouldProbeFable({
-    fable: q.fable || acc?.unified?.fable || {},
-    quota: { ...acc?.unified, ...q },
-    storedTier,
-  })
+  const includeFable =
+    !usageOnly &&
+    shouldProbeFable({
+      fable: q.fable || acc?.unified?.fable || {},
+      quota: { ...acc?.unified, ...q },
+      storedTier,
+    })
   const cache = usageCache || getUsageCache()
   if (force) cache.clear(accountId)
   const skipHop = !shouldHopOfficialUsage(acc?.unified, { hop, force })
@@ -1221,7 +1224,12 @@ export async function buildProbeOne({
     } catch {}
   }
   if (!skipHop) accountQuota.ingestOAuthUsage(accountId, result)
-  if (isSetupTokenMode(credentialModeOfVm(vm)) && (force || includeFable) && !result.usage_scope_missing) {
+  if (
+    !usageOnly &&
+    isSetupTokenMode(credentialModeOfVm(vm)) &&
+    (force || includeFable) &&
+    !result.usage_scope_missing
+  ) {
     try {
       await applyFableProbeResult(accountQuota, accountId, await fableProbe({ exec, timeoutMs: 20000 }))
     } catch {}

@@ -14,8 +14,10 @@ import { shouldProbeFable, usageProbeBackoffRemainingMs } from './crs-usage-prob
 import { hasRefreshPresence } from './oauth-credentials.mjs'
 import { vmHasProxyPath } from './credential-refresh-monitor.mjs'
 import { hasLiveExtraSample, hasOfficialUsageSample, parseResetMs } from '../pool/quota-window.mjs'
+import { weeklyResetProbeDue, weeklyResetProbeTarget } from '../pool/weekly-reset-scheduling.mjs'
 export const DEFAULT_USAGE_PROBE = Object.freeze({
   enabled: false,
+  mode: 'all',
   interval_sec: 60,
   stale_sec: 300,
   // Opt-in: defer the first periodic hop after an Extra 5h reset.
@@ -47,6 +49,7 @@ export function normalizeUsageProbeConfig(raw = {}) {
   const src = raw && typeof raw === 'object' ? raw : {}
   return {
     enabled: asBool(src.enabled, DEFAULT_USAGE_PROBE.enabled),
+    mode: src.mode === 'weekly-reset' ? 'weekly-reset' : 'all',
     interval_sec: clampInt(src.interval_sec, 30, 3600, DEFAULT_USAGE_PROBE.interval_sec),
     stale_sec: clampInt(src.stale_sec, 60, 86_400, DEFAULT_USAGE_PROBE.stale_sec),
     reset_delay_sec: clampInt(src.reset_delay_sec, 0, 3600, DEFAULT_USAGE_PROBE.reset_delay_sec),
@@ -238,7 +241,17 @@ export function createUsageProbeMonitor(opts = {}) {
     const run = worker
       .then(async () => {
         try {
-          const result = await withTimeout(Promise.resolve(opts.probeOne(vm)), config.timeout_ms)
+          const weekly = config.mode === 'weekly-reset'
+          const current = weekly && opts.readTarget ? opts.readTarget(id) : vm
+          const account = current && opts.accountForVm?.(current)
+          if (weekly && !weeklyResetProbeTarget(current, account))
+            return { vm_id: id, ok: false, reason: 'not_target', source: null }
+          const release = weekly ? opts.reserve?.(current, account) : null
+          if (weekly && !release) return { vm_id: id, ok: true, reason: 'account_busy', source: null }
+          const operation = Promise.resolve()
+            .then(() => opts.probeOne(current, { usageOnly: weekly }))
+            .finally(() => release?.())
+          const result = await withTimeout(operation, config.timeout_ms)
           const ok = result?.ok !== false
           if (ok) backoff.delete(id)
           else {
@@ -283,6 +296,7 @@ export function createUsageProbeMonitor(opts = {}) {
       const staleMs = config.stale_sec * 1000
       for (const vm of targets) {
         const account = typeof opts.accountForVm === 'function' ? opts.accountForVm(vm) : null
+        if (config.mode === 'weekly-reset' && !weeklyResetProbeTarget(vm, account)) continue
         if (typeof opts.reconcile === 'function') {
           try {
             opts.reconcile(vm, account)
@@ -294,17 +308,20 @@ export function createUsageProbeMonitor(opts = {}) {
             active = !!opts.isActive(vm, account)
           } catch {}
         }
-        const decision = isUsageProbeDue(account || {}, { now: nowFn(), staleMs, active })
+        const decision =
+          config.mode === 'weekly-reset'
+            ? weeklyResetProbeDue(account, nowFn())
+            : isUsageProbeDue(account || {}, { now: nowFn(), staleMs, active })
         if (!decision.due || typeof opts.probeOne !== 'function') {
           items.push({
             vm_id: vm.id,
             ok: true,
-            reason: 'reconcile_extra',
+            reason: config.mode === 'weekly-reset' ? decision.reason : 'reconcile_extra',
             source: null,
           })
           continue
         }
-        const nextProbeAt = resetProbeAt(account, vm, config, nowFn())
+        const nextProbeAt = config.mode === 'weekly-reset' ? null : resetProbeAt(account, vm, config, nowFn())
         if (nextProbeAt != null && nextProbeAt > nowFn()) {
           items.push({
             vm_id: vm.id,

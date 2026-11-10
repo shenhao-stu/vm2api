@@ -23,13 +23,16 @@
  * as taken and cannot jump the queue.
  */
 
-export const SEAT_STRATEGIES = Object.freeze(['balanced', 'fill'])
+import { weeklyResetRank } from './weekly-reset-scheduling.mjs'
+
+export const SEAT_STRATEGIES = Object.freeze(['balanced', 'fill', 'weekly-reset'])
 
 /** Float slack so a headroom exactly on the reserve line still opens. */
 const BUDGET_EPSILON = 1e-9
 
 export function normalizeSeatStrategy(value) {
-  return String(value || '').trim() === 'fill' ? 'fill' : 'balanced'
+  const strategy = String(value || '').trim()
+  return SEAT_STRATEGIES.includes(strategy) ? strategy : 'balanced'
 }
 
 /**
@@ -60,9 +63,13 @@ function headroomRank(value) {
  * @param {Array<{ vmId: string, priority?: number, seatCap: number, headroom?: number|null }>} candidates
  * @param {{ strategy: string, openOf: (vmId: string) => number }} opts
  */
-export function rankSeatCandidates(candidates, { strategy = 'balanced', openOf }) {
+export function rankSeatCandidates(candidates, { strategy = 'balanced', openOf, now = Date.now() }) {
   const fill = normalizeSeatStrategy(strategy) === 'fill'
   return [...candidates].sort((left, right) => {
+    if (strategy === 'weekly-reset') {
+      const reset = weeklyResetRank(left.weeklyResetAt, now) - weeklyResetRank(right.weeklyResetAt, now)
+      if (reset) return reset
+    }
     const priority = (Number(right.priority) || 0) - (Number(left.priority) || 0)
     if (priority) return priority
     const lo = occupancy(openOf(left.vmId), left.seatCap)

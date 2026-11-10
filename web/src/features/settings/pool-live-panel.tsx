@@ -3,9 +3,11 @@ import { useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import type { Vm } from '@/types/panel-vm'
 import { Activity, Eye, Radio } from 'lucide-react'
+import { expiresAtToMs } from '@/lib/fable-status'
 import { usedPctOf } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { scheduleStateLabel, seatTitle } from '@/lib/vm-status'
+import { useNow } from '@/hooks/use-now'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -44,11 +46,22 @@ function headroomOf(vm: Vm): number | null {
 }
 
 /**
- * 按草稿策略复现 rankSeatCandidates 的顺序：调度等级降序 → 占用比例
+ * 周重置策略先按未来 7d 重置时间升序，再按调度等级降序 → 占用比例
  * （平衡升序 / 填充降序）→ 余量降序 → id。并发、RPM 和预算闸不在这里判，
  * 所以只是预估。
  */
-export function predictSeatOrder(vms: Vm[], strategy: string): SeatRow[] {
+export function predictSeatOrder(
+  vms: Vm[],
+  strategy: string,
+  now = Date.now()
+): SeatRow[] {
+  const resetRank = (vm: Vm) => {
+    const reset = expiresAtToMs(vm.reset_7d)
+    const nativePro =
+      vm.account_tier === 'pro' &&
+      !/re[-_]?claude/i.test([vm.id, vm.name, vm.kind].join(' '))
+    return nativePro && reset > now ? reset : Number.POSITIVE_INFINITY
+  }
   const fill = strategy === 'fill'
   const rows: SeatRow[] = vms
     .filter((vm) => vm.seats_max != null)
@@ -71,6 +84,10 @@ export function predictSeatOrder(vms: Vm[], strategy: string): SeatRow[] {
   const open = rows
     .filter((row) => row.why == null)
     .sort((a, b) => {
+      if (strategy === 'weekly-reset') {
+        const reset = resetRank(a.vm) - resetRank(b.vm)
+        if (reset) return reset
+      }
       const priority =
         (Number(b.vm.schedule_level) || 0) - (Number(a.vm.schedule_level) || 0)
       if (priority) return priority
@@ -138,9 +155,10 @@ export function PoolLivePanel({
 }) {
   const list = useQuery(vmsListQueryOptions(5000))
   usePoolSeatStream()
+  const now = useNow(1000)
   const rows = useMemo(
-    () => predictSeatOrder(list.data?.items || [], strategy),
-    [list.data?.items, strategy]
+    () => predictSeatOrder(list.data?.items || [], strategy, now),
+    [list.data?.items, strategy, now]
   )
   const poolQueue = list.data?.pool_queue
   const totals = rows.reduce(

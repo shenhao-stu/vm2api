@@ -70,8 +70,15 @@ function numOf(source: Obj, key: string, fallback: number): number {
   return Number.isFinite(n) ? n : fallback
 }
 
+const strategyOf = (value: unknown) =>
+  value === 'weekly-reset'
+    ? 'weekly-reset'
+    : value === 'fill'
+      ? 'fill'
+      : 'balanced'
+
 const STRATEGIES: {
-  id: 'balanced' | 'fill'
+  id: 'balanced' | 'fill' | 'weekly-reset'
   title: string
   desc: string
   demo: number[]
@@ -83,6 +90,13 @@ const STRATEGIES: {
     desc: '新设备先去占用比例最低的 VM，负载摊平，单台额度消耗慢。',
     demo: [2, 1, 3],
     next: 1,
+  },
+  {
+    id: 'weekly-reset',
+    title: '周重置优先',
+    desc: '新会话优先选择7d最先重置的可用Pro账号；重置到期或时间未知时降到末尾。已有会话不换号，额度与并发限制照常生效。',
+    demo: [1, 1, 1],
+    next: 0,
   },
   {
     id: 'fill',
@@ -97,8 +111,8 @@ function StrategyCards({
   value,
   onChange,
 }: {
-  value: 'balanced' | 'fill'
-  onChange: (next: 'balanced' | 'fill') => void
+  value: 'balanced' | 'fill' | 'weekly-reset'
+  onChange: (next: 'balanced' | 'fill' | 'weekly-reset') => void
 }) {
   return (
     <div
@@ -427,7 +441,7 @@ export function PoolPane({
   saving = false,
   pending = false,
 }: PoolPaneProps) {
-  const strategy = pool.strategy === 'fill' ? 'fill' : 'balanced'
+  const strategy = strategyOf(pool.strategy)
   const seatCap = Math.min(
     SEAT_CAP_MAX,
     Math.max(1, numOf(inference, 'session_slots', SEAT_CAP_MAX))
@@ -557,7 +571,9 @@ export function PoolPane({
         <SummaryButton
           icon={Layers}
           title='分配策略'
-          value={strategy === 'fill' ? '填充' : '平衡'}
+          value={
+            STRATEGIES.find((item) => item.id === strategy)?.title ?? '平衡分配'
+          }
           desc='Claude 新 session 开席的优先顺序'
           pending={pending}
           disabled={saving}
@@ -651,7 +667,7 @@ export function PoolPane({
             {open === 'strategy' ? (
               <>
                 <StrategyCards
-                  value={poolDraft.strategy === 'fill' ? 'fill' : 'balanced'}
+                  value={strategyOf(poolDraft.strategy)}
                   onChange={(next) => updateDraft('pool', { strategy: next })}
                 />
               </>

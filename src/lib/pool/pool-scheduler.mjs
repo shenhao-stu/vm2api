@@ -49,7 +49,8 @@ import {
   rustKernelReachable,
 } from '../transport/rust-kernel-client.mjs'
 import { resolveSessionSlots } from '../vm/slot-engine.mjs'
-import { SeatPlanner, budgetAllows, rankSeatCandidates } from './seat-planner.mjs'
+import { SeatPlanner, budgetAllows, rankSeatCandidates, normalizeSeatStrategy } from './seat-planner.mjs'
+import { proWeeklyResetAt } from './weekly-reset-scheduling.mjs'
 import { GATE_DRAINING } from './quota-gate.mjs'
 import { activeHoursOf, evaluateActiveHours } from './active-hours.mjs'
 import { quotaRejection } from './quota-rejection.mjs'
@@ -109,7 +110,7 @@ export function normalizePoolRouting(pool = {}) {
   const next = { ...(pool && typeof pool === 'object' ? pool : {}) }
   delete next.max_waiters_per_account
   next.egress_circuit_enabled = next.egress_circuit_enabled !== false
-  next.strategy = next.strategy === 'fill' ? 'fill' : 'balanced'
+  next.strategy = normalizeSeatStrategy(next.strategy)
   next.queue_max = clampNumber(next.queue_max, DEFAULT_POOL_ROUTING.queue_max, QUEUE_MAX_MIN, QUEUE_MAX_MAX)
   next.seat_grace_ms = clampNumber(next.seat_grace_ms, DEFAULT_POOL_ROUTING.seat_grace_ms, 0, SEAT_GRACE_MAX_MS)
   next.seat_budget_reserve_pct = clampNumber(
@@ -825,10 +826,9 @@ export class PoolScheduler extends EventEmitter {
             return { ...fail(quota.reason), ...quota }
           }
           // Machine/device home first, then the session's own pin, then family.
-          // A new session of a machine that already has a VM takes a free slot
-          // there before any other VM. A full home is waited, not skipped.
+          // Weekly ordering applies to new conversations, never to bound session/tool homes.
           const homes = seatHomes({
-            deviceVm: deviceVmOf(),
+            deviceVm: this.config.strategy === 'weekly-reset' ? '' : deviceVmOf(),
             sessionVm: sticky.vmId || '',
             familyVm: familyGated ? '' : familyVm,
           })
@@ -878,7 +878,12 @@ export class PoolScheduler extends EventEmitter {
             this.planner.place(ticket, { kind: 'global', vmId: null })
             ticket.deadline = queueUntil(this.config.fallback_wait_timeout_ms)
           }
-          for (const vmId of ticket.vmId ? [ticket.vmId] : byVm.keys()) this.planner.pump(vmId)
+          const wakeOrder = ticket.vmId
+            ? [ticket.vmId]
+            : this.config.strategy === 'weekly-reset'
+              ? this.planner.rank(candidates).map((item) => item.vmId)
+              : byVm.keys()
+          for (const vmId of wakeOrder) this.planner.pump(vmId)
         }
         if (ticket.granted) return finish(ticket.granted)
         const until = ticket.kind === 'seat' ? ticket.stickyUntil : ticket.deadline
@@ -914,6 +919,7 @@ export class PoolScheduler extends EventEmitter {
         !this.planner.hasSeatWaiters(candidate.vmId),
     )
     const open = openable.filter((candidate) => !candidate.draining)
+    if (this.config.strategy === 'weekly-reset') return openable
     return open.length ? open : openable
   }
 
@@ -1175,6 +1181,7 @@ export class PoolScheduler extends EventEmitter {
         state,
         model: normalizeModel(model),
         priority: priorityOf(vm, eligibility.account, now),
+        weeklyResetAt: proWeeklyResetAt(vm, eligibility.account),
         weight: weightOf(vm, state),
         inflight,
         maxConcurrency,
@@ -1692,6 +1699,10 @@ export class PoolScheduler extends EventEmitter {
       if (home) return { ...home, selectionReason: reasonFor('family-affinity') }
     }
     const deviceVm = deviceVmId ? String(deviceVmId).trim() : ''
+    if (this.config.strategy === 'weekly-reset') {
+      const [selected] = this.planner.rank(candidates)
+      return { ...selected, selectionReason: reasonFor('weekly-reset') }
+    }
     if (deviceVm) {
       const preferred = candidates.find((candidate) => candidate.vmId === deviceVm && this.isReservable(candidate))
       if (preferred) return { ...preferred, selectionReason: reasonFor('device-affinity') }
@@ -1710,6 +1721,8 @@ export class PoolScheduler extends EventEmitter {
 
   peekRank(candidates = []) {
     if (!candidates.length) return null
+    if (this.config.strategy === 'weekly-reset')
+      return { ...this.planner.rank(candidates)[0], selectionReason: 'weekly-reset' }
     const highestPriority = Math.max(...candidates.map((candidate) => candidate.priority))
     let pool = candidates.filter((candidate) => candidate.priority === highestPriority)
     const minLoad = Math.min(...pool.map((candidate) => candidate.loadRatio))
