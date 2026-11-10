@@ -35,6 +35,7 @@ import { ensureSlotSubscriptionType } from './lib/oauth/oauth-credentials.mjs'
 import { createCliNodeGuard } from './lib/vm/cli-node-guard.mjs'
 
 import { createSlotBridgeHealer, powerOnSlot, reviveDownSlots } from './lib/vm/slot-recovery.mjs'
+import { createClaudeResetAuto } from './lib/oauth/claude-reset-auto.mjs'
 import { createUsageProbeMonitor, normalizeUsageProbeConfig } from './lib/oauth/usage-probe-monitor.mjs'
 import { claudeCatalogBusy, createCatalogMonitor } from './lib/admin/catalog-monitor.mjs'
 import { normalizeOfficialCcConfig } from './lib/oauth/official-cc-bootstrap.mjs'
@@ -616,6 +617,24 @@ usageProbeMonitor = createUsageProbeMonitor({
   },
   probeOne: (vm) => panel.buildProbeOne({ cfg, accountQuota, id: vm.id, routingConfig }),
 })
+const claudeResetAuto = createClaudeResetAuto({
+  projectRoot: cfg.paths.project,
+  getConfig: () => routingConfig.claude_reset,
+  listTargets: () => listVms(cfg.paths.project).map((vm) => ({ ...getVm(cfg.paths.project, vm.id), ...vm })),
+  accountForVm: accountForUsageProbe,
+  reserve: (_vm, account) => {
+    const id = account?.account_id
+    if (!id || (accountQuota.inflight.get(id) || 0) > 0) return null
+    accountQuota.acquire(id)
+    return () => accountQuota.release(id)
+  },
+  afterReset: async (vm) => {
+    const result = await panel.buildProbeOne({ cfg, accountQuota, id: vm.id, routingConfig, force: true, hop: true })
+    if (result.status >= 400)
+      throw Object.assign(new Error('reset usage refresh failed'), { code: 'reset_usage_refresh_failed' })
+  },
+  log: (event) => console.log(JSON.stringify(event)),
+})
 catalogMonitor = createCatalogMonitor({
   projectRoot: cfg.paths.project,
   isClaudeBusy: (vm) => claudeCatalogBusy(poolScheduler, vm.id, accountIdOf(vm, cfg.paths.project)),
@@ -1126,7 +1145,7 @@ let backgroundDrain
 const gracefulShutdown = createGracefulShutdown({
   beforeDrain: async () => {
     requestLog.stopCleanupScheduler()
-    backgroundDrain = Promise.allSettled([requestLog.waitForCleanup(), qualityProbe.stop()])
+    backgroundDrain = Promise.allSettled([requestLog.waitForCleanup(), qualityProbe.stop(), claudeResetAuto.stop()])
     installJevUsageRecorder(null)
     try {
       vmTestSchedule.stop()
@@ -1486,6 +1505,8 @@ server.listen(cfg.port, cfg.host, () => {
   } catch (e) {
     console.warn('[cli-node-guard] start failed', e?.message || e)
   }
+  if (process.env.KIN_CRS_MOCK !== '1')
+    claudeResetAuto.start().catch((e) => console.warn('[claude-auto-reset]', e?.code || 'start_failed'))
   try {
     usageProbeMonitor?.start?.({ immediate: true })
   } catch (e) {

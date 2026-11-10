@@ -565,7 +565,7 @@ function compareScopeKeys(left, right) {
 
 /**
  * The same key the panel chip uses. Claude Max/Pro follows `inferClaudeTier`
- * (usage Fable wins over a stored or defaulted Pro). `quota` is the account
+ * (model entitlement never upgrades the subscription). `quota` is the account
  * unified record when the caller has it; summaries often lack it.
  */
 export function scopeAccountFromVm(vm = {}, quota = null) {

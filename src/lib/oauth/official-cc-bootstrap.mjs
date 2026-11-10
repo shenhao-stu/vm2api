@@ -38,7 +38,7 @@ import {
 } from './oauth-credentials.mjs'
 import { canOfficialCc, credentialModeOfVm } from './credential-mode.mjs'
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
-import { inferTierFromOfficialStats, parseOfficialCcStats, tierFromOauthProfile } from './official-cc-stats.mjs'
+import { parseOfficialCcStats, tierFromOauthProfile } from './official-cc-stats.mjs'
 import { defaultSeedPolicy, deploymentTelemetryDisabled, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { applyOfficialFingerprintToVm, readOfficialCcIdentity } from '../identity/official-fingerprint.mjs'
@@ -1225,13 +1225,14 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       step: 'profile',
     })
     const account = await collectOfficialCcAccount({ vmId, homeDir, vm }, { slotOauth })
-    let tierSource = null
-    if (stats?.limits_present === true && !stats.account_tier) {
-      const accountTier = inferTierFromOfficialStats('', stats)
-      if (accountTier) stats = { ...stats, account_tier: accountTier }
+    const tierSource = account.account_tier ? 'profile' : stats?.account_tier ? 'usage' : null
+    if (stats || account.account_tier) {
+      stats = {
+        ...stats,
+        account_tier: account.account_tier || stats?.account_tier || null,
+        account_tier_source: tierSource,
+      }
     }
-    if (!tierSource && stats?.account_tier) tierSource = 'usage'
-    if (stats) stats = { ...stats, account_tier_source: tierSource }
     if (typeof onStats === 'function' && stats) {
       try {
         await onStats(stats, { vmId, projectRoot, homeDir })

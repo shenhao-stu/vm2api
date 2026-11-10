@@ -17,7 +17,6 @@ import {
   summarizeVm,
   getActiveVmId,
   vmHasClaudeCredential,
-  persistAccountTier,
   isCodexVm,
   migrateVmSchedule,
 } from '../vm/vm-registry.mjs'
@@ -1239,7 +1238,7 @@ export async function buildProbeOne({
   const tier = inferClaudeTier(
     {
       has_token: true,
-      account_tier: after?.unified?.account_tier || null,
+      account_tier: vm.claude?.account_tier || after?.unified?.account_tier || null,
       fable: qAfter.fable,
       utilization_7d_oi: qAfter.utilization_7d_oi,
       reset_7d_oi: qAfter.reset_7d_oi,
@@ -1248,14 +1247,6 @@ export async function buildProbeOne({
     },
     qAfter,
   ).key
-  const completeUsage = result.ok === true && result.limits_present === true
-  if (completeUsage && (result.account_tier === 'pro' || result.account_tier === 'max')) {
-    accountQuota.setAccountTier(accountId, result.account_tier, { source: 'usage' })
-    persistAccountTier(cfg.paths.project, id, result.account_tier, { source: 'usage' })
-  } else if (completeUsage && (tier === 'pro' || tier === 'max')) {
-    accountQuota.setAccountTier(accountId, tier, { source: 'usage' })
-    persistAccountTier(cfg.paths.project, id, tier, { source: 'usage' })
-  }
   const availability = evaluateAccount({
     vm,
     account: after || {},
@@ -1326,7 +1317,7 @@ export async function buildProbeOne({
     cred_status: credStatusFromAvailability(availability),
     fable: result.usage_scope_missing ? q.fable || null : after?.unified?.fable || result.fable || q.fable || null,
     fable_probed: includeFable && !skipHop && !result.usage_scope_missing,
-    account_tier: completeUsage ? result.account_tier || tier : tier,
+    account_tier: tier,
     probed_at: result.probed_at,
     ok: !!(result.ok || passive || (rateLimited && cachedWindow)),
     rate_limited: rateLimited,

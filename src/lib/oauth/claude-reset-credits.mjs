@@ -487,6 +487,7 @@ export async function redeemClaudeResetCredit({
   idempotencyKey,
   transport = defaultTransport,
   now = () => Date.now(),
+  shouldRedeem = null,
 } = {}) {
   const normalized = normalizeKey(idempotencyKey)
   if (normalized.error) return normalized.error
@@ -506,6 +507,7 @@ export async function redeemClaudeResetCredit({
       exec: account.exec,
       transport,
       now,
+      shouldRedeem,
     })
     if (!outcome.ok) return outcome
     const saved = await mutateState(projectRoot, async (state) => {
@@ -523,7 +525,7 @@ export async function redeemClaudeResetCredit({
   })
 }
 
-async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now }) {
+async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now, shouldRedeem }) {
   const orgResult = await fetchOrg(transport, exec)
   if (!orgResult.ok) return orgResult
   const orgKey = claudeResetOrgId(orgResult.org)
@@ -554,6 +556,8 @@ async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now }
     if (!status.ok) return status
     const grant = pickGrant(status.block, now())
     if (!grant) return fail('CLAUDE_RESET_NOT_AVAILABLE', '当前没有可兑换的限额重置', 409)
+    if (shouldRedeem && !shouldRedeem(status.block, grant, now()))
+      return fail('CLAUDE_RESET_CONDITION_CHANGED', '自动重置条件已变化，未消耗重置卡', 409)
     const marked = await writeFence(projectRoot, orgKey, {
       operation,
       outcome: 'unknown',

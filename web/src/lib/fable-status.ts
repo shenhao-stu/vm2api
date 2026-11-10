@@ -115,7 +115,7 @@ export function fableUsedOf(
 ): number | null {
   const fb = (subject.fable as Record<string, unknown> | undefined) || {}
   if (
-    tierKey === 'pro' ||
+    (tierKey === 'pro' && subject.usage_has_fable !== true) ||
     fablePlanDenied(fb) ||
     inventedFableWindow(subject)
   ) {
@@ -145,7 +145,8 @@ export function fableProbeLabel(
   tierKey: string
 ): string {
   const fb = subject.fable as Record<string, unknown> | undefined
-  if (tierKey === 'pro') return 'Pro 无 Fable'
+  if (tierKey === 'pro' && subject.usage_has_fable !== true)
+    return '无 Fable 权限'
   // 落盘 Max 但 Fable 被拒：套餐没带 Fable 权限，不是 Pro。
   if (fablePlanDenied(fb)) return '无 Fable 权限'
   if (!fb) return '未探测'
@@ -362,7 +363,9 @@ export function fableCardInfo(
   }
   const txt = fableProbeLabel(subject, tierKey)
   const pro =
-    tierKey === 'pro' || fablePlanDenied(fb) || inventedFableWindow(subject)
+    (tierKey === 'pro' && subject.usage_has_fable !== true) ||
+    fablePlanDenied(fb) ||
+    inventedFableWindow(subject)
   const badgeCls: 'ok' | 'warn' | 'bad' | 'none' = !fb
     ? 'none'
     : pro || fb.banned

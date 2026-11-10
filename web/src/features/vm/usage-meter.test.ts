@@ -4,7 +4,7 @@ import { tierVisual } from '@/lib/tier-visual'
 import { fableRow } from './usage-meter'
 
 describe('account replacement retains explicit Pro display', () => {
-  it('hides inherited Max Fable usage while preserving the Pro badge', () => {
+  it('shows promotional Fable usage while preserving the Pro badge', () => {
     const vm: Vm = {
       id: 'hosted-slot',
       has_token: true,
@@ -15,7 +15,8 @@ describe('account replacement retains explicit Pro display', () => {
       fable: { ok: true },
     }
     expect(tierVisual(vm).label).toBe('Pro')
-    expect(fableRow(vm)).toBe(null)
+    expect(fableRow(vm)).toEqual({ kind: 'bar', pct: 21 })
+    expect(fableRow({ ...vm, usage_has_fable: false })).toBe(null)
     expect(fableRow({ ...vm, account_tier: 'max' })).toEqual({
       kind: 'bar',
       pct: 21,

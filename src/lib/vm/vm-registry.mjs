@@ -207,7 +207,7 @@ export function persistAccountTier(projectRoot, vmId, tier, { source = null } = 
   if (!fs.existsSync(file)) return null
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
   vm.claude = vm.claude || {}
-  if (vm.claude.account_tier_source === 'profile' && source !== 'profile' && source !== 'usage') return vm
+  if (vm.claude.account_tier_source === 'profile' && source !== 'profile') return vm
   if (vm.claude.account_tier === key && (vm.claude.account_tier_source || null) === source) return vm
   vm.claude.account_tier = key
   vm.claude.account_tier_source = source

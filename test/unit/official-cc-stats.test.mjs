@@ -41,7 +41,7 @@ test('parses JSON envelope result text', () => {
   assert.equal(stats.ok, true)
 })
 
-test('direct official usage shape with explicit no Fable classifies Pro', () => {
+test('direct official usage shape with no Fable does not classify the subscription', () => {
   const stats = parseOfficialCcStats({
     five_hour: { utilization: 12 },
     seven_day: { utilization: 34 },
@@ -52,7 +52,7 @@ test('direct official usage shape with explicit no Fable classifies Pro', () => 
   assert.equal(stats.ok, true)
   assert.equal(stats.limits_present, true)
   assert.equal(stats.usage_has_fable, false)
-  assert.equal(stats.account_tier, 'pro')
+  assert.equal(stats.account_tier, null)
 })
 
 test('direct official usage with only five hour is incomplete', () => {
@@ -95,7 +95,7 @@ test('stream-json /usage reads usage_report limits including Fable', () => {
   assert.equal(stats.seven_day_oi.resets_at, '2026-09-30T00:00:00Z')
 })
 
-test('complete official /usage limits without Fable classify Pro', () => {
+test('complete official /usage limits without Fable keep the subscription unknown', () => {
   const stats = parseOfficialCcStats({
     five_hour: { utilization: 12 },
     seven_day: { utilization: 34 },
@@ -108,7 +108,7 @@ test('complete official /usage limits without Fable classify Pro', () => {
   assert.equal(stats.ok, true)
   assert.equal(stats.limits_present, true)
   assert.equal(stats.usage_has_fable, false)
-  assert.equal(stats.account_tier, 'pro')
+  assert.equal(stats.account_tier, null)
 })
 
 test('stream-json /usage without limits is flagged incomplete', () => {

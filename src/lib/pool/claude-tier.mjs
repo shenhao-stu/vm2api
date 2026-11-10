@@ -32,16 +32,11 @@ export function hasClaudeFableUsage(vm = {}, quota = {}) {
 export function inferClaudeTier(vm = {}, quota = {}) {
   const hasToken = !!(vm.has_token || vm.has_access)
   if (!hasToken) return { key: 'none', label: null }
-  const q = quotaView(vm, quota)
-  if ([vm.account_tier, quota.account_tier].some((tier) => String(tier || '').toLowerCase() === 'pro'))
-    return { key: 'pro', label: 'Pro' }
-  if (q.usage_has_fable === false) return { key: 'pro', label: 'Pro' }
-  const stored = String(vm.account_tier || quota.account_tier || '').toLowerCase()
-  if (hasClaudeFableUsage(vm, quota) || stored === 'max') {
-    return { key: 'max', label: 'Max' }
-  }
-  if (stored === 'pro') {
-    return { key: 'pro', label: 'Pro' }
-  }
-  return { key: 'pro', label: 'Pro' }
+  const tiers = [vm.account_tier, quota.account_tier].map((tier) =>
+    String(tier || '')
+      .trim()
+      .toLowerCase(),
+  )
+  if (tiers.includes('pro')) return { key: 'pro', label: 'Pro' }
+  return tiers.includes('max') ? { key: 'max', label: 'Max' } : { key: 'pro', label: 'Pro' }
 }

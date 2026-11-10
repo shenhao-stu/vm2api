@@ -423,7 +423,7 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
     // the slot's stored Claude Code betas, not overwrite them.
     fable = (await probeFableEntitlement({ exec, timeoutMs, identity })).fable
     const hasFableUsage = parsed.usage_has_fable === true || !!parsed.seven_day_oi
-    // Usage listing a Fable model is Max. Hop 401/403 is format noise, not Pro.
+    // Usage may grant Fable to Pro too; a failed entitlement hop cannot override it.
     if (usageRes.ok && fable && hasFableUsage) {
       fable = { ...fable, banned: false, plan_denied: false }
     } else if (usageRes.ok && fable?.banned) {

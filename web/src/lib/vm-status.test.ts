@@ -283,7 +283,7 @@ describe('claudeTier preserves explicit plans over stale usage', () => {
     })
     expect(claudeTier(vm).key).toBe('pro')
     expect(tierVisual(vm).label).toBe('Pro')
-    expect(claudeTier(liveVm({ usage_has_fable: true })).key).toBe('max')
+    expect(claudeTier(liveVm({ usage_has_fable: true })).key).toBe('pro')
   })
 
   it('does not paint quota restriction as 调度关', () => {

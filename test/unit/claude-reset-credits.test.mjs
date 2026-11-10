@@ -505,3 +505,26 @@ test('panel query route returns the public snapshot', async () => {
   assert.equal(result.data.claude_reset_credits.available_count, 2)
   assert.equal(JSON.stringify(result).includes('grant_next'), false)
 })
+
+test('automatic eligibility is rechecked against fresh native grants before consuming a card', async () => {
+  const root = rootDir()
+  writeVm(root)
+  const { transport, posts } = scripted()
+  let checks = 0
+  const result = await redeemClaudeResetCredit({
+    projectRoot: root,
+    vmId: 'vm-1',
+    idempotencyKey: 'auto-condition-changed',
+    transport,
+    now: () => NOW,
+    shouldRedeem: (block, grant) => {
+      checks++
+      assert.equal(grant.id, block.next_grant_id)
+      return false
+    },
+  })
+  assert.equal(result.error, 'CLAUDE_RESET_CONDITION_CHANGED')
+  assert.equal(checks, 1)
+  assert.equal(posts.length, 0)
+  fs.rmSync(root, { recursive: true, force: true })
+})

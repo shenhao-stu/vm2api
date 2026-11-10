@@ -104,7 +104,7 @@ export type FableRow =
   { kind: 'bar'; pct: number } | { kind: 'note'; text: string }
 
 /**
- * Max 账号的 Fable 额度。Pro 没有这个窗口，返回 null 时不占位。
+ * 具有 Fable 权限的账号额度；临时权益不会改变套餐标签。
  *
  * 「拒 / 满」这些态没有百分比，此时返回 `note` 走文案而不是画满格条——
  * 满格红条在一个 5h/7d 都是 0% 的号上会被误读成「烧满了」，
@@ -112,7 +112,7 @@ export type FableRow =
  */
 export function fableRow(vm: Vm): FableRow | null {
   const tier = claudeTier(vm)
-  if (tier.key !== 'max') return null
+  if (tier.key !== 'max' && vm.usage_has_fable !== true) return null
   const st = fableState(vm, tier.key)
   if (st.usedPct != null) return { kind: 'bar', pct: st.usedPct }
   if (st.tone.key === 'none') return null

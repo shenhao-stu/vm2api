@@ -61,12 +61,9 @@ export function tierFromOauthProfile(profile = {}) {
 }
 
 export function inferTierFromOfficialStats(text = '', structured = {}) {
-  if (structured?.seven_day_oi || structured?.fable?.ok || structured?.usage_has_fable) return 'max'
-  if (structured?.usage_has_fable === false) return 'pro'
   const blob = `${text} ${JSON.stringify(structured || {})}`.toLowerCase()
   if (/\b(claude\s+max|max\s*20x|max plan|plan:\s*max)\b/.test(blob)) return 'max'
   if (/\b(claude\s+pro|pro plan|plan:\s*pro)\b/.test(blob)) return 'pro'
-  if (structured?.fable?.plan_denied) return 'pro'
   return null
 }
 
