@@ -31,7 +31,15 @@ Sub2API shared account (configured concurrency)
   → ReClaude service
 ```
 
-## Latest acceptance: 2026-11-01
+## Current upgrade: 2026-11-11
+
+See [the native executable upgrade runbook](NATIVE-UPGRADE.md) for v1.8.3, Fable5.2, preserved
+native CLI versions, quota-parser compatibility and bounded real-call evidence.
+The optional [weekly priority controller](../claude-weekly-priority/README.md)
+keeps eligible Pro accounts ahead of Max and ReClaude using native Sub2API
+priorities, while preserving existing conversations and authorization scopes.
+
+## Earlier acceptance: 2026-11-01
 
 A real, unmodified Claude Code client completed six streamed calls through
 GeToken, Sub2API, the dedicated vm2api gateway and the native ReClaude backend.

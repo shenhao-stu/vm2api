@@ -2,7 +2,7 @@
   "account": {
     "platform": "anthropic",
     "type": "apikey",
-    "priority": 0,
+    "priority": 50,
     "concurrency": 10,
     "rate_multiplier": 1,
     "proxy_id": null,
@@ -12,6 +12,7 @@
   "groups": [],
   "models": [
     "claude-fable-5-1",
+    "claude-fable-5-2",
     "claude-haiku-5-5",
     "claude-opus-5-5",
     "claude-sonnet-5-5"
