@@ -1,6 +1,8 @@
 import type { Vm } from '@/types/panel-vm'
-import { fableState } from '@/lib/fable-status'
+import { expiresAtToMs, fableState } from '@/lib/fable-status'
+import { pct } from '@/lib/format'
 import { cn } from '@/lib/utils'
+import { isCodexVm } from '@/lib/vm-kind'
 import { claudeTier } from '@/lib/vm-status'
 
 /** 用量条统一朝一个方向：值越高越危险。四档对应状态轴。 */
@@ -107,15 +109,32 @@ export type FableRow =
   { kind: 'bar'; pct: number } | { kind: 'note'; text: string }
 
 /**
- * Max 账号的 Fable 额度。Pro 没有这个窗口，返回 null 时不占位。
+ * 官方已探测的 Fable 窗口独立于套餐标签；临时权益不会把 Pro 变成 Max。
+ * 无官方窗口的非 Max 账号不占位。这里展示用量，不决定模型资格或调度。
  *
  * 「拒 / 满」这些态没有百分比，此时返回 `note` 走文案而不是画满格条——
  * 满格红条在一个 5h/7d 都是 0% 的号上会被误读成「烧满了」，
  * 而实际含义是「这个号根本用不了 Fable」。
  */
 export function fableRow(vm: Vm): FableRow | null {
+  if (!vm.has_token || isCodexVm(vm)) return null
   const tier = claudeTier(vm)
-  if (tier.key !== 'max') return null
+  if (tier.key !== 'max') {
+    const used = vm.utilization_7d_oi
+    // Canonical native OAuth window only: a successful model hop or an old
+    // `fable.utilization` fallback does not establish a promotional allowance.
+    if (
+      vm.usage_has_fable !== true ||
+      typeof used !== 'number' ||
+      !Number.isFinite(used) ||
+      used < 0 ||
+      used > 100 ||
+      !expiresAtToMs(vm.reset_7d_oi)
+    )
+      return null
+    if (vm.fable?.banned) return { kind: 'note', text: '拒' }
+    return { kind: 'bar', pct: pct(used) }
+  }
   const st = fableState(vm, tier.key)
   if (st.usedPct != null) return { kind: 'bar', pct: st.usedPct }
   if (st.tone.key === 'none') return null

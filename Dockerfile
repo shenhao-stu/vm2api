@@ -7,6 +7,7 @@ WORKDIR /src/web
 COPY web/package.json web/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY web/ ./
+COPY src/lib/pool/claude-fable-promotion.mjs src/lib/pool/claude-fable-promotion.d.mts /src/src/lib/pool/
 RUN pnpm build
 
 FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS helpers

@@ -4,6 +4,7 @@ import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { catalogForVm, isCodexVm } from '@/lib/vm-kind'
 import { claudeTier } from '@/lib/vm-status'
+import { useNow } from '@/hooks/use-now'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -12,7 +13,12 @@ import { meQueryOptions } from '@/features/auth/queries'
 import { modelPolicyQueryOptions } from '@/features/models/queries'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { vmQueryOptions } from '@/features/vm/queries'
-import { matchesAllowedModel, toggleAllowedModel } from './allowed-models'
+import {
+  canSelectModel,
+  matchesAllowedModel,
+  selectableModels,
+  toggleAllowedModel,
+} from './allowed-models'
 
 type CatalogItem = { id: string; label: string; family?: string }
 
@@ -61,14 +67,15 @@ function allowedListOf(vm: Vm): string[] | null {
   return Array.isArray(a) && a.length ? a : null
 }
 
-function isChecked(vm: Vm, id: string) {
-  if (isFableId(id) && claudeTier(vm).key === 'pro') return false
+function isChecked(vm: Vm, id: string, now: number) {
+  if (!canSelectModel(vm, id, now)) return false
   const allowed = allowedListOf(vm)
   if (!allowed) return true
   return allowed.some((a) => matchesAllowedModel(id, a))
 }
 
 export function AllowedModelsCard({ vm }: { vm: Vm }) {
+  const now = useNow()
   const qc = useQueryClient()
   const me = useQuery(meQueryOptions())
   const canEdit = me.data?.role === 'admin'
@@ -83,11 +90,20 @@ export function AllowedModelsCard({ vm }: { vm: Vm }) {
   })
   const items = catalogForVm(catalogFrom(policy.data), vm)
   const save = useMutation({
-    mutationFn: (next: string[] | null) =>
-      api(`/api/panel/vms/${encodeURIComponent(vm.id)}`, {
+    mutationFn: (next: string[] | null) => {
+      const allowed =
+        next === null ? null : selectableModels(vm, next, Date.now())
+      // Native empty lists mean inheritance, not "deny all". Never accidentally
+      // broaden access when the last selection expires or is unchecked.
+      if (allowed && !allowed.length)
+        throw new Error('至少保留一个可用模型；停用账号请关闭调度')
+      return api(`/api/panel/vms/${encodeURIComponent(vm.id)}`, {
         method: 'PATCH',
-        body: JSON.stringify({ allowed_models: next }),
-      }),
+        body: JSON.stringify({
+          allowed_models: allowed,
+        }),
+      })
+    },
     onSuccess: (_r, next) => {
       toast.success(next?.length ? '已限制模型' : '已恢复全部模型')
       qc.invalidateQueries({ queryKey: vmQueryOptions(vm.id).queryKey })
@@ -97,23 +113,28 @@ export function AllowedModelsCard({ vm }: { vm: Vm }) {
   })
 
   const toggle = (id: string, checked: boolean) => {
+    const clickTime = Date.now()
+    if (!canSelectModel(vm, id, clickTime)) {
+      toast.error('当前套餐或活动时间不允许此模型')
+      return
+    }
     const current = allowedListOf(vm)
     let next: string[]
     if (!current) {
       next = items
         .map((m) => m.id)
         .filter((mid) => {
-          if (pro && isFableId(mid)) return false
+          if (!canSelectModel(vm, mid, clickTime)) return false
           if (mid === id) return checked
           return true
         })
     } else {
       next = toggleAllowedModel(current, id, checked)
-      if (pro) next = next.filter((a) => !isFableId(a))
+      next = selectableModels(vm, next, clickTime)
     }
     // selecting everything is the same as inheriting — store null, not a full list
     const expected = items
-      .filter((m) => !(pro && isFableId(m.id)))
+      .filter((m) => canSelectModel(vm, m.id, clickTime))
       .map((m) => m.id)
     const covers =
       expected.length &&
@@ -133,7 +154,11 @@ export function AllowedModelsCard({ vm }: { vm: Vm }) {
               ? '未限制，继承 GPT 模型矩阵'
               : '未限制，继承全局模型矩阵'
             : '仅下列模型可打入此凭证'}
-          {pro && !gpt ? ' · Pro 账号无 Fable' : ''}
+          {pro && !gpt
+            ? canSelectModel(vm, 'claude-fable-5-2', now)
+              ? ' · Pro 活动期间仅开放 Fable 5.2'
+              : ' · Pro 当前未开放 Fable'
+            : ''}
         </p>
         {!canEdit ? (
           inherit ? null : (
@@ -146,13 +171,13 @@ export function AllowedModelsCard({ vm }: { vm: Vm }) {
         ) : items.length ? (
           <div className='flex flex-wrap gap-x-4 gap-y-2'>
             {items.map((m) => {
-              const locked = pro && isFableId(m.id)
+              const locked = !canSelectModel(vm, m.id, now)
               const id = `slot-model-${m.id}`
               return (
                 <div key={m.id} className='flex items-center gap-2'>
                   <Checkbox
                     id={id}
-                    checked={isChecked(vm, m.id)}
+                    checked={isChecked(vm, m.id, now)}
                     disabled={locked || !canEdit || save.isPending}
                     onCheckedChange={(v) => toggle(m.id, v === true)}
                   />
