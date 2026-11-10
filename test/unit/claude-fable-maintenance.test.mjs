@@ -118,6 +118,29 @@ test('disabled automation does not query official endpoint or redeem', async () 
   assert.equal(f.calls.filter((x) => x.method === 'POST').length, 0)
 })
 
+test('5h exhaustion with Fable remaining performs only a metadata query', async () => {
+  const f = fixture()
+  const api = f.api
+  f.api = async (...args) => {
+    const result = await api(...args)
+    if (!args[1].endsWith('/query')) return result
+    const copy = structuredClone(result)
+    copy.claude_reset_credits.credits[0].percent_used = {
+      five_hour: 100,
+      seven_day: 9,
+      seven_day_overage_included: 13,
+    }
+    return copy
+  }
+  assert.deepEqual(await maintainFableResets(f), [{ vm_id: 'pro1', action: 'skip', reason: 'no_reset_needed' }])
+  assert.deepEqual(
+    f.calls.filter((c) => c.method === 'POST').map((c) => c.route),
+    ['/vms/pro1/claude-reset/query'],
+  )
+  assert.equal(f.snapshots.length, 0)
+  assert.deepEqual(f.state, {})
+})
+
 test('account replacement cannot inherit another account reset history', async () => {
   const f = fixture()
   f.state[`pro1:${'b'.repeat(64)}`] = [{ outcome: 'pending' }]

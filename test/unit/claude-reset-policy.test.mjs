@@ -53,6 +53,17 @@ test('exhausted Fable uses a fresh eligible card without tier inference', () => 
   assert.equal(out.idempotency_key.length, 75)
 })
 
+test('ordinary 5h or 7d exhaustion does not spend a non-expiring Fable card', () => {
+  for (const percent_used of [
+    { five_hour: 100, seven_day: 9, seven_day_overage_included: 13 },
+    { five_hour: 100, seven_day_overage_included: 0 },
+    { seven_day: 100, seven_day_overage_included: 99 },
+  ]) {
+    const plan = planClaudeFableReset(fixture({ credit: { percent_used } }))
+    assert.deepEqual(plan, { action: 'skip', reason: 'no_reset_needed' })
+  }
+})
+
 test('a stale or future snapshot requests only a fresh status query', () => {
   for (const time of [NOW - 600001, NOW + 5001, NaN]) {
     const args = fixture()

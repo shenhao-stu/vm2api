@@ -632,6 +632,28 @@ test('official quota resetting after query makes automatic redemption unnecessar
   assert.equal(posts.length, 1)
 })
 
+test('native automatic preflight rejects ordinary 5h exhaustion with Fable remaining', async (t) => {
+  const root = rootDir()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeVm(root)
+  const status = autoStatus()
+  status.cedar_ember.grants[0].percent_used = {
+    five_hour: 100,
+    seven_day: 9,
+    seven_day_overage_included: 13,
+  }
+  const { transport, posts } = scripted({ status })
+  const result = await redeemClaudeResetCredit({
+    projectRoot: root,
+    vmId: 'vm-1',
+    ...autoRequest(),
+    transport,
+    now: () => NOW,
+  })
+  assert.equal(result.error, 'CLAUDE_RESET_AUTO_NOT_NEEDED')
+  assert.equal(posts.length, 0)
+})
+
 test('a consumed remaining use or another ordinary next card prevents automatic redemption', async (t) => {
   for (const mutate of [
     (block) => {

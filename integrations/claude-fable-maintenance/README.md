@@ -24,6 +24,14 @@ fixed-exit guard are eligible. Redeem one official card when its Fable allowance
 is exhausted, or it expires within 24 hours and a covered allowance has been used.
 Do not enable paid overage. Zero-use cards are not spent merely to test this job.
 
+Ordinary 5H or 7D exhaustion is not Fable exhaustion. For example, 5H at 100%
+and Fable at 13% must leave a non-expiring card untouched, even if the official
+endpoint permits early redemption or the card also clears 5H. A request to
+restore scheduling does not authorize an early manual redemption. Outside the
+automatic policy, require an explicit instruction to spend that card; otherwise
+retain the real upstream cooldown. Never omit `auto_reset` to bypass a skipped
+automatic decision.
+
 The state is account-scoped. Intent is durable before redemption, and the native
 endpoint rechecks official eligibility, account/organization and idempotency.
 Unknown outcomes remain blocked for manual reconciliation; restarting the job
