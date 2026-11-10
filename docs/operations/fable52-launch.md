@@ -26,8 +26,8 @@ operation fences. They never enable paid overage or clear fixed-exit latches.
 
 Standard official rates per million tokens are input $8, output $40, cache write
 5m $10 / 1h $16, cache read $0.20. This deployment supports standard mode only;
-Fable 5.2 has no Fast rate or capability. It uses adaptive thinking, defaults to high effort, supports 1M
-context and up to 128K output; unsupported sampling fields are removed. Existing
+Fable 5.2 has no Fast rate or capability. It uses adaptive thinking, defaults to
+high effort, supports 1M context and up to 128K output; unsupported sampling fields are removed. Existing
 model-specific behavior and administrator model overrides remain intact.
 
 Selected upstream changes: model metadata, explicit subscription metadata, and
