@@ -10,7 +10,7 @@ import {
   filterPublicModelIds,
 } from '../../src/lib/protocol/model-policy.mjs'
 import { clearModelsCache, validateOfficialModel } from '../../src/lib/protocol/models.mjs'
-import { prepareAnthropicRequest } from '../../src/lib/protocol/anthropic-policy.mjs'
+import { prepareAnthropicRequest, modelSupportsFastMode } from '../../src/lib/protocol/anthropic-policy.mjs'
 import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
 import { withRequestProtocolBetas } from '../../src/lib/protocol/claude-code-betas.mjs'
 import { normalizeAnthropicMessages } from '../../src/lib/protocol/sanitize.mjs'
@@ -30,7 +30,14 @@ test('Fable 5.2 uses official capabilities and prices independently of Fable 5.1
   const { input, output, cache_read, cache_5m, cache_1h } = builtinOf(canonical).price
   assert.deepEqual([input, output, cache_read, cache_5m, cache_1h], [8, 40, 0.2, 10, 16])
   assert.equal(BUILTIN_ALIASES[legacy], canonical)
-  assert.equal(builtinOf(canonical).price.modes?.fast, undefined)
+  assert.deepEqual(builtinOf(canonical).price.modes.fast, {
+    input: 16,
+    output: 80,
+    cache_read: 0.4,
+    cache_5m: 20,
+    cache_1h: 32,
+  })
+  assert.equal(modelSupportsFastMode(canonical), false)
   assert.equal(builtinOf('claude-fable-5-1').price.input, 10)
 })
 
