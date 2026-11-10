@@ -38,6 +38,13 @@ For Anthropic SDKs and Claude Code, set
 `ANTHROPIC_BASE_URL=https://storyboardbook.cn/claude`; the client adds
 `/v1/messages`. Direct HTTP calls use `/claude/v1/messages`.
 OpenAI-compatible clients use `base_url=https://storyboardbook.cn/claude/v1`.
+To tolerate an Anthropic client configured with that OpenAI-style URL, include
+`deploy/hosted-prefix-compat.conf` inside the existing `/claude/` proxy location.
+It internally maps the duplicated `/claude/v1/v1/` prefix for Messages, token
+counting, Chat Completions and Models to the same Claude upstream. It does not
+redirect POST requests or change the root GPT routes. Run
+`python3 test/ops/hosted-nginx-prefix.py` on Linux to verify body, authorization,
+query preservation and GPT isolation before reloading Nginx.
 The original GPT Key remains on `/v1`; it is not interchangeable with Keys
 issued by the hosted workspace. Neither route changes the Fable deny policy.
 
