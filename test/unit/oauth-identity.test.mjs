@@ -24,7 +24,13 @@ test('flattenOauthIdentity reads oauth_account bootstrap shape', () => {
         organization_uuid: 'org-1',
       },
     }),
-    { email: 'user@example.com', account_uuid: 'acct-1', org_uuid: 'org-1', subscription_type: null },
+    {
+      email: 'user@example.com',
+      account_uuid: 'acct-1',
+      org_uuid: 'org-1',
+      subscription_type: null,
+      rate_limit_tier: null,
+    },
   )
 })
 
@@ -34,7 +40,13 @@ test('flattenOauthIdentity reads token account/organization objects', () => {
       account: { uuid: 'acct-2', email_address: 'two@example.com' },
       organization: { uuid: 'org-2' },
     }),
-    { email: 'two@example.com', account_uuid: 'acct-2', org_uuid: 'org-2', subscription_type: null },
+    {
+      email: 'two@example.com',
+      account_uuid: 'acct-2',
+      org_uuid: 'org-2',
+      subscription_type: null,
+      rate_limit_tier: null,
+    },
   )
 })
 
@@ -44,6 +56,7 @@ test('flattenOauthIdentity ignores empty strings', () => {
     account_uuid: null,
     org_uuid: null,
     subscription_type: null,
+    rate_limit_tier: null,
   })
 })
 
@@ -180,4 +193,17 @@ test('liveOauthToSetupToken keeps flattened identity', () => {
   assert.equal(out.email, 'live@example.com')
   assert.equal(out.account_uuid, 'acct-live')
   assert.equal(out.org_uuid, 'org-live')
+})
+
+test('subscription extraction uses named identity fields, never arbitrary model or error text', () => {
+  assert.equal(flattenOauthIdentity({ models: ['claude-max'], error: 'upgrade to Claude Max' }).subscription_type, null)
+  assert.equal(
+    flattenOauthIdentity({ account: { has_claude_pro: true }, models: ['claude-fable-5-2'] }).subscription_type,
+    'pro',
+  )
+  assert.equal(flattenOauthIdentity({ organization: { organization_type: 'claude_ultra' } }).subscription_type, 'ultra')
+  assert.equal(
+    flattenOauthIdentity({ organization: { rate_limit_tier: 'default_claude_max_5x' } }).subscription_type,
+    'max',
+  )
 })

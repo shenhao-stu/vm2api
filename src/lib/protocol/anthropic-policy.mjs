@@ -17,6 +17,7 @@ import {
 import {
   applyMaxTokensCap,
   applyModelRequestRules,
+  isFable52Model,
   getCapabilities,
   isHaiku55Model,
   isOpus55Model,
@@ -162,6 +163,12 @@ function thinkingModeEnabled(body) {
  * top_p / top_k are also rejected. Real Claude Code sends temperature: 1.
  */
 export function alignSamplingWithThinking(body = {}) {
+  if (isFable52Model(body?.model)) {
+    delete body.temperature
+    delete body.top_p
+    delete body.top_k
+    return body
+  }
   if (!thinkingModeEnabled(body)) return body
   const out = body
   if (out.temperature !== 1) out.temperature = 1
@@ -438,7 +445,7 @@ export function sanitizeAnthropicBodyForBetaTokens(body = {}, anthropicBetaHeade
 /** sub2api normalizeClaudeOAuthRequestBody defaults (temperature / empty tools). */
 export function ensureClaudeOAuthBodyDefaults(body = {}) {
   const out = body && typeof body === 'object' ? body : {}
-  if (out.temperature == null) out.temperature = 1
+  if (out.temperature == null && !isFable52Model(out.model)) out.temperature = 1
   if (!Array.isArray(out.tools)) out.tools = []
   if (out.tools.length === 0 && out.tool_choice) delete out.tool_choice
   return out

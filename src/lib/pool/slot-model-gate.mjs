@@ -1,4 +1,5 @@
-import { inferClaudeTier } from './claude-tier.mjs'
+import { inferClaudeTier, claudeSubscriptionTier } from './claude-tier.mjs'
+import { proFablePromotionAllows } from './claude-fable-promotion.mjs'
 import { isFableModel } from './upstream-error-policy.mjs'
 import { getModelEntry, getPolicyCatalogIds, resolvePolicyModelId } from '../protocol/model-policy.mjs'
 import { getGptPolicyCatalogIds } from '../protocol/gpt-model-policy.mjs'
@@ -33,9 +34,11 @@ function keysIntersect(left, right) {
   for (const a of left) {
     for (const b of right) {
       if (a === b) return true
-      // The corrected 5-1 id must not widen a Fable 5 allowlist (or vice versa).
-      const fable51 = /^claude-fable-5(?:-1|\.1)(?:-|$)/
-      if (fable51.test(a) !== fable51.test(b)) continue
+      // A dated snapshot may match its base, but another version must not.
+      if (/^claude-fable-/.test(a) || /^claude-fable-/.test(b)) {
+        const version = (id) => id.replace(/-\d{8}$/, '').replace(/\.(\d+)$/, '-$1')
+        if (version(a) !== version(b)) continue
+      }
       // claude-opus-5 is a prefix of claude-opus-5-5. They are different models.
       const opus55 = /^claude-opus-5(?:-5|\.5)(?:-|$)/
       if (opus55.test(a) !== opus55.test(b)) continue
@@ -98,24 +101,28 @@ function quotaView(vm, account) {
     status_7d_oi: unified.status_7d_oi || unified['7d_oi']?.status || vm?.status_7d_oi,
     '7d_oi': unified['7d_oi'],
     account_tier: unified.account_tier || vm?.claude?.account_tier || vm?.account_tier,
+    account_tier_source: unified.account_tier_source || vm?.claude?.account_tier_source || vm?.account_tier_source,
+    subscription_type: unified.subscription_type || vm?.claude?.subscription_type || vm?.subscription_type,
+    rate_limit_tier: unified.rate_limit_tier || vm?.claude?.rate_limit_tier || vm?.rate_limit_tier,
     usage_has_fable: unified.usage_has_fable ?? vm?.usage_has_fable ?? null,
   }
 }
 
 export function resolveSlotTier(vm, account = null) {
   const quota = quotaView(vm, account)
-  // An explicit Pro classification must veto stale Max usage evidence. The
-  // latter can survive a credential change or a Fable entitlement rejection.
-  if (
-    String(vm?.claude?.account_tier || vm?.account_tier || '').toLowerCase() === 'pro' ||
-    String(account?.unified?.account_tier || '').toLowerCase() === 'pro'
-  ) {
-    return 'pro'
-  }
+  const identity =
+    vm?.claude?.subscription_type || vm?.claude?.rate_limit_tier ? vm.claude : vm?.subscription_type ? vm : quota
+  if (identity?.subscription_type) return claudeSubscriptionTier(identity) || 'none'
+  const subscription = claudeSubscriptionTier(identity)
+  if (subscription) return subscription
+  // An explicit Pro classification vetoes stale Max data from another view.
+  const explicitPro = (record) => record?.account_tier === 'pro' && record?.account_tier_source !== 'default'
+  if (explicitPro(vm?.claude || vm) || explicitPro(account?.unified)) return 'pro'
   return inferClaudeTier(
     {
       has_token: true,
       account_tier: quota.account_tier,
+      account_tier_source: quota.account_tier_source,
       fable: quota.fable,
       utilization_7d_oi: quota.utilization_7d_oi,
       reset_7d_oi: quota.reset_7d_oi,
@@ -126,7 +133,7 @@ export function resolveSlotTier(vm, account = null) {
   ).key
 }
 
-export function slotAllowsModel({ vm, account = null, model } = {}) {
+export function slotAllowsModel({ vm, account = null, model, now = Date.now() } = {}) {
   const modelKey = String(model || '').trim()
   if (!modelKey) return { ok: true }
   if (isCodexVm(vm)) {
@@ -136,9 +143,12 @@ export function slotAllowsModel({ vm, account = null, model } = {}) {
   }
   const canonical = resolvePolicyModelId(modelKey) || modelKey
   const deniedUntil = Number(account?.unified?.model_denied_until?.[canonical]) || 0
-  if (deniedUntil > Date.now()) return { ok: false, reason: 'model_not_supported' }
-  if (isFableModel(modelKey) && resolveSlotTier(vm, account) !== 'max') {
-    return { ok: false, reason: 'fable_requires_max' }
+  if (deniedUntil > now) return { ok: false, reason: 'model_not_supported' }
+  if (isFableModel(modelKey)) {
+    const tier = resolveSlotTier(vm, account)
+    if (tier !== 'max' && !(tier === 'pro' && proFablePromotionAllows(canonical, now))) {
+      return { ok: false, reason: 'fable_requires_max' }
+    }
   }
   const allowed = normalizeAllowedModels(vm?.policy?.allowed_models)
   if (allowed && !modelMatchesAllowlist(modelKey, allowed)) {

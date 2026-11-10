@@ -41,7 +41,7 @@ test('parses JSON envelope result text', () => {
   assert.equal(stats.ok, true)
 })
 
-test('direct official usage shape with explicit no Fable classifies Pro', () => {
+test('official usage without a Fable window does not infer a subscription', () => {
   const stats = parseOfficialCcStats({
     five_hour: { utilization: 12 },
     seven_day: { utilization: 34 },
@@ -52,7 +52,7 @@ test('direct official usage shape with explicit no Fable classifies Pro', () => 
   assert.equal(stats.ok, true)
   assert.equal(stats.limits_present, true)
   assert.equal(stats.usage_has_fable, false)
-  assert.equal(stats.account_tier, 'pro')
+  assert.equal(stats.account_tier, null)
 })
 
 test('direct official usage with only five hour is incomplete', () => {
@@ -95,7 +95,7 @@ test('stream-json /usage reads usage_report limits including Fable', () => {
   assert.equal(stats.seven_day_oi.resets_at, '2026-09-30T00:00:00Z')
 })
 
-test('complete official /usage limits without Fable classify Pro', () => {
+test('a complete usage catalog without Fable does not infer a subscription', () => {
   const stats = parseOfficialCcStats({
     five_hour: { utilization: 12 },
     seven_day: { utilization: 34 },
@@ -108,7 +108,7 @@ test('complete official /usage limits without Fable classify Pro', () => {
   assert.equal(stats.ok, true)
   assert.equal(stats.limits_present, true)
   assert.equal(stats.usage_has_fable, false)
-  assert.equal(stats.account_tier, 'pro')
+  assert.equal(stats.account_tier, null)
 })
 
 test('stream-json /usage without limits is flagged incomplete', () => {
@@ -188,4 +188,11 @@ test('tierFromOauthProfile trusts has_claude_max / organization_type', async () 
   assert.equal(tierFromOauthProfile({ account: { has_claude_pro: true } }), 'pro')
   assert.equal(tierFromOauthProfile({ organization: { organization_type: 'claude_pro' } }), 'pro')
   assert.equal(tierFromOauthProfile({}), null)
+})
+
+test('Fable entitlement never overrides explicit Pro subscription identity', () => {
+  assert.equal(inferTierFromOfficialStats('', { usage_has_fable: true, seven_day_oi: { utilization: 0.2 } }), null)
+  assert.equal(inferTierFromOfficialStats('', { subscription_type: 'pro', usage_has_fable: true }), 'pro')
+  assert.equal(inferTierFromOfficialStats('', { subscription_type: 'ultra' }), 'max')
+  assert.equal(inferTierFromOfficialStats('error mentions Claude Max', {}), null)
 })

@@ -8,6 +8,7 @@
  * access_token / refresh_token / session_key from the VM record.
  */
 
+import { claudeSubscriptionTier } from '../pool/claude-tier.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
@@ -70,6 +71,8 @@ export function normalizeOauth(cred = {}) {
     email: identity.email,
     account_uuid: identity.account_uuid,
     org_uuid: identity.org_uuid,
+    subscription_type: identity.subscription_type,
+    rate_limit_tier: identity.rate_limit_tier,
     scope: cred.scope || (scopes.length ? scopes.join(' ') : null),
     source: cred.source || null,
     session_key: cred.session_key || cred.sessionKey || null,
@@ -291,6 +294,7 @@ export function readWorkerCredentialFile(homeDir) {
       org_uuid: oauth.orgUuid || oauth.org_uuid || null,
       scope,
       subscription_type: oauth.subscriptionType || oauth.subscription_type || null,
+      rate_limit_tier: oauth.rateLimitTier || oauth.rate_limit_tier || null,
       source: 'go-slot-worker',
       auth_scheme: resolveAuthScheme({
         mode,
@@ -468,6 +472,7 @@ export function writeWorkerCredentialFile(homeDir, cred) {
   if (isAnySetupTokenMode(mode)) oauth.type = mode
 
   if (subscriptionType) oauth.subscriptionType = subscriptionType
+  if (n.rate_limit_tier) oauth.rateLimitTier = n.rate_limit_tier
   const generation = Number(n._token_version || cred.kinGeneration || cred.kin_generation) || Date.now()
   oauth.kinGeneration = generation
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
@@ -583,7 +588,7 @@ export function restoreScheduleAfterLiveCredential(vm) {
   return vm
 }
 
-export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false } = {}) {
+export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false, operatorImport = false } = {}) {
   if (!vmPath || !fs.existsSync(vmPath)) return null
   const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   const prev = vm.claude || {}
@@ -598,6 +603,19 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false } = {})
     !!(n._token_version && prev._token_version && Number(n._token_version) > Number(prev._token_version))
   const mode = credentialModeFromOauth({ ...cred, mode: cred?.mode || cred?.type || prev.mode })
   vm.claude = stripCredentialSecrets({ ...prev })
+  const identityChanged =
+    (n.account_uuid && prev.account_uuid && n.account_uuid !== prev.account_uuid) ||
+    (n.org_uuid && prev.org_uuid && n.org_uuid !== prev.org_uuid)
+  if (identityChanged) {
+    delete vm.claude.account_tier
+    delete vm.claude.account_tier_source
+  }
+  if (operatorImport || identityChanged) {
+    delete vm.claude.subscription_type
+    delete vm.claude.rate_limit_tier
+  }
+  if (n.subscription_type) vm.claude.subscription_type = n.subscription_type
+  if (n.rate_limit_tier) vm.claude.rate_limit_tier = n.rate_limit_tier
   if (n.access_token || cred.has_access || cred.has_api_key || cred.api_key) vm.claude.has_access = true
   if (n.refresh_token || cred.has_refresh) vm.claude.has_refresh = true
   if (n.expires_at) vm.claude.expires_at = n.expires_at
@@ -613,7 +631,11 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false } = {})
   }
   if (n.source) vm.claude.source = n.source
   vm.claude.mode = mode
-  if (mode !== 'apikey' && vm.claude.account_tier !== 'max') {
+  const subscriptionTier = claudeSubscriptionTier(n)
+  if (mode !== 'apikey' && subscriptionTier) {
+    vm.claude.account_tier = subscriptionTier
+    vm.claude.account_tier_source = 'profile'
+  } else if (mode !== 'apikey' && vm.claude.account_tier !== 'max') {
     vm.claude.account_tier = 'pro'
     vm.claude.account_tier_source = vm.claude.account_tier_source || 'default'
   }

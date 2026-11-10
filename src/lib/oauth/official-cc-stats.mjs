@@ -4,6 +4,8 @@
  * lines, --output-format json envelopes, or raw CLI text. Never logs secrets.
  */
 import { isCompleteOAuthUsage, normUtilization, parseOAuthUsage } from './crs-usage-probe.mjs'
+import { subscriptionTypeFromOauthRaw } from './oauth-identity.mjs'
+import { normalizeClaudeTier } from '../pool/claude-tier.mjs'
 
 export function officialStatsText(raw) {
   if (raw == null) return ''
@@ -50,24 +52,14 @@ function windowFromText(text, patterns) {
  * reads for "Max"/"Pro"). Returns null when the profile does not say.
  */
 export function tierFromOauthProfile(profile = {}) {
-  const account = profile?.account || {}
-  const org = profile?.organization || {}
-  if (account.has_claude_max === true) return 'max'
-  const orgType = String(org.organization_type || '').toLowerCase()
-  const rateTier = String(org.rate_limit_tier || '').toLowerCase()
-  if (orgType === 'claude_max' || rateTier.includes('max')) return 'max'
-  if (account.has_claude_pro === true || orgType === 'claude_pro' || rateTier.includes('pro')) return 'pro'
-  return null
+  return normalizeClaudeTier(subscriptionTypeFromOauthRaw(profile))
 }
 
 export function inferTierFromOfficialStats(text = '', structured = {}) {
-  if (structured?.seven_day_oi || structured?.fable?.ok || structured?.usage_has_fable) return 'max'
-  if (structured?.usage_has_fable === false) return 'pro'
-  const blob = `${text} ${JSON.stringify(structured || {})}`.toLowerCase()
-  if (/\b(claude\s+max|max\s*20x|max plan|plan:\s*max)\b/.test(blob)) return 'max'
-  if (/\b(claude\s+pro|pro plan|plan:\s*pro)\b/.test(blob)) return 'pro'
-  if (structured?.fable?.plan_denied) return 'pro'
-  return null
+  const explicit = normalizeClaudeTier(subscriptionTypeFromOauthRaw(structured))
+  if (explicit) return explicit
+  const plan = String(text).match(/^(?:current\s+)?plan:\s*(?:claude\s+)?(pro|max(?:\s*(?:5|20)x)?|ultra)\b/im)
+  return plan ? normalizeClaudeTier(plan[1].replace(/\s/g, '')) : null
 }
 
 /**
@@ -228,7 +220,7 @@ export function parseOfficialCcStats(raw) {
     extra_usage: extra,
     usage_has_fable: fromOfficialApi?.usage_has_fable ?? fromNested?.usage_has_fable ?? null,
   }
-  const accountTier = inferTierFromOfficialStats(text, { ...usage, fable: structured?.fable })
+  const accountTier = inferTierFromOfficialStats(text, structured)
   const limitsPresent = structured ? isCompleteOAuthUsage(structured, fromOfficialApi) : false
   return {
     ok: !!(fiveHour || sevenDay || sevenDayOi || extra || accountTier),

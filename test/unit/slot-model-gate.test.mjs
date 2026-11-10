@@ -152,3 +152,49 @@ test('Claude slot rejects GPT models', () => {
   assert.equal(hit.ok, false)
   assert.equal(hit.reason, 'claude_model_required')
 })
+
+test('Pro launch entitlement expires at the fixed boundary while Max remains eligible', () => {
+  const pro = {
+    claude: { account_tier: 'pro', subscription_type: 'pro' },
+    policy: { allowed_models: ['claude-fable-5-2'] },
+  }
+  const start = Date.parse('2026-11-09T18:00:00Z')
+  const end = Date.parse('2026-11-17T07:59:00Z')
+  for (const now of [start, end - 1]) {
+    assert.equal(slotAllowsModel({ vm: pro, model: 'claude-fable-5-2', now }).ok, true)
+    assert.equal(slotAllowsModel({ vm: pro, model: 'claude-fable-5.2', now }).ok, true)
+    assert.equal(slotAllowsModel({ vm: pro, model: 'claude-fable-5-1', now }).ok, false)
+  }
+  for (const now of [start - 1, end, end + 1, NaN]) {
+    assert.equal(slotAllowsModel({ vm: pro, model: 'claude-fable-5-2', now }).ok, false)
+  }
+  for (const subscription_type of ['max', 'max5x', 'max20x', 'ultra']) {
+    const vm = { claude: { subscription_type }, policy: {} }
+    assert.equal(slotAllowsModel({ vm, model: 'claude-fable-5-2', now: end + 1 }).ok, true)
+  }
+  const defaultPlan = { claude: { account_tier: 'pro', account_tier_source: 'default' }, policy: {} }
+  assert.equal(slotAllowsModel({ vm: defaultPlan, model: 'claude-fable-5-2', now: start }).ok, false)
+  const polluted = { claude: { account_tier: 'max', account_tier_source: 'usage' }, policy: {} }
+  assert.equal(slotAllowsModel({ vm: polluted, model: 'claude-fable-5-2', now: start }).ok, false)
+  assert.equal(slotAllowsModel({ vm: { claude: {}, policy: {} }, model: 'claude-fable-5-2', now: start }).ok, false)
+})
+
+test('Fable versions do not broaden each other through prefix or dotted aliases', () => {
+  const versions = ['claude-fable-5', 'claude-fable-5-1', 'claude-fable-5-2']
+  for (const model of versions) {
+    for (const allowed of versions) assert.equal(modelMatchesAllowlist(model, [allowed]), model === allowed)
+  }
+  assert.equal(modelMatchesAllowlist('claude-fable-5-2-20261109', ['claude-fable-5.2']), true)
+  assert.equal(modelMatchesAllowlist('claude-fable-5-2-extra', ['claude-fable-5-2']), false)
+})
+
+test('temporary entitlement does not override operator model allowlist or upstream denial', () => {
+  const now = Date.parse('2026-11-10T00:00:00Z')
+  const vm = { claude: { subscription_type: 'pro' }, policy: { allowed_models: ['claude-opus-5-5'] } }
+  assert.equal(slotAllowsModel({ vm, model: 'claude-fable-5-2', now }).reason, 'model_not_allowed')
+  const account = { unified: { model_denied_until: { 'claude-fable-5-2': now + 1000 } } }
+  assert.equal(
+    slotAllowsModel({ vm: { ...vm, policy: {} }, account, model: 'claude-fable-5-2', now }).reason,
+    'model_not_supported',
+  )
+})

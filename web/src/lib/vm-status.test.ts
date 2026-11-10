@@ -227,8 +227,8 @@ describe('health probe must not paint a live ticket unavailable', () => {
   })
 })
 
-describe('claudeTier follows usage Fable presence', () => {
-  it('treats usage Fable as Max even when stored Pro and hop denied', () => {
+describe('claudeTier follows subscription identity', () => {
+  it('keeps Pro despite temporary Fable access or a rejected probe', () => {
     expect(
       claudeTier(
         liveVm({
@@ -237,10 +237,10 @@ describe('claudeTier follows usage Fable presence', () => {
           fable: { plan_denied: true, ok: false, status: 403 },
         })
       ).key
-    ).toBe('max')
+    ).toBe('pro')
   })
 
-  it('treats a real 7d_oi window as Max over stored Pro', () => {
+  it('keeps Pro when a Fable quota window exists', () => {
     expect(
       claudeTier(
         liveVm({
@@ -249,7 +249,7 @@ describe('claudeTier follows usage Fable presence', () => {
           reset_7d_oi: '2026-08-24T00:00:00Z',
         })
       ).key
-    ).toBe('max')
+    ).toBe('pro')
   })
 
   it('keeps Pro when usage has no Fable evidence', () => {
@@ -263,10 +263,35 @@ describe('claudeTier follows usage Fable presence', () => {
     ).toBe('pro')
   })
 
-  it('defaults token accounts to Pro until Max evidence appears', () => {
-    expect(claudeTier(liveVm({ account_tier: 'unknown' })).key).toBe('pro')
-    expect(claudeTier(liveVm({})).key).toBe('pro')
+  it('shows unknown until subscription metadata is available', () => {
+    expect(claudeTier(liveVm({ account_tier: 'unknown' })).key).toBe('none')
+    expect(claudeTier(liveVm({ account_tier: undefined })).key).toBe('none')
     expect(claudeTier(liveVm({ account_tier: 'max' })).key).toBe('max')
+    expect(
+      claudeTier(liveVm({ account_tier: 'max', account_tier_source: 'usage' }))
+        .key
+    ).toBe('none')
+  })
+
+  it('corrects a polluted Max label from official Pro metadata', () => {
+    expect(
+      claudeTier(
+        liveVm({
+          account_tier: 'max',
+          subscription_type: 'pro',
+          usage_has_fable: true,
+        })
+      ).key
+    ).toBe('pro')
+    expect(
+      claudeTier(
+        liveVm({
+          account_tier: 'pro',
+          subscription_type: 'max',
+          usage_has_fable: false,
+        })
+      ).key
+    ).toBe('max')
   })
 
   it('does not paint quota restriction as 调度关', () => {

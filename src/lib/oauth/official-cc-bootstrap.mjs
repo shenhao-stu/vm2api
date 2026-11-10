@@ -42,6 +42,7 @@ import {
 import { canOfficialCc, credentialModeOfVm } from './credential-mode.mjs'
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { inferTierFromOfficialStats, parseOfficialCcStats, tierFromOauthProfile } from './official-cc-stats.mjs'
+import { flattenOauthIdentity } from './oauth-identity.mjs'
 import { defaultSeedPolicy, deploymentTelemetryDisabled } from '../protocol/seed-policy.mjs'
 import { OFFICIAL_CLI_VERSION, loadVmIdentity, persistVmSettings } from '../identity/vm-identity.mjs'
 import { applyOfficialFingerprintToVm, readOfficialCcIdentity } from '../identity/official-fingerprint.mjs'
@@ -1056,6 +1057,8 @@ export async function collectOfficialCcAccount(exec, { slotOauth } = {}) {
   const list = Array.isArray(models?.body?.data) ? models.body.data : []
   return {
     account_tier: tier,
+    subscription_type: profile?.ok ? flattenOauthIdentity(profile.body).subscription_type : null,
+    rate_limit_tier: profile?.ok ? flattenOauthIdentity(profile.body).rate_limit_tier : null,
     profile_ok: !!profile?.ok,
     profile_error: profile?.ok ? null : profile?.body?.error?.code || `http_${profile?.status || 0}`,
     available_models: models?.ok ? list.map((m) => String(m?.id || '')).filter(Boolean) : null,
@@ -1266,11 +1269,20 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
     })
     const account = await collectOfficialCcAccount({ vmId, homeDir, vm }, { slotOauth })
     let tierSource = null
+    if (account.profile_ok && account.account_tier) {
+      stats = {
+        ...stats,
+        account_tier: account.account_tier,
+        subscription_type: account.subscription_type,
+        rate_limit_tier: account.rate_limit_tier,
+      }
+      tierSource = 'profile'
+    }
     if (stats?.limits_present === true && !stats.account_tier) {
       const accountTier = inferTierFromOfficialStats('', stats)
       if (accountTier) stats = { ...stats, account_tier: accountTier }
     }
-    if (!tierSource && stats?.account_tier) tierSource = 'usage'
+    if (!tierSource && stats?.account_tier) tierSource = 'official-plan'
     if (stats) stats = { ...stats, account_tier_source: tierSource }
     if (typeof onStats === 'function' && stats) {
       try {

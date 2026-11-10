@@ -11,6 +11,7 @@ import {
   bindVmProxy,
   getVm,
   persistAccountTier,
+  persistVmSubscription,
   isCodexVm,
   patchVmRecord,
 } from '../vm/vm-registry.mjs'
@@ -110,8 +111,8 @@ export function createImportCommit(ctx) {
       email: identity.email || existing.claude?.email || null,
       account_uuid: identity.account_uuid || existing.claude?.account_uuid || null,
       org_uuid: identity.org_uuid || existing.claude?.org_uuid || null,
-      subscription_type:
-        identity.subscription_type || normalizeSubscriptionType(existing?.claude?.account_tier) || 'pro',
+      subscription_type: identity.subscription_type,
+      rate_limit_tier: identity.rate_limit_tier,
       account_tier: normalizeSubscriptionType(existing?.claude?.account_tier) || 'pro',
       scopes: Array.isArray(oauth.scopes)
         ? oauth.scopes
@@ -123,20 +124,35 @@ export function createImportCommit(ctx) {
   }
 
   function officialCcStatsHandler(vmId, accountUuid = null) {
+    const identity = getVm(ctx.cfg.paths.project, vmId)?.claude || {}
+    const expectedAccount = accountUuid || identity.account_uuid || null
+    const expectedOrg = identity.org_uuid || null
     return (stats) => {
-      const accountId = accountUuid || getVm(ctx.cfg.paths.project, vmId)?.claude?.account_uuid || vmId
+      const currentIdentity = getVm(ctx.cfg.paths.project, vmId)?.claude || {}
+      if (expectedAccount && currentIdentity.account_uuid !== expectedAccount) return
+      if (expectedOrg && currentIdentity.org_uuid !== expectedOrg) return
+      if (stats?.subscription_type)
+        persistVmSubscription(ctx.cfg.paths.project, vmId, stats, {
+          accountUuid: expectedAccount,
+          orgUuid: expectedOrg,
+        })
+      const accountId = expectedAccount || vmId
       if (stats?.five_hour || stats?.seven_day || stats?.seven_day_oi || stats?.extra_usage) {
         try {
           ctx.accountQuota.ingestOAuthUsage(accountId, { usage_status: 200, ok: true, ...stats })
         } catch {}
       }
       if ((stats?.account_tier === 'pro' || stats?.account_tier === 'max') && stats?.limits_present === true) {
-        const source = 'usage'
+        const source = stats.account_tier_source || 'official-plan'
         try {
           ctx.accountQuota.setAccountTier(accountId, stats.account_tier, { source })
         } catch {}
         try {
-          persistAccountTier(ctx.cfg.paths.project, vmId, stats.account_tier, { source })
+          persistAccountTier(ctx.cfg.paths.project, vmId, stats.account_tier, {
+            source,
+            accountUuid: expectedAccount,
+            orgUuid: expectedOrg,
+          })
         } catch {}
         try {
           const vm = getVm(ctx.cfg.paths.project, vmId)
@@ -226,7 +242,7 @@ export function createImportCommit(ctx) {
           mode: importedCredential.mode || credentialModeFromOauth(oauth),
           type: importedCredential.type || importedCredential.mode,
         },
-        { acceptLiveGrant: true },
+        { acceptLiveGrant: true, operatorImport: true },
       )
       try {
         const accountId = importedCredential.account_uuid || existing.claude?.account_uuid || vmId

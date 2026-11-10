@@ -1,49 +1,31 @@
-import { isInventedFableWindow } from '../oauth/crs-usage-probe.mjs'
-
-function quotaView(vm = {}, quota = {}) {
-  return {
-    utilization_7d_oi: quota.utilization_7d_oi ?? vm.utilization_7d_oi,
-    reset_7d_oi: quota.reset_7d_oi || vm.reset_7d_oi,
-    status_7d_oi: quota.status_7d_oi || vm.status_7d_oi,
-    '7d_oi': quota['7d_oi'] || vm['7d_oi'],
-    usage_has_fable: quota.usage_has_fable ?? vm.usage_has_fable,
-  }
+/** Subscription identity and model entitlement are separate facts. */
+export function normalizeClaudeTier(value) {
+  const plan = String(value || '')
+    .trim()
+    .toLowerCase()
+  if (plan === 'pro') return 'pro'
+  if (['max', 'max5x', 'max20x', 'ultra'].includes(plan)) return 'max'
+  return null
 }
 
-/** Official /usage listing a Fable model, or a real 7d_oi window, is Max. */
-export function hasClaudeFableUsage(vm = {}, quota = {}) {
-  const q = quotaView(vm, quota)
-  if (q.usage_has_fable != null) return q.usage_has_fable === true
-  const fb = quota.fable || vm.fable || {}
-  const oi = q['7d_oi'] || {}
-  const hasOi =
-    q.utilization_7d_oi != null ||
-    q.reset_7d_oi ||
-    q.status_7d_oi ||
-    oi.utilization != null ||
-    oi.reset ||
-    oi.resets_at ||
-    oi.status
-  if (!hasOi) return false
-  return !isInventedFableWindow(fb, q)
+export function claudeSubscriptionTier(record = {}) {
+  const subscription = String(record.subscription_type || record.subscriptionType || '')
+    .trim()
+    .toLowerCase()
+  if (subscription) return normalizeClaudeTier(subscription)
+  const rateTier = String(record.rate_limit_tier || record.rateLimitTier || '').toLowerCase()
+  const matched = rateTier.match(/(?:^|_)claude_(pro|max|ultra)(?:_|$)/)
+  return matched ? normalizeClaudeTier(matched[1]) : null
 }
 
-/**
- * Claude-only: official /usage 有 Fable 模型或真实 7d_oi=Max。
- * 落盘 pro / Fable hop 拒绝不能盖掉 usage 里的 Fable。
- * Shared by the panel and the pool picker so they cannot drift.
- */
 export function inferClaudeTier(vm = {}, quota = {}) {
-  const hasToken = !!(vm.has_token || vm.has_access)
-  if (!hasToken) return { key: 'none', label: null }
-  const q = quotaView(vm, quota)
-  if (q.usage_has_fable === false) return { key: 'pro', label: 'Pro' }
-  const stored = String(vm.account_tier || quota.account_tier || '').toLowerCase()
-  if (hasClaudeFableUsage(vm, quota) || stored === 'max') {
-    return { key: 'max', label: 'Max' }
-  }
-  if (stored === 'pro') {
-    return { key: 'pro', label: 'Pro' }
-  }
-  return { key: 'pro', label: 'Pro' }
+  if (!(vm.has_token || vm.has_access)) return { key: 'none', label: null }
+  const identity = vm.subscription_type || vm.subscriptionType ? vm : quota
+  const explicit = claudeSubscriptionTier(identity) || claudeSubscriptionTier(vm)
+  if ((identity.subscription_type || identity.subscriptionType) && !explicit) return { key: 'none', label: null }
+  const source = vm.account_tier_source || quota.account_tier_source
+  const candidate = normalizeClaudeTier(vm.account_tier || quota.account_tier)
+  const stored = source === 'default' || (source === 'usage' && candidate === 'max') ? null : candidate
+  const key = explicit || stored || 'none'
+  return { key, label: key === 'max' ? 'Max' : key === 'pro' ? 'Pro' : null }
 }

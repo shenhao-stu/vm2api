@@ -483,7 +483,7 @@ export function scopePlanOf(account = {}) {
       },
       account,
     )
-    if (tier.key === 'max' || tier.key === 'pro') return tier.key
+    return tier.key === 'max' || tier.key === 'pro' ? tier.key : PLAN_TYPE_NONE
   }
   const stored = scopeText(account.account_tier || account.tier)
   if (stored === 'max' || stored === 'pro') return stored
@@ -522,7 +522,7 @@ function compareScopeKeys(left, right) {
 
 /**
  * The same key the panel chip uses. Claude Max/Pro follows `inferClaudeTier`
- * (usage Fable wins over a stored or defaulted Pro). `quota` is the account
+ * (subscription identity is independent of model access). `quota` is the account
  * unified record when the caller has it; summaries often lack it.
  */
 export function scopeAccountFromVm(vm = {}, quota = null) {
@@ -535,6 +535,9 @@ export function scopeAccountFromVm(vm = {}, quota = null) {
   const view = {
     has_token: !!(vm.has_token || vm.has_access || hasAccessPresence(vm.claude || {})),
     has_access: !!(vm.has_access || vm.claude?.has_access || vm.has_token || hasAccessPresence(vm.claude || {})),
+    account_tier_source: vm.claude?.account_tier_source || q.account_tier_source || vm.account_tier_source,
+    subscription_type: vm.claude?.subscription_type || q.subscription_type || vm.subscription_type,
+    rate_limit_tier: vm.claude?.rate_limit_tier || q.rate_limit_tier || vm.rate_limit_tier,
     account_tier: storedTier === 'codex' ? null : storedTier || null,
     usage_has_fable: q.usage_has_fable ?? vm.usage_has_fable ?? null,
     utilization_7d_oi: q.utilization_7d_oi ?? vm.utilization_7d_oi ?? null,

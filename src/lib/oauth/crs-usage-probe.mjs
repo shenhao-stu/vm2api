@@ -137,7 +137,8 @@ export function parseOAuthUsage(data = {}) {
 
 export function isCompleteOAuthUsage(data = {}, parsed = null) {
   const p = parsed || parseOAuthUsage(data)
-  if (!p.five_hour || !p.seven_day) return false
+  // Ultra can have no five-hour window; a malformed supplied window is still invalid.
+  if (!p.seven_day || (!p.five_hour && data.five_hour != null)) return false
   if (p.usage_has_fable !== null) return true
   // 2.1.293 GET /api/oauth/usage is a Utilization object: named windows, no limits[] catalog.
   if (

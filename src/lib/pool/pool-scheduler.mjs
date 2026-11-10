@@ -1011,12 +1011,12 @@ export class PoolScheduler extends EventEmitter {
     let account = null
     let headroom = null
     let seatQuotaRejection = null
+    try {
+      account = this.accountQuota?.repo?.get?.(accountId) || null
+    } catch {}
+    const modelGate = slotAllowsModel({ vm, account, model, now })
+    if (!modelGate.ok) return modelGate
     if (!pinned) {
-      try {
-        account = this.accountQuota?.repo?.get?.(accountId) || null
-      } catch {}
-      const modelGate = slotAllowsModel({ vm, account, model })
-      if (!modelGate.ok) return modelGate
       if (account) {
         this.syncQuotaSchedule(vm, account)
         if (this.projectRoot) {
@@ -1452,7 +1452,9 @@ export class PoolScheduler extends EventEmitter {
    * release() is idempotent and hands freed concurrency to the VM's queue.
    * Seats are layered on top by claimSeat().
    */
-  reserve(candidate, { skipQuota = false, pinned = false } = {}) {
+  reserve(candidate, { skipQuota = false, pinned = false, now = Date.now() } = {}) {
+    // Queue admission may happen after the promotion expired. Recheck before taking capacity.
+    if (!slotAllowsModel({ vm: candidate.vm, account: candidate.account, model: candidate.model, now }).ok) return null
     const requestInflight = this.inflight.get(candidate.accountId) || 0
     if (!candidate.maxConcurrency || requestInflight >= candidate.maxConcurrency) return null
     const family = isFableModel(candidate.model) ? FABLE_FAMILY_KEY : null

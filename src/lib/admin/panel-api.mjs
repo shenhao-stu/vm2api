@@ -17,6 +17,7 @@ import {
   getActiveVmId,
   vmHasClaudeCredential,
   persistAccountTier,
+  persistVmSubscription,
   isCodexVm,
   setVmSchedulable,
 } from '../vm/vm-registry.mjs'
@@ -992,11 +993,12 @@ export async function buildClaudeResetQuery({ cfg, id, transport, now } = {}) {
   })
 }
 
-export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, transport, now } = {}) {
+export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, autoReset, transport, now } = {}) {
   const result = await redeemClaudeResetCredit({
     projectRoot: cfg.paths.project,
     vmId: id,
     idempotencyKey,
+    autoReset,
     ...(transport ? { transport } : {}),
     ...(now ? { now } : {}),
   })
@@ -1145,7 +1147,9 @@ export async function buildProbeOne({
         probed_at: new Date().toISOString(),
         ...(headerProbe ? { ...headerProbe, error: null } : {}),
       }
-    : await cache.load(accountId, () => probeAccount({ exec, vm, includeFable }), { force: !!force })
+    : await cache.load(accountId, () => probeAccount({ exec, vm, includeFable, refreshSubscription: force }), {
+        force: !!force,
+      })
   if (fatalUsageCredentialFailure(result)) {
     try {
       markVmRefreshError(path.join(cfg.paths.project, 'vms', `${id}.json`), {
@@ -1157,6 +1161,12 @@ export async function buildProbeOne({
     } catch {}
   }
   if (!skipHop) accountQuota.ingestOAuthUsage(accountId, result)
+  if (result.subscription_type) {
+    persistVmSubscription(cfg.paths.project, id, result, {
+      accountUuid: vm.claude?.account_uuid,
+      orgUuid: vm.claude?.org_uuid,
+    })
+  }
   if (isSetupTokenMode(credentialModeOfVm(vm)) && (force || includeFable) && !result.usage_scope_missing) {
     try {
       await applyFableProbeResult(accountQuota, accountId, await fableProbe({ exec, timeoutMs: 20000 }))
@@ -1174,7 +1184,10 @@ export async function buildProbeOne({
   const tier = inferClaudeTier(
     {
       has_token: true,
-      account_tier: after?.unified?.account_tier || null,
+      account_tier: after?.unified?.account_tier || vm.claude?.account_tier || null,
+      account_tier_source: after?.unified?.account_tier_source || vm.claude?.account_tier_source,
+      subscription_type: result.subscription_type || vm.claude?.subscription_type,
+      rate_limit_tier: result.rate_limit_tier || vm.claude?.rate_limit_tier,
       fable: qAfter.fable,
       utilization_7d_oi: qAfter.utilization_7d_oi,
       reset_7d_oi: qAfter.reset_7d_oi,
@@ -1184,12 +1197,13 @@ export async function buildProbeOne({
     qAfter,
   ).key
   const completeUsage = result.ok === true && result.limits_present === true
-  if (completeUsage && (result.account_tier === 'pro' || result.account_tier === 'max')) {
-    accountQuota.setAccountTier(accountId, result.account_tier, { source: 'usage' })
-    persistAccountTier(cfg.paths.project, id, result.account_tier, { source: 'usage' })
-  } else if (completeUsage && (tier === 'pro' || tier === 'max')) {
-    accountQuota.setAccountTier(accountId, tier, { source: 'usage' })
-    persistAccountTier(cfg.paths.project, id, tier, { source: 'usage' })
+  if (completeUsage && result.account_tier_source === 'profile' && ['pro', 'max'].includes(result.account_tier)) {
+    accountQuota.setAccountTier(accountId, result.account_tier, { source: 'profile' })
+    persistAccountTier(cfg.paths.project, id, result.account_tier, {
+      source: 'profile',
+      accountUuid: vm.claude?.account_uuid,
+      orgUuid: vm.claude?.org_uuid,
+    })
   }
   const availability = evaluateAccount({
     vm,
@@ -1579,6 +1593,9 @@ export function quotaFromAccount(acc, quotaConfig) {
     last_probe_check: u.last_probe_check || null,
     probe_source: u.source || acc?.last_probe?.source || null,
     account_tier: u.account_tier || null,
+    account_tier_source: u.account_tier_source || null,
+    subscription_type: u.subscription_type || null,
+    rate_limit_tier: u.rate_limit_tier || null,
     usage_has_fable: u.usage_has_fable ?? null,
   }
   const cfg = weeklySplitConfig(quotaConfig || {})
@@ -1765,6 +1782,9 @@ function enrichVm(v, accountQuota, active, extras = {}) {
         {
           has_token: hasToken,
           account_tier: v.account_tier || q.account_tier,
+          account_tier_source: v.account_tier_source || q.account_tier_source,
+          subscription_type: v.subscription_type || q.subscription_type,
+          rate_limit_tier: v.rate_limit_tier || q.rate_limit_tier,
           fable: q.fable,
           utilization_7d_oi: q.utilization_7d_oi,
           reset_7d_oi: q.reset_7d_oi,
@@ -2005,6 +2025,9 @@ function enrichVm(v, accountQuota, active, extras = {}) {
         }
       : null,
     account_tier: tierKey,
+    account_tier_source: isCodex ? null : v.account_tier_source || q.account_tier_source || null,
+    subscription_type: isCodex ? null : v.subscription_type || null,
+    rate_limit_tier: isCodex ? null : v.rate_limit_tier || null,
     usage_has_fable: isCodex ? null : q.usage_has_fable,
     availability,
     cred_status: credStatusFromAvailability(availability),

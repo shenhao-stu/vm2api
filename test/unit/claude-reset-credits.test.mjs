@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -14,8 +15,12 @@ import {
   redeemClaudeResetCredit,
   resetClaudeResetLeasesForTest,
 } from '../../src/lib/oauth/claude-reset-credits.mjs'
+import { planClaudeFableReset } from '../../src/lib/oauth/claude-reset-policy.mjs'
 
 const ORG = '11111111-1111-4111-8111-111111111111'
+const ACCOUNT = '22222222-2222-4222-8222-222222222222'
+const OTHER_ACCOUNT = '33333333-3333-4333-8333-333333333333'
+const ACCOUNT_FINGERPRINT = createHash('sha256').update(`claude-reset-account:${ACCOUNT}:${ORG}`).digest('hex')
 const NOW = Date.parse('2026-09-25T00:00:00Z')
 const REDEEMABLE = {
   cedar_ember: {
@@ -53,9 +58,10 @@ function writeVm(root, id = 'vm-1') {
       id,
       platform: 'anthropic',
       family: 'claude',
-      claude: { mode: 'oauth', scope: 'user:profile user:inference' },
+      claude: { mode: 'oauth', scope: 'user:profile user:inference', account_uuid: ACCOUNT, org_uuid: ORG },
     }),
   )
+  fs.utimesSync(path.join(root, 'vms', `${id}.json`), NOW / 1000, NOW / 1000)
   return id
 }
 
@@ -67,7 +73,8 @@ function scripted({
 } = {}) {
   const posts = []
   const transport = async (_exec, op, opts = {}) => {
-    if (op === 'profile') return { ok: true, status: 200, body: { organization: { uuid: ORG } } }
+    if (op === 'profile')
+      return { ok: true, status: 200, body: { account: { uuid: ACCOUNT }, organization: { uuid: ORG } } }
     if (op === 'reset-status') return { ok: true, status: 200, body: status }
     if (op === 'reset-redeem') {
       posts.push(opts.body)
@@ -504,4 +511,337 @@ test('panel query route returns the public snapshot', async () => {
   assert.equal(result.ok, true)
   assert.equal(result.data.claude_reset_credits.available_count, 2)
   assert.equal(JSON.stringify(result).includes('grant_next'), false)
+})
+
+function autoStatus() {
+  return {
+    cedar_ember: {
+      eligible: true,
+      at_limit: true,
+      next_grant_id: 'fable_card',
+      grants: [
+        {
+          id: 'fable_card',
+          resets_left: 2,
+          usable_now: true,
+          use_requires_limit: false,
+          clears: ['five_hour', 'seven_day_overage_included'],
+          percent_used: { seven_day_overage_included: 100 },
+          ends_at: new Date(NOW + 3 * 86400000).toISOString(),
+        },
+      ],
+    },
+  }
+}
+
+function autoRequest(status = autoStatus(), now = NOW) {
+  const plan = planClaudeFableReset({
+    vmId: 'vm-1',
+    enabled: true,
+    accountReady: true,
+    exitReady: true,
+    credits: { ...projectClaudeResetCredits(status.cedar_ember, now), account_fingerprint: ACCOUNT_FINGERPRINT },
+    now,
+  })
+  assert.equal(plan.action, 'redeem')
+  return {
+    idempotencyKey: plan.idempotency_key,
+    autoReset: {
+      fingerprint: plan.fingerprint,
+      resets_left: plan.resets_left,
+      account_fingerprint: ACCOUNT_FINGERPRINT,
+    },
+  }
+}
+
+test('automatic reset verifies fresh card, redeems once and reuses the recorded result', async (t) => {
+  const root = rootDir()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeVm(root)
+  const status = autoStatus()
+  const { transport, posts } = scripted({ status })
+  const args = { projectRoot: root, vmId: 'vm-1', ...autoRequest(status), transport, now: () => NOW }
+  const first = await redeemClaudeResetCredit(args)
+  const second = await redeemClaudeResetCredit(args)
+  assert.equal(first.outcome, 'reset')
+  assert.equal(second.replayed, true)
+  assert.equal(posts.length, 1)
+  assert.equal(posts[0].grant_id, 'fable_card')
+})
+
+test('a changed official next grant cannot redeem using the earlier query proof', async (t) => {
+  const root = rootDir()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeVm(root)
+  const oldStatus = autoStatus()
+  const changed = autoStatus()
+  changed.cedar_ember.next_grant_id = 'replacement_card'
+  changed.cedar_ember.grants[0].id = 'replacement_card'
+  const { transport, posts } = scripted({ status: changed })
+  const out = await redeemClaudeResetCredit({
+    projectRoot: root,
+    vmId: 'vm-1',
+    ...autoRequest(oldStatus),
+    transport,
+    now: () => NOW,
+  })
+  assert.equal(out.error, 'CLAUDE_RESET_AUTO_CREDIT_CHANGED')
+  assert.equal(posts.length, 0)
+})
+
+test('query fingerprints distinguish identical public cards without exposing internal grant ids', () => {
+  const status = autoStatus().cedar_ember
+  const first = projectClaudeResetCredits(status, NOW)
+  const credit = first.credits[0]
+  assert.equal(credit.fingerprint.length, 64)
+  status.grants[0].percent_used.seven_day_overage_included = 23
+  status.grants[0].label = 'translated display label'
+  assert.equal(projectClaudeResetCredits(status, NOW + 1).credits[0].fingerprint, credit.fingerprint)
+  status.grants[0].id = 'different-internal-grant'
+  const second = projectClaudeResetCredits(status, NOW)
+  assert.notEqual(second.credits[0].fingerprint, credit.fingerprint)
+  assert.equal(JSON.stringify(second).includes('different-internal-grant'), false)
+})
+
+test('official quota resetting after query makes automatic redemption unnecessary', async (t) => {
+  const root = rootDir()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeVm(root)
+  const oldStatus = autoStatus()
+  const fresh = autoStatus()
+  fresh.cedar_ember.grants[0].percent_used.seven_day_overage_included = 0
+  const { transport, posts } = scripted({ status: fresh })
+  const out = await redeemClaudeResetCredit({
+    projectRoot: root,
+    vmId: 'vm-1',
+    ...autoRequest(oldStatus),
+    transport,
+    now: () => NOW,
+  })
+  assert.equal(out.error, 'CLAUDE_RESET_AUTO_NOT_NEEDED')
+  assert.equal(posts.length, 0)
+  fresh.cedar_ember.grants[0].percent_used.seven_day_overage_included = 100
+  const later = await redeemClaudeResetCredit({
+    projectRoot: root,
+    vmId: 'vm-1',
+    ...autoRequest(oldStatus),
+    transport,
+    now: () => NOW,
+  })
+  assert.equal(later.outcome, 'reset')
+  assert.equal(posts.length, 1)
+})
+
+test('a consumed remaining use or another ordinary next card prevents automatic redemption', async (t) => {
+  for (const mutate of [
+    (block) => {
+      block.grants[0].resets_left = 1
+    },
+    (block) => {
+      block.grants[0].clears = ['five_hour', 'seven_day']
+    },
+  ]) {
+    const root = rootDir()
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    writeVm(root)
+    const fresh = autoStatus()
+    mutate(fresh.cedar_ember)
+    const { transport, posts } = scripted({ status: fresh })
+    const out = await redeemClaudeResetCredit({
+      projectRoot: root,
+      vmId: 'vm-1',
+      ...autoRequest(),
+      transport,
+      now: () => NOW,
+    })
+    assert.equal(out.ok, false)
+    assert.equal(posts.length, 0)
+  }
+})
+
+test('automatic redemption preserves a manual scheduling stop made after query', async (t) => {
+  const root = rootDir()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeVm(root)
+  const file = path.join(root, 'vms', 'vm-1.json')
+  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file)), schedulable: false }))
+  const { transport, posts } = scripted({ status: autoStatus() })
+  const out = await redeemClaudeResetCredit({
+    projectRoot: root,
+    vmId: 'vm-1',
+    ...autoRequest(),
+    transport,
+    now: () => NOW,
+  })
+  assert.equal(out.error, 'CLAUDE_RESET_AUTO_NOT_NEEDED')
+  assert.equal(posts.length, 0)
+})
+
+test('automatic reset requires a stable key and rejects malformed proof without a claim', async (t) => {
+  const root = rootDir()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeVm(root)
+  const { transport, posts } = scripted({ status: autoStatus() })
+  for (const patch of [
+    { autoReset: {} },
+    { autoReset: { fingerprint: 'wrong', resets_left: 2 } },
+    { idempotencyKey: 'fresh-key-every-minute' },
+  ]) {
+    const out = await redeemClaudeResetCredit({
+      projectRoot: root,
+      vmId: 'vm-1',
+      ...autoRequest(),
+      ...patch,
+      transport,
+      now: () => NOW,
+    })
+    assert.equal(out.status, 400)
+  }
+  assert.equal(posts.length, 0)
+})
+
+test('unconfirmed old redemption permanently blocks new automatic claims across restarts', async (t) => {
+  const root = rootDir()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeVm(root)
+  const previous = scripted({ status: autoStatus(), claimStatus: 0 })
+  const first = await redeemClaudeResetCredit({
+    projectRoot: root,
+    vmId: 'vm-1',
+    idempotencyKey: 'old-manual-attempt',
+    transport: previous.transport,
+    now: () => NOW,
+  })
+  assert.equal(first.outcome, 'unknown')
+  resetClaudeResetLeasesForTest()
+  const later = NOW + 25 * 60 * 60 * 1000
+  const next = scripted({ status: autoStatus() })
+  const out = await redeemClaudeResetCredit({
+    projectRoot: root,
+    vmId: 'vm-1',
+    ...autoRequest(autoStatus(), later),
+    transport: next.transport,
+    now: () => later,
+  })
+  assert.equal(out.error, 'CLAUDE_RESET_UNRESOLVED')
+  assert.equal(next.posts.length, 0)
+})
+
+function replaceAccount(root, accountUuid = OTHER_ACCOUNT) {
+  const file = path.join(root, 'vms', 'vm-1.json')
+  const before = fs.statSync(file)
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.claude.account_uuid = accountUuid
+  fs.writeFileSync(file, JSON.stringify(vm))
+  // Reproduce same-size, same-inode, same-timestamp replacement on every OS.
+  // A file-metadata cache is not authoritative evidence of account identity.
+  fs.utimesSync(file, before.atime, before.mtime)
+}
+
+test('query binds the public credit snapshot to account and organization without exposing identifiers', async (t) => {
+  const root = rootDir()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeVm(root)
+  const result = await queryClaudeResetCredits({ projectRoot: root, vmId: 'vm-1', transport: scripted().transport })
+  assert.equal(result.claude_reset_credits.account_fingerprint, ACCOUNT_FINGERPRINT)
+  assert.equal(JSON.stringify(result).includes(ACCOUNT), false)
+  assert.equal(JSON.stringify(result).includes(ORG), false)
+})
+
+test('query does not attach a previous account credit snapshot after credential replacement', async (t) => {
+  const root = rootDir()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeVm(root)
+  const result = await queryClaudeResetCredits({
+    projectRoot: root,
+    vmId: 'vm-1',
+    transport: async () => {
+      replaceAccount(root)
+      return { ok: true, status: 200, body: autoStatus() }
+    },
+  })
+  assert.equal(result.error, 'CLAUDE_RESET_ACCOUNT_CHANGED')
+  assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-1.json'))).claude_reset_credits, undefined)
+})
+
+test('automatic reset rejects a previous account query proof before reaching its worker', async (t) => {
+  const root = rootDir()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeVm(root)
+  replaceAccount(root)
+  let calls = 0
+  const result = await redeemClaudeResetCredit({
+    projectRoot: root,
+    vmId: 'vm-1',
+    ...autoRequest(),
+    now: () => NOW,
+    transport: async () => {
+      calls += 1
+      throw new Error('must not call worker')
+    },
+  })
+  assert.equal(result.error, 'CLAUDE_RESET_ACCOUNT_CHANGED')
+  assert.equal(calls, 0)
+})
+
+test('manual and automatic resets reject profile identity drift and credential replacement before claim', async (t) => {
+  for (const automatic of [false, true]) {
+    for (const phase of [
+      'profile',
+      'reset-status',
+      'profile-drift',
+      'final-profile-drift',
+      'missing-profile-account',
+    ]) {
+      const root = rootDir()
+      t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+      writeVm(root)
+      const base = scripted({ status: autoStatus() })
+      let profileCalls = 0
+      const result = await redeemClaudeResetCredit({
+        projectRoot: root,
+        vmId: 'vm-1',
+        ...(automatic ? autoRequest() : { idempotencyKey: 'manual-identity-check' }),
+        now: () => NOW,
+        transport: async (exec, op, opts) => {
+          if (op === 'profile') profileCalls += 1
+          if (op === phase) replaceAccount(root)
+          if (
+            op === 'profile' &&
+            (phase === 'profile-drift' || (phase === 'final-profile-drift' && profileCalls === 2))
+          ) {
+            return { ok: true, status: 200, body: { account: { uuid: OTHER_ACCOUNT }, organization: { uuid: ORG } } }
+          }
+          if (op === 'profile' && phase === 'missing-profile-account') {
+            return { ok: true, status: 200, body: { organization: { uuid: ORG } } }
+          }
+          return base.transport(exec, op, opts)
+        },
+      })
+      assert.equal(result.error, 'CLAUDE_RESET_ACCOUNT_CHANGED', `${automatic}/${phase}`)
+      assert.equal(base.posts.length, 0, `${automatic}/${phase}`)
+    }
+  }
+})
+
+test('a completed reset remains recorded but never overwrites replacement account metadata', async (t) => {
+  const root = rootDir()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeVm(root)
+  const { transport, posts } = scripted({ status: autoStatus(), onRedeem: () => replaceAccount(root) })
+  const result = await redeemClaudeResetCredit({
+    projectRoot: root,
+    vmId: 'vm-1',
+    ...autoRequest(),
+    now: () => NOW,
+    transport,
+  })
+  assert.equal(result.outcome, 'reset')
+  assert.equal(result.claude_reset_credits, undefined)
+  assert.equal(posts.length, 1)
+  const replacement = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-1.json')))
+  assert.equal(replacement.claude.account_uuid, OTHER_ACCOUNT)
+  assert.equal(replacement.claude_reset_credits, undefined)
+  const recorded = JSON.parse(fs.readFileSync(path.join(root, 'data', 'claude-reset-state.json')))
+  assert.equal(Object.values(recorded.operations)[0].outcome, 'reset')
 })

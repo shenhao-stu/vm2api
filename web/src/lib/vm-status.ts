@@ -663,22 +663,23 @@ export function claudeTier(vm: Vm | undefined): StatusTone {
     return { key: 'codex', label: plan, cls: 'codex', text: plan }
   }
   if (!vm?.has_token) return { key: 'none', label: '—', cls: 'none', text: '—' }
-  if (vm.usage_has_fable === false)
-    return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
-  const raw = String(vm.account_tier || '').toLowerCase()
-  const oi = vm.utilization_7d_oi
-  const oiN =
-    oi == null ? null : Number(oi) > 1.5 ? Number(oi) / 100 : Number(oi)
-  const realFable =
-    vm.usage_has_fable === true ||
-    (oiN != null && Boolean(vm.reset_7d_oi || oiN < 1))
-  // Usage 里有 Fable 就是 Max。落盘 pro / hop 403 不能盖掉。
-  // 没有套餐证据时不要画成 Pro，否则 Max 探测未完成的槽会一直显示 Pro。
-  if (realFable || raw === 'max')
-    return { key: 'max', label: 'Max', cls: 'max', text: 'Max' }
+  const subscription = String(vm.subscription_type || '').toLowerCase()
+  const raw =
+    subscription ||
+    (vm.account_tier_source === 'default' ||
+    (vm.account_tier_source === 'usage' && vm.account_tier === 'max')
+      ? ''
+      : String(vm.account_tier || '').toLowerCase())
+  if (['max', 'max5x', 'max20x', 'ultra'].includes(raw))
+    return {
+      key: 'max',
+      label: raw === 'ultra' ? 'Ultra' : 'Max',
+      cls: 'max',
+      text: raw === 'ultra' ? 'Ultra' : 'Max',
+    }
   if (raw === 'pro')
     return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
-  return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
+  return { key: 'none', label: '—', cls: 'none', text: '—' }
 }
 
 export function vmBuckets(vms: Vm[]) {

@@ -39,8 +39,15 @@ const SETTINGS_KEY = 'model_policy'
 const CONTEXT_1M = CONTEXT_1M_BETA
 const FABLE_51_ID = 'claude-fable-5-1'
 const FABLE_51_LEGACY_ID = 'claude-fable-5.1'
+const FABLE_52_ID = 'claude-fable-5-2'
+const FABLE_52_LEGACY_ID = 'claude-fable-5.2'
 const OPUS_55_ID = 'claude-opus-5-5'
 const OPUS_55_LEGACY_ID = 'claude-opus-5.5'
+const CANONICAL_MODEL_IDS = new Map([
+  [FABLE_51_LEGACY_ID, FABLE_51_ID],
+  [FABLE_52_LEGACY_ID, FABLE_52_ID],
+  [OPUS_55_LEGACY_ID, OPUS_55_ID],
+])
 const SONNET_55_ID = 'claude-sonnet-5-5'
 const HAIKU_55_ID = 'claude-haiku-5-5'
 const OPUS_55_COMPUTER_FROM = 'computer_20251124'
@@ -377,6 +384,22 @@ export function seedDefaultPolicy() {
     aliases: [FABLE_51_LEGACY_ID],
   })
 
+  add(FABLE_52_ID, {
+    display_name: 'Fable 5.2',
+    family: 'fable',
+    sort: 42,
+    capabilities: CAP_ADAPTIVE_ONLY,
+    betas: { pass_context_1m: false },
+    params: {
+      max_tokens_default: 128000,
+      max_tokens_cap: 128000,
+      on_adaptive: 'passthrough',
+      on_enabled: 'convert_to_adaptive',
+      default_effort: 'high',
+    },
+    aliases: [FABLE_52_LEGACY_ID],
+  })
+
   return {
     version: 1,
     updated_at: new Date().toISOString(),
@@ -400,6 +423,7 @@ export function seedDefaultPolicy() {
       'claude-3-5-haiku-latest': 'claude-haiku-4-5-20251001',
       fable: 'claude-fable-5',
       [FABLE_51_LEGACY_ID]: FABLE_51_ID,
+      [FABLE_52_LEGACY_ID]: FABLE_52_ID,
       [OPUS_55_LEGACY_ID]: OPUS_55_ID,
     },
     catalog_mode: 'policy_only',
@@ -434,10 +458,11 @@ export function normalizePolicy(raw) {
   if (raw.models && typeof raw.models === 'object') {
     // Old releases stored the unsupported dotted id. Preserve its overrides;
     // an explicitly configured canonical entry wins field-by-field below.
-    models[FABLE_51_ID] = deepMergeEntry(models[FABLE_51_ID], raw.models[FABLE_51_LEGACY_ID])
-    models[OPUS_55_ID] = deepMergeEntry(models[OPUS_55_ID], raw.models[OPUS_55_LEGACY_ID])
+    for (const [legacy, canonical] of CANONICAL_MODEL_IDS) {
+      models[canonical] = deepMergeEntry(models[canonical], raw.models[legacy])
+    }
     for (const [id, cfg] of Object.entries(raw.models)) {
-      if (!id || id === FABLE_51_LEGACY_ID || id === OPUS_55_LEGACY_ID) continue
+      if (!id || CANONICAL_MODEL_IDS.has(id)) continue
       const base =
         models[id] ||
         entry({
@@ -456,26 +481,19 @@ export function normalizePolicy(raw) {
       models[id] = deepMergeEntry(base, cfg)
     }
   }
-  models[FABLE_51_ID].aliases = [
-    ...new Set([
-      FABLE_51_LEGACY_ID,
-      ...[raw.models?.[FABLE_51_LEGACY_ID]?.aliases, raw.models?.[FABLE_51_ID]?.aliases].flatMap((aliases) =>
-        Array.isArray(aliases) ? aliases : [],
-      ),
-    ]),
-  ]
-  if ('id' in models[FABLE_51_ID]) models[FABLE_51_ID].id = FABLE_51_ID
-  models[OPUS_55_ID].aliases = [
-    ...new Set([
-      OPUS_55_LEGACY_ID,
-      ...[raw.models?.[OPUS_55_LEGACY_ID]?.aliases, raw.models?.[OPUS_55_ID]?.aliases].flatMap((aliases) =>
-        Array.isArray(aliases) ? aliases : [],
-      ),
-    ]),
-  ]
-  if ('id' in models[OPUS_55_ID]) models[OPUS_55_ID].id = OPUS_55_ID
+  for (const [legacy, canonical] of CANONICAL_MODEL_IDS) {
+    models[canonical].aliases = [
+      ...new Set([
+        legacy,
+        ...[raw.models?.[legacy]?.aliases, raw.models?.[canonical]?.aliases].flatMap((aliases) =>
+          Array.isArray(aliases) ? aliases : [],
+        ),
+      ]),
+    ]
+    if ('id' in models[canonical]) models[canonical].id = canonical
+  }
   for (const [id, cfg] of Object.entries(models)) {
-    if (cfg.params?.on_enabled === 'convert_to_adaptive' && id !== OPUS_55_ID) {
+    if (cfg.params?.on_enabled === 'convert_to_adaptive' && id !== OPUS_55_ID && id !== FABLE_52_ID) {
       cfg.params = { ...cfg.params, on_enabled: 'passthrough' }
     }
     if (typeof cfg.betas?.pass_context_1m !== 'boolean') {
@@ -492,11 +510,9 @@ export function normalizePolicy(raw) {
   const aliases = { ...seed.aliases, ...(raw.aliases || {}) }
   for (const [alias, target] of Object.entries(aliases)) {
     const normalized = String(target).trim().toLowerCase()
-    if (normalized === FABLE_51_LEGACY_ID) aliases[alias] = FABLE_51_ID
-    if (normalized === OPUS_55_LEGACY_ID) aliases[alias] = OPUS_55_ID
+    if (CANONICAL_MODEL_IDS.has(normalized)) aliases[alias] = CANONICAL_MODEL_IDS.get(normalized)
   }
-  aliases[FABLE_51_LEGACY_ID] = FABLE_51_ID
-  aliases[OPUS_55_LEGACY_ID] = OPUS_55_ID
+  for (const [legacy, canonical] of CANONICAL_MODEL_IDS) aliases[legacy] = canonical
   return {
     version: Number(raw.version) || 1,
     updated_at: raw.updated_at || new Date().toISOString(),
@@ -543,7 +559,9 @@ export function loadModelPolicy({ force = false } = {}) {
     const repo = new SettingsRepo()
     const stored = repo.get(SETTINGS_KEY, null)
     if (stored) {
-      const persisted = persistHaiku55Model(repo, persistOpus55Model(repo, stored))
+      let persisted = persistSeedModel(repo, stored, OPUS_55_ID, OPUS_55_LEGACY_ID)
+      persisted = persistSeedModel(repo, persisted, FABLE_52_ID, FABLE_52_LEGACY_ID)
+      persisted = persistHaiku55Model(repo, persisted)
       policy = normalizePolicy(persisted)
       policy.source = policy.source || 'settings'
     } else {
@@ -557,24 +575,24 @@ export function loadModelPolicy({ force = false } = {}) {
   return policy
 }
 
-/** Append Opus 5.5 onto an existing settings row. Does not reset other models. */
-function persistOpus55Model(repo, stored) {
+/** Append one model to persisted settings without resetting administrator edits. */
+function persistSeedModel(repo, stored, canonical, legacy) {
   if (!stored || typeof stored !== 'object') return stored
   const seed = seedDefaultPolicy()
   const models = stored.models && typeof stored.models === 'object' ? { ...stored.models } : {}
   let dirty = false
-  if (models[OPUS_55_LEGACY_ID]) {
-    const fromLegacy = deepMergeEntry(seed.models[OPUS_55_ID], models[OPUS_55_LEGACY_ID])
-    models[OPUS_55_ID] = deepMergeEntry(fromLegacy, models[OPUS_55_ID])
-    delete models[OPUS_55_LEGACY_ID]
+  if (models[legacy]) {
+    const fromLegacy = deepMergeEntry(seed.models[canonical], models[legacy])
+    models[canonical] = deepMergeEntry(fromLegacy, models[canonical])
+    delete models[legacy]
     dirty = true
-  } else if (!models[OPUS_55_ID]) {
-    models[OPUS_55_ID] = seed.models[OPUS_55_ID]
+  } else if (!models[canonical]) {
+    models[canonical] = seed.models[canonical]
     dirty = true
   }
   const aliases = { ...(stored.aliases || {}) }
-  if (aliases[OPUS_55_LEGACY_ID] !== OPUS_55_ID) {
-    aliases[OPUS_55_LEGACY_ID] = OPUS_55_ID
+  if (aliases[legacy] !== canonical) {
+    aliases[legacy] = canonical
     dirty = true
   }
   if (!dirty) return stored
@@ -839,6 +857,11 @@ export function isHaiku55Model(model = '') {
   return /^claude-haiku-5(?:-5|\.5)(?=-|$)/i.test(bare || '')
 }
 
+export function isFable52Model(model = '') {
+  const canonical = resolvePolicyModelId(model)
+  return /^claude-fable-5-2(?:-\d{8})?$/i.test(canonical)
+}
+
 function applyHaiku55Thinking(body) {
   if (!body.thinking || typeof body.thinking !== 'object') return body
   const type = String(body.thinking.type || '').toLowerCase()
@@ -851,7 +874,7 @@ function applyHaiku55Thinking(body) {
 }
 
 /**
- * Opus 5.5 and Sonnet 5.5 reject forced tool choice and legacy thinking.
+ * Opus 5.5, Sonnet 5.5 and Fable 5.2 reject forced tools and legacy thinking.
  * Keep the existing auto + strict compatibility policy; strict constrains
  * arguments, not whether the model calls a tool. Computer migration is Opus-only.
  * The patched CLI forwards caller fields, so this has to happen before the hop.
@@ -864,8 +887,14 @@ export function applyModelRequestRules(body = {}) {
     return applyHaiku55Thinking(body)
   }
   const opus55 = isOpus55Model(body.model)
-  if (!opus55 && canonical !== SONNET_55_ID) return body
-  if (canonical === OPUS_55_ID || canonical === SONNET_55_ID) body.model = canonical
+  const fable52 = isFable52Model(body.model)
+  if (!opus55 && !fable52 && canonical !== SONNET_55_ID) return body
+  if (canonical === OPUS_55_ID || canonical === SONNET_55_ID || fable52) body.model = canonical
+  if (fable52) {
+    delete body.temperature
+    delete body.top_p
+    delete body.top_k
+  }
   if (body.thinking && typeof body.thinking === 'object') {
     const type = String(body.thinking.type || '').toLowerCase()
     if (type === 'disabled' || type === 'enabled' || body.thinking.budget_tokens != null) {
@@ -955,15 +984,7 @@ export function getPolicyCatalogIds({ enabledOnly = false } = {}) {
 export function filterPublicModelIds(workerIds = []) {
   if (!loaded) loadModelPolicy()
   const mode = policy.catalog_mode || 'policy_only'
-  const ids = [
-    ...new Set(
-      (workerIds || []).filter(Boolean).map((id) => {
-        if (id === FABLE_51_LEGACY_ID) return FABLE_51_ID
-        if (id === OPUS_55_LEGACY_ID) return OPUS_55_ID
-        return id
-      }),
-    ),
-  ]
+  const ids = [...new Set((workerIds || []).filter(Boolean).map((id) => CANONICAL_MODEL_IDS.get(id) || id))]
 
   if (mode === 'worker_only') return ids
 
@@ -988,7 +1009,7 @@ export function syncWorkerModelsIntoPolicy(workerIds = [], { displayNameOf = nul
   const added = []
   const enabled = policy.catalog_mode === 'worker_only'
   for (const workerId of workerIds || []) {
-    const id = workerId === FABLE_51_LEGACY_ID ? FABLE_51_ID : workerId === OPUS_55_LEGACY_ID ? OPUS_55_ID : workerId
+    const id = CANONICAL_MODEL_IDS.get(workerId) || workerId
     if (!id || !isCatalogModelId(id)) continue
     if (/^gpt/i.test(id)) continue
     if (policy.models[id]) continue

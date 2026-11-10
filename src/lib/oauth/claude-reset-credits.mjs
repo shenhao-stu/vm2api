@@ -11,8 +11,8 @@ import path from 'node:path'
 import { runSlotOauth } from '../transport/slot-oauth.mjs'
 import { credentialModeOfVm, isApiKeyMode } from './credential-mode.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
-import { getVm } from '../vm/vm-registry.mjs'
 import { atomicWriteJson, withVmLock } from '../vm/vm-file.mjs'
+import { planClaudeFableReset } from './claude-reset-policy.mjs'
 
 export const CLAUDE_RESET_USAGE_PATH = '/api/oauth/usage?cedar_ember=1&skip_spend=1'
 export const CLAUDE_RESET_REDEEM_PATH = '/api/organizations/%s/reset_rate_limits'
@@ -148,6 +148,15 @@ export function projectClaudeResetCredits(block, now = Date.now()) {
     if (!held(grant, now)) continue
     const redeemable = claudeResetGrantRedeemable(block, grant, now)
     const credit = {
+      fingerprint: sha256(
+        JSON.stringify([
+          grant.id,
+          timeOf(grant.starts_at),
+          timeOf(grant.ends_at),
+          knownWindows(grant.clears).sort(),
+          requiresLimit(grant),
+        ]),
+      ),
       label: publicLabel(grant, grantIds),
       resets_left: grant.resets_left,
       clears: knownWindows(grant.clears),
@@ -196,7 +205,14 @@ function scopeText(vm) {
 }
 
 function loadAccount(projectRoot, vmId) {
-  const vm = getVm(projectRoot, vmId)
+  // Identity is a precondition for an irreversible claim. File metadata caches
+  // cannot distinguish equal-length in-place writes within one timestamp tick.
+  let vm
+  try {
+    vm = JSON.parse(fs.readFileSync(path.join(projectRoot, 'vms', `${vmId}.json`), 'utf8'))
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+  }
   if (!vm) return fail('vm_not_found', 'VM not found', 404)
   if (isCodexVm(vm) || isApiKeyMode(credentialModeOfVm(vm))) {
     return fail('CLAUDE_RESET_OAUTH_REQUIRED', '只有 Claude 完整 OAuth 槽可以兑换原生限额重置', 400)
@@ -348,6 +364,38 @@ function canonicalUuid(value) {
   return text
 }
 
+function accountIdentity(vm) {
+  return {
+    account: canonicalUuid(vm?.claude?.account_uuid || vm?.account_uuid),
+    org: canonicalUuid(vm?.claude?.org_uuid || vm?.org_uuid),
+  }
+}
+
+function identityFingerprint(identity) {
+  return identity.account && identity.org ? sha256(`claude-reset-account:${identity.account}:${identity.org}`) : null
+}
+
+function accountChanged() {
+  return fail('CLAUDE_RESET_ACCOUNT_CHANGED', '槽账号或组织已变化，请重新查询重置额度', 409)
+}
+
+function sameAccount(left, right) {
+  return left.account === right.account && left.org === right.org
+}
+
+function checkCurrentAccount(projectRoot, vmId, expected) {
+  const current = loadAccount(projectRoot, vmId)
+  return current.ok && sameAccount(accountIdentity(current.vm), expected) ? current : accountChanged()
+}
+
+function profileMatchesIdentity(profile, expected, required = false) {
+  return (
+    (!required || (!!expected.account && !!expected.org)) &&
+    (!expected.account || profile.account === expected.account) &&
+    (!expected.org || profile.org === expected.org)
+  )
+}
+
 async function fetchOrg(transport, exec) {
   const res = await callWorker(transport, exec, 'profile')
   const mapped = workerProblem(res)
@@ -356,7 +404,7 @@ async function fetchOrg(transport, exec) {
     return fail('CLAUDE_RESET_PROFILE_FAILED', 'OAuth 组织信息不可用', 502)
   const org = canonicalUuid(res.body?.organization?.uuid)
   if (!org) return fail('CLAUDE_RESET_ORGANIZATION_INVALID', 'OAuth 组织信息无效', 502)
-  return { ok: true, org }
+  return { ok: true, org, account: canonicalUuid(res.body?.account?.uuid || res.body?.account_uuid) }
 }
 
 function publicOutcome(outcome) {
@@ -413,8 +461,9 @@ function pickGrant(block, now) {
   )
 }
 
-function fenceBlocks(fence, now) {
+function fenceBlocks(fence, now, automatic = false) {
   if (!fence || fence.outcome !== 'unknown') return null
+  if (automatic) return fail('CLAUDE_RESET_UNRESOLVED', '上一次重置结果未确认，自动兑换已暂停', 409)
   const at = Date.parse(fence.at)
   if (!Number.isFinite(at)) return fail('CLAUDE_RESET_UNRESOLVED', '上一次重置结果未确认，暂时不能再兑换', 409)
   if (fence.reason === 'upstream_unavailable') {
@@ -429,27 +478,31 @@ function fenceBlocks(fence, now) {
   return null
 }
 
-async function persistCredits(projectRoot, vmId, credits) {
+async function persistCredits(projectRoot, vmId, credits, expectedIdentity) {
   if (!credits) return
   const file = path.join(projectRoot, 'vms', `${vmId}.json`)
-  await withVmLock(file, async () => {
+  return withVmLock(file, async () => {
     let vm
     try {
       vm = JSON.parse(fs.readFileSync(file, 'utf8'))
     } catch {
-      return
+      return false
     }
+    if (expectedIdentity && !sameAccount(accountIdentity(vm), expectedIdentity)) return false
     vm.claude_reset_credits = persistedCredits(credits)
     vm.updated_at = new Date().toISOString()
     atomicWriteJson(file, vm, { mode: 0o600 })
+    return true
   })
 }
 
 function persistedCredits(view) {
   return {
+    ...(/^[a-f0-9]{64}$/.test(view.account_fingerprint || '') ? { account_fingerprint: view.account_fingerprint } : {}),
     eligible: view.eligible === true,
     available_count: Math.max(0, Number(view.available_count) || 0),
     credits: (Array.isArray(view.credits) ? view.credits : []).map((credit) => ({
+      ...(/^[a-f0-9]{64}$/.test(credit.fingerprint || '') ? { fingerprint: credit.fingerprint } : {}),
       label: String(credit.label || ''),
       resets_left: Math.max(0, Number(credit.resets_left) || 0),
       ...(credit.starts_at ? { starts_at: credit.starts_at } : {}),
@@ -474,10 +527,14 @@ export async function queryClaudeResetCredits({
 } = {}) {
   const account = loadAccount(projectRoot, vmId)
   if (!account.ok) return account
+  const identity = accountIdentity(account.vm)
   const fetched = await fetchBlock(transport, account.exec)
   if (!fetched.ok) return fetched
+  if (!checkCurrentAccount(projectRoot, vmId, identity).ok) return accountChanged()
   const credits = projectClaudeResetCredits(fetched.block, now())
-  await persistCredits(projectRoot, vmId, credits)
+  const fingerprint = identityFingerprint(identity)
+  if (fingerprint) credits.account_fingerprint = fingerprint
+  if ((await persistCredits(projectRoot, vmId, credits, identity)) === false) return accountChanged()
   return { ok: true, claude_reset_credits: credits }
 }
 
@@ -485,15 +542,29 @@ export async function redeemClaudeResetCredit({
   projectRoot,
   vmId,
   idempotencyKey,
+  autoReset = null,
   transport = defaultTransport,
   now = () => Date.now(),
 } = {}) {
   const normalized = normalizeKey(idempotencyKey)
   if (normalized.error) return normalized.error
+  if (
+    autoReset != null &&
+    (typeof autoReset !== 'object' ||
+      Array.isArray(autoReset) ||
+      !/^[a-f0-9]{64}$/.test(autoReset.fingerprint || '') ||
+      !/^[a-f0-9]{64}$/.test(autoReset.account_fingerprint || '') ||
+      !Number.isInteger(autoReset.resets_left) ||
+      autoReset.resets_left <= 0)
+  )
+    return fail('CLAUDE_RESET_AUTO_PRECONDITION_INVALID', '自动兑换前置条件无效', 400)
   const account = loadAccount(projectRoot, vmId)
   if (!account.ok) return account
+  const identity = accountIdentity(account.vm)
+  if (autoReset && autoReset.account_fingerprint !== identityFingerprint(identity)) return accountChanged()
   const operation = claudeResetOperationId(vmId, normalized.key)
   return withAccountLease(vmId, now(), async () => {
+    if (!checkCurrentAccount(projectRoot, vmId, identity).ok) return accountChanged()
     const existing = await mutateState(projectRoot, async (state) => ({
       value: storedOutcome(state.operations[operation]),
     }))
@@ -504,6 +575,9 @@ export async function redeemClaudeResetCredit({
       vmId,
       operation,
       exec: account.exec,
+      identity,
+      autoReset,
+      idempotencyKey: normalized.key,
       transport,
       now,
     })
@@ -523,9 +597,14 @@ export async function redeemClaudeResetCredit({
   })
 }
 
-async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now }) {
+async function redeemOnce({ projectRoot, vmId, operation, exec, identity, autoReset, idempotencyKey, transport, now }) {
   const orgResult = await fetchOrg(transport, exec)
   if (!orgResult.ok) return orgResult
+  if (
+    !profileMatchesIdentity(orgResult, identity, autoReset != null) ||
+    !checkCurrentAccount(projectRoot, vmId, identity).ok
+  )
+    return accountChanged()
   const orgKey = claudeResetOrgId(orgResult.org)
   const owner = crypto.randomUUID()
   if (!tryAcquire(orgKey, owner, now())) {
@@ -548,20 +627,68 @@ async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now }
         }),
       }
     }
-    const blocked = fenceBlocks(fence, now())
+    const blocked = fenceBlocks(fence, now(), autoReset != null)
     if (blocked) return blocked
     const status = await fetchBlock(transport, exec)
     if (!status.ok) return status
+    if (!checkCurrentAccount(projectRoot, vmId, identity).ok) return accountChanged()
     const grant = pickGrant(status.block, now())
-    if (!grant) return fail('CLAUDE_RESET_NOT_AVAILABLE', '当前没有可兑换的限额重置', 409)
-    const marked = await writeFence(projectRoot, orgKey, {
-      operation,
-      outcome: 'unknown',
-      reason: 'claim_unconfirmed',
-      at: iso(now()),
+    if (!grant) {
+      return autoReset != null
+        ? fail('CLAUDE_RESET_AUTO_NOT_NEEDED', '官方状态已变化，当前无需自动兑换', 409)
+        : fail('CLAUDE_RESET_NOT_AVAILABLE', '当前没有可兑换的限额重置', 409)
+    }
+    if (autoReset != null) {
+      const currentAccount = checkCurrentAccount(projectRoot, vmId, identity)
+      if (!currentAccount.ok) return currentAccount
+      const currentVm = currentAccount.vm
+      const plan = planClaudeFableReset({
+        vmId,
+        enabled: true,
+        accountReady: !!currentVm && currentVm.schedulable !== false,
+        // The slot worker enforces the live egress gate; the external scheduler checks its proof first.
+        exitReady: true,
+        credits: {
+          ...projectClaudeResetCredits(status.block, now()),
+          account_fingerprint: identityFingerprint(identity),
+        },
+        now: now(),
+      })
+      if (plan.action !== 'redeem') {
+        return fail('CLAUDE_RESET_AUTO_NOT_NEEDED', '官方状态已变化，当前无需自动兑换', 409)
+      }
+      if (plan.fingerprint !== autoReset.fingerprint || plan.resets_left !== autoReset.resets_left) {
+        return fail('CLAUDE_RESET_AUTO_CREDIT_CHANGED', '官方下一张重置卡已变化，请重新查询', 409)
+      }
+      if (plan.idempotency_key !== idempotencyKey) {
+        return fail('CLAUDE_RESET_AUTO_KEY_INVALID', '自动兑换幂等键与当前重置卡不一致', 400)
+      }
+    }
+    // The native profile verifies the worker's live credential; the VM lock keeps
+    // an import from committing a new slot identity between this check and claim.
+    const claimed = await withVmLock(path.join(projectRoot, 'vms', `${vmId}.json`), async () => {
+      const freshProfile = await fetchOrg(transport, exec)
+      if (!freshProfile.ok) return freshProfile
+      const current = checkCurrentAccount(projectRoot, vmId, identity)
+      if (
+        !current.ok ||
+        !profileMatchesIdentity(freshProfile, identity, autoReset != null) ||
+        freshProfile.org !== orgResult.org ||
+        (orgResult.account && freshProfile.account !== orgResult.account)
+      )
+        return accountChanged()
+      if (autoReset && current.vm.schedulable === false)
+        return fail('CLAUDE_RESET_AUTO_NOT_NEEDED', '官方状态已变化，当前无需自动兑换', 409)
+      const marked = await writeFence(projectRoot, orgKey, {
+        operation,
+        outcome: 'unknown',
+        reason: 'claim_unconfirmed',
+        at: iso(now()),
+      })
+      if (marked?.ok === false) return marked
+      return claim(transport, exec, orgResult.org, grant.id, operation)
     })
-    if (marked?.ok === false) return marked
-    const claimed = await claim(transport, exec, orgResult.org, grant.id, operation)
+    if (claimed?.ok === false) return claimed
     const settled = await writeFence(projectRoot, orgKey, {
       operation,
       outcome: claimed.outcome,
@@ -570,11 +697,13 @@ async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now }
     })
     if (settled?.ok === false)
       return { ok: true, outcome: 'unknown', reason: 'result_persistence_failed', replayed: false }
-    if (claimed.outcome !== 'unknown') {
+    if (claimed.outcome !== 'unknown' && checkCurrentAccount(projectRoot, vmId, identity).ok) {
       const fresh = await fetchBlock(transport, exec)
-      if (fresh.ok) {
+      if (fresh.ok && checkCurrentAccount(projectRoot, vmId, identity).ok) {
         claimed.credits = projectClaudeResetCredits(fresh.block, now())
-        await persistCredits(projectRoot, vmId, claimed.credits)
+        const fingerprint = identityFingerprint(identity)
+        if (fingerprint) claimed.credits.account_fingerprint = fingerprint
+        await persistCredits(projectRoot, vmId, claimed.credits, identity)
       }
     }
     return { ok: true, ...publicOutcome(claimed) }

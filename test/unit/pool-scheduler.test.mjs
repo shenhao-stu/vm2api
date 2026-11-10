@@ -3097,3 +3097,43 @@ test('a failed remote health probe cannot escape a single-VM key restriction', a
   assert.equal(selected.ok, false)
   assert.equal(pool.inflight.size, 0)
 })
+
+test('pinned diagnostics still enforce Pro promotion expiry and keep Max access', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = scheduler(root)
+  const vm = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-01.json'), 'utf8'))
+  const now = Date.parse('2026-11-17T07:59:00Z')
+  const input = {
+    vm: { ...vm, claude: { ...vm.claude, subscription_type: 'pro', account_tier: 'pro' } },
+    accountId: 'account-1',
+    state: {},
+    model: 'claude-fable-5-2',
+    now,
+    pinned: true,
+  }
+  const pro = await pool.checkEligibility(input)
+  assert.deepEqual(pro, { ok: false, reason: 'fable_requires_max' })
+  const max = await pool.checkEligibility({ ...input, vm })
+  assert.equal(max.ok, true)
+})
+
+test('a queued Pro request cannot reserve after the promotion expires', (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = scheduler(root)
+  const vm = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-01.json'), 'utf8'))
+  const candidate = {
+    vmId: vm.id,
+    vm: { ...vm, claude: { ...vm.claude, subscription_type: 'pro' } },
+    accountId: 'account-1',
+    model: 'claude-fable-5-2',
+    maxConcurrency: 1,
+  }
+  const now = Date.parse('2026-11-17T07:59:00Z')
+  assert.equal(pool.reserve(candidate, { now }), null)
+  assert.equal(pool.inflight.size, 0)
+  const admitted = pool.reserve(candidate, { now: now - 1 })
+  assert.equal(admitted.reserved, true)
+  admitted.release()
+})

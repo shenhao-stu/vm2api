@@ -441,64 +441,22 @@ test('leftover oauth_no_refresh out of pool is unavailable', () => {
   assert.equal(st.text, '无效凭证')
 })
 
-test('Claude token defaults to Pro until Fable usage upgrades it', () => {
+test('Claude tier uses subscription identity instead of temporary model access', () => {
   assert.equal(inferClaudeTier({}).key, 'none')
-  assert.equal(inferClaudeTier({ has_token: true }, { fable: { plan_denied: true, status: 403 } }).key, 'pro')
-  assert.equal(inferClaudeTier({ has_token: true, utilization_7d_oi: 0.21 }).key, 'max')
-  assert.equal(inferClaudeTier({ has_token: true, fable: { ok: true } }).key, 'pro')
-  assert.equal(
-    inferClaudeTier({ has_token: true }, { fable: { plan_denied: true, status: 401, error: 'plan_denied' } }).key,
-    'pro',
-  )
-  assert.equal(inferClaudeTier({ has_token: true }, { fable: { ok: false, status: 429, error: 'Error' } }).key, 'pro')
-  assert.equal(
-    inferClaudeTier(
-      { has_token: true, utilization_7d_oi: 1 },
-      {
-        fable: { ok: false, status: 429, error: 'Error' },
-        utilization_7d_oi: 1,
-        status_7d_oi: 'rejected',
-      },
-    ).key,
-    'pro',
-  )
-  assert.equal(
-    inferClaudeTier(
-      { has_token: true, utilization_7d_oi: 0.44, reset_7d_oi: '2026-08-24T00:00:00Z' },
-      {
-        fable: { ok: false, status: 502 },
-        utilization_7d_oi: 0.44,
-        reset_7d_oi: '2026-08-24T00:00:00Z',
-      },
-    ).key,
-    'max',
-  )
-  assert.equal(inferClaudeTier({ has_token: true, account_tier: 'pro' }).key, 'pro')
-  assert.equal(inferClaudeTier({ has_token: true, account_tier: 'max' }).key, 'max')
-  assert.equal(
-    inferClaudeTier(
-      { has_token: true, account_tier: 'max' },
-      {
-        fable: { plan_denied: true, ok: false, status: 429, error: 'Error' },
-      },
-    ).key,
-    'max',
-  )
-  assert.equal(
-    inferClaudeTier(
-      { has_token: true, account_tier: 'pro' },
-      { utilization_7d_oi: 0.21, reset_7d_oi: '2026-08-24T00:00:00Z' },
-    ).key,
-    'max',
-  )
-  assert.equal(
-    inferClaudeTier(
-      { has_token: true, account_tier: 'pro' },
-      { usage_has_fable: true, fable: { plan_denied: true, ok: false, status: 403 } },
-    ).key,
-    'max',
-  )
-  assert.equal(inferClaudeTier({ has_token: true }).key, 'pro')
+  for (const evidence of [
+    { utilization_7d_oi: 0.2 },
+    { usage_has_fable: true },
+    { fable: { ok: true } },
+    { fable: { plan_denied: true, status: 403 } },
+  ]) {
+    assert.equal(inferClaudeTier({ has_token: true }, evidence).key, 'none')
+    assert.equal(inferClaudeTier({ has_token: true, account_tier: 'pro' }, evidence).key, 'pro')
+  }
+  assert.equal(inferClaudeTier({ has_token: true, account_tier: 'pro', account_tier_source: 'usage' }).key, 'pro')
+  assert.equal(inferClaudeTier({ has_token: true, account_tier: 'max', account_tier_source: 'usage' }).key, 'none')
+  assert.equal(inferClaudeTier({ has_token: true, subscription_type: 'pro', account_tier: 'max' }).key, 'pro')
+  assert.equal(inferClaudeTier({ has_token: true, subscription_type: 'max', account_tier: 'pro' }).key, 'max')
+  assert.equal(inferClaudeTier({ has_token: true, account_tier: 'max' }, { usage_has_fable: false }).key, 'max')
 })
 
 test('setup-token Extra-only row is not leftover/seed and is findable', () => {
