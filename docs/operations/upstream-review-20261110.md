@@ -1,9 +1,10 @@
 # 上游 PR 增量审查 — 2026-11-10
 
-以 GitHub API 14:33 北京时间快照和逐文件 diff 为准；网页缓存的“开放中”列表可能滞后。最近15个PR中13个已合入，936/939为关闭未合入。审查不等于批准切换线上内核。
+以 GitHub API 14:33 北京时间快照及15:10增量刷新、逐文件 diff 为准；网页缓存可能滞后。前15个PR中13个已合入，936/939关闭未合入；新增955仍开放。审查不等于批准切换线上内核。
 
 | PR | 结论与处理 |
 |---|---|
+| [955](https://github.com/dofastted/vm2api/pull/955) | 上游在初始化前读取attemptSessionId导致限定账号审核503。我们的审核调用不读取该变量，没有同一缺陷；保留现有协议实现。吸收4项真实FailoverRunner回归，并注入本分支的隔离数据库，保持拒绝会话保护开启；全部通过，无生产代码变化。 |
 | [951](https://github.com/dofastted/vm2api/pull/951) | 显式 OAuth subscription_type/rate_limit_tier、账号更换和异步写回隔离已在本轮选择吸收；保留我们额外的Ultra、活动截止、U134、拒绝会话保护。不能用Fable用量/调用成功推断MAX。 |
 | [948](https://github.com/dofastted/vm2api/pull/948) | 确认当前Codex转换会静默丢掉Anthropic source图片。增加4个上游行为测试，3个先失败；只移植7行imageUrlOf转换，23项全绿。仅源码候选，不重启独立Codex或Claude。 |
 | [949](https://github.com/dofastted/vm2api/pull/949) | codex-auto-review固定映射Luna属于产品路由选择，不是通用错误修复。未覆盖线上模型映射/统一Key/质量静置策略。 |
@@ -17,3 +18,5 @@
 额外实证：34038全链路控制发生worker502后，空池被无条件写成fable_requires_max。已复现并小改为只有真实套餐拒绝才返回套餐错误，保留Pro活动门槛；冷却/尝试耗尽保留实际原因。候选216项回归通过，未加载生产网关，不能以此宣称网络502已修复。
 
 证据：latest-refreshed.safe.json、各PR文件diff、948-red/green.log；../scheduler-cause-red.log、../latest-pr-regression.log。无生产CLI/内核/遥测/出口策略变化，没有重放任何旧客户请求。
+
+955补充证据：`test/unit/scoped-intercept-session.test.mjs`、工作区`pr-followup/955-fork-adapted.log`。原上游测试缺少本分支的隔离仓库，首次4例被pro_session_guard_unavailable安全阻断；补充内存数据库后4例通过，没有关闭保护或更改生产实现。
