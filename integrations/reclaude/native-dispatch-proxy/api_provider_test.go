@@ -30,6 +30,9 @@ func TestAPIProviderPreservesNativeRequestAndAllowsOnePaidDispatch(t *testing.T)
 	base, _ := url.Parse("https://example.com")
 	g := &Gate{Directory: dir, Session: testSession, APIBase: base}
 	g.Transport = roundTrip(func(r *http.Request) (*http.Response, error) {
+		if _, err := os.Stat(filepath.Join(dir, "bbbbaaaa-0000-4000-8000-000000000001.api-stream.private")); err != nil {
+			t.Error("receipt must be allocated before paid dispatch")
+		}
 		if r.URL.String() != "https://example.com/v1/messages?beta=true" || r.Host != "example.com" || r.Header.Get("X-Api-Key") != "fixture-key" || r.Header.Get("User-Agent") != "actual-cli-fixture" {
 			t.Error("native request changed")
 		}

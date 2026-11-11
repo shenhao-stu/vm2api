@@ -11,12 +11,18 @@ with tempfile.TemporaryDirectory(prefix='airoam-pty-')as tmp:
  session=InteractiveSession(directory,[cli,'--setting-sources',''],env,body,timeout=15,dispatch_proxy=pathlib.Path(__file__).with_name('interactive_fixture_guard.py'),api_base='https://offline.invalid',history_profile=profile)
  try:
   turns=[]
-  for i in range(3):
+  identities=[]
+  for i in range(4):
+   if i==2:
+    identities.append(session.native_id)
+    session.close(graceful=True)
+    session=InteractiveSession(directory,[cli,'--setting-sources',''],env,body,timeout=15,dispatch_proxy=pathlib.Path(__file__).with_name('interactive_fixture_guard.py'),api_base='https://offline.invalid',history_profile=profile,restore=True)
+    assert session.native_id==identities[-1], 'idle restart lost native identity'
    events=list(session.request(body));turns.append({'events':[e['type'] for e in events],'pending':len(session.pending_ids),'checkpoint':json.loads((directory/'continuation.json').read_text())['status']})
    assert events[-1]['type']=='message_stop'
    body['messages']=copy.deepcopy(session.history)
    body['messages'].append({'role':'user','content':[{'type':'tool_result','tool_use_id':next(iter(session.pending_ids)),'content':'SYNTHETIC'}] if session.pending_ids else 'Continue with a second answer.'})
-  print(json.dumps({'turns':turns,'dispatches':len(list((directory/'dispatch').glob('*.consumed.json'))),'argv_has_print':'-p' in session.native_cli_argv,'real_provider_calls':0}))
+  print(json.dumps({'turns':turns,'dispatches':len(list((directory/'dispatch').glob('*.consumed.json'))),'argv_has_print':'-p' in session.native_cli_argv,'real_provider_calls':0,'idle_restart_same_native_id':True}))
  except Exception:
   print((directory/'interactive-terminal.private.log').read_text()[-6000:] if (directory/'interactive-terminal.private.log').exists() else 'no terminal')
   debug=directory/'interactive-debug.private.log'

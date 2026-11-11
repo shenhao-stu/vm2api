@@ -8,7 +8,7 @@ import threading
 from urllib.parse import urlsplit
 
 from adapter import Limits, load_relay_key
-from native_bridge_session import Session
+from native_interactive_session import InteractiveSession
 from native_http import NativeServer
 
 
@@ -76,7 +76,7 @@ def main():
            'DISABLE_TELEMETRY': '1', 'DO_NOT_TRACK': '1', 'NO_PROXY': '127.0.0.1,localhost,::1'}
 
     def factory(directory, body):
-        return Session(directory, [str(args.cli), '--setting-sources', ''], env, body,
+        return InteractiveSession(directory, [str(args.cli), '--setting-sources', ''], env, body,
                        timeout=limits.request_seconds, dispatch_proxy=args.dispatch_proxy,
                        api_base=credentials['base_url'], restore=True, history_profile=profile)
 
@@ -86,7 +86,8 @@ def main():
     server = NativeServer((args.private_host or '127.0.0.1', args.port), health,
                           load_relay_key(args.key_file), args.root, factory, limits=limits,
                           private_host=args.private_host, max_requests=args.max_requests,
-                          recover=factory, allow_history_import=True, configuration_channels=True)
+                          recover=factory, allow_history_import=True, configuration_channels=True,
+                          require_principal=True)
     def stop(*_):
         threading.Thread(target=server.shutdown, daemon=True).start()
     signal.signal(signal.SIGTERM, stop)

@@ -148,12 +148,19 @@ func (g *Gate) forwardRequest(conn net.Conn, req *http.Request) {
 	if _, found := req.Header["User-Agent"]; !found {
 		req.Header["User-Agent"] = []string{""}
 	}
+	var capture *apiCapture
 	if modelRequest && g.APIBase != nil {
 		// API-mode acceptance requires an exact private request/receipt pair.
 		if err := writePrivateRequest(g.Directory, grantID, body); err != nil {
 			reply(conn, 502, "native_capture_unavailable_no_dispatch")
 			return
 		}
+		capture, err = g.prepareAPICapture(grantID)
+		if err != nil {
+			reply(conn, 502, "native_capture_unavailable_no_dispatch")
+			return
+		}
+		defer capture.finish()
 	}
 	response, err := g.Transport.RoundTrip(req)
 	if err != nil {
@@ -164,14 +171,8 @@ func (g *Gate) forwardRequest(conn net.Conn, req *http.Request) {
 		return
 	}
 	defer response.Body.Close()
-	if modelRequest && g.APIBase != nil {
-		capture, captureErr := g.captureAPI(response.Body, grantID, response.StatusCode)
-		if captureErr != nil {
-			g.TraceFailures.Add(1)
-			reply(conn, 502, "native_capture_unavailable_no_replay")
-			return
-		}
-		defer capture.finish()
+	if capture != nil {
+		capture.ReadCloser, capture.status = response.Body, response.StatusCode
 		response.Body = capture
 	}
 	if modelRequest && g.APIBase != nil {
@@ -188,6 +189,9 @@ func (g *Gate) forwardRequest(conn net.Conn, req *http.Request) {
 	// Code would only see the grant guard's 429 and misreport a quota limit.
 	if modelRequest && (response.StatusCode == 502 || response.StatusCode == 503 || response.StatusCode == 504) {
 		g.recordGatewayError(grantID, response.StatusCode)
+		if capture != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(capture, 1024*1024))
+		}
 		reply(conn, http.StatusBadRequest, "native_gateway_error_no_replay")
 		return
 	}

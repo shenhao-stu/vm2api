@@ -21,12 +21,29 @@ type apiCapture struct {
 	once             sync.Once
 }
 
-func (g *Gate) captureAPI(body io.ReadCloser, grant string, status int) (*apiCapture, error) {
+func (g *Gate) prepareAPICapture(grant string) (*apiCapture, error) {
 	f, err := os.OpenFile(filepath.Join(g.Directory, grant+".api-stream.private"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return nil, err
 	}
-	return &apiCapture{ReadCloser: body, file: f, directory: g.Directory, grant: grant, status: status}, nil
+	if err = f.Sync(); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err = syncCaptureDirectory(g.Directory); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return &apiCapture{file: f, directory: g.Directory, grant: grant}, nil
+}
+
+func syncCaptureDirectory(directory string) error {
+	f, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 func (c *apiCapture) Read(p []byte) (int, error) {
@@ -66,7 +83,9 @@ func (c *apiCapture) finish() {
 		}
 		closeErr := f.Close()
 		if err == nil && closeErr == nil {
-			_ = os.Rename(path+".tmp", path)
+			if os.Rename(path+".tmp", path) == nil {
+				_ = syncCaptureDirectory(c.directory)
+			}
 		}
 	})
 }

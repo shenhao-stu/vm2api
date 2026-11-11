@@ -38,6 +38,14 @@ class RequestRejected(ContractError):
     """Invalid input rejected before changing a native conversation."""
 
 
+class NativeProviderError(ContractError):
+    """Original API status, with no automatic replay and no private body exposure."""
+
+    def __init__(self, status):
+        super().__init__('native_provider_error_no_replay')
+        self.details = {'upstream_type': 'api_error', 'upstream_status': status, 'no_replay': True}
+
+
 class NativeRateLimit(ContractError):
     """The native CLI rejected this model; other model windows may remain usable."""
 
@@ -1486,7 +1494,7 @@ class Session:
                     if event is None or isinstance(event, Exception):
                         self.failed = True
                         self.close()
-                        if isinstance(event, NativeRateLimit):
+                        if isinstance(event, (NativeRateLimit, NativeProviderError)):
                             raise event
                         if isinstance(event, ContractError) and str(event) == 'native_api_error':
                             raise ContractError('native_upstream_error_no_replay')

@@ -83,7 +83,9 @@ class InteractiveSession(native.Session):
         if not tool_results:
             prompt_text(tail)
         elif (not self.pending_ids or self.suspended or changed
-              or any(b.get('type') != 'tool_result' for b in tail)):
+              or any(b.get('type') != 'tool_result' for b in tail)
+              or any(c['type'] != 'text' for b in tail
+                     for c in native.text_blocks(b.get('content', '')))):
             raise native.RequestRejected('interactive_resume_tool_results_not_supported')
         if native.output_format(body) is not None:
             raise native.RequestRejected('interactive_structured_output_not_supported')
@@ -221,8 +223,8 @@ class InteractiveSession(native.Session):
                     stream.seek(offsets.get(grant,0));data=stream.read(1024*1024)
                     offsets[grant]=stream.tell()
                 buffer=buffers.get(grant,b'')+data
-                while b'\n\n' in buffer:
-                    frame,rest=buffer.split(b'\n\n',1)
+                while separator := re.search(rb'\r?\n\r?\n', buffer):
+                    frame,rest=buffer[:separator.start()],buffer[separator.end():]
                     payload=b'\n'.join(l[5:].lstrip() for l in frame.splitlines() if l.startswith(b'data:'))
                     if not payload:
                         buffer=rest;continue
@@ -240,19 +242,34 @@ class InteractiveSession(native.Session):
                     raise native.ContractError('interactive_event_too_large')
                 if final.exists() and grant not in completed:
                     finish=json.loads(final.read_text())
-                    if finish.get('status')!=200 or not finish.get('complete'):
-                        raise native.ContractError('interactive_upstream_error_no_replay')
+                    if finish.get('grant_id') != grant:
+                        raise native.ContractError('interactive_receipt_mismatch_no_replay')
+                    if finish.get('status') != 200:
+                        status = finish.get('status')
+                        raise native.NativeProviderError(status if type(status) is int and 400 <= status <= 599 else 502)
+                    if offsets[grant] >= finish.get('bytes', path.stat().st_size):
+                        raise native.ContractError('interactive_stream_incomplete_no_replay')
         except Exception as exc:
             self.events.put(exc if isinstance(exc,native.ContractError) else native.ContractError('interactive_reader_failed'))
         finally:
             self.events.put(None)
 
     def _close(self, graceful=False):
+        # Closing a Python stdin wrapper cannot deliver EOF to a PTY. At an
+        # already verified idle boundary use the CLI's normal Ctrl-D exit.
+        if graceful and self.master is not None and self.process and self.process.poll() is None:
+            try:
+                os.write(self.master, b'\x04')
+                self.process.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         self.read_stop.set()
-        super()._close(graceful)
-        if self.master is not None:
-            os.close(self.master)
-            self.master=None
+        try:
+            super()._close(graceful)
+        finally:
+            if self.master is not None:
+                os.close(self.master)
+                self.master=None
 
 
 if __name__=='__main__' and len(sys.argv)==3 and sys.argv[1]=='--hook':
