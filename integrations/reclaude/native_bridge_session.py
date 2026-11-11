@@ -41,7 +41,7 @@ class RequestRejected(ContractError):
 class NativeRateLimit(ContractError):
     """The native CLI rejected this model; other model windows may remain usable."""
 
-    def __init__(self, model, info=None):
+    def __init__(self, model, info=None, api_error=None):
         super().__init__("native_rate_limit")
         self.details = {"upstream_type": "rate_limit_error", "model": model}
         if not isinstance(info, dict) or info.get("status") != "rejected":
@@ -51,6 +51,20 @@ class NativeRateLimit(ContractError):
             self.details["rate_limit_type"] = window
         if type(reset) is int and 0 < reset <= 253402300799:
             self.details["reset_at"] = reset
+        if api_error in {"usage_limit_reached", "model_requires_usage_credits"}:
+            self.details["api_error"] = api_error
+        if window == "seven_day_overage_included" and model.startswith("claude-fable-"):
+            self.details.update(quota_scope="model", quota_family="fable")
+        elif api_error == "model_requires_usage_credits":
+            self.details["quota_scope"] = "model"
+        windows = info.get("unifiedWindows")
+        weekly = windows.get("seven_day") if isinstance(windows, dict) else None
+        if window == "seven_day" and isinstance(weekly, dict):
+            utilization = weekly.get("utilization")
+            if (type(utilization) in (int, float) and 1 <= utilization <= 1000000
+                    and type(reset) is int and weekly.get("resetsAt") == reset
+                    and api_error == "usage_limit_reached"):
+                self.details.update(quota_scope="account", weekly_utilization=utilization)
 
 
 def thinking_configuration(body):
@@ -1211,7 +1225,7 @@ class Session:
                     elif event.get("type") == "assistant" and (
                         event.get("error") or event.get("is_api_error_message")
                     ):
-                        error = (NativeRateLimit(self.model, rate_limit_info)
+                        error = (NativeRateLimit(self.model, rate_limit_info, event.get("api_error"))
                                  if event.get("error") == "rate_limit"
                                  else ContractError("native_api_error"))
                         if isinstance(error, NativeRateLimit):

@@ -92,7 +92,7 @@ export async function resolvePublicHost(host, resolver = lookup, timeoutMs = 800
       ? [{ address: host, family: net.isIP(host) }]
       : await withDeadline(resolver(host, { all: true, verbatim: true }), timeoutMs, 'subscription_blocked')
   } catch {
-    throw new SubscriptionError('subscription_blocked')
+    throw new SubscriptionError('subscription_fetch')
   }
   if (!addresses.length || addresses.length > 32 || addresses.some((item) => !isPublicAddress(item.address))) {
     throw new SubscriptionError('subscription_blocked')
@@ -120,7 +120,48 @@ export function sourceUrl(value) {
   }
 }
 
-export async function fetchSubscription(raw, { resolver = resolvePublicHost, timeoutMs = 20000 } = {}) {
+export function subscriptionSources(raw) {
+  const url = sourceUrl(raw)
+  if (
+    url.protocol !== 'https:' ||
+    url.port ||
+    url.pathname !== '/use/unsafe/sub.php' ||
+    !['equaldcdn.com', 'ipequal.com'].includes(url.hostname)
+  )
+    return [raw]
+  return ['equaldcdn.com', 'ipequal.com'].map((host) => {
+    const next = new URL(url)
+    next.hostname = host
+    return next.href
+  })
+}
+
+export async function fetchSubscription(
+  raw,
+  { resolver = resolvePublicHost, timeoutMs = 20000, fetcher = fetchSource, validate = () => {} } = {},
+) {
+  const sources = subscriptionSources(raw),
+    deadline = Date.now() + timeoutMs
+  for (let index = 0; index < sources.length; index += 1) {
+    const budget = Math.floor((deadline - Date.now()) / (sources.length - index))
+    if (budget <= 0) throw new SubscriptionError('subscription_fetch')
+    try {
+      const body = await withDeadline(
+        fetcher(sources[index], { resolver, timeoutMs: budget }),
+        budget,
+        'subscription_fetch',
+      )
+      validate(body)
+      return body
+    } catch (error) {
+      if (error instanceof SubscriptionError && !['subscription_fetch', 'subscription_invalid'].includes(error.code))
+        throw error
+    }
+  }
+  throw new SubscriptionError('subscription_fetch')
+}
+
+async function fetchSource(raw, { resolver, timeoutMs }) {
   const signal = AbortSignal.timeout(timeoutMs)
   let url = sourceUrl(raw)
   for (let redirect = 0; redirect < 5; redirect += 1) {
