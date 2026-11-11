@@ -148,6 +148,13 @@ func (g *Gate) forwardRequest(conn net.Conn, req *http.Request) {
 	if _, found := req.Header["User-Agent"]; !found {
 		req.Header["User-Agent"] = []string{""}
 	}
+	if modelRequest && g.APIBase != nil {
+		// API-mode acceptance requires an exact private request/receipt pair.
+		if err := writePrivateRequest(g.Directory, grantID, body); err != nil {
+			reply(conn, 502, "native_capture_unavailable_no_dispatch")
+			return
+		}
+	}
 	response, err := g.Transport.RoundTrip(req)
 	if err != nil {
 		if modelRequest {
@@ -157,6 +164,16 @@ func (g *Gate) forwardRequest(conn net.Conn, req *http.Request) {
 		return
 	}
 	defer response.Body.Close()
+	if modelRequest && g.APIBase != nil {
+		capture, captureErr := g.captureAPI(response.Body, grantID, response.StatusCode)
+		if captureErr != nil {
+			g.TraceFailures.Add(1)
+			reply(conn, 502, "native_capture_unavailable_no_replay")
+			return
+		}
+		defer capture.finish()
+		response.Body = capture
+	}
 	if modelRequest && g.APIBase != nil {
 		g.recordAPIStatus(grantID, response.StatusCode)
 		// A private API-mode CLI must not retry a paid POST on a provider 429.

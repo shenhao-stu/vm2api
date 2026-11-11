@@ -1706,6 +1706,9 @@ def mcp(directory):
             }
         elif method == "tools/list":
             result = {"tools": tools}
+            ready = root / 'interactive-mcp-ready.json'
+            if (root / 'interactive-mcp-required').exists():
+                ready.write_text(json.dumps({'names': sorted(t['name'] for t in tools)}))
         elif method == "tools/call":
             params = request["params"]
             tool_id = params.get("_meta", {}).get("claudecode/toolUseId", "")

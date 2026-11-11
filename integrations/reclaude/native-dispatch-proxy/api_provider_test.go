@@ -46,7 +46,16 @@ func TestAPIProviderPreservesNativeRequestAndAllowsOnePaidDispatch(t *testing.T)
 	id, _ := json.Marshal(map[string]string{"session_id": testSession})
 	body, _ := json.Marshal(map[string]any{"model": "claude-sonnet-5-5", "metadata": map[string]string{"user_id": string(id)}, "system": "caller-system-preserved"})
 	s := httptest.NewServer(g)
-	defer s.Close()
+	defer func() {
+		s.Close()
+		deadline := time.Now().Add(time.Second)
+		for g.Active.Load() != 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if g.Active.Load() != 0 {
+			t.Error("private handler did not finish")
+		}
+	}()
 	var wg sync.WaitGroup
 	for range 10 {
 		wg.Add(1)
@@ -92,7 +101,16 @@ func TestAPIProviderRetainsOriginal429WithoutInvitingCLIRetry(t *testing.T) {
 		return &http.Response{StatusCode: 429, Status: "429 Too Many Requests", ProtoMajor: 1, ProtoMinor: 1, Header: http.Header{}, Body: io.NopCloser(bytes.NewBufferString(original)), ContentLength: int64(len(original))}, nil
 	})}
 	s := httptest.NewServer(g)
-	defer s.Close()
+	defer func() {
+		s.Close()
+		deadline := time.Now().Add(time.Second)
+		for g.Active.Load() != 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if g.Active.Load() != 0 {
+			t.Error("private handler did not finish")
+		}
+	}()
 	r, err := s.Client().Post(s.URL+"/v1/messages", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
