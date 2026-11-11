@@ -189,7 +189,7 @@ class SessionPool:
                     import native_bridge_session as native
                     from native_channel_policy import select_channel
                     snapshot = self.channel_store.snapshot(
-                        logical, self.entries, self.capacity)
+                        logical, self.entries, self.capacity, requested_model=body["model"])
                     if snapshot is not None:
                         decision = select_channel(
                             tenant, body, snapshot, native=native,
@@ -222,7 +222,7 @@ class SessionPool:
                         initial_request(body, allow_history_import=True)
                         if retire_rejected_legacy(self.root / key):
                             existing = False
-                            snapshot = self.channel_store.snapshot(logical, self.entries, self.capacity)
+                            snapshot = self.channel_store.snapshot(logical, self.entries, self.capacity, requested_model=body["model"])
                             decision = select_channel(
                                 tenant, body, snapshot, native=native, session_identity=session_identity,
                                 allow_history_import=True, check_capacity=False)

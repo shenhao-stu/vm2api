@@ -89,3 +89,38 @@ class QuotaRecoveryTests(unittest.TestCase):
         with self.f.pool.lease('other-tenant',self.follow)as other:
             self.assertNotEqual(other.directory,self.path)
             self.assertFalse(other.history)
+
+    def test_model_credits_refusal_allows_different_model_before_reset(self):
+        for event in self.events[1:]:
+            event['api_error'] = 'model_requires_usage_credits'
+        self.events[0]['rate_limit_info'].update(
+            resetsAt=int(time.time()) + 3600, rateLimitType='seven_day_overage_included')
+        self.save_log()
+        other = {**self.follow, 'model': 'sonnet'}
+        for restart in (False, True):
+            if restart:
+                self.f.pool.close()
+                self.f.pool = self.f.new_pool()
+            with self.f.pool.lease('tenant', other) as fresh:
+                self.assertNotEqual(fresh.directory, self.path)
+                self.assertFalse(fresh.failed)
+            with self.assertRaises(ContractError):
+                with self.f.pool.lease('tenant', self.follow):
+                    self.fail('original model must stay cooling')
+        self.assertEqual(read_json(self.claim)['state'], 'claimed')
+
+    def test_different_model_does_not_bypass_unproved_or_general_quota(self):
+        self.events[0]['rate_limit_info']['resetsAt'] = int(time.time()) + 3600
+        original = copy.deepcopy(self.events)
+        for mutate in (
+            lambda: None,
+            lambda: self.events[-1]['usage'].update(input_tokens=1),
+            lambda: self.events[-1].update(api_error='model_requires_usage_credits'),
+            lambda: self.events.insert(0, {'type': 'stream_event'}),
+        ):
+            self.events = copy.deepcopy(original)
+            mutate()
+            self.save_log()
+            with self.assertRaises(ContractError):
+                with self.f.pool.lease('tenant', {**self.follow, 'model': 'sonnet'}):
+                    self.fail('unknown or global quota must stay closed')
