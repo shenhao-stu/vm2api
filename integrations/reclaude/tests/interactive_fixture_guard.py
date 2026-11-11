@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline fake provider; synthetic numbers must never enter a customer ledger."""
 
-import argparse, hashlib, http.server, json, os, pathlib, signal, sys, threading, uuid
+import argparse, hashlib, http.server, json, os, pathlib, sys, time, uuid
 
 p = argparse.ArgumentParser()
 p.add_argument("--directory", type=pathlib.Path)
@@ -33,7 +33,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             g = json.loads((a.directory / "grant.json").read_text())
             assert json.loads(body["metadata"]["user_id"])["session_id"] == a.session
             assert g["model"] == body["model"]
-            assert any(
+            assert os.environ.get("FIXTURE_AGENT_MODE") or any(
                 t.get("name") == "mcp__caller__echo" for t in body.get("tools", [])
             ), "caller tools absent"
             with (a.directory / (g["id"] + ".consumed.json")).open("x") as f:
@@ -46,7 +46,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         tool_count = sum(b.get("type") == "tool_use" for m in body["messages"]
                          if m["role"] == "assistant" and isinstance(m.get("content"), list)
                          for b in m["content"])
-        tool = tool_count < int(os.environ.get("FIXTURE_TOOL_TURNS", "1"))
+        tool_name = "Agent" if os.environ.get("FIXTURE_AGENT_MODE") else "echo"
+        tool = tool_count < int(os.environ.get("FIXTURE_TOOL_TURNS", "1")) and any(
+            t.get("name") == "mcp__caller__" + tool_name for t in body.get("tools", [])
+        )
+        tool_input = {"subagent_type": "probe", "description": "Isolated child check",
+                      "prompt": "Return OFFLINE_CHILD_OK only."} if tool_name == "Agent" else {"text": "SYNTHETIC"}
         mid = "msg_" + uuid.uuid4().hex
         events = [
             {
@@ -71,8 +76,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "index": 0,
                 "content_block": {
                     "type": "tool_use",
-                    "id": "toolu_fixture_" + str(tool_count),
-                    "name": "echo" if os.environ.get("FIXTURE_RAW_TOOL_NAMES") else "mcp__caller__echo",
+                    "id": "toolu_fixture_" + a.session + "_" + str(tool_count),
+                    "name": tool_name if os.environ.get("FIXTURE_RAW_TOOL_NAMES") else "mcp__caller__" + tool_name,
                     "input": {},
                 }
                 if tool
@@ -83,10 +88,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "index": 0,
                 "delta": {
                     "type": "input_json_delta",
-                    "partial_json": '{"text":"SYNTHETIC"}',
+                    "partial_json": json.dumps(tool_input),
                 }
                 if tool
-                else {"type": "text_delta", "text": "INTERACTIVE_OK"},
+                else {"type": "text_delta", "text": "OFFLINE_CHILD_OK" if tool_name == "Agent" else "INTERACTIVE_OK"},
             },
             {"type": "content_block_stop", "index": 0},
             {
@@ -99,6 +104,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             },
             {"type": "message_stop"},
         ]
+        if "FIXTURE_PARTIAL_TERMINAL" in json.dumps(body["messages"]):
+            events = events[:-1]
+        # Gives concurrent HTTP tests a deterministic in-flight overlap.
+        if "FIXTURE_DELAY" in json.dumps(body["messages"]):
+            time.sleep(0.5)
         data = b"".join(
             ("event: " + e["type"] + "\ndata: " + json.dumps(e) + "\n\n").encode()
             for e in events
@@ -117,7 +127,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if os.environ.get("FIXTURE_RAW_TOOL_NAMES"):
             sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
             from native_interactive_recovery import caller_tool_stream
-            data = caller_tool_stream(data, [{"name": "echo"}])
+            data = caller_tool_stream(data, [{"name": tool_name}])
         self.wfile.write(data)
         self.wfile.flush()
         self.close_connection = True

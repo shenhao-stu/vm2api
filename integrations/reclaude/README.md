@@ -541,9 +541,21 @@ additional usage to the caller. Missing or changed evidence is rejected. Raw
 transcripts and provider records remain preserved. Provider tool-name aliases
 are mapped only to unambiguously declared MCP tools; original usage is unchanged.
 
-The real outer Claude Code builtin-Agent acceptance is still incomplete: the
-provider disabled the current API key before the corrected tool-name path could
-be verified live. Full-chain accounting through Sub2API also remains unverified.
+Network-disabled acceptance also runs an outer interactive official CLI with its
+builtin Agent, an isolated child and a parent continuation. Five distinct requests
+completed with one guarded dispatch each. A reproduced local 429 at the parent /
+child handoff is addressed with a two-second maximum wait before admission, only
+for `session_busy`. Each attempt rechecks the original pool's isolation and
+history rules. Consumed, failed or unknown turns are not retried; long contention
+still returns 429. Existing OAuth handlers retain immediate admission semantics.
+
+Separate HTTP fixtures verify concurrent duplicate suppression, three-tenant
+pending-tool recovery after restart, invalid tool results without poisoning the
+parent, disconnect accounting and missing-terminal rejection. Fixture usage is
+synthetic and never enters a customer ledger. These results do not establish live
+provider acceptance: the provider disabled the current API key before the
+corrected tool-name path could be verified live. Full-chain accounting through
+Sub2API also remains unverified.
 First-time imports ending in tool results, media prompts and structured outputs
 are explicitly unsupported. Do not invent a continuation or repeat a consumed
 model turn. Existing production routes are unchanged by this candidate.

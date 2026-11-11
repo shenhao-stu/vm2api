@@ -181,6 +181,9 @@ def failure_status(error, code, expired=False):
 
 
 class NativeHandler(RelayHandler):
+    def lease_session(self, tenant, body):
+        return self.server.pool.lease(tenant, body)
+
     def authenticated_tenant(self):
         tenant = self.server.tenant
         if self.server.require_principal:
@@ -301,7 +304,7 @@ class NativeHandler(RelayHandler):
             if failed or not self.server.proof():
                 record["readiness_failures"] = failed or ["official_proof_unavailable"]
                 raise Rejection(503, "native_not_ready")
-            context = self.server.pool.lease(tenant, body)
+            context = self.lease_session(tenant, body)
             lease_started = time.monotonic()
             session = context.__enter__()
             record["pool_lease_ms"] = round((time.monotonic() - lease_started) * 1000)

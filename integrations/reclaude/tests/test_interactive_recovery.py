@@ -156,5 +156,165 @@ class EvidenceLimitTests(unittest.TestCase):
                 bounded_bytes(path, 2)
 
 
+class DurableRecoveryEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        import hashlib
+        import uuid
+        from native_bridge_session import signature
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name)
+        self.dispatch = self.root / "dispatch"
+        self.dispatch.mkdir()
+        self.sid, self.grant = str(uuid.uuid4()), str(uuid.uuid4())
+        self.body = {
+            "model": "fixture",
+            "metadata": {"user_id": json.dumps({"session_id": self.sid})},
+            "messages": [{"role": "user", "content": "fixture"}],
+            "max_tokens": 64,
+        }
+        self.path("api-request.private.json").write_text(json.dumps(self.body))
+        self.path("consumed.json").write_text(
+            json.dumps(
+                {
+                    "body_sha256": hashlib.sha256(
+                        self.path("api-request.private.json").read_bytes()
+                    ).hexdigest()
+                }
+            )
+        )
+        self.assistant = [
+            {
+                "type": "tool_use",
+                "id": "tool_owned",
+                "name": "echo",
+                "input": {"text": "fixture"},
+            }
+        ]
+        self.events = [
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_fixture",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "fixture",
+                    "content": [],
+                    "usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 11,
+                        "cache_creation": {"ephemeral_1h_input_tokens": 11},
+                    },
+                },
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {**self.assistant[0], "input": {}},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '{"text":"fixture"}',
+                },
+            },
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use"},
+                "usage": {"output_tokens": 3},
+            },
+            {"type": "message_stop"},
+        ]
+        self.plan = {
+            "version": 1,
+            "native_id": self.sid,
+            "tools": [{"name": "echo"}],
+            "steps": [
+                {"grant_id": self.grant, "assistant_sha256": signature(self.assistant)}
+            ],
+        }
+        self.write_stream()
+
+    def path(self, extension):
+        return self.dispatch / (self.grant + "." + extension)
+
+    def write_stream(self):
+        data = b"".join(
+            ("data: " + json.dumps(e) + "\n\n").encode() for e in self.events
+        )
+        self.path("api-stream.private").write_bytes(data)
+        self.path("api-terminal.json").write_text(
+            json.dumps(
+                {
+                    "grant_id": self.grant,
+                    "status": 200,
+                    "complete": True,
+                    "bytes": len(data),
+                }
+            )
+        )
+
+    def load(self):
+        from native_interactive_recovery import load_steps
+
+        return load_steps(self.root, self.plan, self.sid)
+
+    def test_valid_evidence_preserves_original_bytes_and_usage(self):
+        original = self.path("api-stream.private").read_bytes()
+        step = self.load()[0]
+        self.assertEqual(step["pending"], self.assistant)
+        self.assertIn(b'"ephemeral_1h_input_tokens": 11', step["stream"])
+        self.assertEqual(self.path("api-stream.private").read_bytes(), original)
+
+    def test_missing_or_changed_request_evidence_cannot_restore(self):
+        self.path("api-request.private.json").write_text('{"model":"changed"}')
+        with self.assertRaisesRegex(RecoveryError, "digest_mismatch"):
+            self.load()
+        self.path("api-request.private.json").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.load()
+
+    def test_complete_transport_without_semantic_terminal_is_not_final_usage(self):
+        self.events.pop()
+        self.write_stream()
+        with self.assertRaisesRegex(RecoveryError, "terminal_mismatch"):
+            self.load()
+
+    def test_tool_argument_change_is_not_accepted_by_matching_tool_id(self):
+        self.events[2]["delta"]["partial_json"] = '{"text":"tampered"}'
+        self.write_stream()
+        with self.assertRaisesRegex(RecoveryError, "terminal_mismatch"):
+            self.load()
+
+    def test_failed_incomplete_or_other_grant_receipt_is_rejected(self):
+        original = json.loads(self.path("api-terminal.json").read_bytes())
+        for change in (
+            {"complete": False},
+            {"status": 429},
+            {"grant_id": "foreign"},
+            {"bytes": 0},
+        ):
+            with self.subTest(change=change):
+                self.path("api-terminal.json").write_text(
+                    json.dumps({**original, **change})
+                )
+                with self.assertRaises(RecoveryError):
+                    self.load()
+
+    def test_other_native_session_and_path_traversal_are_rejected(self):
+        self.plan["native_id"] = "other"
+        with self.assertRaises(RecoveryError):
+            self.load()
+        self.plan["native_id"] = self.sid
+        self.plan["steps"][0]["grant_id"] = "../../foreign"
+        with self.assertRaises(ValueError):
+            self.load()
+
+
 if __name__ == "__main__":
     unittest.main()

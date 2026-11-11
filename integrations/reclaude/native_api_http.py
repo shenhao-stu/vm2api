@@ -7,16 +7,41 @@ import json
 import os
 import signal
 import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from adapter import Limits, load_relay_key
+from native_bridge_session import ContractError
 from native_http import NativeHandler, NativeServer
 from native_interactive_session import InteractiveSession
 
 
 class APIHandler(NativeHandler):
     """A dedicated client key has its own tenant and needs no internal header."""
+
+    lease_wait_seconds = 2.0
+
+    @contextmanager
+    def lease_session(self, tenant, body):
+        # The interactive client starts child/continuation requests before the
+        # prior HTTP lease finishes. Wait only before admission, never retry a
+        # consumed model turn or weaken the pool's history/identity checks.
+        deadline = time.monotonic() + self.lease_wait_seconds
+        while True:
+            lease = self.server.pool.lease(tenant, body)
+            try:
+                session = lease.__enter__()
+                break
+            except ContractError as exc:
+                if str(exc) != "session_busy" or time.monotonic() >= deadline:
+                    raise
+                time.sleep(min(0.02, max(0, deadline - time.monotonic())))
+        try:
+            yield session
+        finally:
+            lease.__exit__(None, None, None)
 
     def authorized(self):
         self.client_tenant = None
