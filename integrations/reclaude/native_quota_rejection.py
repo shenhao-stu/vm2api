@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 
 
-def terminal_reset(events, native_id, at_ms, now):
+def terminal_reset(events, native_id, at_ms, now, *, model_change=False):
     if any(e.get('type') == 'stream_event' for e in events):
         return None
     assistants = [e for e in events if e.get('type') == 'assistant']
@@ -29,12 +29,14 @@ def terminal_reset(events, native_id, at_ms, now):
     limit = limits[0].get('rate_limit_info', {})
     reset = limit.get('resetsAt')
     if (limit.get('status') != 'rejected' or type(reset) is not int or type(at_ms) is not int
-            or not 0 < at_ms / 1000 < reset <= now):
+            or not 0 < at_ms / 1000 < reset):
+        return None
+    if reset > now and not (model_change and api_error == 'model_requires_usage_credits'):
         return None
     return reset
 
 
-def rejected_request(directory, state, claims, now):
+def rejected_request(directory, state, claims, now, *, requested_model=None):
     """No offset means no proof: old or ambiguous consumed records stay blocked."""
     directory = Path(directory)
 
@@ -74,6 +76,10 @@ def rejected_request(directory, state, claims, now):
         with log.open('rb') as stream:
             stream.seek(offset)
             events = [json.loads(line) for line in stream.read(2 * 1024 * 1024 + 1).splitlines() if line.strip()]
-        return request if terminal_reset(events, native_id, receipt.get('at_ms'), now) else None
+        model_change = (isinstance(requested_model, str) and bool(requested_model)
+                        and isinstance(grant.get('model'), str) and bool(grant['model'])
+                        and requested_model != grant['model'])
+        return request if terminal_reset(events, native_id, receipt.get('at_ms'), now,
+                                         model_change=model_change) else None
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None

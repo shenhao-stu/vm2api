@@ -141,7 +141,7 @@ class ChannelStore:
             write_json(path, expected, exclusive=True)
         session.channel_store = self
 
-    def snapshot(self, logical, entries, capacity, *, stopped=False, pressure=False):
+    def snapshot(self, logical, entries, capacity, *, stopped=False, pressure=False, requested_model=None):
         document = self.document(logical)
         if document is None:
             return None
@@ -176,7 +176,7 @@ class ChannelStore:
             # recover() still verifies the exact result set on its own path.
             claims = directory / 'caller-grants'
             claim_values = {path.stem: read_json(path) for path in claims.glob('*.json')}
-            rejected = rejected_request(directory, state, claim_values, time.time()) if status == 'failed' else None
+            rejected = rejected_request(directory, state, claim_values, time.time(), requested_model=requested_model) if status == 'failed' else None
             terminal_error = failed_request(directory, state, claim_values) if status == 'failed' else None
             if rejected:
                 status = 'quota_rejected'
