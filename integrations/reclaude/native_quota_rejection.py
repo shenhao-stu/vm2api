@@ -14,10 +14,11 @@ def terminal_reset(events, native_id, at_ms, now):
     assistant, result = assistants[0], results[-1]
     if any(e.get('session_id') != native_id for e in (assistant, result, limits[0])):
         return None
+    api_error = assistant.get('api_error')
     if (assistant.get('error') != 'rate_limit' or assistant.get('api_error_status') != 429
-            or assistant.get('api_error') != 'usage_limit_reached'
+            or api_error not in {'usage_limit_reached', 'model_requires_usage_credits'}
             or result.get('is_error') is not True or result.get('api_error_status') != 429
-            or result.get('api_error') != 'usage_limit_reached'
+            or result.get('api_error') != api_error
             or result.get('terminal_reason') != 'api_error' or result.get('modelUsage') != {}
             or type(result.get('total_cost_usd')) not in (int, float) or result['total_cost_usd'] != 0):
         return None

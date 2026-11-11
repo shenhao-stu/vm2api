@@ -42,6 +42,23 @@ class QuotaRecoveryTests(unittest.TestCase):
                 with self.f.pool.lease('tenant',{**self.body,'model':'sonnet'}):self.fail('paid replay')
         self.assertEqual(old,{str(p.relative_to(self.path)):p.read_bytes()for p in self.path.rglob('*')if p.is_file()})
 
+    def test_credits_required_zero_use_recovers_only_after_official_reset(self):
+        for event in self.events[1:]:
+            event['api_error'] = 'model_requires_usage_credits'
+        self.events[0]['rate_limit_info']['rateLimitType'] = 'seven_day_overage_included'
+        self.save_log()
+        self.test_reset_after_proven_rejection_creates_generation_but_keeps_paid_dedup()
+
+    def test_mismatched_or_unknown_quota_error_remains_closed(self):
+        for assistant, result in [('usage_limit_reached', 'model_requires_usage_credits'),
+                                  ('model_requires_usage_credits', 'unknown_limit')]:
+            self.events[1]['api_error'] = assistant
+            self.events[2]['api_error'] = result
+            self.save_log()
+            with self.assertRaises(ContractError):
+                with self.f.pool.lease('tenant', self.follow):
+                    self.fail('unproved quota terminal')
+
     def test_unknown_nonzero_future_or_unbound_rejection_stays_closed(self):
         original=copy.deepcopy(self.events)
         for mutate in (lambda:self.events.pop(),lambda:self.events[-1]['usage'].update(output_tokens=1),

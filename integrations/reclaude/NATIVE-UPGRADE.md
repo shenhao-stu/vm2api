@@ -129,3 +129,12 @@ unknown session or edit a paid transcript. Regression covers a real child exitin
 during configuration sync, prepared and imported histories, prewarming, and unknown
 or nonzero dispatch observations. Local and production-image isolated suites each
 passed 336 tests; no provider request was needed for those tests.
+
+Native Fable quota refusals can also use `model_requires_usage_credits`. The
+zero-use quota proof accepts that code only when the assistant and terminal result
+agree, the existing zero-token/zero-cost and dispatch evidence checks pass, and
+the official reset has elapsed. It retains paid/unknown deduplication and does not
+change current cooldowns. Map a witnessed Fable-specific window to Sub2API's native
+model cooldown, preserving access to unrelated models. A consumed dispatch marker
+means the turn was sent; it does not by itself prove that the provider charged it.
+The two quota regressions bring the isolated suite to 338 tests on both hosts.
