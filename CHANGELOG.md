@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Codex 客户端兼容 pin 更新到已核实的官方 `0.167.1`，补齐参考目录中的 Astra、6.1 Sol/Terra 和 5.6 家族静态回退项；账号实时目录仍优先，新增型号沿用默认关闭，不猜测 6.2 灰度型号的能力或价格。修复 `ultra` 被降到 `medium` 及 Completions 丢失推理参数，槽位测试、定时计划和日志同步支持。
 - #937：Anthropic Messages `type=image` + `source`（base64/url）在转 Codex Responses 时不再被静默丢弃，顺序与 OpenAI `image_url` 路径兼容。
 - 新增可选 `compatibility.preserve_pruned_tool_results`：在槽位Claude推理中，按认证密钥和DSH会话隔离保存成功请求的有限工具原文；精确识别默认工具文本裁剪后恢复原始前缀，避免小幅历史裁剪造成整段缓存重写。真实编辑/压缩、失败/重试、并发歧义和内存/上下文预算不足时不恢复；缺省关闭，不改变客户端配置或API直连端点。
 

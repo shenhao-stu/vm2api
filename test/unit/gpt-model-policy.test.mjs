@@ -5,6 +5,7 @@ import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import {
   getGptModelPolicy,
   isGptFastAliasAvailable,
+  isGptModelEnabled,
   isImageToolModelEnabled,
   listGptPolicyModels,
   listGptFastAliases,
@@ -284,4 +285,18 @@ test('a failed SQLite write is reported and does not publish uncommitted switche
   }
   loadGptModelPolicy({ force: true })
   assert.deepEqual(getGptModelPolicy(), before)
+})
+
+test('new 6.2 catalog IDs require explicit enablement without invented capabilities', (t) => {
+  withDb(t)
+  const id = 'gpt-6.2-astra'
+  syncGptIdsIntoPolicy([{ id, display_name: 'Account catalog model', catalog: {} }])
+  assert.equal(isGptModelEnabled(id), false)
+  assert.equal(getGptModelPolicy().models[id].capabilities.context_window, undefined)
+  assert.equal(getGptModelPolicy().models[id].params.max_tokens_cap, undefined)
+  saveGptModelPolicy({ models: { [id]: { enabled: true } } })
+  loadGptModelPolicy({ force: true })
+  syncGptIdsIntoPolicy([{ id, catalog: {} }])
+  assert.equal(isGptModelEnabled(id), true)
+  assert.equal(isGptModelEnabled('gpt-6.2-not-in-account-catalog'), false)
 })
