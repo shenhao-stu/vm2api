@@ -29,6 +29,7 @@ import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
 import { usageQueryOptions } from '@/features/overview/queries'
+import { routingQueryOptions } from '@/features/settings/queries'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
 import { DeleteActiveVmHint } from '@/features/vm/delete-active-hint'
@@ -55,6 +56,7 @@ const SORT_CHIPS = [
   ['status', '状态'],
   ['name', '名称'],
   ['remain', '5H 剩余'],
+  ['reset7d', '7D 重置'],
   ['today', '今日花费'],
   ['cost7', '7D 费用'],
   ['total', '总计费用'],
@@ -94,6 +96,13 @@ function writePref(key: string, value: string) {
 export function VmListPage() {
   const me = useQuery(meQueryOptions())
   const vmsQ = useQuery(vmsListQueryOptions(5000))
+  const routing = useQuery({
+    ...routingQueryOptions(),
+    enabled: me.data?.role === 'admin',
+  })
+  const weeklyReset =
+    (routing.data?.pool as { strategy?: string } | undefined)?.strategy ===
+    'weekly-reset'
   usePoolSeatStream()
   const usage = useQuery({
     ...usageQueryOptions(5000),
@@ -117,7 +126,9 @@ export function VmListPage() {
     setSizeState(next)
     writePref(LS_SIZE, next)
   }
-  const [sort, setSort] = useState<VmSortKey>('status')
+  const [sortChoice, setSort] = useState<VmSortKey | null>(null)
+  const sort =
+    sortChoice ?? (weeklyReset && kind !== 'gpt' ? 'reset7d' : 'status')
   const [dir, setDir] = useState<'asc' | 'desc'>('asc')
   const [resetTarget, setResetTarget] = useState<Vm | null>(null)
   const [resetMode, setResetMode] = useState<'keep' | 'traits'>('keep')
@@ -179,7 +190,11 @@ export function VmListPage() {
   return (
     <PageHeader
       title={VIEW_TITLES.vm}
-      description='按线路管理账号：导入凭证、确认连接、开启调度。运行中的槽位仍需满足健康、额度和容量条件才能接单。'
+      description={
+        weeklyReset && kind !== 'gpt'
+          ? 'Claude 新会话优先选 7D 即将重置且符合模型、额度与并发条件的槽位。已绑定的会话和工具续轮优先沿用原槽。'
+          : '按线路管理账号。运行中的槽位仍需满足健康、额度和容量条件才能接单。'
+      }
       fluid
       extra={
         poolQueue || canCreate ? (
@@ -241,7 +256,7 @@ export function VmListPage() {
               value={sort}
               onValueChange={(next) => {
                 setSort(next as VmSortKey)
-                setDir(next === 'name' ? 'asc' : 'desc')
+                setDir(next === 'name' || next === 'reset7d' ? 'asc' : 'desc')
               }}
             >
               <SelectTrigger size='sm' className='w-28' aria-label='排序字段'>
@@ -342,7 +357,11 @@ export function VmListPage() {
                 onCreate={canCreate ? () => setCreateOpen(true) : undefined}
               />
             ) : (
-              <VmTable vms={list} accounts={accounts} />
+              <VmTable
+                vms={list}
+                accounts={accounts}
+                weeklyReset={weeklyReset}
+              />
             )
           ) : (
             <EmptyState

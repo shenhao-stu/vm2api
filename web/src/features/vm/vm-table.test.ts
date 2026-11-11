@@ -1,6 +1,6 @@
 import type { Vm } from '@/types/panel-vm'
 import { describe, expect, it } from 'vitest'
-import { filterVms } from './vm-table'
+import { filterVms, sortVms } from './vm-table'
 
 function vm(over: Partial<Vm> = {}): Vm {
   return {
@@ -130,5 +130,32 @@ describe('filterVms fleet chips', () => {
       'warn',
       'claude',
     ])
+  })
+})
+
+describe('7D reset order in the slot list', () => {
+  it('shows the next valid weekly reset first and keeps stale windows and stopped slots behind', () => {
+    const now = Date.parse('2026-11-11T06:00:00Z')
+    const running = { status: 'running', schedulable: true } as const
+    const rows = [
+      vm({
+        ...running,
+        id: 'late',
+        reset_7d: '2026-11-16T18:00:00Z',
+        schedule_level: 7,
+      }),
+      vm({ ...running, id: 'stale', reset_7d: '2026-11-11T06:00:00Z' }),
+      vm({ ...running, id: 'near', reset_7d: '1794387600', schedule_level: 1 }),
+      vm({ ...running, id: 'unknown', reset_7d_oi: '2026-11-11T06:01:00Z' }),
+      vm({
+        id: 'stopped',
+        status: 'stopped',
+        schedulable: false,
+        reset_7d: '2026-11-11T06:01:00Z',
+      }),
+    ]
+    expect(
+      sortVms(rows, 'reset7d', 'asc', undefined, now).map((row) => row.id)
+    ).toEqual(['near', 'late', 'stale', 'unknown', 'stopped'])
   })
 })

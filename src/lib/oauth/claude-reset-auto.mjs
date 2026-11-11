@@ -11,7 +11,7 @@ const RETRY_MS = 5 * 60_000
 /** Native percent_used is 0–100; subscription and model eligibility remain separate. */
 export function autoResetReason(grant, now = Date.now()) {
   if (!fablePromotionActive(now) || !(grant?.resets_left > 0)) return null
-  if (!grant.clears?.includes('seven_day_overage_included')) return null
+  if (!grant.clears?.includes('seven_day_overage_included') || grant.clears.includes('seven_day')) return null
   const end = Date.parse(grant.expires_at || grant.ends_at || '')
   const start = Date.parse(grant.starts_at || '')
   if (!Number.isFinite(end) || end <= now || end > FABLE_PROMOTION_END || (Number.isFinite(start) && start > now))

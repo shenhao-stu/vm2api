@@ -124,12 +124,18 @@ function StatusReason({ vm, tone }: { vm: Vm; tone: StatusTone }) {
   )
 }
 
-function PriorityChip({ vm }: { vm: Vm }) {
+function PriorityChip({ vm, weeklyReset }: { vm: Vm; weeklyReset: boolean }) {
   const level = Number(vm.schedule_level)
   const valid = Number.isInteger(level) && level >= 0
-  const text = valid ? `优先级-${level}` : '优先级-—'
+  const text = weeklyReset
+    ? '周重置优先'
+    : valid
+      ? `优先级-${level}`
+      : '优先级-—'
   const mode = vm.schedule_level_mode === 'manual' ? '手动' : '自动'
-  const title = `${mode}调度等级`
+  const title = weeklyReset
+    ? '新会话按 7D 重置时间比较，重置时间相同才使用调度等级'
+    : `${mode}调度等级`
   return (
     <span
       className='inline-flex rounded border border-border/70 px-1.5 py-0.5 font-mono text-[11px] leading-none font-semibold text-muted-foreground tabular-nums'
@@ -144,9 +150,18 @@ function PriorityChip({ vm }: { vm: Vm }) {
  * 类型列：调用形式（console / oauth / api）+ 调度优先级，下一行是周窗口重置时刻。
  * 平台（Claude / GPT）与 pro / max 等级都在「账号」列，不在这里重复。
  */
-function TypeCell({ vm, now }: { vm: Vm; now: number }) {
+function TypeCell({
+  vm,
+  now,
+  weeklyReset,
+}: {
+  vm: Vm
+  now: number
+  weeklyReset: boolean
+}) {
   const hasToken = Boolean(vm.has_token)
-  const resetAt = vm.reset_7d || vm.reset_7d_oi
+  const weeklyPro = weeklyReset && !isCodexVm(vm) && vm.account_tier === 'pro'
+  const resetAt = weeklyPro ? vm.reset_7d : vm.reset_7d || vm.reset_7d_oi
   const clock = hasToken ? fmtResetClock(resetAt) : null
   const resetMs = clock ? expiresAtToMs(resetAt) : 0
   const dueCls =
@@ -161,7 +176,7 @@ function TypeCell({ vm, now }: { vm: Vm; now: number }) {
         ) : (
           <span className='text-xs text-muted-foreground'>无凭证</span>
         )}
-        <PriorityChip vm={vm} />
+        <PriorityChip vm={vm} weeklyReset={weeklyPro} />
       </div>
       {clock ? (
         <div
@@ -399,6 +414,7 @@ type CellCtx = {
   now: number
   week: VmWeekOutcome
   statusShow: StatusBarShow
+  weeklyReset: boolean
 }
 
 const COLUMNS: Record<
@@ -416,7 +432,9 @@ const COLUMNS: Record<
   },
   type: {
     label: '类型',
-    cell: ({ vm, now }) => <TypeCell vm={vm} now={now} />,
+    cell: ({ vm, now, weeklyReset }) => (
+      <TypeCell vm={vm} now={now} weeklyReset={weeklyReset} />
+    ),
   },
   status: {
     label: '状态',
@@ -443,9 +461,11 @@ const COLUMNS: Record<
 export function VmTable({
   vms,
   accounts,
+  weeklyReset = false,
 }: {
   vms: Vm[]
   accounts?: UsageAccountRow[]
+  weeklyReset?: boolean
 }) {
   const actions = useVmActions()
   const now = useNow()
@@ -556,6 +576,7 @@ export function VmTable({
             now,
             week,
             statusShow: statusBar.show,
+            weeklyReset,
           }
           return (
             <div

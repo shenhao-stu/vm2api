@@ -65,8 +65,12 @@ export function isCredentialRefreshFailed({
   workerCredential = null,
   now = Date.now(),
 } = {}) {
-  if (isOfficialUsageRateLimited(probe)) return false
   const recordedError = currentRefreshError(vm, refreshError)
+  const expiry = expiresAtToMs(workerCredential?.expires_at) || liveAccessTtlMs(vm, {}, expiresAt)
+  if (expiry > 0 && expiry <= now && (recordedError === 'refresh_failed' || workerLastError === 'refresh_failed')) {
+    return true
+  }
+  if (isOfficialUsageRateLimited(probe)) return false
   const transientRecorded = TRANSIENT_CREDENTIAL_REFRESH_FAIL.test(String(recordedError || ''))
   const accessOutlives = currentAccessOutlivesGrantError(
     vm,

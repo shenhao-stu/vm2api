@@ -131,3 +131,14 @@ test('a disabled setting prevents new claims even if it changes while querying',
   assert.equal(checked, false)
   assert.equal(f.counts().releases, 1)
 })
+
+test('an all-window reset never enters the Fable-only automation', () => {
+  const fullReset = {
+    ...grant,
+    clears: [...grant.clears, 'seven_day'],
+    percent_used: { seven_day_overage_included: 100 },
+  }
+  assert.equal(autoResetReason({ ...fullReset, expires_at: '2026-12-10T22:00:00Z' }, NOW), null)
+  assert.equal(autoResetReason(fullReset, NOW), null)
+  assert.equal(autoResetReason(fullReset, END - 1), null)
+})

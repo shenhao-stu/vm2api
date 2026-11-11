@@ -613,3 +613,28 @@ test('rest stays restricted even with a stale cooldown left on the slot', () => 
   assert.equal(triad.restriction_until, until)
   assert.equal(triad.restriction_text, '休息时段')
 })
+
+test('expired access with a failed refresh overrides cached usage and recovers with a live credential', () => {
+  const now = Date.parse('2026-11-11T06:04:29Z')
+  const input = {
+    vm: {
+      status: 'running',
+      schedulable: true,
+      claude: { has_access: true, has_refresh: true, refresh_error: 'refresh_failed' },
+    },
+    expiresAt: now - 60_000,
+    lastProbe: officialOk,
+    now,
+  }
+  for (const lastProbe of [officialOk, { ...officialOk, rate_limited: true }]) {
+    const stale = evaluateAccount({ ...input, lastProbe })
+    assert.equal(stale.accept, false)
+    assert.equal(stale.usable, false)
+    assert.equal(stale.reason, 'credential_refresh_failed')
+  }
+  assert.equal(evaluateAccount({ ...input, expiresAt: now + 60_000 }).accept, true)
+  assert.equal(
+    evaluateAccount({ ...input, workerCredential: { has_access: true, expires_at: now + 60_000 } }).accept,
+    true,
+  )
+})

@@ -1,6 +1,7 @@
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { credTypeLabel, credTypeOf } from '@/lib/cred-type'
+import { expiresAtToMs } from '@/lib/fable-status'
 import { usedPctOf } from '@/lib/format'
 import { isCodexVm, platformLabel } from '@/lib/vm-kind'
 import { claudeTier, fleetGroup, vmCredDead, vmFailedAt } from '@/lib/vm-status'
@@ -12,7 +13,14 @@ import { zoneOf, type VmZoneFilter } from '@/features/vm/vm-rack-model'
 export { VmTable } from './vm-list-table'
 
 export type VmSortKey =
-  'name' | 'today' | 'cache' | 'remain' | 'status' | 'cost7' | 'total'
+  | 'name'
+  | 'today'
+  | 'cache'
+  | 'remain'
+  | 'status'
+  | 'cost7'
+  | 'total'
+  | 'reset7d'
 
 /**
  * 状态优先级：在池 → 受限 → 关闭调用 → 未使用 → 无效凭证 → revoke。
@@ -65,9 +73,16 @@ export function sortVms(
   vms: Vm[],
   key: VmSortKey,
   dir: 'asc' | 'desc',
-  accounts?: UsageAccountRow[]
+  accounts?: UsageAccountRow[],
+  now = Date.now()
 ): Vm[] {
   const sign = dir === 'asc' ? 1 : -1
+  const weeklyReset = (vm: Vm) => {
+    const at = expiresAtToMs(vm.reset_7d)
+    return at > now ? at : null
+  }
+  const running = (vm: Vm) =>
+    vm.status === 'running' && vm.schedulable !== false && vm.has_token
   const val = (vm: Vm): number | string => {
     switch (key) {
       case 'today':
@@ -95,6 +110,16 @@ export function sortVms(
     const db = vmCredDead(b)
     if (da !== db) return da ? 1 : -1
     if (da && db) return deadCmp(a, b)
+    if (key === 'reset7d') {
+      const active = Number(running(b)) - Number(running(a))
+      if (active) return active
+      const left = weeklyReset(a)
+      const right = weeklyReset(b)
+      if (left === right) return 0
+      if (left == null) return 1
+      if (right == null) return -1
+      return sign * (left - right)
+    }
     const av = val(a)
     const bv = val(b)
     if (typeof av === 'string' || typeof bv === 'string') {
