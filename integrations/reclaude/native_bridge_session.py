@@ -599,6 +599,7 @@ class Session:
         restore=False,
         history_profile=None,
         personal_max_profile=None,
+        api_base=None,
     ):
         native_env, self.options = native_options(body)
         self.budget_options = []
@@ -642,6 +643,9 @@ class Session:
         self.personal_max_profile = personal_max_profile
         self.personal_max_confirmed = False
         self.dispatch_proxy = dispatch_proxy
+        self.api_base = api_base
+        if api_base and not dispatch_proxy:
+            raise ContractError("api_provider_requires_dispatch_guard")
         self.history_profile = Path(history_profile) if history_profile else None
         self.dispatch_process = None
         self.dispatch_address = None
@@ -1019,7 +1023,7 @@ class Session:
         }
         if self.dispatch_proxy:
             self.start_dispatch_proxy()
-            settings["env"] = {
+            settings["env"] = {"ANTHROPIC_BASE_URL": self.dispatch_address} if self.api_base else {
                 key: self.dispatch_address
                 for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]
             }
@@ -1097,28 +1101,27 @@ class Session:
         self.process.stdin.flush()
 
     def start_dispatch_proxy(self):
-        home = Path(self.environment["HOME"]) / ".rec"
-        state = json.loads((home / "state.json").read_text())
-        port = state["daemon"]["port"]
-        if type(port) is not int or not 0 < port < 65536:
-            raise ContractError("native_proxy_port_invalid")
         directory = self.directory / "dispatch"
         directory.mkdir(mode=0o700, exist_ok=True)
         command = [
             str(self.dispatch_proxy),
             "--listen",
             "127.0.0.1:0",
-            "--upstream",
-            "127.0.0.1:" + str(port),
             "--directory",
             str(directory),
             "--session",
             self.native_id,
-            "--ca",
-            str(home / "ca.pem"),
-            "--ca-key",
-            str(home / "ca.key"),
         ]
+        if self.api_base:
+            command += ["--api-base", self.api_base]
+        else:
+            home = Path(self.environment["HOME"]) / ".rec"
+            state = json.loads((home / "state.json").read_text())
+            port = state["daemon"]["port"]
+            if type(port) is not int or not 0 < port < 65536:
+                raise ContractError("native_proxy_port_invalid")
+            command += ["--upstream", "127.0.0.1:" + str(port),
+                        "--ca", str(home / "ca.pem"), "--ca-key", str(home / "ca.key")]
         with (directory / "stderr.private.log").open("ab") as log:
             self.dispatch_process = subprocess.Popen(
                 command,

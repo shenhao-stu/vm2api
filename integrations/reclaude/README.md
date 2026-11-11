@@ -515,3 +515,26 @@ Fixed egress governs the server-to-ReClaude hop only. ReClaude's subsequent
 provider connection is outside this deployment's control and has not been
 verified. Short successful tests would not guarantee long-term authorization
 stability or eliminate suspension risk.
+
+### Experimental API-provider native CLI candidate
+
+`native_api_http.py` runs the official CLI with an explicitly configured HTTPS
+API origin. It uses an independent HOME, profile and state directory and does
+not read native OAuth or device credentials. A mode-specific loopback dispatch
+guard permits one model POST for each durable grant. Provider response-header
+status receipts are diagnostics, not final-usage receipts. A provider 429 is
+presented as a non-retryable error to the private CLI while retaining its original
+body and status sidecar; it is not a production gateway status policy.
+
+This candidate is **not approved for shared customer routing**. Local tests do
+not establish provider permission for CLI SDK mode. Deployment also requires
+verified downstream tenant scoping, original provider status/auth handling and
+end-to-end terminal usage reconciliation. A single shared relay credential does
+not authenticate the downstream end user. Keep the listener private and the
+candidate separate from existing ReClaude runtimes until these checks pass.
+
+Provider credentials must be in a mode-0600 JSON file with `base_url`, `api_key`
+and an optional explicit `proxy_url`. Build the Go guard for the target CPU,
+validate the official CLI binary/version and test outbound TLS before making a
+synthetic model call. Do not inherit an existing customer's CLI HOME or retry
+an uncertain dispatched turn while changing transports.

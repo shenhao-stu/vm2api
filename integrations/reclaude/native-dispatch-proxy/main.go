@@ -44,6 +44,7 @@ type Gate struct {
 	Certificate    tls.Certificate
 	GetCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 	Transport      http.RoundTripper
+	APIBase        *url.URL
 	Attempts       atomic.Int64
 	Denied         atomic.Int64
 	Requests       atomic.Int64
@@ -100,16 +101,20 @@ func reply(conn net.Conn, status int, code string) {
 }
 
 func (g *Gate) forward(conn net.Conn, reader *bufio.Reader) {
-	started := time.Now()
 	req, err := http.ReadRequest(reader)
 	if err != nil {
 		return
 	}
+	g.forwardRequest(conn, req)
+}
+
+func (g *Gate) forwardRequest(conn net.Conn, req *http.Request) {
+	started := time.Now()
 	defer req.Body.Close()
 	g.Requests.Add(1)
 	requestHost := strings.ToLower(strings.TrimSuffix(req.Host, ":443"))
 	requestHost = strings.TrimSuffix(requestHost, ".")
-	if requestHost != "api.anthropic.com" {
+	if g.APIBase == nil && requestHost != "api.anthropic.com" {
 		reply(conn, 400, "unexpected_host")
 		return
 	}
@@ -130,6 +135,11 @@ func (g *Gate) forward(conn net.Conn, reader *bufio.Reader) {
 	}
 	req.URL.Scheme = "https"
 	req.URL.Host = "api.anthropic.com"
+	if g.APIBase != nil {
+		req.URL.Scheme, req.URL.Host = g.APIBase.Scheme, g.APIBase.Host
+		req.URL.Path = strings.TrimSuffix(g.APIBase.Path, "/") + req.URL.Path
+		req.Host = g.APIBase.Host
+	}
 	req.RequestURI = ""
 	req.Close = true
 	req.Body = io.NopCloser(bytes.NewReader(body))
@@ -147,6 +157,16 @@ func (g *Gate) forward(conn net.Conn, reader *bufio.Reader) {
 		return
 	}
 	defer response.Body.Close()
+	if modelRequest && g.APIBase != nil {
+		g.recordAPIStatus(grantID, response.StatusCode)
+		// A private API-mode CLI must not retry a paid POST on a provider 429.
+		// Retain the original status in a sidecar and the original error body.
+		// This is internal to the CLI guard, not an external status conversion.
+		if response.StatusCode == http.StatusTooManyRequests {
+			response.StatusCode = http.StatusBadRequest
+			response.Status = "400 Bad Request"
+		}
+	}
 	// These headers finish this one-shot model attempt. A retry inside Claude
 	// Code would only see the grant guard's 429 and misreport a quota limit.
 	if modelRequest && (response.StatusCode == 502 || response.StatusCode == 503 || response.StatusCode == 504) {
@@ -193,6 +213,10 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	defer g.Active.Add(-1)
 	if active > 32 {
 		http.Error(w, "private connection budget", 503)
+		return
+	}
+	if g.APIBase != nil {
+		g.serveAPI(w, req)
 		return
 	}
 	host, port, err := net.SplitHostPort(req.Host)
@@ -306,7 +330,12 @@ func main() {
 	session := flag.String("session", "", "native CLI session UUID")
 	ca := flag.String("ca", "", "own native CA certificate")
 	key := flag.String("ca-key", "", "own native CA private key, never exported")
+	apiBase := flag.String("api-base", "", "explicit HTTPS API provider, without native OAuth")
 	flag.Parse()
+	if *apiBase != "" {
+		serveAPIProvider(*listen, *apiBase, *directory, *session)
+		return
+	}
 	for _, address := range []string{*listen, *upstream} {
 		host, _, err := net.SplitHostPort(address)
 		if err != nil || host != "127.0.0.1" {
