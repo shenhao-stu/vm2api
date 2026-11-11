@@ -1179,7 +1179,6 @@ class Session:
                 if any(marker in text for marker in ready):
                     return
             time.sleep(0.05)
-        self.failed = True
         self.close()
         raise ContractError("native_policy_not_ready_no_dispatch")
 
@@ -1287,7 +1286,8 @@ class Session:
             return None
 
     def preserve_initialization_boundary(self, exc, boundary):
-        if (boundary is None or str(exc) != "native_initialize_not_ready_no_dispatch"
+        if (boundary is None or str(exc) not in {"native_initialize_not_ready_no_dispatch",
+                                                   "native_policy_not_ready_no_dispatch"}
                 or self.failed or self.process_has_turn
                 or self.last_grant_id != boundary["last_grant"]):
             return False

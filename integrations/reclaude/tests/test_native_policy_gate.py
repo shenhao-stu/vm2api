@@ -66,7 +66,7 @@ class PolicyGate(unittest.TestCase):
         ):
             s.start([{"type": "text", "text": "MUST NOT SEND"}])
         self.assertFalse((s.directory / "received.json").exists())
-        self.assertTrue(s.failed)
+        self.assertFalse(s.failed)
         self.assertIsNotNone(s.process.poll())
 
     def test_prepare_has_no_input_and_reuses_one_process(self):

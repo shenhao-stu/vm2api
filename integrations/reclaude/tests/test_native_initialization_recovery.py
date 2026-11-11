@@ -128,6 +128,71 @@ class InitializationRecovery(unittest.TestCase):
                     list(session.request(body or self.body))
         return session
 
+    def fail_policy(self, session):
+        self.proxy(session)
+        session.process = Process(Writer(self.inputs.append))
+        session.policy_log = self.root / "missing-native-policy.log"
+        session.await_native_policy()
+
+    def test_policy_sync_exit_preserves_zero_dispatch_boundary(self):
+        self.fail_initialize = self.fail_policy
+        # The same recovery invariants apply to policy sync and CLI initialize.
+        for body in [self.body, {**self.body, "messages": [
+                {"role": "user", "content": "earlier"},
+                {"role": "assistant", "content": "complete"},
+                {"role": "user", "content": "new caller turn"}]}]:
+            resident_before = self.pool.snapshot()["resident"]
+            body = copy.deepcopy(body)
+            body["metadata"]["user_id"] = str(uuid.uuid4())
+            with self.pool.lease("tenant-A", body) as session:
+                with patch.object(Session, "prepare", lambda s: self.fail_policy(s)):
+                    with self.assertRaisesRegex(RequestRejected, "native_policy_not_ready_no_dispatch"):
+                        list(session.request(body))
+                self.assertFalse(session.failed)
+                self.assertEqual(json.loads((session.directory / "continuation.json").read_text())["status"], "prepared")
+            self.assertEqual(self.pool.snapshot()["resident"], resident_before)
+            with self.pool.lease("tenant-A", body) as recovered:
+                with patch.object(Session, "prepare", lambda s: self.succeed(s)):
+                    self.assertEqual(list(recovered.request(body))[-1]["type"], "message_stop")
+                self.assertEqual(len(list((recovered.directory / "dispatch").glob("*.consumed.json"))), 1)
+                recovered.process.code = recovered.dispatch_process.code = 0
+        self.assertEqual(sum(x["type"] == "user" for x in self.inputs), 2)
+
+    def test_policy_sync_prewarm_is_recoverable_without_model_input(self):
+        with self.pool.lease("tenant-A", self.body) as session:
+            with patch.object(Session, "prepare", lambda s: self.fail_policy(s)):
+                with self.assertRaisesRegex(RequestRejected, "native_policy_not_ready_no_dispatch"):
+                    session.prepare_request(self.body)
+            self.assertFalse(session.failed)
+        self.assertEqual(self.pool.snapshot()["resident"], 0)
+        self.assertEqual(self.inputs, [])
+
+    def test_policy_sync_unknown_dispatch_remains_failed(self):
+        for stats in [{}, {"upstream_attempts": 1, "denied": 0},
+                      {"upstream_attempts": 0, "denied": 1}]:
+            self.stats = stats
+            self.body["metadata"]["user_id"] = str(uuid.uuid4())
+            with self.pool.lease("tenant-A", self.body) as session:
+                with patch.object(Session, "prepare", lambda s: self.fail_policy(s)):
+                    with self.assertRaisesRegex(ContractError, "native_policy_not_ready_no_dispatch"):
+                        list(session.request(self.body))
+                self.assertTrue(session.failed)
+
+    def test_real_child_config_failure_sends_nothing_and_retires(self):
+        child = self.root / "sync-config-failure.py"
+        child.write_text("import sys\nsys.stderr.write('Syncing config: context deadline exceeded\\n')\nsys.exit(1)\n")
+        with self.pool.lease("tenant-A", self.body) as session:
+            session.command = [sys.executable, str(child)]
+            session.timeout = 2
+            with patch.object(Session, "start_dispatch_proxy", lambda s: self.proxy(s)):
+                with self.assertRaisesRegex(RequestRejected, "native_policy_not_ready_no_dispatch"):
+                    list(session.request(self.body))
+            self.assertFalse(session.failed)
+            self.assertIsNotNone(session.process.poll())
+            self.assertIsNone(session.last_grant_id)
+            self.assertEqual((session.directory / "stdout.private.jsonl").stat().st_size, 0)
+        self.assertEqual(self.pool.snapshot()["resident"], 0)
+
     def test_failed_initialize_preserves_unconsumed_boundary_for_next_customer_request(self):
         first = self.fail_initialization_request()
         saved = json.loads((first.directory / "continuation.json").read_text())

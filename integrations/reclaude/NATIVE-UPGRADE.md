@@ -100,3 +100,32 @@ note in the first fixture's third response. Its JSON/protocol and marker were
 correct but an exact-text assertion failed. The subsequent new unmodified history
 fixture passed exact assertions. Keep this distinction when evaluating adapter
 correctness; do not remove isolation protections to force a model's wording.
+
+## Host reboot and pre-dispatch recovery
+
+A host restart can leave SSH/socket forwarding available before its native HTTP
+listener. That produced EOF at the upstream gateway during a November 11 recovery.
+Use `Manager.action("stop", operation_id)` to pause Sub scheduling before draining
+and stopping a worker. Calling only `runtime("stop")` does not pause scheduling.
+Resume through the manager only after the fixed exit, original binding, private
+DNS and isolated network rules, native daemon and HTTP listener pass their checks.
+Do not flush shared firewall tables, enable public DNS fallback, or automatically
+rearm an exit/authentication latch. A management tunnel should not share its
+lifecycle with one account's guarded egress tunnel.
+
+Configuration synchronization may fail before the CLI receives a user turn.
+`native_policy_not_ready_no_dispatch` now uses the existing initialization-boundary
+recovery: both processes must be stopped, fresh dispatch counters must be zero,
+and the checkpoint, grants and consumption records must remain unchanged. The
+failed CLI is retired; only a later caller request may continue. Unknown or paid
+failures retain their existing protections. This does not retry or erase requests,
+relax native policy checks, or clear old failed sessions automatically.
+
+For a legacy failed session, preserve evidence first. One incident was manually
+archived only after confirming an empty output log, no caller grant or consumption
+record, matching native configuration-timeout evidence, zero dispatch counters and
+a sole-member registry while the worker was stopped. Do not generalize this to an
+unknown session or edit a paid transcript. Regression covers a real child exiting
+during configuration sync, prepared and imported histories, prewarming, and unknown
+or nonzero dispatch observations. Local and production-image isolated suites each
+passed 336 tests; no provider request was needed for those tests.
