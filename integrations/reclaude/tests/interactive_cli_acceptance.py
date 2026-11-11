@@ -1,6 +1,6 @@
 """Real interactive CLI with an offline, bounded provider and caller MCP tool."""
 
-import copy, json, os, pathlib, sys, tempfile
+import copy, json, os, pathlib, signal, sys, tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from native_interactive_session import InteractiveSession
@@ -52,6 +52,9 @@ with tempfile.TemporaryDirectory(prefix="airoam-pty-") as tmp:
             }
         ],
     }
+    if "--imported-prefix" in sys.argv:
+        body["messages"] = [{"role": "user", "content": "Remember the prior context."},
+                            {"role": "assistant", "content": "Prior context retained."}] + body["messages"]
     session = InteractiveSession(
         directory,
         [cli, "--setting-sources", ""],
@@ -66,9 +69,14 @@ with tempfile.TemporaryDirectory(prefix="airoam-pty-") as tmp:
         turns = []
         identities = []
         for i in range(4):
-            if i == 2:
+            restart = i in (1, 2) if "--chain-restart" in sys.argv else i == (1 if "--pending-restart" in sys.argv else 2)
+            if restart:
                 identities.append(session.native_id)
-                session.close(graceful=True)
+                if "--pending-restart" in sys.argv or "--chain-restart" in sys.argv:
+                    assert session.pending_ids, "test must interrupt a pending MCP wait"
+                    os.killpg(session.process.pid, signal.SIGKILL)
+                    session.process.wait(timeout=5)
+                session.close()
                 session = InteractiveSession(
                     directory,
                     [cli, "--setting-sources", ""],
@@ -121,6 +129,8 @@ with tempfile.TemporaryDirectory(prefix="airoam-pty-") as tmp:
                     "argv_has_print": "-p" in session.native_cli_argv,
                     "real_provider_calls": 0,
                     "idle_restart_same_native_id": True,
+                    "pending_restart": "--pending-restart" in sys.argv,
+                    "local_recoveries": len(list(directory.glob("recovery-*/result.safe.json"))),
                 }
             )
         )

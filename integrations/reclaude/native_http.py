@@ -181,6 +181,15 @@ def failure_status(error, code, expired=False):
 
 
 class NativeHandler(RelayHandler):
+    def authenticated_tenant(self):
+        tenant = self.server.tenant
+        if self.server.require_principal:
+            principals = self.headers.get_all('X-Native-Relay-Principal', [])
+            if len(principals) != 1 or not re.fullmatch(r'[0-9a-f]{64}', principals[0]):
+                raise Rejection(400, 'authenticated_relay_principal_required')
+            tenant = hashlib.sha256((tenant + ':' + principals[0]).encode()).hexdigest()
+        return tenant
+
     def send_json(self, status, body):
         if not getattr(self, "request_body_read", False):
             return super().send_json(status, body)
@@ -276,12 +285,7 @@ class NativeHandler(RelayHandler):
         try:
             raw, body = self.read_message()
             self.request_body_read = True
-            tenant = self.server.tenant
-            if self.server.require_principal:
-                principals = self.headers.get_all('X-Native-Relay-Principal', [])
-                if len(principals) != 1 or not re.fullmatch(r'[0-9a-f]{64}', principals[0]):
-                    raise Rejection(400, 'authenticated_relay_principal_required')
-                tenant = hashlib.sha256((tenant + ':' + principals[0]).encode()).hexdigest()
+            tenant = self.authenticated_tenant()
             record.update(request_trace(body, len(raw)))
             record["session_pool_key"] = session_key(tenant, body)
             record.update(

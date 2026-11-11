@@ -210,6 +210,13 @@ func (g *Gate) forwardRequest(conn net.Conn, req *http.Request) {
 	}
 	provider := &transferReader{ReadCloser: response.Body}
 	response.Body = provider
+	if capture != nil && response.StatusCode == 200 && strings.Contains(response.Header.Get("Content-Type"), "text/event-stream") {
+		if aliases := callerToolAliases(body); len(aliases) > 0 {
+			response.Body = &toolAliasReader{ReadCloser: provider, reader: bufio.NewReaderSize(provider, 64*1024), aliases: aliases}
+			response.ContentLength = -1
+			response.Header.Del("Content-Length")
+		}
+	}
 	downstream := &transferWriter{Writer: conn}
 	if err = response.Write(downstream); err != nil && modelRequest {
 		if provider.err != nil {

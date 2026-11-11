@@ -75,7 +75,8 @@ class InteractiveContractTests(unittest.TestCase):
             self.session.suspended = suspended
             original = copy.deepcopy(body)
             with self.assertRaisesRegex(
-                RequestRejected, "interactive_resume_tool_results_not_supported"
+                RequestRejected, "interactive_pending_recovery_unavailable_no_replay"
+                if suspended else "interactive_resume_tool_results_not_supported"
             ):
                 list(self.session.request(body))
             self.assertEqual(body, original)

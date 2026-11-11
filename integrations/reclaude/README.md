@@ -529,15 +529,24 @@ This candidate is **not admitted to shared customer routing**. AgentNAS acceptan
 with CLI 2.1.321 passed four new synthetic HTTP requests: main tool call, isolated
 child, parent tool result, and continuation. Each had a complete provider SSE
 terminal and real usage. An unauthenticated request returned 401. Network-disabled
-real-CLI fixtures also passed fresh private-profile initialization and idle
-restart with the same native session ID.
+real-CLI fixtures also passed fresh private-profile initialization, imported
+completed history, and two successive pending-tool restarts with the same native
+session ID. Four caller turns produced four guarded dispatches.
 
-A process interrupted while waiting for a tool result remains a release blocker:
-the interactive CLI resumes as interrupted, not as a live MCP waiter. Such
-requests, imported histories ending in tool results, media prompts and structured
-outputs are rejected before a new dispatch. Do not convert tool results into
-ordinary prompt text, invent a continuation, or replay a consumed model turn.
-Existing Airoam and ReClaude production routes are unchanged by this candidate.
+Pending-tool recovery requires complete, durable original provider SSE and a
+request digest. A local-only gate reconstructs the CLI's MCP wait from those
+records, matching the full request, identity, tool arguments and history before
+enabling any new dispatch. Reconstruction makes no provider call and emits no
+additional usage to the caller. Missing or changed evidence is rejected. Raw
+transcripts and provider records remain preserved. Provider tool-name aliases
+are mapped only to unambiguously declared MCP tools; original usage is unchanged.
+
+The real outer Claude Code builtin-Agent acceptance is still incomplete: the
+provider disabled the current API key before the corrected tool-name path could
+be verified live. Full-chain accounting through Sub2API also remains unverified.
+First-time imports ending in tool results, media prompts and structured outputs
+are explicitly unsupported. Do not invent a continuation or repeat a consumed
+model turn. Existing production routes are unchanged by this candidate.
 
 API mode requires exactly one `X-Native-Relay-Principal` header containing 64
 lowercase hexadecimal characters in addition to the private relay credential.
@@ -546,6 +555,14 @@ strip client or account-header overrides. Sub2API's opt-in
 `anthropic_relay_session_scope` feature derives this from its authenticated
 principal and already-verified affinity tags. Never expose the listener directly
 to customers with a shared credential.
+
+For a dedicated direct Claude Code client, `--client-key-file` supplies a separate
+mode-0600 key. It must differ from the shared gateway key; its tenant is derived
+from the credential, and any caller principal header is ignored. The client can
+use the ordinary base URL and Bearer or `x-api-key` authentication. Do not share
+this dedicated credential across unrelated customers. Both credentials can read
+the authenticated `/v1/models` allowlist; the gateway key still requires a trusted
+principal for inference.
 
 Provider credentials use a mode-0600 JSON file with `base_url`, `api_key` and an
 optional explicit `proxy_url`. Provision only a new private HOME. Initialization

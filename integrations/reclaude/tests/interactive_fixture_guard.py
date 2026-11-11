@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline fake provider; synthetic numbers must never enter a customer ledger."""
 
-import argparse, http.server, json, os, pathlib, signal, sys, threading, uuid
+import argparse, hashlib, http.server, json, os, pathlib, signal, sys, threading, uuid
 
 p = argparse.ArgumentParser()
 p.add_argument("--directory", type=pathlib.Path)
@@ -37,12 +37,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 t.get("name") == "mcp__caller__echo" for t in body.get("tools", [])
             ), "caller tools absent"
             with (a.directory / (g["id"] + ".consumed.json")).open("x") as f:
-                json.dump(g, f)
+                json.dump({**g, "body_sha256": hashlib.sha256(raw).hexdigest()}, f)
         except Exception:
             self.send_error(400)
             return
         (a.directory / (g["id"] + ".request.private.json")).write_bytes(raw)
-        tool = not any(m["role"] == "assistant" for m in body["messages"])
+        (a.directory / (g["id"] + ".api-request.private.json")).write_bytes(raw)
+        tool_count = sum(b.get("type") == "tool_use" for m in body["messages"]
+                         if m["role"] == "assistant" and isinstance(m.get("content"), list)
+                         for b in m["content"])
+        tool = tool_count < int(os.environ.get("FIXTURE_TOOL_TURNS", "1"))
         mid = "msg_" + uuid.uuid4().hex
         events = [
             {
@@ -67,8 +71,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "index": 0,
                 "content_block": {
                     "type": "tool_use",
-                    "id": "toolu_fixture",
-                    "name": "mcp__caller__echo",
+                    "id": "toolu_fixture_" + str(tool_count),
+                    "name": "echo" if os.environ.get("FIXTURE_RAW_TOOL_NAMES") else "mcp__caller__echo",
                     "input": {},
                 }
                 if tool
@@ -104,12 +108,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f.flush()
             os.fsync(f.fileno())
         (a.directory / (g["id"] + ".api-terminal.json")).write_text(
-            json.dumps({"grant_id": g["id"], "status": 200, "complete": True})
+            json.dumps({"grant_id": g["id"], "status": 200, "complete": True, "bytes": len(data)})
         )
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Connection", "close")
         self.end_headers()
+        if os.environ.get("FIXTURE_RAW_TOOL_NAMES"):
+            sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+            from native_interactive_recovery import caller_tool_stream
+            data = caller_tool_stream(data, [{"name": "echo"}])
         self.wfile.write(data)
         self.wfile.flush()
         self.close_connection = True

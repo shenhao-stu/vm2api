@@ -1,16 +1,65 @@
 """Isolated official Claude Code runtime for an explicitly configured API provider."""
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
-from pathlib import Path
 import signal
 import threading
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from adapter import Limits, load_relay_key
+from native_http import NativeHandler, NativeServer
 from native_interactive_session import InteractiveSession
-from native_http import NativeServer
+
+
+class APIHandler(NativeHandler):
+    """A dedicated client key has its own tenant and needs no internal header."""
+
+    def authorized(self):
+        self.client_tenant = None
+        key = getattr(self.server, "client_key", None)
+        auth = self.headers.get_all("Authorization", [])
+        api = self.headers.get_all("x-api-key", [])
+        if len(auth) > 1 or len(api) > 1:
+            return False
+        if auth and not auth[0].lower().startswith("bearer "):
+            return False
+        tokens = ([auth[0][7:].strip()] if auth else []) + api
+        if (
+            key
+            and tokens
+            and all(
+                len(token) <= 512 and hmac.compare_digest(token.encode(), key.encode())
+                for token in tokens
+            )
+        ):
+            self.client_tenant = hashlib.sha256(
+                ("api-client:" + key).encode()
+            ).hexdigest()
+            return True
+        return super().authorized()
+
+    def authenticated_tenant(self):
+        return self.client_tenant or super().authenticated_tenant()
+
+    def do_GET(self):
+        if self.path != "/v1/models":
+            return super().do_GET()
+        if not self.authorized():
+            return self.send_error_json(401, "invalid_relay_key")
+        self.send_json(
+            200,
+            {
+                "data": [
+                    {"id": model, "type": "model", "display_name": model}
+                    for model in self.server.limits.models
+                ],
+                "has_more": False,
+            },
+        )
 
 
 def provider(path):
@@ -89,6 +138,7 @@ def main():
     for name in ("home", "root", "key-file", "provider-file", "cli", "dispatch-proxy"):
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--port", type=int, default=18790)
+    p.add_argument("--client-key-file", type=Path)
     p.add_argument("--private-host")
     p.add_argument("--model", action="append", required=True)
     p.add_argument("--concurrency", type=int, default=2)
@@ -154,6 +204,14 @@ def main():
         configuration_channels=True,
         require_principal=True,
     )
+    server.client_key = (
+        load_relay_key(args.client_key_file) if args.client_key_file else None
+    )
+    if server.client_key and hmac.compare_digest(
+        server.client_key, load_relay_key(args.key_file)
+    ):
+        raise ValueError("client_and_gateway_keys_must_differ")
+    server.RequestHandlerClass = APIHandler
 
     def stop(*_):
         threading.Thread(target=server.shutdown, daemon=True).start()

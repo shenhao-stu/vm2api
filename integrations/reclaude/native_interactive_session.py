@@ -1,11 +1,10 @@
 """Experimental PTY driver. Provider SSE, never terminal text, carries usage."""
 
-import copy
 import fcntl
 import json
 import os
-from pathlib import Path
 import pty
+import queue
 import re
 import select
 import shlex
@@ -15,8 +14,17 @@ import sys
 import termios
 import threading
 import time
+import uuid
+from pathlib import Path
 
 import native_bridge_session as native
+from native_interactive_recovery import (
+    RecoveryError,
+    RecoveryGate,
+    caller_tool_event,
+    load_steps,
+    private_json,
+)
 
 
 def prompt_text(blocks):
@@ -81,6 +89,8 @@ class InteractiveSession(native.Session):
         self.master = None
         self.ui_ready = threading.Event()
         self.read_stop = threading.Event()
+        self.recovery_gate = None
+        self.recovery_steps = None
         super().__init__(*args, **kwargs)
         if not self.api_base or self.require_policy:
             raise native.ContractError("interactive_api_provider_only")
@@ -99,7 +109,6 @@ class InteractiveSession(native.Session):
             prompt_text(tail)
         elif (
             not self.pending_ids
-            or self.suspended
             or changed
             or any(b.get("type") != "tool_result" for b in tail)
             or any(
@@ -113,7 +122,191 @@ class InteractiveSession(native.Session):
             )
         if native.output_format(body) is not None:
             raise native.RequestRejected("interactive_structured_output_not_supported")
-        yield from super().request(body)
+        if tool_results and (
+            self.suspended
+            or self.process is not None
+            and self.process.poll() is not None
+        ):
+            self.recover_pending(body)
+        for event in super().request(body):
+            if event.get("type") == "message_stop" and self.pending_ids:
+                self.remember_pending(body, tail, tool_results)
+            yield event
+
+    def remember_pending(self, body, tail, tool_results):
+        path = self.directory / "interactive-recovery.private.json"
+        if tool_results:
+            # Old sessions without a recovery record remain protected, rather
+            # than guessing which prior provider response belongs to them.
+            if not path.exists():
+                return
+            plan = json.loads(path.read_bytes())
+        else:
+            plan = {
+                "version": 1,
+                "native_id": self.native_id,
+                "base_history": body["messages"][:-1],
+                "tools": self.tools,
+                "configuration": self.body_signature,
+                "steps": [],
+            }
+        if len(plan["steps"]) >= 64:
+            return
+        plan["steps"].append(
+            {
+                "grant_id": self.last_grant_id,
+                "input": tail,
+                "assistant_sha256": native.signature(self.history[-1]["content"]),
+                "message_id": self.resume_message_id,
+            }
+        )
+        plan["history_sha256"] = native.signature(native.history_shape(self.history))
+        private_json(path, plan)
+
+    def start_dispatch_proxy(self):
+        super().start_dispatch_proxy()
+        if self.recovery_steps is not None and self.recovery_gate is None:
+            self.recovery_gate = RecoveryGate(
+                self.dispatch_address, self.native_id, self.recovery_steps
+            )
+            self.dispatch_address = "http://127.0.0.1:" + str(
+                self.recovery_gate.server_port
+            )
+
+    def recover_pending(self, body):
+        if not self.lock.acquire(blocking=False):
+            raise native.RequestRejected("session_busy")
+        try:
+            self.validate_configuration(body)
+            self.history_prefix(body["messages"])
+            plan = json.loads(
+                (self.directory / "interactive-recovery.private.json").read_bytes()
+            )
+            if plan.get("configuration") != self.body_signature or plan.get(
+                "history_sha256"
+            ) != native.signature(native.history_shape(self.history)):
+                raise RecoveryError("recovery_boundary_changed")
+            steps = load_steps(self.directory, plan, self.native_id)
+            attempt = self.prepare_recovery_runtime(plan, steps, body)
+            for index, step in enumerate(steps):
+                self.restore_pending_step(index, step)
+            self.recovery_gate.activate()
+            state = json.loads((self.directory / "continuation.json").read_bytes())
+            self.checkpoint(
+                "awaiting_tools", state["request_sha256"], steps[-1]["message_id"]
+            )
+            if not self.resume_uuid:
+                raise RecoveryError("recovery_assistant_boundary_missing")
+            self.suspended = False
+            self.process_has_turn = True
+            private_json(
+                attempt / "result.safe.json",
+                {
+                    "restored": True,
+                    "local_responses": len(steps),
+                    "upstream_dispatches": 0,
+                },
+            )
+        except (OSError, ValueError, KeyError, TypeError, native.ContractError) as exc:
+            self.close()
+            self.suspended = True
+            raise native.RequestRejected(
+                "interactive_pending_recovery_unavailable_no_replay"
+            ) from exc
+        finally:
+            self.recovery_steps = None
+            self.lock.release()
+
+    def prepare_recovery_runtime(self, plan, steps, body):
+        self.close()
+        if self.reader and self.reader.is_alive():
+            raise RecoveryError("recovery_reader_still_running")
+        attempt = self.directory / ("recovery-" + uuid.uuid4().hex)
+        attempt.mkdir(mode=0o700)
+        project_key = re.sub(r"[^a-zA-Z0-9]", "-", str(self.directory.resolve()))
+        transcript = (
+            self.history_profile
+            / "projects"
+            / project_key
+            / (self.native_id + ".jsonl")
+        )
+        if transcript.exists():
+            os.rename(transcript, attempt / "original-transcript.private.jsonl")
+        for pattern in ("*.pending.json", "*.result.json"):
+            for path in self.directory.glob(pattern):
+                os.rename(path, attempt / path.name)
+        self.process = self.reader = self.dispatch_process = None
+        self.last_grant_id = self.dispatch_address = None
+        self.events = queue.Queue()
+        self.result = self.result_message_id = self.last_native_message_id = None
+        self.resume_uuid = self.resume_message_id = None
+        self.assistants.clear()
+        if plan["base_history"]:
+            self.resume_uuid = native.write_transcript(
+                self.history_profile,
+                self.directory,
+                self.native_id,
+                [
+                    {
+                        **m,
+                        "content": native.dispatch_blocks(
+                            native.native_blocks(m["content"])
+                        ),
+                    }
+                    for m in plan["base_history"]
+                ],
+                initial_effort=native.effective_effort(body, leading_only=True),
+            )
+        self.recovery_steps = steps
+        self.prepare()
+        return attempt
+
+    def restore_pending_step(self, index, step):
+        if index == 0:
+            self.process.stdin.write(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {"role": "user", "content": step["input"]},
+                    }
+                )
+            )
+        else:
+            for result in step["input"]:
+                if result.get("type") != "tool_result":
+                    raise RecoveryError("recovery_tool_result_invalid")
+                private_json(
+                    self.directory / (result["tool_use_id"] + ".result.json"),
+                    {
+                        "content": native.text_blocks(result.get("content", "")),
+                        "isError": bool(result.get("is_error", False)),
+                    },
+                )
+        deadline = time.monotonic() + min(30, self.timeout)
+        while True:
+            if self.recovery_gate.error or self.process.poll() is not None:
+                raise RecoveryError(self.recovery_gate.error or "recovery_cli_stopped")
+            pending = []
+            for tool in step["pending"]:
+                path = self.directory / (tool["id"] + ".pending.json")
+                try:
+                    value = json.loads(path.read_bytes())
+                except (FileNotFoundError, json.JSONDecodeError):
+                    # MCP creates this file before its JSON write completes.
+                    continue
+                if (
+                    value.get("name") != tool["name"]
+                    or value.get("arguments") != tool["input"]
+                ):
+                    raise RecoveryError("recovery_tool_arguments_changed")
+                pending.append(tool["id"])
+            if self.recovery_gate.index == index + 1 and len(pending) == len(
+                step["pending"]
+            ):
+                break
+            if time.monotonic() > deadline:
+                raise RecoveryError("recovery_tool_wait_not_restored")
+            time.sleep(0.02)
 
     def prepare(self):
         if self.process is not None:
@@ -352,7 +545,7 @@ class InteractiveSession(native.Session):
                                 "interactive_stream_incomplete_no_replay"
                             )
                         completed.add(grant)
-                    self.events.put(event)
+                    self.events.put(caller_tool_event(event, self.tools))
                     buffer = rest
                 buffers[grant] = buffer
                 if len(buffer) > 2 * 1024 * 1024:
@@ -401,6 +594,9 @@ class InteractiveSession(native.Session):
         try:
             super()._close(graceful)
         finally:
+            if self.recovery_gate is not None:
+                self.recovery_gate.close()
+                self.recovery_gate = None
             if self.master is not None:
                 os.close(self.master)
                 self.master = None

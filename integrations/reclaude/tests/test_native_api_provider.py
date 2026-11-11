@@ -1,15 +1,72 @@
 import json
-import os
-from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from email.message import Message
+from pathlib import Path
+from types import SimpleNamespace
 
-from native_api_http import APIHealth, initialize_api_profile, provider
+from native_api_http import APIHandler, APIHealth, initialize_api_profile, provider
 from native_bridge_session import ContractError, Session
 
 
 class APIProviderTests(unittest.TestCase):
+    def handler(self, headers):
+        handler = object.__new__(APIHandler)
+        handler.server = SimpleNamespace(
+            client_key="c" * 40,
+            relay_key="g" * 40,
+            tenant="gateway",
+            require_principal=True,
+        )
+        handler.headers = Message()
+        for name, val in headers:
+            handler.headers[name] = val
+        return handler
+
+    def test_dedicated_client_key_needs_no_principal_header(self):
+        for name, value in [
+            ("Authorization", "Bearer " + "c" * 40),
+            ("x-api-key", "c" * 40),
+        ]:
+            handler = self.handler(
+                [(name, value), ("X-Native-Relay-Principal", "forged")]
+            )
+            self.assertTrue(handler.authorized())
+            self.assertNotEqual(handler.authenticated_tenant(), "gateway")
+            tenant = handler.authenticated_tenant()
+            handler.headers.replace_header("X-Native-Relay-Principal", "0" * 64)
+            self.assertEqual(handler.authenticated_tenant(), tenant)
+
+    def test_ambiguous_credentials_cannot_select_a_tenant(self):
+        handler = self.handler(
+            [("Authorization", "Bearer " + "c" * 40), ("x-api-key", "g" * 40)]
+        )
+        self.assertFalse(handler.authorized())
+
+    def test_gateway_key_still_requires_trusted_principal(self):
+        from adapter import Rejection
+
+        handler = self.handler([("Authorization", "Bearer " + "g" * 40)])
+        self.assertTrue(handler.authorized())
+        with self.assertRaises(Rejection):
+            handler.authenticated_tenant()
+        handler.headers["X-Native-Relay-Principal"] = "0" * 64
+        self.assertNotEqual(handler.authenticated_tenant(), "gateway")
+
+    def test_matching_bearer_and_api_key_select_same_client(self):
+        handler = self.handler(
+            [("Authorization", "bearer " + "c" * 40), ("x-api-key", "c" * 40)]
+        )
+        self.assertTrue(handler.authorized())
+        self.assertNotEqual(handler.authenticated_tenant(), "gateway")
+        handler = self.handler(
+            [
+                ("Authorization", "Bearer " + "c" * 40),
+                ("Authorization", "Bearer " + "c" * 40),
+            ]
+        )
+        self.assertFalse(handler.authorized())
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
