@@ -303,7 +303,7 @@ test('stalled node DNS is bounded and releases the mutation lock without changin
   assert.equal(manager.state.nodes.length, 0)
   await assert.rejects(
     resolvePublicHost('proxy.example.com', () => new Promise(() => {}), 10),
-    rejectCode('subscription_blocked'),
+    rejectCode('subscription_fetch'),
   )
 })
 
@@ -345,4 +345,42 @@ test('opt-in remote subscription bindings require pinned guards and survive rest
   assert.equal(pool.getProxyForVm('vm-test'), null)
   assert.equal(pool.ensureBoundToVm('vm-test'), null)
   assert.equal(pool.allocateForVm('vm-test'), null)
+})
+
+test('mirror refresh preserves node binding, exit policy, port and disabled state', async (t) => {
+  const { manager, pool } = environment(t)
+  const url = 'https://ipequal.com/use/unsafe/sub.php?t=fixture&s=signature'
+  await manager.start()
+  await manager.import({ url })
+  const original = structuredClone(manager.state.nodes[0]),
+    id = manager.state.profiles[0].id
+  pool.bind(original.proxyId, 'vm-test')
+  pool.setEnabled(original.proxyId, false)
+  const poolBefore = structuredClone(pool.state)
+  assert.equal(new URL(manager.state.profiles[0].url).hostname, 'equaldcdn.com')
+  const calls = []
+  manager.fetcher = (source, options) =>
+    fetchSubscription(source, {
+      ...options,
+      fetcher: async (target) => {
+        calls.push(new URL(target).hostname)
+        if (target.includes('equaldcdn.com')) throw new SubscriptionError('subscription_fetch')
+        return Buffer.from(fixture())
+      },
+    })
+  await manager.import({ id })
+  assert.deepEqual(calls, ['equaldcdn.com', 'ipequal.com'])
+  assert.deepEqual(manager.state.nodes[0], original)
+  assert.deepEqual(pool.state, poolBefore)
+  const before = JSON.stringify(manager.state)
+  manager.fetcher = (source, options) =>
+    fetchSubscription(source, {
+      ...options,
+      fetcher: async () => {
+        throw new SubscriptionError('subscription_fetch')
+      },
+    })
+  await assert.rejects(manager.import({ id }), rejectCode('subscription_fetch'))
+  assert.equal(JSON.stringify(manager.state), before)
+  assert.deepEqual(pool.state, poolBefore)
 })

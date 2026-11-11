@@ -6,7 +6,7 @@ import { SubscriptionRuntime } from './subscription-runtime.mjs'
 import {
   fetchSubscription,
   resolvePublicHost,
-  sourceUrl,
+  subscriptionSources,
   SubscriptionError,
   withDeadline,
 } from './subscription-network.mjs'
@@ -252,11 +252,11 @@ export class ProxySubscriptions {
       const existing = this.state.profiles.find((item) => item.id === input.id)
       const name = String(input.name ?? existing?.name ?? '代理订阅').trim()
       if (!name || name.length > 100 || /[\x00-\x1f\x7f]/.test(name)) throw new SubscriptionError()
-      const url = input.url ?? existing?.url
+      const source = input.url ?? existing?.url
+      const url = source ? subscriptionSources(source)[0] : source
       const text = input.content ?? existing?.content
       if ((!url && !text) || (url && text)) throw new SubscriptionError()
-      if (url) sourceUrl(url)
-      const nodes = parseSubscription(url ? await this.fetcher(url) : text)
+      const nodes = parseSubscription(url ? await this.fetcher(url, { validate: parseSubscription }) : text)
       const hosts = new Map()
       const uniqueHosts = [...new Set(nodes.map((node) => node.config.server))]
       for (let start = 0; start < uniqueHosts.length; start += 8) {
