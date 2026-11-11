@@ -516,25 +516,47 @@ provider connection is outside this deployment's control and has not been
 verified. Short successful tests would not guarantee long-term authorization
 stability or eliminate suspension risk.
 
-### Experimental API-provider native CLI candidate
+### Experimental interactive API-provider relay
 
-`native_api_http.py` runs the official CLI with an explicitly configured HTTPS
-API origin. It uses an independent HOME, profile and state directory and does
-not read native OAuth or device credentials. A mode-specific loopback dispatch
-guard permits one model POST for each durable grant. Provider response-header
-status receipts are diagnostics, not final-usage receipts. A provider 429 is
-presented as a non-retryable error to the private CLI while retaining its original
-body and status sidecar; it is not a production gateway status policy.
+`native_api_http.py` exposes private authenticated `POST /v1/messages` around
+an unmodified, interactive official Claude Code CLI. It does not use `-p` or
+SDK mode and does not imitate provider client headers. The CLI has an independent
+HOME/profile, bounded process pool, and only caller-supplied MCP tools; it cannot
+execute a customer's tools on the relay host. A loopback dispatch guard permits
+one paid model POST per durable request grant.
 
-This candidate is **not approved for shared customer routing**. Local tests do
-not establish provider permission for CLI SDK mode. Deployment also requires
-verified downstream tenant scoping, original provider status/auth handling and
-end-to-end terminal usage reconciliation. A single shared relay credential does
-not authenticate the downstream end user. Keep the listener private and the
-candidate separate from existing ReClaude runtimes until these checks pass.
+This candidate is **not admitted to shared customer routing**. AgentNAS acceptance
+with CLI 2.1.321 passed four new synthetic HTTP requests: main tool call, isolated
+child, parent tool result, and continuation. Each had a complete provider SSE
+terminal and real usage. An unauthenticated request returned 401. Network-disabled
+real-CLI fixtures also passed fresh private-profile initialization and idle
+restart with the same native session ID.
 
-Provider credentials must be in a mode-0600 JSON file with `base_url`, `api_key`
-and an optional explicit `proxy_url`. Build the Go guard for the target CPU,
-validate the official CLI binary/version and test outbound TLS before making a
-synthetic model call. Do not inherit an existing customer's CLI HOME or retry
-an uncertain dispatched turn while changing transports.
+A process interrupted while waiting for a tool result remains a release blocker:
+the interactive CLI resumes as interrupted, not as a live MCP waiter. Such
+requests, imported histories ending in tool results, media prompts and structured
+outputs are rejected before a new dispatch. Do not convert tool results into
+ordinary prompt text, invent a continuation, or replay a consumed model turn.
+Existing Airoam and ReClaude production routes are unchanged by this candidate.
+
+API mode requires exactly one `X-Native-Relay-Principal` header containing 64
+lowercase hexadecimal characters in addition to the private relay credential.
+The trusted ingress must derive it from authenticated user/key identity; it must
+strip client or account-header overrides. Sub2API's opt-in
+`anthropic_relay_session_scope` feature derives this from its authenticated
+principal and already-verified affinity tags. Never expose the listener directly
+to customers with a shared credential.
+
+Provider credentials use a mode-0600 JSON file with `base_url`, `api_key` and an
+optional explicit `proxy_url`. Provision only a new private HOME. Initialization
+creates its onboarding setting once and leaves existing settings untouched; it
+does not read, copy or generate OAuth credentials. Validate the official CLI
+binary/version and the configured egress before a synthetic model call.
+
+Raw response streams and model request bodies are private, durable evidence.
+Capture files are allocated before dispatch, and the terminal marker is synced
+only after the complete provider body. Terminal screen text never supplies usage.
+A provider 429 is made non-retryable to this private CLI while retaining its
+original status and body; this is not a customer-facing status mapping or proof
+that quota/policy restrictions have been resolved. Failed or uncertain consumed
+turns remain protected against replay.
