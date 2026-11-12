@@ -85,6 +85,32 @@ class NativeHealthTests(unittest.TestCase):
         (self.rec / "claude/current").write_text("122")
         self.assertIn("native_binding_mismatch", self.health.failed_health_checks())
 
+    def test_current_account_review_is_separate_from_device_revocation(self):
+        self.state["identities"]["claude"]["last_error"] = {
+            "kind": "account_sync_failed",
+            "detail": 'sync current account: unexpected status 403: {"error":{"code":"account_needs_review","status":403}}',
+            "at_ms": self.state["daemon"]["started_at_ms"] + 1000,
+        }
+        self.write_state()
+        self.assertIn("native_account_needs_review", self.health.failed_health_checks())
+        self.assertFalse(self.health.authorization_revoked())
+        (self.rec / "claude/current").write_text("122")
+        self.assertNotIn("native_account_needs_review", self.health.failed_health_checks())
+
+    def test_other_errors_and_previous_daemon_reviews_do_not_signal_current_review(self):
+        started = self.state["daemon"]["started_at_ms"]
+        identity = self.state["identities"]["claude"]
+        for status, code, at_ms in ((403, "permission_denied", started),
+                                    (429, "account_needs_review", started),
+                                    (403, "account_needs_review", started - 1000)):
+            identity["last_error"] = {
+                "kind": "account_sync_failed",
+                "detail": f"sync current account: unexpected status {status}: " + json.dumps({"error": {"code": code}}),
+                "at_ms": at_ms,
+            }
+            self.write_state()
+            self.assertNotIn("native_account_needs_review", self.health.failed_health_checks())
+
 
 if __name__ == "__main__":
     unittest.main()
