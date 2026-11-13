@@ -3,10 +3,43 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"io"
+	"net/http"
 	"strings"
 )
+
+// The capture and alias reader need decoded SSE events, never compression bytes.
+func decodeAPIEventStream(response *http.Response) error {
+	switch strings.ToLower(strings.TrimSpace(response.Header.Get("Content-Encoding"))) {
+	case "", "identity":
+		response.Header.Del("Content-Encoding")
+		return nil
+	case "gzip":
+		reader, err := gzip.NewReader(response.Body)
+		if err != nil {
+			return err
+		}
+		response.Body = decodedEventStream{reader, response.Body}
+		response.Header.Del("Content-Encoding")
+		response.Header.Del("Content-Length")
+		response.ContentLength = -1
+		return nil
+	default:
+		return errors.New("unsupported provider stream encoding")
+	}
+}
+
+type decodedEventStream struct {
+	*gzip.Reader
+	raw io.Closer
+}
+
+func (r decodedEventStream) Close() error {
+	return errors.Join(r.Reader.Close(), r.raw.Close())
+}
 
 // Some API providers return a caller's original tool name even though the
 // interactive CLI registered it under MCP. Only declared, unambiguous aliases

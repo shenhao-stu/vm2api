@@ -1348,6 +1348,11 @@ class Session:
         self.suspended = True
         return True
 
+    def tool_results_need_restart(self, blocks, results):
+        return any(b.get("type") == "text" for b in blocks) or any(
+            c["type"] != "text" for result in results.values() for c in result["content"]
+        )
+
     def request(self, body):
         if not self.lock.acquire(blocking=False):
             raise RequestRejected("session_busy")
@@ -1448,8 +1453,7 @@ class Session:
                 # mid-turn system attachment. Resume at the actual tool-use
                 # assistant instead, preserving the caller's whole user message.
                 resume_tools = bool(results) and (
-                    changed or self.suspended or any(b.get("type") == "text" for b in blocks)
-                    or any(c['type'] != 'text' for r in results.values() for c in r['content'])
+                    changed or self.suspended or self.tool_results_need_restart(blocks, results)
                 )
                 if changed or resume_tools or self.suspended:
                     self.restart_for_request(body)

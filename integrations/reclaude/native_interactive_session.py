@@ -24,6 +24,7 @@ from native_interactive_recovery import (
     caller_tool_event,
     load_steps,
     private_json,
+    project_tool_text,
 )
 
 
@@ -96,8 +97,7 @@ class InteractiveSession(native.Session):
             raise native.ContractError("interactive_api_provider_only")
 
     def request(self, body):
-        # No semantic coercion of images or resumed tool results into terminal text.
-        # This driver remains opt-in until those cases have their own acceptance.
+        # Reject content the interactive MCP bridge cannot represent.
         changed = native.signature(native.configuration(body)) != self.body_signature
         tail = native.native_blocks(
             next(m for m in reversed(body["messages"]) if m["role"] == "user")[
@@ -110,10 +110,11 @@ class InteractiveSession(native.Session):
         elif (
             not self.pending_ids
             or changed
-            or any(b.get("type") != "tool_result" for b in tail)
+            or any(b.get("type") not in {"tool_result", "text"} for b in tail)
             or any(
                 c["type"] != "text"
                 for b in tail
+                if b["type"] == "tool_result"
                 for c in native.text_blocks(b.get("content", ""))
             )
         ):
@@ -165,13 +166,34 @@ class InteractiveSession(native.Session):
 
     def start_dispatch_proxy(self):
         super().start_dispatch_proxy()
-        if self.recovery_steps is not None and self.recovery_gate is None:
+        if self.recovery_gate is None:
             self.recovery_gate = RecoveryGate(
-                self.dispatch_address, self.native_id, self.recovery_steps
+                self.dispatch_address, self.native_id, self.recovery_steps,
+                self.project_tool_text, self.reject_projection,
             )
             self.dispatch_address = "http://127.0.0.1:" + str(
                 self.recovery_gate.server_port
             )
+
+    def tool_results_need_restart(self, blocks, results):
+        # The MCP results still pass through the native CLI. Its private gate
+        # rejoins the caller's trailing user text at the exact tool boundary.
+        return False
+
+    def project_tool_text(self, data):
+        messages = native.history_shape(self.history)
+        if not any(
+            message["role"] == "user"
+            and any(b["type"] == "tool_result" for b in message["content"])
+            and any(b["type"] == "text" for b in message["content"])
+            for message in messages
+        ):
+            return data
+        body = project_tool_text(json.loads(data), messages)
+        return json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
+
+    def reject_projection(self, code):
+        self.events.put(native.ContractError(code))
 
     def recover_pending(self, body):
         if not self.lock.acquire(blocking=False):
@@ -273,6 +295,8 @@ class InteractiveSession(native.Session):
             )
         else:
             for result in step["input"]:
+                if result.get("type") == "text":
+                    continue
                 if result.get("type") != "tool_result":
                     raise RecoveryError("recovery_tool_result_invalid")
                 private_json(

@@ -139,6 +139,7 @@ func (g *Gate) forwardRequest(conn net.Conn, req *http.Request) {
 		req.URL.Scheme, req.URL.Host = g.APIBase.Scheme, g.APIBase.Host
 		req.URL.Path = strings.TrimSuffix(g.APIBase.Path, "/") + req.URL.Path
 		req.Host = g.APIBase.Host
+		req.Header.Set("Accept-Encoding", "identity")
 	}
 	req.RequestURI = ""
 	req.Close = true
@@ -172,7 +173,15 @@ func (g *Gate) forwardRequest(conn net.Conn, req *http.Request) {
 	}
 	defer response.Body.Close()
 	if capture != nil {
-		capture.ReadCloser, capture.status = response.Body, response.StatusCode
+		capture.status = response.StatusCode
+		if response.StatusCode == http.StatusOK && strings.Contains(response.Header.Get("Content-Type"), "text/event-stream") {
+			if err := decodeAPIEventStream(response); err != nil {
+				capture.failed = true
+				reply(conn, http.StatusBadRequest, "native_stream_encoding_unsupported_no_replay")
+				return
+			}
+		}
+		capture.ReadCloser = response.Body
 		response.Body = capture
 	}
 	if modelRequest && g.APIBase != nil {

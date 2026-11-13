@@ -233,9 +233,11 @@ class DurableRecoveryEvidenceTests(unittest.TestCase):
         self.plan = {
             "version": 1,
             "native_id": self.sid,
+            "base_history": [],
             "tools": [{"name": "echo"}],
             "steps": [
-                {"grant_id": self.grant, "assistant_sha256": signature(self.assistant)}
+                {"grant_id": self.grant, "assistant_sha256": signature(self.assistant),
+                 "input": [{"type": "text", "text": "synthetic"}]}
             ],
         }
         self.write_stream()

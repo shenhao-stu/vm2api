@@ -76,6 +76,46 @@ def private_json(path, value):
         os.close(fd)
 
 
+def project_tool_text(body, messages):
+    """Keep caller text next to its own native tool results, in the user role."""
+    overlays = {}
+    for message in messages:
+        if message["role"] != "user" or not isinstance(message["content"], list):
+            continue
+        blocks = message["content"]
+        ids = tuple(b["tool_use_id"] for b in blocks if b["type"] == "tool_result")
+        text = [b for b in blocks if b["type"] == "text"]
+        if ids and text and len(ids) + len(text) == len(blocks):
+            if len(ids) != len(set(ids)) or ids in overlays:
+                raise RecoveryError("interactive_tool_text_duplicate_boundary")
+            overlays[ids] = text
+    if not overlays:
+        return body
+    matched = set()
+    for message in body["messages"]:
+        if message["role"] != "user" or not isinstance(message["content"], list):
+            continue
+        blocks = message["content"]
+        ids = tuple(b["tool_use_id"] for b in blocks if b["type"] == "tool_result")
+        if ids not in overlays:
+            continue
+        if ids in matched:
+            raise RecoveryError("interactive_tool_text_duplicate_boundary")
+        matched.add(ids)
+        text = overlays[ids]
+        suffix = [{k: v for k, v in b.items() if k != "cache_control"}
+                  for b in blocks[len(ids):]]
+        if any(b["type"] != "tool_result" for b in blocks[:len(ids)]):
+            raise RecoveryError("interactive_tool_text_boundary_changed")
+        if not suffix:
+            message["content"] = [*blocks, *copy.deepcopy(text)]
+        elif suffix != text:
+            raise RecoveryError("interactive_tool_text_boundary_changed")
+    if matched != overlays.keys():
+        raise RecoveryError("interactive_tool_text_boundary_missing")
+    return body
+
+
 def semantic_request(body, session_id):
     if not isinstance(body, dict) or not isinstance(body.get("metadata"), dict):
         raise RecoveryError("recovery_invalid_request")
@@ -105,6 +145,7 @@ def load_steps(directory, plan, session_id):
     ):
         raise RecoveryError("recovery_plan_invalid")
     steps = []
+    tool_inputs = list(plan["base_history"])
     total_bytes = 0
     for item in plan["steps"]:
         if not isinstance(item, dict):
@@ -158,9 +199,11 @@ def load_steps(directory, plan, session_id):
             or native.signature(turn.message["content"]) != item["assistant_sha256"]
         ):
             raise RecoveryError("recovery_tool_terminal_mismatch")
+        tool_inputs.append({"role": "user", "content": item["input"]})
         steps.append(
             {
                 **item,
+                "tool_inputs": tuple(tool_inputs),
                 "expected": expected,
                 "stream": caller_tool_stream(stream, plan["tools"]),
                 "pending": [
@@ -174,11 +217,12 @@ def load_steps(directory, plan, session_id):
 class RecoveryGate(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, target, session_id, steps):
+    def __init__(self, target, session_id, steps, live_projection=None, on_reject=None):
         super().__init__(("127.0.0.1", 0), RecoveryHandler)
         self.target, self.session_id, self.steps = target, session_id, steps
         self.lock = threading.Lock()
-        self.index, self.live, self.error = 0, False, None
+        self.index, self.live, self.error = 0, steps is None, None
+        self.live_projection, self.on_reject = live_projection, on_reject
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
 
@@ -234,13 +278,23 @@ class RecoveryHandler(http.server.BaseHTTPRequestHandler):
                         raise RecoveryError("recovery_unexpected_request")
                     step = self.server.steps[self.server.index]
                     if (
-                        semantic_request(json.loads(data), self.server.session_id)
+                        semantic_request(project_tool_text(json.loads(data), step.get("tool_inputs", ())),
+                                         self.server.session_id)
                         != step["expected"]
                     ):
                         raise RecoveryError("recovery_request_changed")
                     self.server.index += 1
                     self.answer(200, step["stream"], "text/event-stream")
                     return
+            if (
+                self.command == "POST"
+                and urlsplit(self.path).path == "/v1/messages"
+                and self.server.live_projection is not None
+            ):
+                projected = self.server.live_projection(data)
+                if len(projected) > 16 * 1024 * 1024:
+                    raise RecoveryError("interactive_tool_text_body_limit")
+                data = projected
             target = urlsplit(self.server.target)
             conn = http.client.HTTPConnection(target.hostname, target.port, timeout=370)
             try:
@@ -274,6 +328,8 @@ class RecoveryHandler(http.server.BaseHTTPRequestHandler):
                     if isinstance(exc, RecoveryError)
                     else "recovery_invalid_request"
                 )
+            if self.server.live and self.server.on_reject:
+                self.server.on_reject(self.server.error)
             self.answer(
                 400,
                 b'{"type":"error","error":{"type":"invalid_request_error","message":"local recovery rejected; no upstream dispatch"}}',

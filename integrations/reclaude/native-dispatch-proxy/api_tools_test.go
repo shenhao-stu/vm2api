@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -58,6 +59,40 @@ func TestAPIToolMappingKeepsOriginalReceiptAndOneDispatch(t *testing.T) {
 	}
 	if err != nil || json.Unmarshal(terminal, &marker) != nil || !marker.Complete || marker.Bytes != len(original) {
 		t.Fatal("original terminal not durable")
+	}
+}
+
+func TestCompressedSSEKeepsOriginalProviderEvents(t *testing.T) {
+	for _, encoding := range []string{"", "gzip", "br"} {
+		t.Run(encoding, func(t *testing.T) {
+			original := []byte(`data: {"type":"message_stop"}` + "\n\n")
+			var wire bytes.Buffer
+			if encoding == "gzip" {
+				z := gzip.NewWriter(&wire)
+				_, _ = z.Write(original)
+				_ = z.Close()
+			} else {
+				wire.Write(original)
+			}
+			r := &http.Response{Header: make(http.Header), Body: io.NopCloser(&wire), ContentLength: int64(wire.Len())}
+			if encoding != "" {
+				r.Header.Set("Content-Encoding", encoding)
+			}
+			err := decodeAPIEventStream(r)
+			if encoding == "br" {
+				if err == nil {
+					t.Fatal("unsupported coding accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := io.ReadAll(r.Body)
+			if err != nil || !bytes.Equal(data, original) || r.Header.Get("Content-Encoding") != "" {
+				t.Fatalf("stream mismatch: %v", err)
+			}
+		})
 	}
 }
 

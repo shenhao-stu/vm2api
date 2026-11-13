@@ -178,6 +178,8 @@ def run(root, cli):
         assert h.request(parent)[0] == 400 and h.dispatches() == after
         checks.append("duplicate_zero_dispatch")
         continuation = follow(parent, first)
+        reminder = "<system-reminder>OFFLINE_AGENT_RESULT</system-reminder>"
+        continuation["messages"][-1]["content"].append({"type": "text", "text": reminder})
         wrong = copy.deepcopy(continuation)
         wrong["messages"][-1]["content"][0]["tool_use_id"] = "another_session_tool"
         assert h.request(wrong)[0] == 400 and h.dispatches() == after
@@ -208,6 +210,11 @@ def run(root, cli):
         success(follow(parent, foreign), principal="b" * 64)
         success(follow(parent, dedicated), client=True, principal="f" * 64)
         assert h.dispatches() == before + 3
+        native_requests = [json.loads(p.read_text())
+                           for p in (root / "state").rglob("*.api-request.private.json")]
+        matches = [b for request in native_requests for m in request["messages"] if m["role"] == "user"
+                   and isinstance(m["content"], list) for b in m["content"] if b.get("text") == reminder]
+        assert matches == [{"type": "text", "text": reminder}]
         checks.append("http_restart_pending_isolated_three_tenants")
         next_turn = follow(continuation, result, "FIXTURE_DELAY: independent follow-up")
         before = h.dispatches()
