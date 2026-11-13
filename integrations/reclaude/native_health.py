@@ -6,6 +6,24 @@ import math
 from pathlib import Path
 
 
+def current_account_needs_review(error, daemon_started_at):
+    if not isinstance(error, dict) or error.get("kind") != "account_sync_failed":
+        return False
+    observed_at = error.get("at_ms")
+    if type(observed_at) is not int or type(daemon_started_at) is not int or observed_at < daemon_started_at:
+        return False
+    detail = error.get("detail")
+    prefix = "sync current account: unexpected status 403: "
+    if not isinstance(detail, str) or not detail.startswith(prefix):
+        return False
+    try:
+        response = json.loads(detail[len(prefix):])
+    except ValueError:
+        return False
+    failure = response.get("error") if isinstance(response, dict) else None
+    return isinstance(failure, dict) and failure.get("code") == "account_needs_review"
+
+
 class NativeHealth:
     def __init__(self, home, binding):
         self.home, self.binding = Path(home), str(binding)
@@ -68,16 +86,17 @@ class NativeHealth:
             if not state["daemon"].get("leak_report"):
                 failed.append("native_reporting_unavailable")
             current = (self.home / ".rec/claude/current").read_text().strip()
-            if (
-                bindings != [self.binding]
-                or current != self.binding
-                or sorted(identity["bindings"]) != [self.binding]
-            ):
+            same_binding = bindings == sorted(identity["bindings"]) == [self.binding] and current == self.binding
+            if not same_binding:
                 failed.append("native_binding_mismatch")
             if self.control_authorization_revoked(state):
                 failed.append("native_control_authorization_revoked")
             if self.authorization_revoked(state):
                 failed.append("native_device_revoked")
+            elif same_binding and current_account_needs_review(
+                identity.get("last_error"), state["daemon"].get("started_at_ms")
+            ):
+                failed.append("native_account_needs_review")
             elif identity.get("last_error"):
                 failed.append("native_identity_error")
             return failed

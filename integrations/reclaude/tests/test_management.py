@@ -191,6 +191,23 @@ class ManagementTests(unittest.TestCase):
         self.assertTrue(all(x[1] == "status" for x in self.calls))
         self.assertTrue(evidence.exists())
 
+    def test_account_review_pauses_only_scheduling_and_preserves_the_reason(self):
+        self.r.update(failed_checks=["native_account_needs_review"], http_ready=False)
+        result = self.manager.refresh()
+        self.assertFalse(result["sub"]["schedulable"])
+        self.assertFalse(result["authorization_latched"])
+        self.assertTrue((self.manager.root / "account-review.json").exists())
+        with self.assertRaises(ManagementError):
+            self.action("resume_schedule")
+        self.r.update(failed_checks=[], http_ready=True)
+        self.assertFalse(self.manager.refresh()["sub"]["schedulable"])
+        self.assertEqual([x for x in self.calls if x[1] != "status"], [("sub", "pause")])
+
+    def test_transient_readiness_failure_does_not_apply_account_review_hold(self):
+        self.r.update(failed_checks=["native_unavailable", "native_identity_error"], http_ready=False)
+        self.assertTrue(self.manager.refresh()["sub"]["schedulable"])
+        self.assertNotIn(("sub", "pause"), self.calls)
+
     def test_pause_failure_cannot_claim_paused_or_stop(self):
         self.fail = ("sub", "pause")
         with self.assertRaises(ManagementError):

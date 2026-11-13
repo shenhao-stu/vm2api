@@ -151,12 +151,13 @@ class Manager:
     def _refresh(self):
         r = self.runtime()
         sub = self.sub()
-        if r.get("revoked") or r.get("auth_latched"):
-            # Pause first. No rebind, process restart, guard rearm or model probe.
-            if sub.get("schedulable"):
-                sub = self.sub("pause")
-                if sub.get("schedulable") is not False:
-                    raise ManagementError("sub_pause_unconfirmed", 503)
+        revoked = r.get("revoked") or r.get("auth_latched")
+        under_review = "native_account_needs_review" in (r.get("failed_checks") or ())
+        if (revoked or under_review) and sub.get("schedulable") is not False:
+            sub = self.sub("pause")
+            if sub.get("schedulable") is not False:
+                raise ManagementError("sub_pause_unconfirmed", 503)
+        if revoked:
             evidence = self.root / "authorization-latch.json"
             if not evidence.exists():
                 data = {"at": time.time(), "binding": self.config["binding"],
@@ -165,6 +166,14 @@ class Manager:
                 with evidence.open("x") as file:
                     json.dump(data, file)
                 self.record("authorization_latched", **data)
+        elif under_review:
+            evidence = self.root / "account-review.json"
+            if not evidence.exists():
+                data = {"at": time.time(), "sub_account": self.config["sub_account"],
+                        "paused": True, "reason": "account_needs_review"}
+                with evidence.open("x") as file:
+                    json.dump(data, file)
+                self.record("account_needs_review", **data)
         guard = (guard_status(self.config, r.get("exit_guard") or {})
                  if self.config.get("guard_source") == "runtime" else guard_status(self.config))
         result = {"id": self.config["id"], "name": self.config["name"],
