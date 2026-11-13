@@ -17,7 +17,7 @@ import time
 from urllib.parse import urlsplit
 
 from adapter import Limits, Rejection, RelayHandler, RelayServer, load_relay_key, request_trace
-from native_bridge_session import ContractError, NativeRateLimit, RequestRejected, Session, Turn
+from native_bridge_session import ContractError, NativeProviderError, NativeRateLimit, RequestRejected, Session, Turn
 from native_session_pool import SessionPool, memory_pressure, session_key
 from native_health import NativeHealth, validate_official
 
@@ -45,6 +45,7 @@ class NativeServer(RelayServer):
         memory_current_file=Path("/sys/fs/cgroup/memory.current"),
         allow_history_import=False,
         configuration_channels=False,
+        require_principal=False,
     ):
         if type(memory_high_bytes) is not int or memory_high_bytes < 0:
             raise ValueError("invalid_memory_high_bytes")
@@ -78,6 +79,7 @@ class NativeServer(RelayServer):
         self.memory_high_bytes = memory_high_bytes
         self.maintenance_error = None
         self.tenant = hashlib.sha256(key.encode()).hexdigest()
+        self.require_principal = require_principal
         self.proof = proof
         self.allow_prewarm = allow_prewarm
         self.stop_reaper = threading.Event()
@@ -179,6 +181,18 @@ def failure_status(error, code, expired=False):
 
 
 class NativeHandler(RelayHandler):
+    def lease_session(self, tenant, body):
+        return self.server.pool.lease(tenant, body)
+
+    def authenticated_tenant(self):
+        tenant = self.server.tenant
+        if self.server.require_principal:
+            principals = self.headers.get_all('X-Native-Relay-Principal', [])
+            if len(principals) != 1 or not re.fullmatch(r'[0-9a-f]{64}', principals[0]):
+                raise Rejection(400, 'authenticated_relay_principal_required')
+            tenant = hashlib.sha256((tenant + ':' + principals[0]).encode()).hexdigest()
+        return tenant
+
     def send_json(self, status, body):
         if not getattr(self, "request_body_read", False):
             return super().send_json(status, body)
@@ -274,8 +288,9 @@ class NativeHandler(RelayHandler):
         try:
             raw, body = self.read_message()
             self.request_body_read = True
+            tenant = self.authenticated_tenant()
             record.update(request_trace(body, len(raw)))
-            record["session_pool_key"] = session_key(self.server.tenant, body)
+            record["session_pool_key"] = session_key(tenant, body)
             record.update(
                 {
                     "model": body["model"],
@@ -289,7 +304,7 @@ class NativeHandler(RelayHandler):
             if failed or not self.server.proof():
                 record["readiness_failures"] = failed or ["official_proof_unavailable"]
                 raise Rejection(503, "native_not_ready")
-            context = self.server.pool.lease(self.server.tenant, body)
+            context = self.lease_session(tenant, body)
             lease_started = time.monotonic()
             session = context.__enter__()
             record["pool_lease_ms"] = round((time.monotonic() - lease_started) * 1000)
@@ -397,7 +412,7 @@ class NativeHandler(RelayHandler):
             )
             if expired.is_set():
                 code = "native_request_deadline"
-            error_details = dict(exc.details) if isinstance(exc, NativeRateLimit) else None
+            error_details = dict(exc.details) if isinstance(exc, (NativeRateLimit, NativeProviderError)) else None
             if error_details:
                 record["upstream_error"] = error_details
             if code == "unsupported_thinking_configuration" and isinstance(body, dict):

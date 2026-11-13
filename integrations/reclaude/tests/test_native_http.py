@@ -155,7 +155,7 @@ class NativeHTTPTests(unittest.TestCase):
             **changes,
         }
 
-    def request(self, body=None, key=None, path="/v1/messages"):
+    def request(self, body=None, key=None, path="/v1/messages", headers=None):
         c = http.client.HTTPConnection(*self.server.server_address, timeout=5)
         c.request(
             "POST",
@@ -164,12 +164,31 @@ class NativeHTTPTests(unittest.TestCase):
             {
                 "Content-Type": "application/json",
                 "Authorization": "Bearer " + (key or "k" * 40),
+                **(headers or {}),
             },
         )
         r = c.getresponse()
         result = (r.status, r.read())
         c.close()
         return result
+
+    def test_private_api_relay_requires_server_principal(self):
+        self.server.require_principal = True
+        for value in ('', 'spoof', 'a' * 63, 'a' * 65, 'A' * 64):
+            status, raw = self.request(headers={'X-Native-Relay-Principal': value})
+            self.assertEqual(status, 400)
+            self.assertIn(b'authenticated_relay_principal_required', raw)
+        self.assertEqual(self.created, [])
+
+    def test_same_caller_session_is_separate_across_private_principals(self):
+        self.server.require_principal = True
+        for principal in ('a' * 64, 'b' * 64):
+            status, _ = self.request(headers={'X-Native-Relay-Principal': principal})
+            self.assertEqual(status, 200)
+        self.assertEqual(len(self.created), 2)
+        self.assertNotEqual(self.created[0].directory, self.created[1].directory)
+        self.assertEqual(self.request(headers={'X-Native-Relay-Principal': 'a' * 64})[0], 200)
+        self.assertEqual(len(self.created), 2)
 
     def test_failure_audit_links_scoped_pool_without_storing_caller_metadata(self):
         from native_session_pool import session_key

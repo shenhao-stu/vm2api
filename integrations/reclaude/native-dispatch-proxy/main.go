@@ -44,6 +44,7 @@ type Gate struct {
 	Certificate    tls.Certificate
 	GetCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 	Transport      http.RoundTripper
+	APIBase        *url.URL
 	Attempts       atomic.Int64
 	Denied         atomic.Int64
 	Requests       atomic.Int64
@@ -100,16 +101,20 @@ func reply(conn net.Conn, status int, code string) {
 }
 
 func (g *Gate) forward(conn net.Conn, reader *bufio.Reader) {
-	started := time.Now()
 	req, err := http.ReadRequest(reader)
 	if err != nil {
 		return
 	}
+	g.forwardRequest(conn, req)
+}
+
+func (g *Gate) forwardRequest(conn net.Conn, req *http.Request) {
+	started := time.Now()
 	defer req.Body.Close()
 	g.Requests.Add(1)
 	requestHost := strings.ToLower(strings.TrimSuffix(req.Host, ":443"))
 	requestHost = strings.TrimSuffix(requestHost, ".")
-	if requestHost != "api.anthropic.com" {
+	if g.APIBase == nil && requestHost != "api.anthropic.com" {
 		reply(conn, 400, "unexpected_host")
 		return
 	}
@@ -130,6 +135,12 @@ func (g *Gate) forward(conn net.Conn, reader *bufio.Reader) {
 	}
 	req.URL.Scheme = "https"
 	req.URL.Host = "api.anthropic.com"
+	if g.APIBase != nil {
+		req.URL.Scheme, req.URL.Host = g.APIBase.Scheme, g.APIBase.Host
+		req.URL.Path = strings.TrimSuffix(g.APIBase.Path, "/") + req.URL.Path
+		req.Host = g.APIBase.Host
+		req.Header.Set("Accept-Encoding", "identity")
+	}
 	req.RequestURI = ""
 	req.Close = true
 	req.Body = io.NopCloser(bytes.NewReader(body))
@@ -137,6 +148,20 @@ func (g *Gate) forward(conn net.Conn, reader *bufio.Reader) {
 	req.TransferEncoding = nil
 	if _, found := req.Header["User-Agent"]; !found {
 		req.Header["User-Agent"] = []string{""}
+	}
+	var capture *apiCapture
+	if modelRequest && g.APIBase != nil {
+		// API-mode acceptance requires an exact private request/receipt pair.
+		if err := writePrivateRequest(g.Directory, grantID, body); err != nil {
+			reply(conn, 502, "native_capture_unavailable_no_dispatch")
+			return
+		}
+		capture, err = g.prepareAPICapture(grantID)
+		if err != nil {
+			reply(conn, 502, "native_capture_unavailable_no_dispatch")
+			return
+		}
+		defer capture.finish()
 	}
 	response, err := g.Transport.RoundTrip(req)
 	if err != nil {
@@ -147,10 +172,35 @@ func (g *Gate) forward(conn net.Conn, reader *bufio.Reader) {
 		return
 	}
 	defer response.Body.Close()
+	if capture != nil {
+		capture.status = response.StatusCode
+		if response.StatusCode == http.StatusOK && strings.Contains(response.Header.Get("Content-Type"), "text/event-stream") {
+			if err := decodeAPIEventStream(response); err != nil {
+				capture.failed = true
+				reply(conn, http.StatusBadRequest, "native_stream_encoding_unsupported_no_replay")
+				return
+			}
+		}
+		capture.ReadCloser = response.Body
+		response.Body = capture
+	}
+	if modelRequest && g.APIBase != nil {
+		g.recordAPIStatus(grantID, response.StatusCode)
+		// A private API-mode CLI must not retry a paid POST on a provider 429.
+		// Retain the original status in a sidecar and the original error body.
+		// This is internal to the CLI guard, not an external status conversion.
+		if response.StatusCode == http.StatusTooManyRequests {
+			response.StatusCode = http.StatusBadRequest
+			response.Status = "400 Bad Request"
+		}
+	}
 	// These headers finish this one-shot model attempt. A retry inside Claude
 	// Code would only see the grant guard's 429 and misreport a quota limit.
 	if modelRequest && (response.StatusCode == 502 || response.StatusCode == 503 || response.StatusCode == 504) {
 		g.recordGatewayError(grantID, response.StatusCode)
+		if capture != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(capture, 1024*1024))
+		}
 		reply(conn, http.StatusBadRequest, "native_gateway_error_no_replay")
 		return
 	}
@@ -169,6 +219,13 @@ func (g *Gate) forward(conn net.Conn, reader *bufio.Reader) {
 	}
 	provider := &transferReader{ReadCloser: response.Body}
 	response.Body = provider
+	if capture != nil && response.StatusCode == 200 && strings.Contains(response.Header.Get("Content-Type"), "text/event-stream") {
+		if aliases := callerToolAliases(body); len(aliases) > 0 {
+			response.Body = &toolAliasReader{ReadCloser: provider, reader: bufio.NewReaderSize(provider, 64*1024), aliases: aliases}
+			response.ContentLength = -1
+			response.Header.Del("Content-Length")
+		}
+	}
 	downstream := &transferWriter{Writer: conn}
 	if err = response.Write(downstream); err != nil && modelRequest {
 		if provider.err != nil {
@@ -193,6 +250,10 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	defer g.Active.Add(-1)
 	if active > 32 {
 		http.Error(w, "private connection budget", 503)
+		return
+	}
+	if g.APIBase != nil {
+		g.serveAPI(w, req)
 		return
 	}
 	host, port, err := net.SplitHostPort(req.Host)
@@ -306,7 +367,12 @@ func main() {
 	session := flag.String("session", "", "native CLI session UUID")
 	ca := flag.String("ca", "", "own native CA certificate")
 	key := flag.String("ca-key", "", "own native CA private key, never exported")
+	apiBase := flag.String("api-base", "", "explicit HTTPS API provider, without native OAuth")
 	flag.Parse()
+	if *apiBase != "" {
+		serveAPIProvider(*listen, *apiBase, *directory, *session)
+		return
+	}
 	for _, address := range []string{*listen, *upstream} {
 		host, _, err := net.SplitHostPort(address)
 		if err != nil || host != "127.0.0.1" {

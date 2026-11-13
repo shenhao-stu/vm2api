@@ -515,3 +515,77 @@ Fixed egress governs the server-to-ReClaude hop only. ReClaude's subsequent
 provider connection is outside this deployment's control and has not been
 verified. Short successful tests would not guarantee long-term authorization
 stability or eliminate suspension risk.
+
+### Experimental interactive API-provider relay
+
+`native_api_http.py` exposes private authenticated `POST /v1/messages` around
+an unmodified, interactive official Claude Code CLI. It does not use `-p` or
+SDK mode and does not imitate provider client headers. The CLI has an independent
+HOME/profile, bounded process pool, and only caller-supplied MCP tools; it cannot
+execute a customer's tools on the relay host. A loopback dispatch guard permits
+one paid model POST per durable request grant.
+
+This candidate is **not admitted to shared customer routing**. AgentNAS acceptance
+with CLI 2.1.321 passed four new synthetic HTTP requests: main tool call, isolated
+child, parent tool result, and continuation. Each had a complete provider SSE
+terminal and real usage. An unauthenticated request returned 401. Network-disabled
+real-CLI fixtures also passed fresh private-profile initialization, imported
+completed history, and two successive pending-tool restarts with the same native
+session ID. Four caller turns produced four guarded dispatches.
+
+Pending-tool recovery requires complete, durable original provider SSE and a
+request digest. A local-only gate reconstructs the CLI's MCP wait from those
+records, matching the full request, identity, tool arguments and history before
+enabling any new dispatch. Reconstruction makes no provider call and emits no
+additional usage to the caller. Missing or changed evidence is rejected. Raw
+transcripts and provider records remain preserved. Provider tool-name aliases
+are mapped only to unambiguously declared MCP tools; original usage is unchanged.
+
+Network-disabled acceptance also runs an outer interactive official CLI with its
+builtin Agent, an isolated child and a parent continuation. Five distinct requests
+completed with one guarded dispatch each. A reproduced local 429 at the parent /
+child handoff is addressed with a two-second maximum wait before admission, only
+for `session_busy`. Each attempt rechecks the original pool's isolation and
+history rules. Consumed, failed or unknown turns are not retried; long contention
+still returns 429. Existing OAuth handlers retain immediate admission semantics.
+
+Separate HTTP fixtures verify concurrent duplicate suppression, three-tenant
+pending-tool recovery after restart, invalid tool results without poisoning the
+parent, disconnect accounting and missing-terminal rejection. Fixture usage is
+synthetic and never enters a customer ledger. These results do not establish live
+provider acceptance: the provider disabled the current API key before the
+corrected tool-name path could be verified live. Full-chain accounting through
+Sub2API also remains unverified.
+First-time imports ending in tool results, media prompts and structured outputs
+are explicitly unsupported. Do not invent a continuation or repeat a consumed
+model turn. Existing production routes are unchanged by this candidate.
+
+API mode requires exactly one `X-Native-Relay-Principal` header containing 64
+lowercase hexadecimal characters in addition to the private relay credential.
+The trusted ingress must derive it from authenticated user/key identity; it must
+strip client or account-header overrides. Sub2API's opt-in
+`anthropic_relay_session_scope` feature derives this from its authenticated
+principal and already-verified affinity tags. Never expose the listener directly
+to customers with a shared credential.
+
+For a dedicated direct Claude Code client, `--client-key-file` supplies a separate
+mode-0600 key. It must differ from the shared gateway key; its tenant is derived
+from the credential, and any caller principal header is ignored. The client can
+use the ordinary base URL and Bearer or `x-api-key` authentication. Do not share
+this dedicated credential across unrelated customers. Both credentials can read
+the authenticated `/v1/models` allowlist; the gateway key still requires a trusted
+principal for inference.
+
+Provider credentials use a mode-0600 JSON file with `base_url`, `api_key` and an
+optional explicit `proxy_url`. Provision only a new private HOME. Initialization
+creates its onboarding setting once and leaves existing settings untouched; it
+does not read, copy or generate OAuth credentials. Validate the official CLI
+binary/version and the configured egress before a synthetic model call.
+
+Raw response streams and model request bodies are private, durable evidence.
+Capture files are allocated before dispatch, and the terminal marker is synced
+only after the complete provider body. Terminal screen text never supplies usage.
+A provider 429 is made non-retryable to this private CLI while retaining its
+original status and body; this is not a customer-facing status mapping or proof
+that quota/policy restrictions have been resolved. Failed or uncertain consumed
+turns remain protected against replay.

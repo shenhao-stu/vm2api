@@ -38,6 +38,14 @@ class RequestRejected(ContractError):
     """Invalid input rejected before changing a native conversation."""
 
 
+class NativeProviderError(ContractError):
+    """Original API status, with no automatic replay and no private body exposure."""
+
+    def __init__(self, status):
+        super().__init__('native_provider_error_no_replay')
+        self.details = {'upstream_type': 'api_error', 'upstream_status': status, 'no_replay': True}
+
+
 class NativeRateLimit(ContractError):
     """The native CLI rejected this model; other model windows may remain usable."""
 
@@ -613,6 +621,7 @@ class Session:
         restore=False,
         history_profile=None,
         personal_max_profile=None,
+        api_base=None,
     ):
         native_env, self.options = native_options(body)
         self.budget_options = []
@@ -656,6 +665,9 @@ class Session:
         self.personal_max_profile = personal_max_profile
         self.personal_max_confirmed = False
         self.dispatch_proxy = dispatch_proxy
+        self.api_base = api_base
+        if api_base and not dispatch_proxy:
+            raise ContractError("api_provider_requires_dispatch_guard")
         self.history_profile = Path(history_profile) if history_profile else None
         self.dispatch_process = None
         self.dispatch_address = None
@@ -1033,7 +1045,7 @@ class Session:
         }
         if self.dispatch_proxy:
             self.start_dispatch_proxy()
-            settings["env"] = {
+            settings["env"] = {"ANTHROPIC_BASE_URL": self.dispatch_address} if self.api_base else {
                 key: self.dispatch_address
                 for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]
             }
@@ -1111,28 +1123,27 @@ class Session:
         self.process.stdin.flush()
 
     def start_dispatch_proxy(self):
-        home = Path(self.environment["HOME"]) / ".rec"
-        state = json.loads((home / "state.json").read_text())
-        port = state["daemon"]["port"]
-        if type(port) is not int or not 0 < port < 65536:
-            raise ContractError("native_proxy_port_invalid")
         directory = self.directory / "dispatch"
         directory.mkdir(mode=0o700, exist_ok=True)
         command = [
             str(self.dispatch_proxy),
             "--listen",
             "127.0.0.1:0",
-            "--upstream",
-            "127.0.0.1:" + str(port),
             "--directory",
             str(directory),
             "--session",
             self.native_id,
-            "--ca",
-            str(home / "ca.pem"),
-            "--ca-key",
-            str(home / "ca.key"),
         ]
+        if self.api_base:
+            command += ["--api-base", self.api_base]
+        else:
+            home = Path(self.environment["HOME"]) / ".rec"
+            state = json.loads((home / "state.json").read_text())
+            port = state["daemon"]["port"]
+            if type(port) is not int or not 0 < port < 65536:
+                raise ContractError("native_proxy_port_invalid")
+            command += ["--upstream", "127.0.0.1:" + str(port),
+                        "--ca", str(home / "ca.pem"), "--ca-key", str(home / "ca.key")]
         with (directory / "stderr.private.log").open("ab") as log:
             self.dispatch_process = subprocess.Popen(
                 command,
@@ -1337,6 +1348,11 @@ class Session:
         self.suspended = True
         return True
 
+    def tool_results_need_restart(self, blocks, results):
+        return any(b.get("type") == "text" for b in blocks) or any(
+            c["type"] != "text" for result in results.values() for c in result["content"]
+        )
+
     def request(self, body):
         if not self.lock.acquire(blocking=False):
             raise RequestRejected("session_busy")
@@ -1437,8 +1453,7 @@ class Session:
                 # mid-turn system attachment. Resume at the actual tool-use
                 # assistant instead, preserving the caller's whole user message.
                 resume_tools = bool(results) and (
-                    changed or self.suspended or any(b.get("type") == "text" for b in blocks)
-                    or any(c['type'] != 'text' for r in results.values() for c in r['content'])
+                    changed or self.suspended or self.tool_results_need_restart(blocks, results)
                 )
                 if changed or resume_tools or self.suspended:
                     self.restart_for_request(body)
@@ -1483,7 +1498,7 @@ class Session:
                     if event is None or isinstance(event, Exception):
                         self.failed = True
                         self.close()
-                        if isinstance(event, NativeRateLimit):
+                        if isinstance(event, (NativeRateLimit, NativeProviderError)):
                             raise event
                         if isinstance(event, ContractError) and str(event) == 'native_api_error':
                             raise ContractError('native_upstream_error_no_replay')
@@ -1717,6 +1732,9 @@ def mcp(directory):
             }
         elif method == "tools/list":
             result = {"tools": tools}
+            ready = root / 'interactive-mcp-ready.json'
+            if (root / 'interactive-mcp-required').exists():
+                ready.write_text(json.dumps({'names': sorted(t['name'] for t in tools)}))
         elif method == "tools/call":
             params = request["params"]
             tool_id = params.get("_meta", {}).get("claudecode/toolUseId", "")
