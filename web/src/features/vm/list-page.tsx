@@ -30,6 +30,7 @@ import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
 import { usageQueryOptions } from '@/features/overview/queries'
+import { AiroamRelay } from '@/features/vm/airoam-relay'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
 import { FleetPulse } from '@/features/vm/fleet-pulse'
 import { VmListSkeleton } from '@/features/vm/list-skeleton'
@@ -191,6 +192,9 @@ export function VmListPage() {
         <CodexQualityCard />
       )}
       <NativeRelays
+        enabled={me.data?.role === 'admin' && selectedController() === 'main'}
+      />
+      <AiroamRelay
         enabled={me.data?.role === 'admin' && selectedController() === 'main'}
       />
       <QueryGate
