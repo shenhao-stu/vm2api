@@ -3,6 +3,7 @@
 The existing native_api credential helper stays on Sub2API's server. The public
 key granting access is restricted to this command, with forwarding/PTY disabled.
 """
+from datetime import datetime
 import importlib.util
 import json
 import os
@@ -32,6 +33,27 @@ def matches_shared_profile(account, profile):
                  sorted(row.get("keywords") or [])) for row in entries]
 
     return rules(creds.get("temp_unschedulable_rules") or []) == rules(profile["cooldowns"])
+
+
+def model_cooldowns(account, models):
+    """Read-only, credential-free projection; scheduling remains Sub2API's decision."""
+    extra = account.get("extra") or {}
+    limits = extra.get("model_rate_limits") if isinstance(extra, dict) else None
+    if not isinstance(limits, dict):
+        return []
+    result = []
+    for model in sorted(set(models)):
+        row = limits.get(model)
+        reset = row.get("rate_limit_reset_at") if isinstance(row, dict) else None
+        if not isinstance(reset, str) or len(reset) > 64:
+            continue
+        try:
+            if datetime.fromisoformat(reset.replace("Z", "+00:00")).utcoffset() is None:
+                continue
+        except ValueError:
+            continue
+        result.append({"model": model, "reset_at": reset})
+    return result
 
 
 def execute(config, action):
@@ -72,7 +94,8 @@ def execute(config, action):
     return {"ok": True, "shared_policy_matches": matches, "id": value["id"], "status": value["status"],
             "schedulable": value["schedulable"], "concurrency": value["concurrency"],
             "rate_limit_reset_at": value.get("rate_limit_reset_at"),
-            "temp_unschedulable_until": value.get("temp_unschedulable_until")}
+            "temp_unschedulable_until": value.get("temp_unschedulable_until"),
+            "model_cooldowns": model_cooldowns(value, config["models"])}
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 import { cn } from '@/lib/utils'
-import type { NativeRelay } from './native-relay-state'
+import { activeModelCooldowns, type NativeRelay } from './native-relay-state'
 import { QuotaWindowRow } from './quota-window-row'
 import { relayUsageModel } from './relay-usage-model'
 
@@ -38,7 +38,7 @@ export function RelayUsageCard({
             官方 · 全员
           </span>
           {windowsStale ? (
-            <span title='以下为上次官方读数，过重置时间不代表已确认恢复'>
+            <span title='官方读数过期，历史值保留在详情；过重置时间不代表已确认恢复'>
               待更新
             </span>
           ) : relay.runtime.official_windows ? (
@@ -62,6 +62,12 @@ export function RelayUsageCard({
         </h4>
         {windows.map((w) => (
           <QuotaWindowRow key={w.label} w={w} now={now} hasToken quiet />
+        ))}
+        {activeModelCooldowns(relay, now).map((row) => (
+          <p key={row.model} className='text-xs text-amber-600'>
+            {row.model} · 额度冷却至 {exactTime(Date.parse(row.reset_at))}
+            （北京）
+          </p>
         ))}
         <div
           className='flex h-5 items-center justify-between gap-2 text-xs'
@@ -126,7 +132,9 @@ export function RelayUsageDetail({ relay }: { relay: NativeRelay }) {
       {!windows && <p>官方未提供 5H / 7D 百分比，显示为 —。</p>}
       {windows && (
         <p>
-          官方更新 {exactTime(windows.source_updated_ms)}；读取{' '}
+          上次读数：5H {windows.five_hour.used_percent}% / 7D{' '}
+          {windows.seven_day.used_percent}%。 官方更新{' '}
+          {exactTime(windows.source_updated_ms)}；读取{' '}
           {exactTime(windows.observed_at_ms)}（北京）
         </p>
       )}

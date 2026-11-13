@@ -36,6 +36,64 @@ const relay: NativeRelay = {
 }
 
 describe('native Relay VM management', () => {
+  it('shows model cooldown without freezing the whole account or fabricating usage', () => {
+    const now = Date.now()
+    const item = {
+      ...relay,
+      models: ['claude-opus-5-5', 'claude-fable-5-2'],
+      sub: {
+        ...relay.sub,
+        model_cooldowns: [
+          {
+            model: 'claude-fable-5-2',
+            reset_at: new Date(now + 60000).toISOString(),
+          },
+          {
+            model: 'claude-opus-5-5',
+            reset_at: new Date(now - 1).toISOString(),
+          },
+        ],
+      },
+    }
+    expect(scheduleLabel(item, now)).toBe('部分模型冷却')
+    expect(relayState(item, now)).toBe('部分模型冷却')
+    expect(canResumeSchedule(item)).toBe(true)
+    expect(scheduleLabel(item, now + 60000)).toBe('已开启')
+    const html = render(true, item)
+    expect(html).toContain('claude-fable-5-2')
+    expect(html).toContain('额度冷却至')
+    const doc = new Window().document
+    doc.body.innerHTML = html
+    expect(doc.body.textContent).not.toContain('100%')
+  })
+  it('hides stale official percentage bars while retaining the last reading in details', () => {
+    const now = Date.now()
+    const item = {
+      ...relay,
+      runtime: {
+        ...relay.runtime,
+        official_windows: {
+          five_hour: { used_percent: 15, resets_at_ms: now - 1000 },
+          seven_day: { used_percent: 46, resets_at_ms: now + 86400000 },
+          observed_at_ms: now - 900001,
+          source_updated_ms: now - 900001,
+          stale: true,
+        },
+      },
+    }
+    const doc = new Window().document
+    doc.body.innerHTML = render(true, item)
+    expect(doc.querySelectorAll('[role=meter]')).toHaveLength(0)
+    expect(
+      doc.querySelector('[aria-label="ReClaude 官方套餐窗口"]')?.textContent
+    ).not.toContain('15%')
+    expect(doc.body.textContent).toContain('上次读数：5H 15%')
+    expect(relayUsageModel(item, now).windows.map((w) => w.pct)).toEqual([
+      null,
+      null,
+    ])
+  })
+
   it('keeps scheduling separate from lifecycle and native cooldown', () => {
     expect(canResumeSchedule(relay)).toBe(true)
     expect(canResumeSchedule({ ...relay, authorization_latched: true })).toBe(
@@ -154,6 +212,7 @@ describe('native Relay VM management', () => {
     expect(render(true)).toContain('官方未提供 5H / 7D 百分比')
   })
   it('keeps personal percentage windows separate from the other account', () => {
+    const now = Date.now()
     const personal = {
       ...relay,
       id: 'second',
@@ -163,10 +222,10 @@ describe('native Relay VM management', () => {
       runtime: {
         ...relay.runtime,
         official_windows: {
-          five_hour: { used_percent: 17, resets_at_ms: 2000 },
-          seven_day: { used_percent: 98, resets_at_ms: 3000 },
-          observed_at_ms: 1000,
-          source_updated_ms: 800,
+          five_hour: { used_percent: 17, resets_at_ms: now + 2000 },
+          seven_day: { used_percent: 98, resets_at_ms: now + 3000 },
+          observed_at_ms: now,
+          source_updated_ms: now,
           stale: false,
         },
       },
@@ -232,7 +291,11 @@ describe('native Relay VM management', () => {
     const after = relayUsageModel(item, 1800000000002)
     expect(before.stale).toBe(false)
     expect(after.stale).toBe(true)
-    expect(after.windows.map((w) => w.pct)).toEqual([0, 105])
+    expect(after.windows.map((w) => w.pct)).toEqual([null, null])
+    expect(after.windows.map((w) => w.note)).toEqual([
+      '已过重置 · 待更新',
+      '已过重置 · 待更新',
+    ])
     expect(
       relayUsageModel(relay, 1800000000002).windows.map((w) => w.pct)
     ).toEqual([null, null])

@@ -3,7 +3,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from management_sub import execute
+from management_sub import execute, model_cooldowns
 
 
 class ScheduleBrokerTests(unittest.TestCase):
@@ -15,6 +15,7 @@ class ScheduleBrokerTests(unittest.TestCase):
                         'concurrency': 10, 'group_ids': [3],
                         'rate_limit_reset_at': '2099-01-01T00:00:00Z',
                         'temp_unschedulable_until': '2098-01-01T00:00:00Z',
+                        'extra': {'model_rate_limits': {'claude-fable-5-1': {'rate_limit_reset_at': '2099-01-01T00:00:00Z'}}},
                         'credentials': {'base_url': 'http://relay.internal',
                                         'model_mapping': {'claude-fable-5-1': 'claude-fable-5-1'},
                                         'api_key': 'fixture'}}
@@ -43,5 +44,17 @@ def api(service, method, path, data=None, receipt=None):
                 self.assertEqual(result['schedulable'], action == 'resume')
                 self.assertEqual(json.loads(state.read_text()),
                                  {**original, 'schedulable': action == 'resume'})
+                self.assertEqual(result['model_cooldowns'], [{'model': 'claude-fable-5-1', 'reset_at': '2099-01-01T00:00:00Z'}])
                 self.assertEqual(result['rate_limit_reset_at'], original['rate_limit_reset_at'])
                 self.assertEqual(result['temp_unschedulable_until'], original['temp_unschedulable_until'])
+
+    def test_only_bound_models_and_aware_reset_times_are_exposed(self):
+        account = {'extra': {'model_rate_limits': {
+            'claude-fable-5-2': {'rate_limit_reset_at': '2099-01-01T00:00:00Z', 'secret': 'never return'},
+            'claude-opus-5-5': {'rate_limit_reset_at': '2099-01-01T00:00:00'},
+            'other': {'rate_limit_reset_at': '2099-01-01T00:00:00Z'},
+        }}}
+        self.assertEqual(model_cooldowns(account, ['claude-fable-5-2', 'claude-opus-5-5']),
+                         [{'model': 'claude-fable-5-2', 'reset_at': '2099-01-01T00:00:00Z'}])
+        self.assertEqual(model_cooldowns({'extra': {'model_rate_limits': []}}, ['x']), [])
+        self.assertEqual(model_cooldowns({'extra': None}, ['x']), [])
