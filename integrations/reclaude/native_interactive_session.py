@@ -611,12 +611,14 @@ class InteractiveSession(native.Session):
         ):
             try:
                 os.write(self.master, b"\x04")
-                self.process.wait(timeout=5)
+                self.process.wait(timeout=0.3)
             except (OSError, subprocess.TimeoutExpired):
                 pass
         self.read_stop.set()
         try:
-            super()._close(graceful)
+            # The PTY has no stdin pipe. A second graceful wait adds ten seconds
+            # on eviction when the CLI has already ignored its normal exit.
+            super()._close(False)
         finally:
             if self.recovery_gate is not None:
                 self.recovery_gate.close()

@@ -167,8 +167,12 @@ def main():
     p.add_argument("--private-host")
     p.add_argument("--model", action="append", required=True)
     p.add_argument("--concurrency", type=int, default=2)
+    p.add_argument("--resident-capacity", type=int)
+    p.add_argument("--memory-high-bytes", type=int, default=0)
     p.add_argument("--max-requests", type=int)
     args = p.parse_args()
+    if args.resident_capacity is not None and not args.concurrency <= args.resident_capacity <= 10:
+        p.error("--resident-capacity must be between --concurrency and 10")
     credentials = provider(args.provider_file)
     # Only the dispatch guard inherits this server environment. The CLI receives
     # its own clean environment and connects exclusively to its loopback guard.
@@ -228,6 +232,8 @@ def main():
         allow_history_import=True,
         configuration_channels=True,
         require_principal=True,
+        resident_capacity=args.resident_capacity,
+        memory_high_bytes=args.memory_high_bytes,
     )
     server.client_key = (
         load_relay_key(args.client_key_file) if args.client_key_file else None
