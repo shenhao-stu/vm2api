@@ -48,6 +48,7 @@ export type NativeRelay = {
   }
   sub: {
     schedulable: boolean | null
+    model_cooldowns?: { model: string; reset_at: string }[]
     shared_policy_matches?: boolean
     rate_limit_reset_at?: string | null
     temp_unschedulable_until?: string | null
@@ -72,6 +73,12 @@ export function canResumeSchedule(relay: NativeRelay) {
   )
 }
 
+export function activeModelCooldowns(relay: NativeRelay, now: number) {
+  return (relay.sub.model_cooldowns ?? []).filter(
+    (row) => relay.models.includes(row.model) && Date.parse(row.reset_at) > now
+  )
+}
+
 export function scheduleLabel(relay: NativeRelay, now = Date.now()) {
   if (relay.sub.schedulable == null) return '状态未知'
   if (!relay.sub.schedulable) return '已暂停'
@@ -79,9 +86,14 @@ export function scheduleLabel(relay: NativeRelay, now = Date.now()) {
     relay.sub.rate_limit_reset_at,
     relay.sub.temp_unschedulable_until,
   ]
-  return limits.some((value) => value && Date.parse(value) > now)
-    ? '冷却中'
-    : '已开启'
+  if (limits.some((value) => value && Date.parse(value) > now)) return '冷却中'
+  const models = activeModelCooldowns(relay, now)
+  if (models.length)
+    return new Set(models.map((row) => row.model)).size ===
+      new Set(relay.models).size
+      ? '模型额度冷却'
+      : '部分模型冷却'
+  return '已开启'
 }
 
 export function relayState(relay: NativeRelay, now = Date.now()) {
@@ -103,7 +115,10 @@ export function relayState(relay: NativeRelay, now = Date.now()) {
     !relay.sub.schedulable
   )
     return '已暂停'
-  if (scheduleLabel(relay, now) === '冷却中') return '额度冷却'
+  const scheduled = scheduleLabel(relay, now)
+  if (scheduled === '冷却中') return '额度冷却'
+  if (scheduled === '部分模型冷却' || scheduled === '模型额度冷却')
+    return scheduled
   if (!relay.runtime.http_ready) return 'Relay 待检查'
   const windows = relay.runtime.official_windows
   if (windows && !windows.stale) {

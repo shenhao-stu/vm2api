@@ -7,6 +7,12 @@ const validAmount = (value: unknown): value is number =>
 export function relayUsageModel(relay: NativeRelay, now: number) {
   const source = relay.runtime.official_windows
   const q = relay.official_quota
+  const sourceStale = Boolean(
+    source &&
+    (source.stale ||
+      now - source.observed_at_ms > 900_000 ||
+      now - source.source_updated_ms > 7_200_000)
+  )
   const windows = (
     [
       ['5H', 'five_hour'],
@@ -14,23 +20,25 @@ export function relayUsageModel(relay: NativeRelay, now: number) {
     ] as const
   ).map(([label, key]) => {
     const row = source?.[key]
+    const expired = row?.resets_at_ms != null && row.resets_at_ms <= now
+    const stale = sourceStale || expired
     return {
       label,
-      pct: validAmount(row?.used_percent) ? row.used_percent : null,
-      reset: row?.resets_at_ms ?? null,
+      pct: !stale && validAmount(row?.used_percent) ? row.used_percent : null,
+      reset: expired ? null : (row?.resets_at_ms ?? null),
+      note:
+        row && stale
+          ? expired
+            ? '已过重置 · 待更新'
+            : '读数过期 · 待更新'
+          : null,
     }
   })
   const quota =
     q && validAmount(q.used_usd) && validAmount(q.quota_usd) && q.quota_usd > 0
       ? q
       : null
-  const windowsStale = Boolean(
-    source &&
-    (source.stale ||
-      now - source.observed_at_ms > 900_000 ||
-      now - source.source_updated_ms > 7_200_000 ||
-      windows.some((w) => w.reset != null && w.reset <= now))
-  )
+  const windowsStale = windows.some((w) => w.note != null)
   const quotaStale = Boolean(
     quota &&
     (quota.stale ||
