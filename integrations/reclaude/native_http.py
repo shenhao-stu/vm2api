@@ -46,6 +46,7 @@ class NativeServer(RelayServer):
         allow_history_import=False,
         configuration_channels=False,
         require_principal=False,
+        resident_capacity=None,
     ):
         if type(memory_high_bytes) is not int or memory_high_bytes < 0:
             raise ValueError("invalid_memory_high_bytes")
@@ -68,7 +69,7 @@ class NativeServer(RelayServer):
         self.pool = SessionPool(
             root / "sessions",
             factory,
-            limits.concurrency,
+            limits.concurrency if resident_capacity is None else resident_capacity,
             idle_seconds,
             recover=recover,
             prepared_idle_seconds=prepared_idle_seconds,
@@ -222,6 +223,8 @@ class NativeHandler(RelayHandler):
             "ok": not failed and not paused, "failed": failed,
             "management_paused": paused, "active_requests": active,
             "pool": self.server.pool.snapshot(),
+            "execution_slots": self.server.limits.concurrency,
+            "models": list(self.server.limits.models),
             "memory_high_bytes": self.server.memory_high_bytes,
             "history_import_enabled": self.server.pool.allow_history_import,
         })
