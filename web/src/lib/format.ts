@@ -4,9 +4,7 @@ export function pct(value: unknown): number {
   if (!Number.isFinite(n)) return 0
   if (n < 0) return 0
   if (n > 100) return 100
-  // Extra / Codex utilization is 0–1. Leftover official Settings numbers are 0–100.
-  // `1` is 100% used on the 0–1 contract (and 1% on raw Settings). Panel GPT
-  // windows should use usedPctOf() so `used_percent=1` stays 1%.
+  // Legacy callers may supply either a ratio or a percentage.
   return n > 1 ? n : n * 100
 }
 
@@ -28,7 +26,11 @@ export function usedPctOf(
     const n = Number(hit.used_percent)
     if (Number.isFinite(n)) return Math.max(0, Math.min(100, n))
   }
-  return pct(window === '5h' ? source?.utilization_5h : source?.utilization_7d)
+  // VM utilization fields are ratios, including values above 1 after rejection.
+  const ratio = Number(
+    window === '5h' ? source?.utilization_5h : source?.utilization_7d
+  )
+  return Number.isFinite(ratio) ? Math.max(0, Math.min(1, ratio)) * 100 : 0
 }
 
 export function fmtNum(n: unknown): string {

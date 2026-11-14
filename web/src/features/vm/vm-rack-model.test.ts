@@ -189,6 +189,26 @@ describe('vmWindows', () => {
       null,
     ])
   })
+
+  it('shows full usage for an upstream-limited slot with a ratio over one', () => {
+    const limited = vm({
+      schedule_state: 'restricted',
+      availability: {
+        key: 'quota',
+        usable: true,
+        text: '限流中',
+        reason: 'rate_limited',
+      },
+      utilization_5h: 1.13,
+      utilization_7d: 0.37,
+    })
+    expect(zoneCounts([limited]).restricted).toBe(1)
+    expect(
+      vmWindows(limited)
+        .slice(0, 2)
+        .map((w) => w.pct)
+    ).toEqual([100, 37])
+  })
 })
 
 describe('bladeState', () => {
