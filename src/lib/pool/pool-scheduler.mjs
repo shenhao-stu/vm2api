@@ -451,6 +451,12 @@ export class PoolScheduler extends EventEmitter {
         keyScope,
         quotaRequest,
       })
+      if (!candidates.length) {
+        const unavailable = emptyPoolFailure(candidates)
+        if (unavailable.reason === 'quota_guard_request_too_large') {
+          return { ...fail(unavailable.reason, candidates), ...unavailable, familyGated: false }
+        }
+      }
       // A gated family home (quota, credential, excluded) is a migration
       // signal for the caller. Busy is not: it still yields a candidate.
       const familyVm = familyVmId ? String(familyVmId).trim() : ''
@@ -613,6 +619,13 @@ export class PoolScheduler extends EventEmitter {
         candidates = await this.eligibleCandidates({ model, excluded, signal, ownerScope, keyScope, quotaRequest })
         // A grant can land while eligibility was being re-read.
         if (ticket?.granted) return finish(ticket.granted)
+        // A request-size veto does not invalidate the session's existing home.
+        if (!candidates.length) {
+          const unavailable = emptyPoolFailure(candidates)
+          if (unavailable.reason === 'quota_guard_request_too_large') {
+            return { ...fail(unavailable.reason), ...unavailable, familyGated: false }
+          }
+        }
         if (familyVm && !candidates.some((candidate) => candidate.vmId === familyVm)) familyGated = true
         const sticky = this.reconcileSticky({
           stickyKey,
