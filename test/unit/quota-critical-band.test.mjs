@@ -492,3 +492,44 @@ test('admission and the panel agree near the gate (vm-10: pro, 7d 90% of a 95% l
   assert.equal(gated.accept, false)
   assert.equal(q.canAccept('vm10', { requestRisk: smallRisk }).ok, false)
 })
+
+test('a zero-dispatch large-cold rejection retains the session pin for its next turn', async (t) => {
+  const root = schedulerProject()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const accountQuota = quota()
+  setUtil(accountQuota, 'account-1', { u5: 0.79 })
+  setUtil(accountQuota, 'account-2', { u5: 0.77 })
+  const pins = new Map([
+    ['session', { vmId: 'vm-01', accountId: 'account-1' }],
+    ['family', { vmId: 'vm-01', accountId: 'account-1' }],
+  ])
+  const stickyRouter = { resolve: (key) => pins.get(key), unbind: (key) => pins.delete(key) }
+  const scheduler = new PoolScheduler({
+    projectRoot: root,
+    runtimeRepo: new RuntimeRepo(),
+    accountQuota,
+    stickyRouter,
+    workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
+    config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
+  })
+  const model = 'claude-opus-5-5'
+  const canonicalBody = { model, messages: [{ role: 'user', content: 'long '.repeat(80000) }] }
+  const runner = new FailoverRunner({ scheduler, stickyRouter, config: { total_retry_deadline_ms: 500 } })
+  const result = await runner.runOnce({
+    requestId: 'quota-sticky-fixture',
+    model,
+    canonicalBody,
+    seatKey: 'device',
+    stickyKey: 'session',
+    familyKey: 'family',
+    familyVmId: 'vm-01',
+    quotaRequest: { body: canonicalBody, sessionId: 'upstream-session' },
+    callAttempt: async () => {
+      assert.fail('quota rejection must not dispatch')
+    },
+  })
+  assert.equal(result.status, 429)
+  assert.equal(result.body.error.code, 'quota_guard_request_too_large')
+  assert.equal(pins.get('session')?.accountId, 'account-1')
+  assert.equal(pins.get('family')?.accountId, 'account-1')
+})
