@@ -12,7 +12,7 @@ import { runSlotOauth } from '../transport/slot-oauth.mjs'
 import { credentialModeOfVm, isApiKeyMode } from './credential-mode.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { atomicWriteJson, withVmLock } from '../vm/vm-file.mjs'
-import { planClaudeFableReset } from './claude-reset-policy.mjs'
+import { isFableOnlyResetCredit, planClaudeFableReset } from './claude-reset-policy.mjs'
 
 export const CLAUDE_RESET_USAGE_PATH = '/api/oauth/usage?cedar_ember=1&skip_spend=1'
 export const CLAUDE_RESET_REDEEM_PATH = '/api/organizations/%s/reset_rate_limits'
@@ -639,6 +639,9 @@ async function redeemOnce({ projectRoot, vmId, operation, exec, identity, autoRe
         : fail('CLAUDE_RESET_NOT_AVAILABLE', '当前没有可兑换的限额重置', 409)
     }
     if (autoReset != null) {
+      if (!isFableOnlyResetCredit(grant)) {
+        return fail('CLAUDE_RESET_AUTO_NOT_NEEDED', '官方下一张重置券不符合 Fable 专用条件', 409)
+      }
       const currentAccount = checkCurrentAccount(projectRoot, vmId, identity)
       if (!currentAccount.ok) return currentAccount
       const currentVm = currentAccount.vm

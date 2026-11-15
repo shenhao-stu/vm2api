@@ -89,6 +89,8 @@ test('at limit never overrides official eligibility, cooldown or next-grant sele
 test('unknown-purpose, expired, not-started and exhausted cards are never redeemed', () => {
   for (const credit of [
     { clears: ['five_hour', 'seven_day'] },
+    { clears: ['five_hour', 'seven_day', 'seven_day_overage_included'] },
+    { clears: ['five_hour', 'future_window', 'seven_day_overage_included'] },
     { expires_at: iso(NOW) },
     { expires_at: null },
     { expires_at: 'bad' },
@@ -113,9 +115,9 @@ test('expiring card needs a real benefit; zero usage does not waste it', () => {
   }
 })
 
-test('a Fable card nearing expiry can refill another explicitly cleared, used window', () => {
+test('a Fable card nearing expiry is kept if only another window was used', () => {
   const credit = { expires_at: iso(NOW + 1), percent_used: { five_hour: 50 } }
-  assert.equal(planClaudeFableReset(fixture({ credit })).reason, 'used_credit_expiring')
+  assert.equal(planClaudeFableReset(fixture({ credit })).action, 'skip')
   credit.percent_used = { unrecognized_window: 50 }
   assert.equal(planClaudeFableReset(fixture({ credit })).action, 'skip')
 })

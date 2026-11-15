@@ -39,6 +39,13 @@ function usedPercent(credit, key) {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100 ? value : 0
 }
 
+export function isFableOnlyResetCredit(credit) {
+  const clears = credit?.clears
+  // Fable vouchers can also reset 5H. A general voucher clears the base 7D window.
+  return Array.isArray(clears) && clears.includes(FABLE_WINDOW) &&
+    clears.every((window) => window === FABLE_WINDOW || window === 'five_hour')
+}
+
 function validFableCredit(credit, now) {
   const expires = timestamp(credit?.expires_at)
   const starts = timestamp(credit?.starts_at)
@@ -46,7 +53,7 @@ function validFableCredit(credit, now) {
     credit?.redeemable === true &&
     Number.isInteger(credit.resets_left) &&
     credit.resets_left > 0 &&
-    windowsOf(credit).includes(FABLE_WINDOW) &&
+    isFableOnlyResetCredit(credit) &&
     expires != null &&
     expires > now &&
     (credit.starts_at == null || (starts != null && starts <= now)) &&
@@ -131,9 +138,8 @@ export function planClaudeFableReset({
     now - windowAt <= maxSnapshotAgeMs &&
     (fableWindow.resets_at == null || (windowReset != null && windowReset > now))
   const exhausted = fableUsed >= 100 || (freshWindow && fableWindow.exhausted === true)
-  const used = windowsOf(credit).some((key) => usedPercent(credit, key) > 0)
   const expiring = timestamp(credit.expires_at) - now <= expiryLeadMs
-  if (!exhausted && !(expiring && used)) return decision('skip', 'no_reset_needed')
+  if (!exhausted && !(expiring && fableUsed > 0)) return decision('skip', 'no_reset_needed')
   return {
     action: 'redeem',
     reason: exhausted ? 'fable_limit_reached' : 'used_credit_expiring',

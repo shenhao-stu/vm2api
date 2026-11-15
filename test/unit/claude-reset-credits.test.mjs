@@ -589,6 +589,25 @@ test('a changed official next grant cannot redeem using the earlier query proof'
   assert.equal(posts.length, 0)
 })
 
+test('automatic reset rejects a new grant window hidden by the public projection', async (t) => {
+  const root = rootDir()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeVm(root)
+  const status = autoStatus()
+  const request = autoRequest(status)
+  status.cedar_ember.grants[0].clears.push('unrecognized_window')
+  const { transport, posts } = scripted({ status })
+  const out = await redeemClaudeResetCredit({
+    projectRoot: root,
+    vmId: 'vm-1',
+    ...request,
+    transport,
+    now: () => NOW,
+  })
+  assert.equal(out.error, 'CLAUDE_RESET_AUTO_NOT_NEEDED')
+  assert.equal(posts.length, 0)
+})
+
 test('query fingerprints distinguish identical public cards without exposing internal grant ids', () => {
   const status = autoStatus().cedar_ember
   const first = projectClaudeResetCredits(status, NOW)
