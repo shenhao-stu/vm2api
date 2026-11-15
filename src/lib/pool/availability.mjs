@@ -30,7 +30,7 @@ export const REVOKE_TEXT = 'revoke'
 /** Dead grant only. Do not match stale-access 401 (`authentication_failed_after_refresh`) or `/usage` 429. */
 export const TRANSIENT_CREDENTIAL_REFRESH_FAIL = /worker_output_invalid|refresh_rejected|refresh_denied/i
 export const CREDENTIAL_REFRESH_FAIL =
-  /oauth_invalid_grant|invalid_grant|refresh_token_missing|refresh_token_invalid|refresh token not found|oauth_revoked|oauth_no_refresh|oauth_cleared|credential_refresh_failed|worker_output_invalid|refresh_rejected|refresh_denied/i
+  /oauth_invalid_grant|invalid_grant|refresh_token_missing|refresh_token_invalid|refresh token not found|oauth_revoked|oauth_no_refresh|oauth_cleared|credential_refresh_failed|\brefresh_failed\b|worker_output_invalid|refresh_rejected|refresh_denied/i
 
 function liveAccessTtlMs(vm = {}, workerCredential = {}, expiresAt = null) {
   return (
@@ -65,7 +65,9 @@ export function isCredentialRefreshFailed({
   now = Date.now(),
 } = {}) {
   if (isOfficialUsageRateLimited(probe)) return false
-  const recordedError = currentRefreshError(vm, refreshError)
+  const rawRefreshError = currentRefreshError(vm, refreshError)
+  const retryableRefresh = rawRefreshError === 'refresh_failed' && vm?.claude?.refresh_class === 'retryable'
+  const recordedError = retryableRefresh ? null : rawRefreshError
   const transientRecorded = TRANSIENT_CREDENTIAL_REFRESH_FAIL.test(String(recordedError || ''))
   const accessOutlives = currentAccessOutlivesGrantError(
     vm,
@@ -92,7 +94,7 @@ export function isCredentialRefreshFailed({
   const bits = [scheduleDisabledReason, vm.schedule_disabled_reason]
   if (!(accessLive && (transientRecorded || accessOutlives))) bits.push(recordedError)
   // Leftover worker last_error must not keep a freshly rotated ticket out of the pool.
-  if (!accessLive) bits.push(workerLastError)
+  if (!accessLive && !(retryableRefresh && workerLastError === rawRefreshError)) bits.push(workerLastError)
   if (!staleProbe && !(accessLive && isUsageRefreshSuccess(probe))) {
     bits.push(probe?.error, probe?.message)
   }

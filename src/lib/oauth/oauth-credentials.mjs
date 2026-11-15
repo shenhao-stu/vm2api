@@ -661,6 +661,9 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false, operat
     return vm
   }
   vm.claude.refresh_error = null
+  delete vm.claude.refresh_class
+  delete vm.claude.refresh_http_status
+  delete vm.claude.refresh_failed_at
   vm.claude.refreshed_at = new Date().toISOString()
   vm.claude._token_version = n._token_version || Date.now()
   clearClaudeAuthCooldown(vm.claude)
@@ -833,11 +836,18 @@ export function markVmRefreshError(vmPath, result) {
   const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   vm.claude = stripCredentialSecrets({ ...(vm.claude || {}) })
   vm.claude.refresh_error = refreshErrorCodeOf(result)
-  if (classifyCredentialRefresh(result) === 'fatal') {
+  const classification = classifyCredentialRefresh(result)
+  vm.claude.refresh_class = classification
+  vm.claude.refresh_http_status = Number(result?.status) || null
+  vm.claude.refresh_failed_at = new Date().toISOString()
+  if (classification === 'fatal') {
     vm.schedulable = false
     const code = vm.claude.refresh_error
     vm.schedule_disabled_reason = code === 'oauth_revoked' ? 'oauth_revoked' : 'oauth_invalid_grant'
     if (String(vm.status || '').toLowerCase() === 'running') vm.status = 'paused'
+  } else if (classification === 'failed' && isFullyExpired(vm.claude.expires_at) && vm.schedulable !== false) {
+    vm.schedulable = false
+    vm.schedule_disabled_reason = 'credential_refresh_failed'
   }
 
   vm.updated_at = new Date().toISOString()
