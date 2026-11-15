@@ -14,7 +14,7 @@ from native_paid_sibling import CompletedBoundary, PaidSibling
 from native_channel_policy import Channel, Identity, Snapshot, request_identity
 from native_quota_rejection import rejected_request
 from native_tool_handoff import ToolHandoff
-from native_terminal_error import failed_request
+from native_terminal_error import failed_request, provider_admission_denial
 
 
 def sync_directory(path):
@@ -176,9 +176,12 @@ class ChannelStore:
             # recover() still verifies the exact result set on its own path.
             claims = directory / 'caller-grants'
             claim_values = {path.stem: read_json(path) for path in claims.glob('*.json')}
+            admission_denial = provider_admission_denial(directory, state, claim_values) if status == 'failed' else None
             rejected = rejected_request(directory, state, claim_values, time.time(), requested_model=requested_model) if status == 'failed' else None
             terminal_error = failed_request(directory, state, claim_values) if status == 'failed' else None
-            if rejected:
+            if admission_denial:
+                status = 'provider_admission_denied'
+            elif rejected:
                 status = 'quota_rejected'
             elif terminal_error:
                 status = 'terminal_error'
@@ -215,7 +218,7 @@ class ChannelStore:
                         and valid_usage(claim.get('terminal_usage'))):
                     status = 'policy_refused'
                     continue
-                if request in {rejected, terminal_error}:
+                if request in {rejected, terminal_error, admission_denial}:
                     continue
                 if claim.get('state') != 'complete' or receipt.get('id') != grant_id:
                     unknown = True
@@ -244,7 +247,8 @@ class ChannelStore:
                     complete = False
             if status == 'prepared' and (records or known_grants):
                 complete = False
-            if (status not in {'quota_rejected', 'terminal_error', 'policy_refused'} and session is not None and session.history
+            if (status not in {'quota_rejected', 'terminal_error', 'policy_refused', 'provider_admission_denied'}
+                    and session is not None and session.history
                     and (length != len(session.history)
                          or history_sha != native.signature(native.history_shape(session.history)))):
                 complete = False

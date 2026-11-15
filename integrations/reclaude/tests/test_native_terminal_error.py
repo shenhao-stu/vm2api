@@ -1,5 +1,6 @@
 """A terminal native server error is paid failure, never an invitation to replay."""
 import copy
+import hashlib
 import io
 import json
 import unittest
@@ -89,6 +90,43 @@ class TerminalErrorTests(unittest.TestCase):
         for attempts in (0, 4, True):
             write_json(final, {'upstream_attempts': attempts, 'denied': 0})
             self.assertIsNone(failed_request(active.directory, state, claims))
+
+    def test_provider_admission_denial_survives_restart_without_branch_or_replay(self):
+        active, log = self.failed()
+        log.unlink()  # Interactive CLI records the provider response, without print-mode stdout.
+        dispatch = active.directory / 'dispatch'
+        grant = read_json(dispatch / 'grant.json')
+        prefix = dispatch / grant['id']
+        sent_body = b'{"model":"opus"}'
+        prefix.with_suffix('.api-request.private.json').write_bytes(sent_body)
+        write_json(prefix.with_suffix('.consumed.json'), {
+            **grant, 'body_sha256': hashlib.sha256(sent_body).hexdigest()})
+        body = json.dumps({
+            'type': 'error',
+            'error': {'type': 'upstream_error',
+                      'message': 'This group only accepts sessions first seen here.'},
+        }).encode()
+        prefix.with_suffix('.api-stream.private').write_bytes(body)
+        write_json(prefix.with_suffix('.provider-status.json'), {
+            'grant_id': grant['id'], 'status': 429})
+        terminal = {'grant_id': grant['id'], 'status': 429, 'complete': True, 'bytes': len(body)}
+        write_json(prefix.with_suffix('.api-terminal.json'), terminal)
+        self.pool.close()
+        self.pool = self.new_pool()
+        fresh = {**self.body, 'messages': [user('newly authored request')]}
+        for request in (self.body, fresh):
+            with self.assertRaisesRegex(ContractError, '^native_provider_session_admission_denied_no_replay$'):
+                with self.pool.lease('tenant-a', request):
+                    pass
+        with self.pool.lease('tenant-b', fresh) as other:
+            self.assertNotEqual(other.native_id, active.native_id)
+        # Missing, truncated or unrelated 429 evidence retains the unknown-state guard.
+        for fields in ({'complete': False}, {'bytes': len(body) + 1}, {'grant_id': 'other'}):
+            write_json(prefix.with_suffix('.api-terminal.json'), {**terminal, **fields})
+            with self.assertRaisesRegex(ContractError, '^native_session_evidence_unknown$'):
+                with self.pool.lease('tenant-a', fresh):
+                    pass
+        self.assertEqual(len(list(dispatch.glob('*.consumed.json'))), 1)
 
     def test_reader_keeps_terminal_usage_and_never_emits_success_stop(self):
         with self.pool.lease('tenant-a', self.body) as active:

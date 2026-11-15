@@ -23,13 +23,33 @@ class RecoveryError(ValueError):
 
 
 def bounded_bytes(path, limit):
-    with Path(path).open("rb") as stream:
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
         if os.fstat(stream.fileno()).st_size > limit:
             raise RecoveryError("recovery_evidence_limit")
         data = stream.read(limit + 1)
     if len(data) > limit:
         raise RecoveryError("recovery_evidence_limit")
     return data
+
+
+def pending_tools_seen(directory, pending):
+    """An MCP endpoint can block on its first tool while the rest queue."""
+    seen = False
+    for tool in pending:
+        tool_id = tool["id"]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", tool_id):
+            raise RecoveryError("recovery_tool_id_invalid")
+        try:
+            witness = json.loads(bounded_bytes(directory / (tool_id + ".pending.json"), 2 * 1024 * 1024))
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+        if (witness.get("_meta", {}).get("claudecode/toolUseId") != tool_id
+                or witness.get("name") != tool["name"]
+                or witness.get("arguments") != tool["input"]
+                or (directory / (tool_id + ".result.json")).exists()):
+            raise RecoveryError("recovery_tool_arguments_changed")
+        seen = True
+    return seen
 
 
 def caller_tool_event(event, tools):
@@ -175,7 +195,8 @@ def load_steps(directory, plan, session_id):
         )
         total_bytes += len(request_bytes)
         consumed = json.loads(bounded_bytes(root / (grant + ".consumed.json"), 65536))
-        if consumed.get("body_sha256") != hashlib.sha256(request_bytes).hexdigest():
+        if (consumed.get("id") != grant or consumed.get("session_id") != session_id
+                or consumed.get("body_sha256") != hashlib.sha256(request_bytes).hexdigest()):
             raise RecoveryError("recovery_request_digest_mismatch")
         request = json.loads(request_bytes)
         expected = semantic_request(request, session_id)
@@ -196,6 +217,7 @@ def load_steps(directory, plan, session_id):
             or kinds[-1] != "message_stop"
             or kinds.count("message_stop") != 1
             or turn.message.get("stop_reason") != "tool_use"
+            or turn.message.get("id") != item["message_id"]
             or native.signature(turn.message["content"]) != item["assistant_sha256"]
         ):
             raise RecoveryError("recovery_tool_terminal_mismatch")

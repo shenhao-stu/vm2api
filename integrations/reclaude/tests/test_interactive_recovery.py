@@ -178,6 +178,8 @@ class DurableRecoveryEvidenceTests(unittest.TestCase):
         self.path("consumed.json").write_text(
             json.dumps(
                 {
+                    "id": self.grant,
+                    "session_id": self.sid,
                     "body_sha256": hashlib.sha256(
                         self.path("api-request.private.json").read_bytes()
                     ).hexdigest()
@@ -236,7 +238,8 @@ class DurableRecoveryEvidenceTests(unittest.TestCase):
             "base_history": [],
             "tools": [{"name": "echo"}],
             "steps": [
-                {"grant_id": self.grant, "assistant_sha256": signature(self.assistant),
+                {"grant_id": self.grant, "message_id": "msg_fixture",
+                 "assistant_sha256": signature(self.assistant),
                  "input": [{"type": "text", "text": "synthetic"}]}
             ],
         }

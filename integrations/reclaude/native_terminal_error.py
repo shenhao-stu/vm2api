@@ -1,5 +1,65 @@
 """Read-only proof that one consumed request ended in a native server error."""
 import json
+import hashlib
+import re
+
+
+def provider_admission_denial(directory, state, claims):
+    """Verify the interactive provider's explicit, terminal session refusal."""
+    dispatch = directory / 'dispatch'
+
+    def read(path, limit=16384):
+        if path.is_symlink():
+            raise ValueError('invalid provider evidence')
+        with path.open('rb') as stream:
+            data = stream.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError('provider evidence too large')
+        return data
+
+    try:
+        if directory.is_symlink() or dispatch.is_symlink() or state.get('status') != 'failed':
+            return None
+        grant = json.loads(read(dispatch / 'grant.json'))
+        grant_id = grant.get('id')
+        if not isinstance(grant_id, str) or not re.fullmatch(r'[0-9a-f-]{36}', grant_id):
+            return None
+        matches = [(key, claim) for key, claim in claims.items()
+                   if claim.get('grant_id') == grant_id]
+        if len(matches) != 1:
+            return None
+        request, claim = matches[0]
+        session_id = state.get('native_id')
+        consumed = json.loads(read(dispatch / (grant_id + '.consumed.json')))
+        if (not session_id or claim.get('state') != 'claimed'
+                or claim.get('request_sha256') != request
+                or claim.get('native_id') != session_id
+                or grant.get('session_id') != session_id
+                or consumed.get('id') != grant_id
+                or consumed.get('session_id') != session_id
+                or consumed.get('model') != grant.get('model')):
+            return None
+        status = json.loads(read(dispatch / (grant_id + '.provider-status.json')))
+        terminal = json.loads(read(dispatch / (grant_id + '.api-terminal.json')))
+        if (status != {'grant_id': grant_id, 'status': 429}
+                or terminal.get('grant_id') != grant_id or terminal.get('status') != 429
+                or terminal.get('complete') is not True):
+            return None
+        stream = read(dispatch / (grant_id + '.api-stream.private'))
+        if len(stream) != terminal.get('bytes') or json.loads(stream) != {
+            'type': 'error',
+            'error': {
+                'type': 'upstream_error',
+                'message': 'This group only accepts sessions first seen here.',
+            },
+        }:
+            return None
+        body = read(dispatch / (grant_id + '.api-request.private.json'), 16 * 1024 * 1024)
+        if hashlib.sha256(body).hexdigest() != consumed.get('body_sha256'):
+            return None
+        return request
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
 
 
 def terminal_usage(events, native_id):

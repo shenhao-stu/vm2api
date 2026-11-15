@@ -33,6 +33,7 @@ class Harness:
         self.profile = initialize_api_profile(root / "home")
         self.gateway, self.client = "g" * 40, "c" * 40
         self.created = []
+        self.hide_cursor = False
         self.start()
 
     def factory(self, path, body):
@@ -57,6 +58,10 @@ class Harness:
             restore=True,
         )
         self.created.append(session)
+        if self.hide_cursor:
+            # The real CLI and MCP still receive all events. Model a tool
+            # boundary whose assistant record is absent from the transcript.
+            session.native_assistants = lambda: None
         return session
 
     def start(self):
@@ -261,7 +266,36 @@ def run(root, cli):
         h.close()
 
 
+def run_missing_tool_cursor(root, cli):
+    h = Harness(root, cli)
+    h.hide_cursor = True
+    try:
+        parent = body()
+        status, first = h.request(parent)
+        assert status == 200, (status, first)
+        assert first["stop_reason"] == "tool_use" and first["usage"]["output_tokens"] == 5
+        state = json.loads((h.created[0].directory / "continuation.json").read_text())
+        assert state["status"] == "awaiting_tools" and not state.get("assistant_uuid")
+        assert h.request(parent)[0] == 400 and h.dispatches() == 1
+        h.close()
+        h.start()
+        continuation = follow(parent, first)
+        h.hide_cursor = False
+        status, done = h.request(continuation)
+        assert status == 200 and done["stop_reason"] == "end_turn", (status, done)
+        assert done["usage"]["output_tokens"] == 5 and h.dispatches() == 2
+        assert h.request(continuation)[0] == 400 and h.dispatches() == 2
+        restored = list((root / "state").rglob("recovery-*/result.safe.json"))
+        assert len(restored) == 1, restored
+        assert json.loads(restored[0].read_text())["upstream_dispatches"] == 0
+        assert [r["attempts"] for r in h.audit()] == [1, 0, 1, 0]
+        return {"verified_tool_cursor_recovery": True, "real_provider_calls": 0}
+    finally:
+        h.close()
+
+
 if __name__ == "__main__":
     os.umask(0o077)
     with tempfile.TemporaryDirectory(prefix="airoam-http-isolation-") as tmp:
-        print(json.dumps(run(Path(tmp), sys.argv[1])))
+        run_acceptance = run_missing_tool_cursor if "--missing-tool-cursor" in sys.argv else run
+        print(json.dumps(run_acceptance(Path(tmp), sys.argv[1])))

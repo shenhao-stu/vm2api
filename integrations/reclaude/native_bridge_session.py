@@ -749,7 +749,7 @@ class Session:
             body['messages'], state['history_length'], state['history_sha256'],
             checkpoint_controls(self.directory, state), checkpoint_pending(self.directory, state))
         self.native_id = str(uuid.UUID(state["native_id"]))
-        self.resume_uuid = str(uuid.UUID(state["assistant_uuid"]))
+        self.resume_uuid = self.restore_cursor(state)
         self.resume_message_id = state.get("message_id")
         self.checkpoint_configuration = state["configuration"]
         self.history = copy.deepcopy(history)
@@ -770,6 +770,9 @@ class Session:
             self.suspended = True
         self.continuation_import(body)
         self.adopt_checkpoint_configuration(state)
+
+    def restore_cursor(self, state):
+        return str(uuid.UUID(state["assistant_uuid"]))
 
     def adopt_checkpoint_configuration(self, state):
         # Commit the verified boundary before tools.json changes. Ordinary
@@ -792,19 +795,15 @@ class Session:
                 "system_sha256": signature((self.directory / "system.txt").read_text()),
             })
         elif status in {"idle", "awaiting_tools"}:
-            with self.assistant_ready:
-                self.assistant_ready.wait_for(
-                    lambda: message_id in self.assistants, timeout=5
-                )
-                assistant_uuid = self.assistants.get(message_id)
-            if not assistant_uuid:
+            cursor = self.checkpoint_cursor(status, message_id)
+            if not cursor:
                 status = state["status"] = "native_resume_point_missing"
             else:
-                self.resume_uuid = str(uuid.UUID(assistant_uuid))
+                self.resume_uuid = cursor.get("assistant_uuid")
                 self.resume_message_id = message_id
                 state.update(
                     {
-                        "assistant_uuid": assistant_uuid,
+                        **cursor,
                         "message_id": message_id,
                         "configuration": self.body_signature,
                         "fixed_configuration": self.fixed_signature,
@@ -825,6 +824,12 @@ class Session:
                     state['history_controls_sha256'] = controls_sha
         self.write_checkpoint(state)
         self.checkpoint_configuration = state.get("configuration")
+
+    def checkpoint_cursor(self, status, message_id):
+        with self.assistant_ready:
+            self.assistant_ready.wait_for(lambda: message_id in self.assistants, timeout=5)
+            assistant_uuid = self.assistants.get(message_id)
+        return {"assistant_uuid": str(uuid.UUID(assistant_uuid))} if assistant_uuid else None
 
     def write_checkpoint(self, state):
         path = self.directory / "continuation.json"

@@ -1,6 +1,7 @@
 """Experimental PTY driver. Provider SSE, never terminal text, carries usage."""
 
 import fcntl
+import hashlib
 import json
 import os
 import pty
@@ -21,8 +22,10 @@ import native_bridge_session as native
 from native_interactive_recovery import (
     RecoveryError,
     RecoveryGate,
+    bounded_bytes,
     caller_tool_event,
     load_steps,
+    pending_tools_seen,
     private_json,
     project_tool_text,
 )
@@ -130,39 +133,82 @@ class InteractiveSession(native.Session):
         ):
             self.recover_pending(body)
         for event in super().request(body):
-            if event.get("type") == "message_stop" and self.pending_ids:
-                self.remember_pending(body, tail, tool_results)
+            if event.get("type") == "message_stop" and self.pending_ids and self.resume_uuid:
+                self.remember_pending(self.resume_message_id)
             yield event
 
-    def remember_pending(self, body, tail, tool_results):
-        path = self.directory / "interactive-recovery.private.json"
+    @property
+    def pending_plan_path(self):
+        return self.directory / "interactive-recovery.private.json"
+
+    def pending_plan(self, message_id):
+        history = self.history[:-1]
+        tail = native.native_blocks(
+            next(m for m in reversed(history) if m["role"] == "user")["content"]
+        )
+        tool_results = any(b.get("type") == "tool_result" for b in tail)
         if tool_results:
-            # Old sessions without a recovery record remain protected, rather
-            # than guessing which prior provider response belongs to them.
-            if not path.exists():
-                return
-            plan = json.loads(path.read_bytes())
+            if not self.pending_plan_path.is_file():
+                return None
+            plan = json.loads(bounded_bytes(self.pending_plan_path, 64 * 1024 * 1024))
         else:
             plan = {
                 "version": 1,
                 "native_id": self.native_id,
-                "base_history": body["messages"][:-1],
+                "base_history": history[:-1],
                 "tools": self.tools,
                 "configuration": self.body_signature,
                 "steps": [],
             }
         if len(plan["steps"]) >= 64:
-            return
+            return None
         plan["steps"].append(
             {
                 "grant_id": self.last_grant_id,
                 "input": tail,
                 "assistant_sha256": native.signature(self.history[-1]["content"]),
-                "message_id": self.resume_message_id,
+                "message_id": message_id,
             }
         )
         plan["history_sha256"] = native.signature(native.history_shape(self.history))
-        private_json(path, plan)
+        return plan
+
+    def remember_pending(self, message_id):
+        plan = self.pending_plan(message_id)
+        if plan is not None:
+            private_json(self.pending_plan_path, plan)
+
+    def checkpoint_cursor(self, status, message_id):
+        cursor = super().checkpoint_cursor(status, message_id)
+        if cursor or status != "awaiting_tools":
+            return cursor
+        try:
+            plan = self.pending_plan(message_id)
+            if plan is None:
+                return None
+            # The CLI has entered the provider's exact MCP call. The saved
+            # provider response can rebuild this boundary locally after eviction.
+            step = load_steps(self.directory, plan, self.native_id)[-1]
+            if (set(t["id"] for t in step["pending"]) != self.pending_ids
+                    or not pending_tools_seen(self.directory, step["pending"])):
+                return None
+            private_json(self.pending_plan_path, plan)
+            return {"interactive_pending_sha256": self.pending_plan_digest()}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
+
+    def pending_plan_digest(self):
+        return hashlib.sha256(bounded_bytes(self.pending_plan_path, 64 * 1024 * 1024)).hexdigest()
+
+    def restore_cursor(self, state):
+        if state.get("status") == "awaiting_tools" and "interactive_pending_sha256" in state:
+            try:
+                if state["interactive_pending_sha256"] == self.pending_plan_digest():
+                    return None
+            except (OSError, RecoveryError):
+                pass
+            raise native.ContractError("interactive_pending_recovery_unavailable_no_replay")
+        return super().restore_cursor(state)
 
     def start_dispatch_proxy(self):
         super().start_dispatch_proxy()
@@ -201,9 +247,12 @@ class InteractiveSession(native.Session):
         try:
             self.validate_configuration(body)
             self.history_prefix(body["messages"])
-            plan = json.loads(
-                (self.directory / "interactive-recovery.private.json").read_bytes()
-            )
+            state = json.loads((self.directory / "continuation.json").read_bytes())
+            plan_bytes = bounded_bytes(self.pending_plan_path, 64 * 1024 * 1024)
+            digest = state.get("interactive_pending_sha256")
+            if digest and digest != hashlib.sha256(plan_bytes).hexdigest():
+                raise RecoveryError("recovery_boundary_changed")
+            plan = json.loads(plan_bytes)
             if plan.get("configuration") != self.body_signature or plan.get(
                 "history_sha256"
             ) != native.signature(native.history_shape(self.history)):
@@ -213,12 +262,6 @@ class InteractiveSession(native.Session):
             for index, step in enumerate(steps):
                 self.restore_pending_step(index, step)
             self.recovery_gate.activate()
-            state = json.loads((self.directory / "continuation.json").read_bytes())
-            self.checkpoint(
-                "awaiting_tools", state["request_sha256"], steps[-1]["message_id"]
-            )
-            if not self.resume_uuid:
-                raise RecoveryError("recovery_assistant_boundary_missing")
             self.suspended = False
             self.process_has_turn = True
             private_json(
@@ -310,23 +353,8 @@ class InteractiveSession(native.Session):
         while True:
             if self.recovery_gate.error or self.process.poll() is not None:
                 raise RecoveryError(self.recovery_gate.error or "recovery_cli_stopped")
-            pending = []
-            for tool in step["pending"]:
-                path = self.directory / (tool["id"] + ".pending.json")
-                try:
-                    value = json.loads(path.read_bytes())
-                except (FileNotFoundError, json.JSONDecodeError):
-                    # MCP creates this file before its JSON write completes.
-                    continue
-                if (
-                    value.get("name") != tool["name"]
-                    or value.get("arguments") != tool["input"]
-                ):
-                    raise RecoveryError("recovery_tool_arguments_changed")
-                pending.append(tool["id"])
-            if self.recovery_gate.index == index + 1 and len(pending) == len(
-                step["pending"]
-            ):
+            if (self.recovery_gate.index == index + 1
+                    and pending_tools_seen(self.directory, step["pending"])):
                 break
             if time.monotonic() > deadline:
                 raise RecoveryError("recovery_tool_wait_not_restored")

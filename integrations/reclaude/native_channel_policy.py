@@ -161,6 +161,8 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
         if request_sha in snapshot.consumed:
             return reject("native_request_consumed_no_replay")
         return reject("native_session_evidence_unknown")
+    if any(c.status == 'provider_admission_denied' for c in channels):
+        return reject('native_provider_session_admission_denied_no_replay')
     if snapshot.stopped:
         return reject("native_pool_stopped")
     if snapshot.inflight or any(c.busy or c.status in {"in_flight", "closing"}
