@@ -13,6 +13,7 @@
  * }
  */
 import { quotaRejection } from '../pool/quota-rejection.mjs'
+import { thinkingRequestError } from '../protocol/thinking-validation.mjs'
 
 export const ErrorType = {
   AUTH: 'authentication_error',
@@ -849,6 +850,18 @@ export function validateRequestBody(protocol, body) {
     }
   }
 
+  const thinkingError = thinkingRequestError(body)
+  if (thinkingError) {
+    return {
+      ok: false,
+      errorResult: makeError({
+        type: ErrorType.INVALID_REQUEST,
+        code: ErrorCode.INVALID_FIELD,
+        status: 400,
+        ...thinkingError,
+      }),
+    }
+  }
   return { ok: true, body }
 }
 
