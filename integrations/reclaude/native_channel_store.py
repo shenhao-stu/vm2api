@@ -12,7 +12,7 @@ import native_bridge_session as native
 from native_history_boundary import BoundaryError, control_record, pending_record, validate_record
 from native_paid_sibling import CompletedBoundary, PaidSibling
 from native_channel_policy import Channel, Identity, Snapshot, request_identity
-from native_quota_rejection import rejected_request
+from native_quota_rejection import rejected_request, retired_request
 from native_tool_handoff import ToolHandoff
 from native_terminal_error import failed_request
 
@@ -177,8 +177,10 @@ class ChannelStore:
             claims = directory / 'caller-grants'
             claim_values = {path.stem: read_json(path) for path in claims.glob('*.json')}
             rejected = rejected_request(directory, state, claim_values, time.time(), requested_model=requested_model) if status == 'failed' else None
+            retired_quota = rejected or (retired_request(directory, state, claim_values, time.time(),
+                                                        requested_model=requested_model) if status == 'failed' else None)
             terminal_error = failed_request(directory, state, claim_values) if status == 'failed' else None
-            if rejected:
+            if retired_quota:
                 status = 'quota_rejected'
             elif terminal_error:
                 status = 'terminal_error'
@@ -215,7 +217,7 @@ class ChannelStore:
                         and valid_usage(claim.get('terminal_usage'))):
                     status = 'policy_refused'
                     continue
-                if request in {rejected, terminal_error}:
+                if request in {retired_quota, terminal_error}:
                     continue
                 if claim.get('state') != 'complete' or receipt.get('id') != grant_id:
                     unknown = True

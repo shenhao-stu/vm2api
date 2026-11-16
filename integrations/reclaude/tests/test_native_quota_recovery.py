@@ -124,3 +124,57 @@ class QuotaRecoveryTests(unittest.TestCase):
             with self.assertRaises(ContractError):
                 with self.f.pool.lease('tenant', {**self.follow, 'model': 'sonnet'}):
                     self.fail('unknown or global quota must stay closed')
+
+    def cumulative_terminal(self):
+        self.events[1]['message'] = {'model': '<synthetic>', 'usage': {
+            k: 0 for k in ('input_tokens', 'output_tokens',
+                          'cache_read_input_tokens', 'cache_creation_input_tokens')}}
+        self.events[1]['is_api_error_message'] = True
+        self.events[-1].update(num_turns=9, total_cost_usd=.25,
+                              usage={'input_tokens': 3, 'output_tokens': 2,
+                                     'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0},
+                              modelUsage={'opus': {'inputTokens': 3, 'outputTokens': 2,
+                                          'cacheReadInputTokens': 0, 'cacheCreationInputTokens': 0}})
+        self.save_log()
+
+    def test_reset_with_accounted_cumulative_usage_allows_new_turn_not_old_request(self):
+        self.cumulative_terminal()
+        fresh_body = {**self.follow, 'messages': self.follow['messages'] + [
+            {'role': 'user', 'content': 'a genuinely new continuation'}]}
+        before = {str(p.relative_to(self.path)): p.read_bytes()
+                  for p in self.path.rglob('*') if p.is_file()}
+        for restart in (False, True):
+            if restart:
+                self.f.pool.close()
+                self.f.pool = self.f.new_pool()
+            with self.f.pool.lease('tenant', fresh_body) as fresh:
+                self.assertNotEqual(fresh.directory, self.path)
+                self.assertFalse(fresh.failed)
+            with self.assertRaisesRegex(ContractError, 'already_consumed'):
+                with self.f.pool.lease('tenant', self.follow):
+                    self.fail('old consumed quota request must not be retried')
+        self.assertEqual(before, {str(p.relative_to(self.path)): p.read_bytes()
+                                 for p in self.path.rglob('*') if p.is_file()})
+
+    def test_cumulative_usage_requires_exact_prior_grants_and_official_quota_terminal(self):
+        self.cumulative_terminal()
+        original = copy.deepcopy(self.events)
+        fresh = {**self.follow, 'messages': self.follow['messages'] + [
+            {'role': 'user', 'content': 'new continuation'}]}
+        for mutate in (
+            lambda: self.events[-1]['modelUsage']['opus'].update(outputTokens=3),
+            lambda: self.events[-1]['modelUsage']['opus'].update(inputTokens=True),
+            lambda: self.events[-1]['modelUsage'].update(other={'inputTokens': 1}),
+            lambda: self.events[1]['message']['usage'].update(output_tokens=1),
+            lambda: self.events[1].update(api_error=None),
+            lambda: self.events[1].update(message=None),
+            lambda: self.events[-1]['modelUsage'].update(opus=None),
+            lambda: self.events[0]['rate_limit_info'].update(resetsAt=int(time.time()) + 3600),
+            lambda: self.events.append(copy.deepcopy(self.events[-1])),
+        ):
+            self.events = copy.deepcopy(original)
+            mutate()
+            self.save_log()
+            with self.assertRaises(ContractError):
+                with self.f.pool.lease('tenant', fresh):
+                    self.fail('unproven cumulative failure must remain closed')

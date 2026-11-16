@@ -2,6 +2,24 @@
 import json
 
 
+def gateway_terminal(events, native_id):
+    relevant = [e for e in events if e.get('type') in {'assistant', 'result', 'stream_event'}]
+    if (len(relevant) != 2 or [e['type'] for e in relevant] != ['assistant', 'result']
+            or any(e.get('session_id') != native_id for e in relevant)):
+        return False
+    assistant, result = relevant
+    message = assistant.get('message', {})
+    if (assistant.get('is_api_error_message') is not True or message.get('model') != '<synthetic>'
+            or result.get('is_error') is not True or result.get('terminal_reason') != 'api_error'
+            or type(result.get('num_turns')) is not int or result['num_turns'] < 1):
+        return False
+    text = '\n'.join(b.get('text', '') for b in message.get('content', [])
+                     if isinstance(b, dict) and b.get('type') == 'text')
+    status = assistant.get('api_error_status')
+    marker = {400: 'native_gateway_error_no_replay', 429: 'native_dispatch_already_consumed'}.get(status)
+    return bool(marker and result.get('api_error_status') == status and marker in text)
+
+
 def terminal_usage(events, native_id):
     relevant = [(i, e) for i, e in enumerate(events)
                 if e.get('type') in {'assistant', 'result', 'stream_event'}]
@@ -53,11 +71,15 @@ def failed_request(directory, state, claims):
             return None
         receipt = read(directory / 'dispatch' / (grant_id + '.consumed.json'))
         final = read(directory / 'dispatch/final.safe.json')
+        gateway_path = directory / 'dispatch' / (grant_id + '.gateway-error.json')
+        gateway = read(gateway_path) if gateway_path.exists() else {}
+        gateway_known = gateway.get('id') == grant_id and type(gateway.get('status')) is int and gateway['status'] in (502, 503, 504)
         if (receipt.get('id') != grant_id or receipt.get('session_id') != native_id
                 or receipt.get('model') != grant.get('model')
                 or type(final.get('upstream_attempts')) is not int
                 or not 1 <= final['upstream_attempts'] <= len(claims)
-                or type(final.get('denied')) is not int or final['denied'] != 0):
+                or type(final.get('denied')) is not int
+                or final['denied'] not in ((0, 1) if gateway_known else (0,))):
             return None
         # Gate counters span the resident CLI lifetime. The unique consumed
         # grant and this claim's stdout offset identify the current turn.
@@ -67,6 +89,10 @@ def failed_request(directory, state, claims):
         with log.open('rb') as stream:
             stream.seek(offset)
             events = [json.loads(line) for line in stream.read(2 * 1024 * 1024 + 1).splitlines() if line.strip()]
-        return request if terminal_usage(events, native_id) is not None else None
+        complete = terminal_usage(events, native_id) is not None
+        # Header failure can have unknown provider cost. Keep the old grant
+        # consumed; this only permits a different, newly authored caller turn.
+        complete = complete or (gateway_known and gateway_terminal(events, native_id))
+        return request if complete else None
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None

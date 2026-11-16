@@ -119,5 +119,57 @@ class TerminalErrorTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, '^native_session_evidence_unknown$'):
             with self.pool.lease('tenant-a', {**self.body, 'messages': [user('new input')]}): pass
 
+    def test_observed_gateway_failure_retires_cli_but_keeps_consumed_request(self):
+        active, log = self.failed()
+        grant = read_json(active.directory / 'dispatch/grant.json')
+        witness = active.directory / 'dispatch' / (grant['id'] + '.gateway-error.json')
+        write_json(witness, {'id': grant['id'], 'status': 502})
+        for legacy in (False, True):
+            marker = 'native_dispatch_already_consumed' if legacy else 'native_gateway_error_no_replay'
+            status = 429 if legacy else 400
+            log.write_text(''.join(json.dumps(e) + '\n' for e in [
+                {'type': 'assistant', 'session_id': active.native_id, 'error': 'rate_limit' if legacy else 'unknown',
+                 'is_api_error_message': True, 'api_error_status': status,
+                 'message': {'model': '<synthetic>', 'content': [{'type': 'text', 'text': 'API Error: ' + marker}]}},
+                {'type': 'result', 'session_id': active.native_id, 'is_error': True,
+                 'terminal_reason': 'api_error', 'api_error_status': status, 'num_turns': 4}]))
+            write_json(active.directory / 'dispatch/final.safe.json',
+                       {'upstream_attempts': 1, 'denied': int(legacy)})
+            new = {**self.body, 'messages': [user('new caller continuation ' + str(legacy))]}
+            with self.pool.lease('tenant-a', new) as fresh:
+                self.assertNotEqual(fresh.directory, active.directory)
+            with self.assertRaisesRegex(ContractError, 'already_consumed'):
+                with self.pool.lease('tenant-a', self.body):
+                    self.fail('original gateway attempt may have been charged')
+        witness.unlink()
+        with self.assertRaisesRegex(ContractError, 'evidence_unknown'):
+            with self.pool.lease('tenant-a', {**self.body, 'messages': [user('without proof')]}):
+                self.fail('a local retry denial alone cannot authorize recovery')
+
+    def test_gateway_witness_cannot_reclassify_another_grant_or_real_quota(self):
+        active, log = self.failed()
+        grant = read_json(active.directory / 'dispatch/grant.json')
+        witness = active.directory / 'dispatch' / (grant['id'] + '.gateway-error.json')
+        terminal = [
+            {'type': 'assistant', 'session_id': active.native_id, 'is_api_error_message': True,
+             'api_error_status': 400, 'message': {'model': '<synthetic>', 'content': [
+                 {'type': 'text', 'text': 'native_gateway_error_no_replay'}]}},
+            {'type': 'result', 'session_id': active.native_id, 'is_error': True,
+             'terminal_reason': 'api_error', 'api_error_status': 400, 'num_turns': 1}]
+        for reason in ('wrong_grant', 'wrong_status', 'wrong_session', 'missing_result', 'stream_started', 'real_quota'):
+            changed = copy.deepcopy(terminal)
+            receipt = {'id': grant['id'], 'status': 502}
+            if reason == 'wrong_grant': receipt['id'] = 'another-grant'
+            elif reason == 'wrong_status': receipt['status'] = 429
+            elif reason == 'wrong_session': changed[-1]['session_id'] = 'another-session'
+            elif reason == 'missing_result': changed.pop()
+            elif reason == 'stream_started': changed.insert(0, {'type': 'stream_event'})
+            else: changed[0]['message']['content'][0]['text'] = 'usage_limit_reached'
+            write_json(witness, receipt)
+            log.write_text(''.join(json.dumps(e) + '\n' for e in changed))
+            with self.subTest(reason=reason), self.assertRaisesRegex(ContractError, 'evidence_unknown'):
+                with self.pool.lease('tenant-a', {**self.body, 'messages': [user('new turn')]}):
+                    self.fail('unproved gateway failure')
+
 
 if __name__ == '__main__': unittest.main()
