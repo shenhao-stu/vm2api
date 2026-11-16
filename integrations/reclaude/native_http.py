@@ -420,6 +420,15 @@ class NativeHandler(RelayHandler):
                 record["upstream_error"] = error_details
             if code == "unsupported_thinking_configuration" and isinstance(body, dict):
                 record["thinking"] = safe_thinking_summary(body.get("thinking"))
+            if code == "unsupported_request_parameter" and isinstance(body, dict):
+                # Only public API field names, never arbitrary keys or values.
+                known = {'model', 'messages', 'system', 'tools', 'metadata', 'max_tokens',
+                         'stream', 'thinking', 'output_config', 'context_management',
+                         'tool_choice', 'temperature', 'cache_control', 'top_p', 'top_k',
+                         'stop_sequences', 'service_tier', 'betas', 'extra_body',
+                         'speed', 'inference_geo', 'container', 'mcp_servers'}
+                record['parameter_keys'] = sorted(set(body) & known)
+                record['unknown_parameter_count'] = len(set(body) - known)
             status = failure_status(exc, code, expired.is_set())
             consumed = (
                 set((session.directory / "dispatch").glob("*.consumed.json")) - before

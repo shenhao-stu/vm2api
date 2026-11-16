@@ -119,6 +119,35 @@ class TerminalErrorTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, '^native_session_evidence_unknown$'):
             with self.pool.lease('tenant-a', {**self.body, 'messages': [user('new input')]}): pass
 
+    def test_incomplete_stream_with_terminal_denied_retry_does_not_poison_new_turn(self):
+        active, log = self.failed()
+        original = events(active.native_id)
+        first = {'type': 'assistant', 'session_id': active.native_id, 'message': {
+            'model': 'opus', 'stop_reason': None, 'content': [{'type': 'thinking', 'thinking': 'fixture'}]}}
+        error = {'type': 'assistant', 'session_id': active.native_id,
+                 'error': 'rate_limit', 'is_api_error_message': True, 'api_error_status': 429,
+                 'message': {'model': '<synthetic>', 'content': [
+                     {'type': 'text', 'text': 'native_dispatch_already_consumed'}]}}
+        result = {**original[-1], 'num_turns': 29, 'api_error_status': 429}
+        terminal = [original[0], first, original[-2], error, result]
+        write_json(active.directory / 'dispatch/final.safe.json', {'upstream_attempts': 1, 'denied': 1})
+        log.write_text(''.join(json.dumps(e)+'\n' for e in terminal))
+        before = log.read_bytes()
+        with self.assertRaisesRegex(ContractError, 'consumed'):
+            with self.pool.lease('tenant-a', self.body): pass
+        with self.pool.lease('tenant-a', {**self.body, 'messages': [user('new continuation')]}): pass
+        self.assertEqual(log.read_bytes(), before)
+        for change in ('missing_result', 'wrong_identity', 'second_stream', 'policy', 'not_guard'):
+            changed = copy.deepcopy(terminal)
+            if change == 'missing_result': changed.pop()
+            elif change == 'wrong_identity': changed[-1]['session_id'] = 'other'
+            elif change == 'second_stream': changed.insert(2, original[0])
+            elif change == 'policy': changed[1]['error'] = 'invalid_request'
+            else: changed[-2]['message']['content'][0]['text'] = 'real quota error'
+            log.write_text(''.join(json.dumps(e)+'\n' for e in changed))
+            with self.subTest(change=change), self.assertRaisesRegex(ContractError, 'evidence_unknown'):
+                with self.pool.lease('tenant-a', {**self.body, 'messages': [user('another continuation')]}): pass
+
     def test_observed_gateway_failure_retires_cli_but_keeps_consumed_request(self):
         active, log = self.failed()
         grant = read_json(active.directory / 'dispatch/grant.json')

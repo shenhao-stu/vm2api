@@ -47,6 +47,31 @@ def terminal_usage(events, native_id):
     return usage if all(type(usage.get(k)) is int and usage[k] >= 0 for k in keys) else None
 
 
+def interrupted_terminal(events, native_id):
+    """A closed partial stream plus a denied CLI retry is terminal, not replayable.
+
+    This is deliberately not a success or zero-cost proof. The original claim
+    stays consumed; only a different caller turn may import its own history.
+    """
+    relevant = [e for e in events if e.get('type') in {'assistant', 'result', 'stream_event'}]
+    if (len(relevant) < 4 or not gateway_terminal(relevant[-2:], native_id)
+            or relevant[-2].get('api_error_status') != 429):
+        return False
+    prefix = relevant[:-2]
+    if any(e.get('session_id') != native_id or e.get('error')
+           or e.get('is_api_error_message') for e in prefix):
+        return False
+    streams = [e['event'] for e in prefix if e['type'] == 'stream_event']
+    boundaries = [e.get('type') for e in streams
+                  if e.get('type') in {'message_start', 'message_delta', 'message_stop', 'error'}]
+    if boundaries != ['message_start', 'message_stop']:
+        return False
+    if prefix[0].get('event', {}).get('type') != 'message_start' or prefix[-1].get('event', {}).get('type') != 'message_stop':
+        return False
+    return all(e.get('message', {}).get('stop_reason') is None
+               for e in prefix if e['type'] == 'assistant')
+
+
 def failed_request(directory, state, claims):
     """The old request remains consumed; this proof only retires its broken CLI."""
     def read(path):
@@ -79,7 +104,7 @@ def failed_request(directory, state, claims):
                 or type(final.get('upstream_attempts')) is not int
                 or not 1 <= final['upstream_attempts'] <= len(claims)
                 or type(final.get('denied')) is not int
-                or final['denied'] not in ((0, 1) if gateway_known else (0,))):
+                or final['denied'] not in (0, 1)):
             return None
         # Gate counters span the resident CLI lifetime. The unique consumed
         # grant and this claim's stdout offset identify the current turn.
@@ -89,10 +114,11 @@ def failed_request(directory, state, claims):
         with log.open('rb') as stream:
             stream.seek(offset)
             events = [json.loads(line) for line in stream.read(2 * 1024 * 1024 + 1).splitlines() if line.strip()]
-        complete = terminal_usage(events, native_id) is not None
+        complete = final['denied'] == 0 and terminal_usage(events, native_id) is not None
         # Header failure can have unknown provider cost. Keep the old grant
         # consumed; this only permits a different, newly authored caller turn.
         complete = complete or (gateway_known and gateway_terminal(events, native_id))
+        complete = complete or (final['denied'] == 1 and interrupted_terminal(events, native_id))
         return request if complete else None
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None

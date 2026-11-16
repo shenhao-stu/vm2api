@@ -385,6 +385,15 @@ class NativeHTTPTests(unittest.TestCase):
         self.assertFalse(self.created)
         self.assertTrue(all(row["attempts"] == 0 for row in self.audit()))
 
+    def test_parameter_diagnostic_does_not_log_private_names_or_values(self):
+        self.assertEqual(self.request(self.body(service_tier='PRIVATE_VALUE', PRIVATE_NAME='PRIVATE_VALUE'))[0], 400)
+        row = self.audit()[0]
+        self.assertIn('service_tier', row['parameter_keys'])
+        self.assertEqual(row['unknown_parameter_count'], 1)
+        self.assertNotIn('PRIVATE', json.dumps(row))
+        self.assertEqual(row['attempts'], 0)
+        self.assertFalse(self.created)
+
     def test_unsupported_thinking_audit_contains_only_safe_shape_enums(self):
         secret_values = ['PRIVATE_MODE', 'PRIVATE_DISPLAY', 'PRIVATE_KEY',
                          'PRIVATE_VALUE', 'PRIVATE_BUDGET', 'PRIVATE_BODY']
