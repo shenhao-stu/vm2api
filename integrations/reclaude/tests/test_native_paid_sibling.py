@@ -177,6 +177,25 @@ class PaidSiblingTests(unittest.TestCase):
         self.assertEqual(len(list(child_path.glob('dispatch/*.consumed.json'))), 2)
         self.assertEqual(evidence(self.parent), before)
 
+    def test_continue_after_paid_owned_tool_results_is_a_new_turn(self):
+        # The original tool IDs were issued here, not imported from another client.
+        with self.pool.lease('tenant-a', self.original) as parent:
+            self.completed(parent, self.original, [tool('next_call')], ['next_call'])
+        before = evidence(self.parent)
+        self.restart()
+        extended = self.extension(self.original)
+        with self.pool.lease('tenant-a', extended) as child:
+            self.assertNotEqual(child.directory, self.parent)
+            child_path = child.directory
+            history = self.bill_one_turn(child, extended)
+        self.assertEqual(evidence(self.parent), before)
+        self.restart()
+        for old in (self.original, extended, self.extension(self.original, ' ')):
+            self.refused(old)
+        with self.pool.lease('tenant-a', {**extended, 'messages': history + [user('new followup')]}) as child:
+            self.assertEqual(child.directory, child_path)
+        self.assertEqual(len(list(child_path.glob('dispatch/*.consumed.json'))), 1)
+
     def test_new_user_extension_can_follow_an_already_proven_sibling(self):
         with self.pool.lease('tenant-a', self.alternate) as child:
             self.completed(child, self.alternate, [tool('lost_child')], ['lost_child'])

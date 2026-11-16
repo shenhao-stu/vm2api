@@ -8,7 +8,7 @@ not fields accepted from an HTTP client. No files, sessions or grants are mutate
 from dataclasses import dataclass
 import hashlib
 
-from native_paid_sibling import CompletedBoundary, PaidSibling
+from native_paid_sibling import CompletedBoundary, PaidSibling, proven_user_extension
 from native_tool_handoff import ToolHandoff, prove_handoff
 
 
@@ -244,6 +244,23 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
         return Decision('create', 'validated_caller_history', scope, request_sha, key)
     owners = [c for c in channels if final_results & c.pending_ids]
     if not owners:
+        # Old tool results may remain in a caller's merged Continue message.
+        # Require the completed paid input plus newly appended text; tool-only
+        # retries and unverified deliveries still cannot acquire another grant.
+        extensions = [sibling for c in channels
+                      if allow_history_import
+                      and (sibling := proven_user_extension(
+                          c, messages, request_sha, native.signature)) is not None]
+        if len(extensions) > 1:
+            return reject('native_channel_ambiguous')
+        if extensions:
+            if snapshot.memory_pressure:
+                return reject('native_memory_pressure')
+            if check_capacity and snapshot.resident_total >= snapshot.capacity:
+                return reject('native_session_capacity')
+            sibling = extensions[0]
+            return Decision('create', 'verified_paid_user_extension', scope, request_sha,
+                            sibling.key(native.signature), sibling=sibling)
         return reject('request_already_consumed')
     if len(owners) != 1:
         return reject('native_channel_ambiguous')
