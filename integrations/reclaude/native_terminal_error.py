@@ -35,9 +35,11 @@ def terminal_usage(events, native_id):
         return None
     ai, assistant = assistants[0]
     ri, result = results[0]
+    # The CLI counts turns since startup. This grant's stdout offset and single
+    # start/delta/stop sequence identify the individual request.
     if (assistant.get('error') != 'server_error' or assistant.get('is_api_error_message') is not True
             or result.get('is_error') is not True or result.get('terminal_reason') != 'api_error'
-            or result.get('num_turns') != 1
+            or type(result.get('num_turns')) is not int or result['num_turns'] < 1
             or not starts[0][0] < ai < deltas[0][0] < stops[0][0] < ri
             or ri != relevant[-1][0]):
         return None

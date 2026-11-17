@@ -62,16 +62,32 @@ class TerminalErrorTests(unittest.TestCase):
         self.assertEqual(log.read_bytes(), before)
         self.assertEqual(len(list((active.directory/'dispatch').glob('*.consumed.json'))), 1)
 
+    def test_resident_cli_terminal_is_proved_per_grant_after_many_turns(self):
+        active, log = self.failed()
+        current = events(active.native_id)
+        current[-1]['num_turns'] = 22
+        log.write_text(''.join(json.dumps(e) + '\n' for e in current))
+        before = log.read_bytes()
+        with self.assertRaisesRegex(ContractError, 'consumed'):
+            with self.pool.lease('tenant-a', self.body):
+                self.fail('a terminal error cannot release the old request')
+        with self.pool.lease('tenant-a', {**self.body, 'messages': [user('new caller turn')]}) as child:
+            self.assertNotEqual(child.directory, active.directory)
+        self.assertEqual(log.read_bytes(), before)
+
     def test_incomplete_mixed_identity_or_policy_rejection_stays_unknown(self):
         active, log = self.failed()
         original = events(active.native_id)
-        for change in ('missing_result', 'missing_stop', 'wrong_identity', 'refusal', 'two_turns', 'bad_usage'):
+        for change in ('missing_result', 'missing_stop', 'wrong_identity', 'refusal', 'two_turns',
+                       'bool_turns', 'zero_turns', 'bad_usage'):
             changed = copy.deepcopy(original)
             if change == 'missing_result': changed.pop()
             elif change == 'missing_stop': changed.pop(-2)
             elif change == 'wrong_identity': changed[-1]['session_id'] = 'another'
             elif change == 'refusal': changed[1]['error'] = 'invalid_request'
             elif change == 'two_turns': changed += original
+            elif change == 'bool_turns': changed[-1]['num_turns'] = True
+            elif change == 'zero_turns': changed[-1]['num_turns'] = 0
             else: changed[2]['event']['usage']['output_tokens'] = -1
             log.write_text(''.join(json.dumps(e)+'\n' for e in changed))
             with self.subTest(change=change), self.assertRaisesRegex(ContractError, 'evidence_unknown'):
