@@ -9,6 +9,22 @@ import {
 } from '../../src/lib/admin/pricing.mjs'
 import { resolvePrice } from '../../src/lib/admin/price-catalog.mjs'
 
+test('GPT-6.2 uses the published cache retention and whole-request long context rates', () => {
+  for (const [model, input] of [['gpt-6.2-astra', 8], ['gpt-6.2-sol', 2]]) {
+    const { price } = resolvePrice(model)
+    assert.equal(price.cache_5m, input * 1.25)
+    assert.equal(price.cache_1h, input * 2.5)
+    const usage = { input_tokens: 272_000, output_tokens: 100 }
+    const standard = calculateCost(usage, model)
+    assert.equal(standard.total_cost, (272_000 * input + 100 * input * 5) / 1_000_000)
+    const above = { ...usage, input_tokens: 272_001 }
+    const long = calculateCost(above, model)
+    assert.equal(long.total_cost, (272_001 * 2 * input + 100 * 7.5 * input) / 1_000_000)
+    assert.equal(calculateCost({ ...above, service_tier: 'priority' }, model).total_cost, long.total_cost * 2)
+    assert.equal(calculateCost({ ...above, service_tier: 'ultrafast' }, model).known, false)
+  }
+})
+
 test('official family aliases resolve to current list prices', () => {
   assert.equal(resolvePrice('fable').id, 'claude-fable-5')
   assert.equal(resolvePrice('opus').id, 'claude-opus-5')
