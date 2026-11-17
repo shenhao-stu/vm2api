@@ -207,7 +207,11 @@ class ChannelStore:
                         or any(c not in '0123456789abcdef-' for c in grant_id)):
                     raise native.ContractError('native_channel_evidence_unknown')
                 known_grants.add(grant_id)
-                if (status == 'awaiting_tools' and session is None
+                # During tool-result adoption the CLI clears its live IDs before
+                # publishing the next checkpoint. Pair the published history
+                # with the IDs from its own claim when the entry is busy.
+                if (status == 'awaiting_tools'
+                        and (session is None or (entry.busy and claim.get('state') == 'complete'))
                         and state.get('request_sha256') == request
                         and state.get('history_sha256') == claim.get('history_sha256')):
                     pending = frozenset(claim.get('pending_ids', ()))

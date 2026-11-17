@@ -184,6 +184,37 @@ class ChannelTests(unittest.TestCase):
                     {'role': 'user', 'content': 'fresh'}]}):
                 self.fail('damaged adoption must fail closed')
 
+    def test_tool_adoption_keeps_published_evidence_while_cli_prepares(self):
+        body = {**self.body, 'tools': [{'name': 'Bash', 'input_schema': {'type': 'object'}}]}
+        assistant = [{'type': 'tool_use', 'id': 'owned_bash', 'name': 'Bash',
+                      'input': {'command': 'cd /owned/project && printf ready'}}]
+        with self.pool.lease('tenant-a', body) as session:
+            history = self.completed(session, body, assistant, pending=('owned_bash',))
+        following = {**body, 'messages': history + [{'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': 'owned_bash', 'content': 'ready'}]}]}
+        following['messages'][-2]['content'][-1]['input']['command'] = 'printf ready'
+        fresh = {**body, 'messages': [{'role': 'user', 'content': 'separate new turn'}]}
+
+        observed = []
+
+        def check_during_prepare():
+            self.assertEqual(active.pending_ids, set())
+            self.assertEqual(read_json(active.directory / 'continuation.json')['status'], 'awaiting_tools')
+            for request in (body, fresh):
+                try:
+                    with self.pool.lease('tenant-a', request):
+                        observed.append('admitted')
+                except ContractError as exc:
+                    observed.append(str(exc))
+            raise ContractError('offline_prepare_finished')
+
+        with self.pool.lease('tenant-a', following) as active:
+            with patch.object(active, 'prepare', side_effect=check_during_prepare):
+                with self.assertRaisesRegex(ContractError, '^offline_prepare_finished$'):
+                    list(active.request(following))
+        self.assertEqual(observed, ['native_request_in_flight_no_replay', 'session_busy'])
+        self.assertEqual(len(list((active.directory / 'caller-grants').glob('*.json'))), 1)
+
     def test_pending_tool_identity_changes_are_rejected(self):
         content = [{'type': 'tool_use', 'id': 'owned_tool', 'name': 'Read', 'input': {'path': 'old'}}]
         with self.pool.lease('tenant-a', self.body) as session:
