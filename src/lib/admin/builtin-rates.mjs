@@ -1,7 +1,7 @@
 /**
  * Official list-price snapshot (USD / 1M tokens), keyed by full canonical model id.
  * Anthropic cache: 5m = 1.25× input, 1h = 2× input unless a published read/write differs.
- * OpenAI cache_5m = published cache_write (0 if none); cache_1h = cache_5m.
+ * OpenAI uses the short and long cache-write buckets for the provider's published retention windows.
  */
 export const BUILTIN_SOURCE = 'builtin-2026-10-14'
 
@@ -26,10 +26,9 @@ function tokenPrice(input, output, cache_read, cache_5m, cache_1h) {
 
 function openaiFrom(std, extra = {}) {
   const writeRatio = std.input ? std.cache_write / std.input : 0
-  const band = (input, output, cache_read) => {
-    const w = writeRatio ? input * writeRatio : 0
-    return { input, output, cache_read, cache_5m: w, cache_1h: w }
-  }
+  const longWriteRatio = std.cache_write_long == null ? writeRatio : std.cache_write_long / std.input
+  const band = (input, output, cache_read) =>
+    tokenPrice(input, output, cache_read, input * writeRatio, input * longWriteRatio)
   const base = band(std.input, std.output, std.cache_read)
   const unpricedLong = [{ above: OPENAI_LONG, unpriced: true }]
   if (extra.unpriced_long_context) {
@@ -103,6 +102,15 @@ function gptImage() {
 }
 
 const OPENAI = {
+  // OpenAI GPT-6.2 model cards, 2026-11-17. Cache writes are priced at 30m and 12h.
+  'gpt-6.2-astra': openaiFrom(
+    { input: 8, output: 40, cache_read: 0.4, cache_write: 10, cache_write_long: 20 },
+    { fast: [16, 80, 0.8], long_standard: [16, 60, 0.8], long_fast: [32, 120, 1.6] },
+  ),
+  'gpt-6.2-sol': openaiFrom(
+    { input: 2, output: 10, cache_read: 0.1, cache_write: 2.5, cache_write_long: 5 },
+    { fast: [4, 20, 0.2], long_standard: [4, 15, 0.2], long_fast: [8, 30, 0.4] },
+  ),
   'gpt-6-astra': openaiFrom(
     { input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
     {
