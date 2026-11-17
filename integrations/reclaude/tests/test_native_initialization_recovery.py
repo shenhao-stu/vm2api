@@ -158,6 +158,28 @@ class InitializationRecovery(unittest.TestCase):
                 recovered.process.code = recovered.dispatch_process.code = 0
         self.assertEqual(sum(x["type"] == "user" for x in self.inputs), 2)
 
+    def test_closed_policy_proxy_supplies_only_one_live_observation(self):
+        import urllib.error
+        import urllib.request
+
+        real_open = urllib.request.OpenerDirector.open
+        reads = []
+        def gate_open(opener, url, *args, **kwargs):
+            if reads:
+                raise urllib.error.URLError("dispatch proxy has exited")
+            reads.append(url)
+            return real_open(opener, url, *args, **kwargs)
+
+        with self.pool.lease("tenant-A", self.body) as session:
+            with patch.object(urllib.request.OpenerDirector, "open", gate_open), \
+                 patch.object(Session, "prepare", lambda s: self.fail_policy(s)):
+                with self.assertRaisesRegex(RequestRejected, "native_policy_not_ready_no_dispatch"):
+                    list(session.request(self.body))
+            self.assertEqual(len(reads), 1)
+            self.assertFalse(session.failed)
+            self.assertEqual(self.inputs, [])
+            self.assertEqual(json.loads((session.directory / "continuation.json").read_text())["status"], "prepared")
+
     def test_policy_sync_prewarm_is_recoverable_without_model_input(self):
         with self.pool.lease("tenant-A", self.body) as session:
             with patch.object(Session, "prepare", lambda s: self.fail_policy(s)):

@@ -34,6 +34,16 @@ class ContractError(ValueError):
     pass
 
 
+class PolicyNotReady(ContractError):
+    """The closing dispatch proxy's last observation belongs to this CLI only."""
+
+    def __init__(self, session):
+        super().__init__("native_policy_not_ready_no_dispatch")
+        self.cli = session.process
+        self.proxy = session.dispatch_process
+        self.observation = session.dispatch_close_observation
+
+
 class RequestRejected(ContractError):
     """Invalid input rejected before changing a native conversation."""
 
@@ -1205,7 +1215,7 @@ class Session:
                     return
             time.sleep(0.05)
         self.close()
-        raise ContractError("native_policy_not_ready_no_dispatch")
+        raise PolicyNotReady(self)
 
     def read_output(self):
         rate_limit_info = None
@@ -1317,8 +1327,13 @@ class Session:
                 or self.last_grant_id != boundary["last_grant"]):
             return False
         # Stop both producers, then require a fresh observation from this proxy.
-        self.close()
-        stats = self.dispatch_close_observation
+        if isinstance(exc, PolicyNotReady):
+            if exc.cli is not self.process or exc.proxy is not self.dispatch_process:
+                return False
+            stats = exc.observation
+        else:
+            self.close()
+            stats = self.dispatch_close_observation
         if (self.failed or not self.process or self.process.poll() is None
                 or not self.dispatch_process or self.dispatch_process.poll() is None
                 or self.reader and self.reader.is_alive()
