@@ -164,6 +164,72 @@ class TerminalErrorTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaisesRegex(ContractError, 'evidence_unknown'):
                 with self.pool.lease('tenant-a', {**self.body, 'messages': [user('another continuation')]}): pass
 
+    def test_empty_max_tokens_then_local_retry_keeps_original_claim(self):
+        active, log = self.failed()
+        native_id = active.native_id
+        start, _, delta, stop, result = events(native_id)
+        delta['event']['delta']['stop_reason'] = 'max_tokens'
+        delta['event']['usage'] = dict(start['event']['message']['usage'], output_tokens=1)
+        start['event']['message']['usage']['output_tokens'] = 1
+        allowed = {'type': 'rate_limit_event', 'session_id': native_id,
+                   'rate_limit_info': {'status': 'allowed'}}
+        retry = {'type': 'user', 'session_id': native_id, 'isSynthetic': True,
+                 'message': {'role': 'user', 'content': 'continue'}}
+        rejected = {**allowed, 'rate_limit_info': {'status': 'rejected'}}
+        denial = {'type': 'assistant', 'session_id': native_id, 'error': 'rate_limit',
+                  'api_error_status': 429, 'is_api_error_message': True,
+                  'message': {'model': '<synthetic>', 'content': [
+                      {'type': 'text', 'text': 'native_dispatch_already_consumed'}]}}
+        batch = [start, delta, stop, allowed, retry, rejected, denial,
+                 {**result, 'api_error_status': 429, 'num_turns': 2}]
+        def write(items):
+            log.write_text(''.join(json.dumps(e) + '\n' for e in items))
+        counters = active.directory / 'dispatch/final.safe.json'
+        write_json(counters, {'upstream_attempts': 1, 'denied': 1})
+        write(batch)
+        self.pool.close()
+        self.pool = self.new_pool()
+        before = log.read_bytes()
+        with self.assertRaisesRegex(ContractError, '^request_already_consumed$'):
+            with self.pool.lease('tenant-a', self.body):
+                self.fail('original turn was leased twice')
+        fresh = {**self.body, 'messages': [user('new question after the empty stream')]}
+        with self.pool.lease('tenant-a', fresh) as child:
+            self.assertNotEqual(child.directory, active.directory)
+        self.assertEqual(log.read_bytes(), before)
+        self.assertEqual(len(list((active.directory/'dispatch').glob('*.consumed.json'))), 1)
+        state = read_json(active.directory/'continuation.json')
+        claims = {p.stem: read_json(p) for p in (active.directory/'caller-grants').glob('*.json')}
+        for label, index, path, value in (
+            ('vendor quota', 6, ('message','content'), [{'type':'text','text':'usage_limit_reached'}]),
+            ('real reset', 5, ('rate_limit_info','resetsAt'), 1900000000),
+            ('tool content', 0, ('event','message','content'), [{'type':'tool_use'}]),
+            ('wrong model', 0, ('event','message','model'), 'other-model'),
+            ('end turn', 1, ('event','delta','stop_reason'), 'end_turn'),
+            ('invalid usage', 1, ('event','usage','output_tokens'), True),
+            ('different input usage', 1, ('event','usage','input_tokens'), 4),
+            ('different session', 4, ('session_id',), 'other-session'),
+            ('external user', 4, ('isSynthetic',), False),
+            ('policy', 6, ('error',), 'invalid_request'),
+        ):
+            changed = copy.deepcopy(batch)
+            target = changed[index]
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            write(changed)
+            with self.subTest(reason=label):
+                self.assertIsNone(failed_request(active.directory, state, claims))
+        for items in (batch[:-1], batch[:2] + batch[3:], [start, *batch],
+                      [*batch[:1], {'type':'stream_event','session_id':native_id,
+                       'event':{'type':'content_block_start'}}, *batch[1:]]):
+            write(items)
+            self.assertIsNone(failed_request(active.directory, state, claims))
+        write(batch)
+        for attempts, denied in ((0,1), (2,1), (1,0)):
+            write_json(counters, {'upstream_attempts': attempts, 'denied': denied})
+            self.assertIsNone(failed_request(active.directory, state, claims))
+
     def test_observed_gateway_failure_retires_cli_but_keeps_consumed_request(self):
         active, log = self.failed()
         grant = read_json(active.directory / 'dispatch/grant.json')

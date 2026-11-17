@@ -74,6 +74,39 @@ def interrupted_terminal(events, native_id):
                for e in prefix if e['type'] == 'assistant')
 
 
+def exhausted_output_then_local_retry(events, native_id, model):
+    """A single empty max_tokens response ended before the CLI retried its spent grant."""
+    steps = [e for e in events if e.get('type') != 'system']
+    if ([e.get('type') for e in steps] != [
+            'stream_event', 'stream_event', 'stream_event', 'rate_limit_event',
+            'user', 'rate_limit_event', 'assistant', 'result']
+            or any(e.get('session_id') != native_id for e in steps)
+            or any(e.get('subtype') not in ('init', 'status') for e in events if e.get('type') == 'system')
+            or not gateway_terminal(steps[-2:], native_id)):
+        return False
+    start, delta, stop = (e['event'] for e in steps[:3])
+    if [start.get('type'), delta.get('type'), stop.get('type')] != [
+            'message_start', 'message_delta', 'message_stop']:
+        return False
+    message = start['message']
+    retry, limit, denial, result = steps[4], steps[5]['rate_limit_info'], steps[6], steps[7]
+    if (message.get('role') != 'assistant' or message.get('type') != 'message'
+            or not message.get('id') or not model or message.get('model') != model
+            or message.get('content') != [] or message.get('stop_reason') is not None
+            or delta.get('delta', {}).get('stop_reason') != 'max_tokens'
+            or steps[3]['rate_limit_info'].get('status') != 'allowed'
+            or retry.get('isSynthetic') is not True or retry.get('message', {}).get('role') != 'user'
+            or limit.get('status') != 'rejected' or limit.get('resetsAt') is not None
+            or limit.get('rateLimitType') is not None or denial.get('error') != 'rate_limit'
+            or denial.get('api_error_status') != 429 or denial.get('api_error') or result.get('api_error')):
+        return False
+    final_usage = delta.get('usage', {})
+    initial = message.get('usage', {})
+    keys = ('input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens')
+    return all(type(initial.get(k)) is int and type(final_usage.get(k)) is int
+               and final_usage[k] == initial[k] >= 0 for k in keys) and final_usage['output_tokens'] > 0
+
+
 def failed_request(directory, state, claims):
     """The old request remains consumed; this proof only retires its broken CLI."""
     def read(path):
@@ -121,6 +154,8 @@ def failed_request(directory, state, claims):
         # consumed; this only permits a different, newly authored caller turn.
         complete = complete or (gateway_known and gateway_terminal(events, native_id))
         complete = complete or (final['denied'] == 1 and interrupted_terminal(events, native_id))
+        if not complete and final['denied'] == final['upstream_attempts'] == len(claims) == 1:
+            complete = exhausted_output_then_local_retry(events, native_id, grant.get('model'))
         return request if complete else None
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
