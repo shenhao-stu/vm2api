@@ -74,6 +74,31 @@ async function readLines(stream, onLine) {
   if (buf) await onLine(buf)
 }
 
+const nativeAdmissionCodes = new Set(['session_busy', 'native_session_capacity', 'native_memory_pressure'])
+
+function isNativeAdmissionError(payload) {
+  const error = payload?.error
+  return (
+    payload?.type === 'error' &&
+    Object.keys(payload).length === 2 &&
+    error?.type === 'api_error' &&
+    Object.keys(error).length === 3 &&
+    error.message === error.code &&
+    nativeAdmissionCodes.has(error.code)
+  )
+}
+
+function coolApiKey(scheduler, store, key, header) {
+  const now = Date.now()
+  const value = String(header ?? '').trim()
+  const reset = /^\d+$/.test(value) ? now + Number(value) * 1000 : Date.parse(value)
+  const until = new Date(Number.isFinite(new Date(reset).getTime()) ? Math.max(now + 1000, reset) : now + 30000)
+  try {
+    store.setKeyCooldown(key.id, until.toISOString())
+  } catch {}
+  scheduler.reload(store.listRaw())
+}
+
 export async function runApiInference({
   req,
   res,
@@ -185,14 +210,15 @@ export async function runApiInference({
   }
 
   const status = Number(upstream.statusCode) || 502
-  if (status === 429 && !picked.endpoint.disable_cooling) {
-    const retry = Number(upstream.headers['retry-after'] || 30)
-    const until = new Date(Date.now() + Math.max(1, retry) * 1000).toISOString()
-    try {
-      store.setKeyCooldown(picked.key.id, until)
-    } catch {}
-    scheduler.reload(store.listRaw())
-  }
+  const shouldCool = status === 429 && !picked.endpoint.disable_cooling
+  // A native relay reports local admission failures before model dispatch.
+  // Explicit provider limit headers always retain their account-wide effect.
+  const inspectAdmission =
+    shouldCool &&
+    cfg.api_passthrough === true &&
+    !isOpenAI &&
+    !Object.keys(upstream.headers).some((key) => key === 'retry-after' || /rate-?limit/i.test(key))
+  if (shouldCool && !inspectAdmission) coolApiKey(scheduler, store, picked.key, upstream.headers['retry-after'])
 
   const resultBase = {
     ok: status >= 200 && status < 300,
@@ -208,6 +234,7 @@ export async function runApiInference({
 
   if (status >= 400) {
     const payload = await readApiJson(upstream).catch(() => ({}))
+    if (inspectAdmission && !isNativeAdmissionError(payload)) coolApiKey(scheduler, store, picked.key)
     const passthroughError =
       cfg.api_passthrough === true ? safeNativeRelayError(status, payload?.error, picked.upstream_model) : null
     const message = payload?.error?.message || payload?.message || `upstream ${status}`
