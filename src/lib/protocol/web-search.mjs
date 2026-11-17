@@ -50,7 +50,7 @@ function isClaudeCodeClientWebSearch(tool, type) {
 export function isWebSearchTool(tool) {
   if (!tool || typeof tool !== 'object') return false
   const type = String(tool.type || '').toLowerCase()
-  if (isClaudeCodeClientWebSearch(tool, type)) return false
+  if (isClaudeCodeClientWebSearch(tool, type) || type === 'function' || type === 'custom' || tool.function) return false
   const name = searchToolName(tool)
   return type.startsWith('web_search') || type === 'google_search' || WEB_SEARCH_NAMES.has(name)
 }
@@ -61,6 +61,10 @@ export function isCallerClientSearchTool(tool) {
   if (isClaudeCodeClientWebSearch(tool, String(tool.type || '').toLowerCase())) return true
   const name = searchToolName(tool)
   return name === 'search_web' || name === 'scrape_web'
+}
+
+export function isVersionedAnthropicServerTool(tool) {
+  return typeof tool?.type === 'string' && /_\d{8}$/.test(tool.type) && typeof tool.name === 'string' && !!tool.name
 }
 
 export function isAnthropicServerTool(tool) {
@@ -237,6 +241,7 @@ export function toAnthropicCustomTool(tool) {
   const description = String(fn?.description || tool.description || '')
   const input_schema = fn?.parameters || tool.input_schema || tool.parameters || { type: 'object', properties: {} }
   const out = { name, input_schema }
+  if ((tool.type === 'custom' || fn) && isWebSearchTool({ name })) out.type = 'custom'
   if (description) out.description = description
   if (tool.cache_control) out.cache_control = tool.cache_control
   const strict = fn?.strict ?? tool.strict

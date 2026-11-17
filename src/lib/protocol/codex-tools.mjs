@@ -3,6 +3,8 @@
  * Pure protocol conversion — no CLI involvement.
  */
 
+import { isVersionedAnthropicServerTool } from './web-search.mjs'
+
 export const CODEX_TOOL_MAP = {
   apply_patch: 'Bash',
   applyPatch: 'Bash',
@@ -35,7 +37,7 @@ function remapToolName(name) {
 export function remapCodexTools(tools) {
   if (!Array.isArray(tools)) return tools
   return tools.map((t) => {
-    if (!t || typeof t !== 'object') return t
+    if (!t || typeof t !== 'object' || isVersionedAnthropicServerTool(t)) return t
     if (t.name) return { ...t, name: remapToolName(t.name) }
     if (t.function?.name) {
       return { ...t, function: { ...t.function, name: remapToolName(t.function.name) } }

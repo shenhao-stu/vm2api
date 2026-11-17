@@ -408,3 +408,18 @@ test('caller-declared web_search is not given injected defaults', () => {
   const [capped] = sanitizeAnthropicTools([{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }])
   assert.equal(capped.max_uses, 3)
 })
+
+test('mixed Claude tool lists retain the version, limits and domain scope of hosted search', () => {
+  const hosted = { type: 'web_search_20260209', name: 'web_search', max_uses: 2, allowed_domains: ['example.org'] }
+  const alias = { type: 'web_search_preview' }
+  const fetch = { type: 'web_fetch_20250910', name: 'web_fetch', max_uses: 1 }
+  for (const tools of [[alias, hosted, fetch], [hosted, alias, fetch]]) {
+    const { claude } = toClaudeMessages('openai.chat', { messages: [{ role: 'user', content: 'test' }], tools })
+    assert.deepEqual(claude.tools, [hosted, fetch])
+  }
+})
+
+test('a function explicitly named web_search keeps its caller schema', () => {
+  const tools = openaiToolsToClaude([{ type: 'function', function: { name: 'web_search', parameters: { type: 'object', required: ['q'], properties: { q: { type: 'string' } } } } }])
+  assert.deepEqual(officialMessagesBody({ tools }).tools[0].input_schema.required, ['q'])
+})

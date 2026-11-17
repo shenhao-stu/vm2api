@@ -15,7 +15,7 @@ import { inboundHasOpenAIToolShape } from '../identity/crs-persona.mjs'
 import { openaiReasoningToClaudeThinking, claudeThinkingToOpenAIReasoning } from './thinking.mjs'
 import { openaiContentToClaudeContent } from './images.mjs'
 import { remapCodexTools } from './codex-tools.mjs'
-import { CLAUDE_WEB_SEARCH_TOOL, isWebSearchTool } from './web-search.mjs'
+import { CLAUDE_WEB_SEARCH_TOOL, isVersionedAnthropicServerTool, isWebSearchTool } from './web-search.mjs'
 
 const DEFAULT_MODEL = 'claude-haiku-4-5-20251001'
 
@@ -74,14 +74,22 @@ export function isClaudeMessagesShape(body) {
 /** OpenAI tools → Claude tools. Server search maps to web_search_20250305; function tools stay client tools. */
 export function openaiToolsToClaude(tools) {
   if (!Array.isArray(tools) || !tools.length) return undefined
-  const seenSearch = new Set()
+  let searchIndex = -1
   const out = []
   for (const t of remapCodexTools(tools)) {
     if (!t) continue
     if (isWebSearchTool(t)) {
-      if (seenSearch.has('web_search')) continue
-      seenSearch.add('web_search')
-      out.push({ ...CLAUDE_WEB_SEARCH_TOOL })
+      const search = isVersionedAnthropicServerTool(t) ? t : CLAUDE_WEB_SEARCH_TOOL
+      if (searchIndex < 0) {
+        searchIndex = out.length
+        out.push(search)
+      } else if (out[searchIndex] === CLAUDE_WEB_SEARCH_TOOL) {
+        out[searchIndex] = search
+      }
+      continue
+    }
+    if (isVersionedAnthropicServerTool(t)) {
+      out.push(t)
       continue
     }
     if (!(t.type === 'function' || t.function || t.name)) continue
@@ -92,6 +100,7 @@ export function openaiToolsToClaude(tools) {
           withCacheControl(
             {
               name: t.function.name,
+              ...(isWebSearchTool({ name: t.function.name }) ? { type: 'custom' } : {}),
               description: t.function.description || '',
               input_schema: t.function.parameters || { type: 'object', properties: {} },
               ...(typeof t.function.strict === 'boolean' ? { strict: t.function.strict } : {}),
@@ -114,6 +123,7 @@ export function openaiToolsToClaude(tools) {
         withCacheControl(
           {
             name,
+            ...(isWebSearchTool({ name }) ? { type: 'custom' } : {}),
             description: t.description || '',
             input_schema: t.input_schema || t.parameters || { type: 'object', properties: {} },
             ...(typeof t.strict === 'boolean' ? { strict: t.strict } : {}),
