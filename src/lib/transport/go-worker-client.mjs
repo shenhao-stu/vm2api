@@ -916,6 +916,8 @@ export async function streamGoWorker({
         usage: mergeUsage(mergeUsage(assembled?.usage || null, sseUsage), meta.usage),
         model: meta.model || sseModel || assembled?.model || null,
         stopReason,
+        // Keep provider diagnostics even when a later error replaces the assembled body.
+        stopDetails: assembled?.stop_details ?? null,
         sawMessageStop,
         ttftMs,
         firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
