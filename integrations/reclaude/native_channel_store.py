@@ -329,20 +329,21 @@ class ChannelStore:
         path = session.directory / 'caller-grants' / (request_sha + '.json')
         claim = read_json(path)
         consumed = session.directory / 'dispatch' / (claim['grant_id'] + '.consumed.json')
+        receipt = read_json(consumed) if consumed.is_file() else {}
         if (not valid_usage(usage)
-                or claim.get('state') != 'claimed' or not consumed.is_file()
+                or claim.get('state') != 'claimed'
                 or claim.get('request_sha256') != request_sha
                 or claim.get('native_id') != session.native_id
-                or read_json(consumed).get('id') != claim['grant_id']):
+                or receipt.get('id') != claim['grant_id']):
             raise native.ContractError('native_channel_evidence_unknown')
-        return path, claim
+        return path, claim, receipt
 
     def refuse(self, session, request_sha, usage):
-        path, claim = self.terminal_claim(session, request_sha, usage)
+        path, claim, _ = self.terminal_claim(session, request_sha, usage)
         write_json(path, {**claim, 'state': 'policy_refused', 'terminal_usage': usage})
 
     def complete(self, session, request_sha, usage):
-        path, claim = self.terminal_claim(session, request_sha, usage)
+        path, claim, receipt = self.terminal_claim(session, request_sha, usage)
         state = read_json(session.directory / 'continuation.json')
         if (state.get('status') not in {'idle', 'awaiting_tools'}
                 or state.get('request_sha256') != request_sha):
@@ -350,6 +351,17 @@ class ChannelStore:
         claim.update(state='complete', terminal_usage=usage,
                      history_sha256=state['history_sha256'],
                      history_length=state['history_length'], pending_ids=sorted(session.pending_ids))
+        # Record only resume metadata from a paid tool turn. A later failed
+        # startup may overwrite continuation.json. Admission never consults
+        # this historical copy or treats it as permission for a new dispatch.
+        required = {'version', 'status', 'native_id', 'assistant_uuid', 'message_id',
+                    'configuration', 'fixed_configuration', 'request_sha256', 'history_length',
+                    'history_sha256', 'history_pending_sha256'}
+        if (state['status'] == 'awaiting_tools' and session.pending_ids
+                and required <= state.keys() <= required | {'history_controls_sha256', 'structured_output'}
+                and state['native_id'] == session.native_id
+                and receipt.get('session_id') == session.native_id):
+            claim['completed_checkpoint'] = state
         write_json(path, claim)
 
 
