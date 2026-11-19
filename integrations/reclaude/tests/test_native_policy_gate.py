@@ -16,6 +16,10 @@ log=pathlib.Path(sys.argv[sys.argv.index('--debug-file')+1])
 if __import__('os').environ.get('FIXTURE_POLICY_READY'):
  time.sleep(.25)
  log.write_text('Policy limits: Cache still valid (304 Not Modified)\\n')
+if __import__('os').environ.get('FIXTURE_POLICY_UNCONFIRMED'):
+ time.sleep(.25)
+ log.write_text('Policy limits: fetch failed (http 429) from provider\\nPolicy limits: Retry 5/5 after 8209ms\\n'
+                'Policy limits: Using stale cache after fetch failure\\n')
 for line in sys.stdin:
  message=json.loads(line)
  if message['type']=='control_request':
@@ -38,10 +42,12 @@ class PolicyGate(unittest.TestCase):
             session.close()
         self.temp.cleanup()
 
-    def session(self, ready):
+    def session(self, ready, unconfirmed=False, timeout=0.6):
         env = {"PATH": os.environ["PATH"]}
         if ready:
             env["FIXTURE_POLICY_READY"] = "1"
+        if unconfirmed:
+            env["FIXTURE_POLICY_UNCONFIRMED"] = "1"
         body = {
             "model": "fixture",
             "messages": [{"role": "user", "content": "one actual turn"}],
@@ -53,7 +59,7 @@ class PolicyGate(unittest.TestCase):
             [sys.executable, str(self.child)],
             env,
             body,
-            timeout=0.6,
+            timeout=timeout,
             require_policy=True,
         )
         self.sessions.append(s)
@@ -68,6 +74,17 @@ class PolicyGate(unittest.TestCase):
         self.assertFalse((s.directory / "received.json").exists())
         self.assertFalse(s.failed)
         self.assertIsNotNone(s.process.poll())
+
+    def test_unconfirmed_policy_fails_as_soon_as_the_cli_gives_up(self):
+        # Production 2026-11-20 (34050): six provider 429s, then the CLI logged that it
+        # kept its stale cache. The worker still waited its full 90 seconds.
+        s = self.session(False, unconfirmed=True, timeout=30)
+        started = time.monotonic()
+        with self.assertRaisesRegex(ContractError, "native_policy_not_ready_no_dispatch"):
+            s.start([{"type": "text", "text": "MUST NOT SEND"}])
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse((s.directory / "received.json").exists())
+        self.assertFalse(s.failed)
 
     def test_prepare_has_no_input_and_reuses_one_process(self):
         s = self.session(True)

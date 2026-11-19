@@ -1234,12 +1234,17 @@ class Session:
             "Policy limits: Applied new restrictions successfully",
             "Policy limits: Cache still valid (304 Not Modified)",
         )
+        # The CLI finished its own retries without a confirmation. It will not
+        # produce one for this launch, so the remaining wait cannot succeed.
+        unconfirmed = "Policy limits: Using stale cache after fetch failure"
         while self.process.poll() is None and time.monotonic() < deadline:
             if path.exists():
                 with path.open() as log:
                     text = log.read(2 * 1024 * 1024)
                 if any(marker in text for marker in ready):
                     return
+                if unconfirmed in text:
+                    break
             time.sleep(0.05)
         exited_early = self.process.poll() is not None
         self.close()
