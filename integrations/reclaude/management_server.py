@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 
 from management import ManagementError, Manager
+from enrolled_device import EnrolledDevice
 
 PREFIX = "/api/panel/native-relays"
 
@@ -98,11 +99,13 @@ class Server(http.server.ThreadingHTTPServer):
             raise ValueError("at least one native relay is required")
         configs = [entry.config for entry in entries]
         for field in ("id", "binding", "sub_account", "state_dir"):
-            values = [str(Path(c[field]).resolve()) if field == "state_dir" else c[field] for c in configs]
+            scoped = [c for c in configs if field != "sub_account" or not c.get("enrollment_only")]
+            values = [str(Path(c[field]).resolve()) if field == "state_dir" else c[field] for c in scoped]
             if len(set(values)) != len(values):
                 raise ValueError("duplicate native relay " + field)
         for field in ("runtime_command", "sub_command"):
-            if len({tuple(c[field]) for c in configs}) != len(configs):
+            scoped = [c for c in configs if field != "sub_command" or not c.get("enrollment_only")]
+            if len({tuple(c[field]) for c in scoped}) != len(scoped):
                 raise ValueError("duplicate native relay " + field)
         if any(not re.fullmatch(r"[A-Za-z0-9_-]+", c["id"]) for c in configs):
             raise ValueError("invalid native relay id")
@@ -156,7 +159,8 @@ def main():
     parser.add_argument("--port", type=int, required=True)
     args = parser.parse_args()
     os.umask(0o077)
-    managers = [Manager(json.loads(Path(path).read_text())) for path in args.config]
+    configs = [json.loads(Path(path).read_text()) for path in args.config]
+    managers = [EnrolledDevice(c) if c.get("enrollment_only") else Manager(c) for c in configs]
     server = Server(("127.0.0.1", args.port), managers)
     stopped = threading.Event()
 
