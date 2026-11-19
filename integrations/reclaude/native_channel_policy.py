@@ -51,6 +51,12 @@ class Snapshot:
     stopped: bool = False
     memory_pressure: bool = False
     issued_tool_ids: frozenset[str] = frozenset()
+    # Channels whose own turn failed or lost its terminal. Their claimed
+    # requests remain consumed; a different caller turn may import its own
+    # complete history into a new channel instead of being refused forever.
+    abandoned: frozenset[str] = frozenset()
+    abandoned_requests: frozenset[str] = frozenset()
+    abandoned_tool_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -87,6 +93,11 @@ def consistent_snapshot(snapshot, native):
     if (type(snapshot.channels) is not tuple or type(snapshot.consumed) is not frozenset
             or type(snapshot.issued_tool_ids) is not frozenset
             or any(not isinstance(t, str) or not t for t in snapshot.issued_tool_ids)
+            or any(type(v) is not frozenset for v in (
+                snapshot.abandoned, snapshot.abandoned_requests, snapshot.abandoned_tool_ids))
+            or not snapshot.abandoned <= {c.key for c in snapshot.channels}
+            or not snapshot.abandoned_requests <= snapshot.consumed
+            or not snapshot.abandoned_tool_ids <= snapshot.issued_tool_ids
             or any(type(flag) is not bool for flag in (
                 snapshot.evidence_complete, snapshot.unknown_dispatch, snapshot.inflight,
                 snapshot.stopped, snapshot.memory_pressure))
@@ -161,12 +172,21 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
         if request_sha in snapshot.consumed:
             return reject("native_request_consumed_no_replay")
         return reject("native_session_evidence_unknown")
+    abandoned = snapshot.abandoned
+    if abandoned:
+        if request_sha in snapshot.abandoned_requests:
+            return reject("native_request_consumed_no_replay")
+        if not allow_history_import:
+            if any(c.key in abandoned and c.status == 'failed' for c in channels):
+                return reject("native_session_failed_no_replay")
+            return reject("native_session_evidence_unknown")
     if snapshot.stopped:
         return reject("native_pool_stopped")
-    if snapshot.inflight or any(c.busy or c.status in {"in_flight", "closing"}
+    if snapshot.inflight or any(c.key not in abandoned and (c.busy or c.status in {"in_flight", "closing"})
                                for c in channels):
         return reject("session_busy")
-    retired = tuple(c.key for c in channels if c.status in {'quota_rejected', 'terminal_error'})
+    retired = tuple(c.key for c in channels
+                    if c.status in {'quota_rejected', 'terminal_error'} or c.key in abandoned)
     channels = tuple(c for c in channels if c.key not in retired)
     if any(c.status == "failed" for c in channels):
         return reject("native_session_failed_no_replay")
@@ -202,7 +222,10 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
         if check_capacity and not target.resident and snapshot.resident_total >= snapshot.capacity:
             return reject('native_session_capacity')
         return Decision('reuse', 'prepared_tool_handoff', scope, request_sha, target.key)
-    if not (final_results & snapshot.issued_tool_ids):
+    # Results for tools issued by an abandoned turn continue that completed
+    # tool_use through the caller's own history, never through its channel.
+    issued = snapshot.issued_tool_ids - snapshot.abandoned_tool_ids
+    if not (final_results & issued):
         # A verified tool-use terminal is also a completed upstream turn. Its
         # pending client tools do not own unrelated caller history. Only results
         # for our own issued tools need the strict owner path below.

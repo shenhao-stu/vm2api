@@ -23,11 +23,14 @@ import time
 import uuid
 import urllib.request
 from native_history import (HistoryError, active_efforts, import_plan, trailing_system_text,
-                            validate_system_messages, write_transcript)
+                            validate_system_messages, without_foreign_thinking, write_transcript)
 import native_history_boundary as boundary
 
 
 STRUCTURED_RESPONSE_LIMIT = 16 * 1024 * 1024
+# ReClaude's launcher syncs account config over the network before the CLI
+# exists; a transient timeout exits with zero model dispatches. Relaunch once.
+POLICY_LAUNCH_ATTEMPTS = 2
 
 
 class ContractError(ValueError):
@@ -37,11 +40,12 @@ class ContractError(ValueError):
 class PolicyNotReady(ContractError):
     """The closing dispatch proxy's last observation belongs to this CLI only."""
 
-    def __init__(self, session):
+    def __init__(self, session, exited_early=False):
         super().__init__("native_policy_not_ready_no_dispatch")
         self.cli = session.process
         self.proxy = session.dispatch_process
         self.observation = session.dispatch_close_observation
+        self.exited_early = exited_early
 
 
 class RequestRejected(ContractError):
@@ -1027,6 +1031,29 @@ class Session:
             ):
                 raise ContractError("native_account_scope_changed")
             return
+        for attempt in range(1, POLICY_LAUNCH_ATTEMPTS + 1):
+            try:
+                return self.launch()
+            except PolicyNotReady as exc:
+                if attempt == POLICY_LAUNCH_ATTEMPTS or not self.zero_dispatch_exit(exc):
+                    raise
+            self.process = self.reader = self.dispatch_process = None
+            self.dispatch_address = None
+            self.events = queue.Queue()
+            self.initialize_id = self.initialize_response = None
+            time.sleep(1)
+
+    def zero_dispatch_exit(self, exc):
+        """The launcher left on its own and the closed proxy saw no model request."""
+        stats = exc.observation
+        return (exc.exited_early and not self.failed and not self.process_has_turn
+                and exc.cli is self.process and exc.proxy is self.dispatch_process
+                and not (self.reader and self.reader.is_alive())
+                and isinstance(stats, dict)
+                and all(type(stats.get(k)) is int and stats[k] == 0
+                        for k in ("upstream_attempts", "denied")))
+
+    def launch(self):
         config = {
             "mcpServers": {
                 "caller": {
@@ -1214,8 +1241,9 @@ class Session:
                 if any(marker in text for marker in ready):
                     return
             time.sleep(0.05)
+        exited_early = self.process.poll() is not None
         self.close()
-        raise PolicyNotReady(self)
+        raise PolicyNotReady(self, exited_early)
 
     def read_output(self):
         rate_limit_info = None
@@ -1398,6 +1426,9 @@ class Session:
                     self.pending_ids = set()
                     self.structured_checkpoint = False
                 if imported:
+                    own = {signature(m) for m in history_shape(self.history)
+                           if m['role'] == 'assistant'}
+                    imported = without_foreign_thinking(imported, own, signature)
                     # A new caller-owned transcript; no other native session is read.
                     self.close()
                     self.process = self.reader = self.dispatch_process = None
@@ -1513,6 +1544,8 @@ class Session:
                     if event is None or isinstance(event, Exception):
                         self.failed = True
                         self.close()
+                        if isinstance(event, NativeRateLimit) and self.guard_denied_retry(event):
+                            raise ContractError('native_dispatch_retry_denied_no_replay')
                         if isinstance(event, (NativeRateLimit, NativeProviderError)):
                             raise event
                         if isinstance(event, ContractError) and str(event) == 'native_api_error':
@@ -1653,6 +1686,18 @@ class Session:
              "usage": copy.deepcopy(turn.message.get("usage", {}))},
             {"type": "message_stop"},
         ]
+
+    def guard_denied_retry(self, error):
+        """Our one-dispatch guard, not the provider, answered the CLI's retry.
+
+        Claude Code retries some upstream 4xx (e.g. a foreign thinking signature)
+        after the single permitted POST. The guard's 429 is then reported as a
+        rate limit without any provider window; it must not cool the model down.
+        """
+        stats = self.dispatch_close_observation
+        return ('reset_at' not in error.details and 'api_error' not in error.details
+                and 'rate_limit_type' not in error.details and isinstance(stats, dict)
+                and type(stats.get('denied')) is int and stats['denied'] >= 1)
 
     def expire_tool_wait(self):
         if not self.lock.acquire(blocking=False):

@@ -129,6 +129,32 @@ def import_plan(messages):
     return conversation[:last_assistant + 1], tail
 
 
+def without_foreign_thinking(messages, own, digest):
+    """Drop older thinking blocks this relay did not itself produce.
+
+    A thinking signature is verified by the provider for the organization that
+    produced it. History completed on another account can carry signatures the
+    native CLI then fails to replay ("Invalid `signature` in `thinking` block");
+    its built-in strip-and-retry would need a second paid dispatch. Earlier turns'
+    thinking is optional context, so it is omitted from the imported transcript.
+    A last assistant message ending in tool_use keeps its blocks: the tool loop
+    being continued requires them.
+    """
+    assistants = [i for i, m in enumerate(messages) if m['role'] == 'assistant']
+    last = assistants[-1] if assistants else None
+    loop = last is not None and any(b.get('type') == 'tool_use' for b in messages[last]['content'])
+    result = []
+    for index, message in enumerate(messages):
+        if (message['role'] == 'assistant' and not (index == last and loop)
+                and digest(message) not in own):
+            kept = [b for b in message['content']
+                    if b.get('type') not in {'thinking', 'redacted_thinking'}]
+            if kept and len(kept) != len(message['content']):
+                message = {**message, 'content': kept}
+        result.append(message)
+    return result
+
+
 def write_transcript(profile, directory, native_id, messages, initial_effort=None):
     """Use CLI 2.1.304's native JSONL resume format, with our own UUIDs and cwd."""
     directory = Path(directory).resolve()

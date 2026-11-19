@@ -17,6 +17,28 @@ from native_tool_handoff import ToolHandoff
 from native_terminal_error import failed_request
 
 
+# An unknown terminal may still be executing upstream. Only after the channel's
+# evidence has been quiet this long may a different caller turn continue the
+# conversation in a new channel (its claimed requests remain consumed).
+ABANDON_AFTER_SECONDS = 600
+
+
+def quiet_seconds(directory, now):
+    newest = 0.0
+    for path in (directory / 'continuation.json', directory / 'stdout.private.jsonl'):
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            pass
+    for sub in ('caller-grants', 'dispatch'):
+        try:
+            for path in (directory / sub).iterdir():
+                newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            pass
+    return now - newest
+
+
 def sync_directory(path):
     descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -148,6 +170,10 @@ class ChannelStore:
         channels, consumed, issued_tools = [], set(), set()
         complete, unknown = True, False
         paid = {}
+        # A channel whose own turn failed or never reached a terminal is
+        # abandoned: its claimed requests stay consumed (never replayed), but
+        # its evidence no longer decides a different caller turn.
+        abandoned, abandoned_requests, abandoned_tools, live_tools = set(), set(), set(), set()
         for key, raw_identity in document['channels'].items():
             if (len(key) != 64 or any(c not in '0123456789abcdef' for c in key)
                     or raw_identity.get('logical_key') != logical):
@@ -185,6 +211,8 @@ class ChannelStore:
             elif terminal_error:
                 status = 'terminal_error'
             known_grants = set()
+            channel_unknown = False
+            channel_tools = set()
             for request, claim in claim_values.items():
                 if (len(request) != 64 or any(c not in '0123456789abcdef' for c in request)
                         or claim.get('request_sha256') != request):
@@ -223,7 +251,11 @@ class ChannelStore:
                     continue
                 if request in {retired_quota, terminal_error}:
                     continue
-                if claim.get('state') != 'complete' or receipt.get('id') != grant_id:
+                if claim.get('state') != 'complete':
+                    # The request is known (its claim is durable), so an exact
+                    # resend stays consumed; only its terminal is unknown.
+                    channel_unknown = True
+                elif receipt.get('id') != grant_id:
                     unknown = True
                 elif (isinstance(claim.get('terminal_usage'), dict)
                       and all(type(claim['terminal_usage'].get(k)) is int and claim['terminal_usage'][k] >= 0
@@ -233,6 +265,7 @@ class ChannelStore:
                     if not isinstance(tool_ids, list) or any(not isinstance(t, str) or not t for t in tool_ids):
                         raise native.ContractError('native_channel_evidence_unknown')
                     issued_tools.update(tool_ids)
+                    channel_tools.update(tool_ids)
                     if claim.get('pending_ids') == [] and type(claim.get('history_length')) is int:
                         completed.append(claim)
                     if (status == 'awaiting_tools' and request == state.get('request_sha256')
@@ -253,7 +286,21 @@ class ChannelStore:
             if (status not in {'quota_rejected', 'terminal_error', 'policy_refused'} and session is not None and session.history
                     and (length != len(session.history)
                          or history_sha != native.signature(native.history_shape(session.history)))):
-                complete = False
+                if session.failed:
+                    channel_unknown = True
+                else:
+                    complete = False
+            idle_dead = session is None and status in {'in_flight', 'closing'}
+            if (not (entry and entry.busy) and (status == 'failed' or idle_dead or channel_unknown)
+                    and quiet_seconds(directory, time.time()) >= ABANDON_AFTER_SECONDS):
+                abandoned.add(key)
+                abandoned_requests.update(r for r, c in claim_values.items()
+                                          if r not in {retired_quota, terminal_error})
+                abandoned_tools.update(channel_tools)
+            else:
+                live_tools.update(channel_tools)
+                if channel_unknown:
+                    unknown = True
             try:
                 fields = dict(raw_identity)
                 marker = fields.pop('paid_sibling', None)
@@ -298,11 +345,17 @@ class ChannelStore:
                     or parents[transfer.parent].logical_key != logical
                     or paid.get((transfer.parent, transfer.paid_input)) != transfer.paid_history):
                 raise native.ContractError('native_channel_evidence_unknown')
+        for channel in channels:
+            if channel.key not in abandoned and channel.tool_handoff:
+                live_tools.update(channel.tool_handoff.tool_ids)
         return Snapshot(logical, tuple(channels), frozenset(consumed), complete,
                         len(entries), capacity, unknown_dispatch=unknown,
                         inflight=any(c.busy for c in channels),
                         stopped=stopped, memory_pressure=pressure,
-                        issued_tool_ids=frozenset(issued_tools))
+                        issued_tool_ids=frozenset(issued_tools),
+                        abandoned=frozenset(abandoned),
+                        abandoned_requests=frozenset(abandoned_requests & consumed),
+                        abandoned_tool_ids=frozenset(abandoned_tools - live_tools))
 
     def bind(self, session, request_sha, grant_id):
         directory = session.directory / 'caller-grants'
