@@ -1,6 +1,6 @@
 """Offline: an identical caller request is answered again without a second dispatch.
 
-Production 2026-11-20 (Ciry/HAO relays): one automated caller repeated byte-identical
+Production 2026-11-20 (two shared relays): one automated caller repeated byte-identical
 streaming requests while the original was still running or had just completed, and
 also sent non-streaming twins. Each repeat got 400 request_already_consumed or
 native_request_in_flight_no_replay although the answer already existed.

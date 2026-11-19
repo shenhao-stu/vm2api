@@ -76,7 +76,7 @@ class PolicyGate(unittest.TestCase):
         self.assertIsNotNone(s.process.poll())
 
     def test_unconfirmed_policy_fails_as_soon_as_the_cli_gives_up(self):
-        # Production 2026-11-20 (34050): six provider 429s, then the CLI logged that it
+        # Production 2026-11-20 (one relay): six provider 429s, then the CLI logged that it
         # kept its stale cache. The worker still waited its full 90 seconds.
         s = self.session(False, unconfirmed=True, timeout=30)
         started = time.monotonic()
