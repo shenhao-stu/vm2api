@@ -20,6 +20,8 @@ from adapter import Limits, Rejection, RelayHandler, RelayServer, load_relay_key
 from native_bridge_session import ContractError, NativeProviderError, NativeRateLimit, RequestRejected, Session, Turn
 from native_session_pool import SessionPool, memory_pressure, session_key
 from native_health import NativeHealth, validate_official
+from native_bridge_session import history_shape, signature
+from native_reply_cache import REPLAYABLE, ZERO_USAGE, ReplyCache, without_usage
 
 
 class NativeServer(RelayServer):
@@ -89,6 +91,7 @@ class NativeServer(RelayServer):
         self.counter_lock = threading.Lock()
         self.active_requests = 0
         self.management_pause = root / "management-paused"
+        self.replies = ReplyCache(root / "replies")
         self.reaper = threading.Thread(target=self.reap, daemon=True)
         self.reaper.start()
 
@@ -97,6 +100,7 @@ class NativeServer(RelayServer):
             self.maintain_pool()
 
     def maintain_pool(self):
+        self.replies.sweep()
         reclaimed, error = 0, None
         try:
             reclaimed = self.pool.expire()
@@ -229,6 +233,50 @@ class NativeHandler(RelayHandler):
             "history_import_enabled": self.server.pool.allow_history_import,
         })
 
+    def serve_replay(self, body, record, code, started):
+        """Answer an identical repeat from the completed turn. Never dispatches."""
+        try:
+            scope, model = record["session_pool_key"], body["model"]
+            request = signature(history_shape(body["messages"]))
+        except (KeyError, TypeError, ContractError):
+            return False
+        replies = self.server.replies
+        reply = replies.load(scope, request, model)
+        if reply is None and code == "native_request_in_flight_no_replay":
+            # A waiting repeat runs nothing, so it gives its execution slot back.
+            self.server.inference.release()
+            self.permit_released = True
+            remaining = self.server.limits.request_seconds - (time.monotonic() - started) - 5
+            reply = replies.join(scope, request, model, remaining)
+        if reply is None:
+            return False
+        record.update(replayed=True, replay_of=code, usage=dict(ZERO_USAGE),
+                      message_id=reply["message"].get("id"))
+        try:
+            self.send_response(200)
+            self.send_header("Connection", "close")
+            if body.get("stream"):
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                for event in reply["events"]:
+                    event = without_usage(event)
+                    encoded = ("event: " + event["type"] + "\ndata: "
+                               + json.dumps(event, separators=(",", ":")) + "\n\n").encode()
+                    record["response_bytes"] += len(encoded)
+                    self.wfile.write(encoded)
+            else:
+                encoded = json.dumps({**reply["message"], "usage": dict(ZERO_USAGE)}).encode()
+                record["response_bytes"] += len(encoded)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(encoded)
+            self.wfile.flush()
+            record.update(status=200, complete=True)
+        except OSError:
+            record["status"] = 499
+        return True
+
     def do_POST(self):
         self.request_body_read = False
         parsed = urlsplit(self.path)
@@ -274,6 +322,10 @@ class NativeHandler(RelayHandler):
         observation = Turn([])
         lease = None
         body = None
+        reply_key = None
+        request_signature = None
+        sent_events = []
+        self.permit_released = False
 
         def expire():
             expired.set()
@@ -331,6 +383,8 @@ class NativeHandler(RelayHandler):
                 ):
                     raise Rejection(429, "canary_budget_consumed")
                 self.server.accepted += 1
+            request_signature = signature(history_shape(body["messages"]))
+            reply_key = self.server.replies.begin(record["session_pool_key"], request_signature)
             iterator = session.request(body)
             first = next(iterator)
             if body.get("stream"):
@@ -357,6 +411,7 @@ class NativeHandler(RelayHandler):
                 ):
                     record["first_content_ms"] = round((time.monotonic() - started) * 1000)
                 collect(observation, event)
+                sent_events.append(event)
                 encoded = (
                     "event: "
                     + event["type"]
@@ -382,6 +437,9 @@ class NativeHandler(RelayHandler):
                     )
                 if event["type"] == "message_stop":
                     record["complete"] = True
+            if record["complete"]:
+                self.server.replies.store(record["session_pool_key"], request_signature,
+                                          body["model"], observation.message, sent_events)
             if not body.get("stream") and not disconnected:
                 try:
                     encoded = json.dumps(observation.message).encode()
@@ -415,6 +473,9 @@ class NativeHandler(RelayHandler):
             )
             if expired.is_set():
                 code = "native_request_deadline"
+            if (code in REPLAYABLE and not committed and not prewarm
+                    and self.serve_replay(body, record, code, started)):
+                return
             error_details = dict(exc.details) if isinstance(exc, (NativeRateLimit, NativeProviderError)) else None
             if error_details:
                 record["upstream_error"] = error_details
@@ -498,7 +559,9 @@ class NativeHandler(RelayHandler):
                     if lease:
                         lease.__exit__(None, None, None)
                 finally:
-                    self.server.inference.release()
+                    self.server.replies.finish(reply_key)
+                    if not self.permit_released:
+                        self.server.inference.release()
                     with self.server.counter_lock:
                         self.server.active_requests -= 1
 
