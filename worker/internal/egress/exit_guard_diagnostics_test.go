@@ -30,7 +30,10 @@ func persistedProbe(t *testing.T, f *guardFixture) map[string]any {
 func TestExitGuardProbeFailureDiagnosticsSurviveRestart(t *testing.T) {
 	f := newGuardFixture(t)
 	f.reflector.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
-	f.server.guard.client.Timeout = 25 * time.Millisecond
+	// Bound only the wait for response headers. A whole-request timeout this
+	// short also covers the proxy connect and TLS handshake, so on a busy
+	// machine it can expire there and the guard rightly reports that stage.
+	f.server.guard.client.Transport.(*http.Transport).ResponseHeaderTimeout = 25 * time.Millisecond
 	if err := f.server.VerifyExit(context.Background()); err == nil {
 		t.Fatal("timeout admitted a request")
 	}
