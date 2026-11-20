@@ -34,7 +34,8 @@ The table above describes the published gateway images. Later commits on `main` 
 | Change | Commit | Loaded by |
 | --- | --- | --- |
 | Identical relay requests are answered again from the completed turn | `d183b18d` | The native Relay HTTP workers, since 2026-11-20. They keep their pinned `native_http.py` base and carry the same edit together with `native_reply_cache.py`. |
-| Policy confirmation stops waiting once the CLI reports a stale cache | `99ad4a8d` | No runtime yet. |
+| Policy confirmation stops waiting once the CLI reports a stale cache | `99ad4a8d` | The native Relay HTTP workers, since 2026-11-20, released together with the launch pause below. |
+| New launches pause after the provider leaves policy unconfirmed | `4324ecda` | The native Relay HTTP workers, since 2026-11-20. Released with the stale-cache change because that change alone shortens the interval between failed launches. |
 | Relay sessions recover after switching accounts | `5d36a9ef` | The native Relay HTTP workers, since 2026-11-19. |
 | Enrolled native devices appear before inference admission | `ae795e07` | The Relay management service, since 2026-11-19. |
 | Upstream fixes: egress DNS cache, atomic credential symlinks, 429 instead of 502 when every account is rate limited, refusal details in diagnostics | `b6024028`, `3e3680d5`, `70f9183e`, `55003e26` | No runtime yet. They need a gateway image rebuild and a guarded restart. |
