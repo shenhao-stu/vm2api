@@ -40,8 +40,10 @@ const queryClient = new QueryClient({
     },
   },
   queryCache: new QueryCache({
-    onError: (error) => {
+    onError: (error, query) => {
       if (error instanceof ApiError && error.status === 401) return
+      // 轮询型查询自己在页面内说明读取失败，不逐次弹出提示。
+      if (query.meta?.quiet) return
       handleServerError(error)
     },
   }),

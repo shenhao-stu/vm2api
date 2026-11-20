@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { api } from '@/lib/api'
+import { StatusMark } from '@/components/status-mark'
 
 type RelayStatus = {
   state: 'ready' | 'paused' | 'unavailable' | 'unknown'
@@ -16,20 +17,28 @@ const labels = {
   unavailable: '不可用',
   unknown: '状态未知',
 }
+const tones = {
+  ready: 'ok',
+  paused: 'off',
+  unavailable: 'bad',
+  unknown: 'none',
+}
 
 export function AiroamRelayCard({ status }: { status?: RelayStatus }) {
+  const state = status?.state ?? 'unknown'
   return (
     <article
       aria-label='Airoam · AgentNAS Native Relay'
-      className='mb-5 max-w-xl space-y-3 rounded-[10px] bg-muted/50 p-3.5 shadow-[inset_0_0_0_1px_var(--hairline)]'
+      className='min-w-0 space-y-3 rounded-[10px] bg-muted/50 p-3 ps-3.5 shadow-[inset_0_0_0_1px_var(--hairline)]'
     >
       <header className='flex items-center justify-between gap-3'>
         <h2 className='text-[13px] font-semibold'>
           Airoam · AgentNAS Native Relay
         </h2>
-        <span className='shrink-0 rounded bg-muted px-1.5 py-0.5 text-xs'>
-          {labels[status?.state ?? 'unknown']}
-        </span>
+        <StatusMark
+          variant='pill'
+          tone={{ key: state, cls: tones[state], text: labels[state] }}
+        />
       </header>
       <p className='text-xs break-words text-muted-foreground'>
         {status?.models.length ? status.models.join(' · ') : '模型状态未知'}
@@ -62,5 +71,10 @@ export function AiroamRelay({ enabled }: { enabled: boolean }) {
     refetchInterval: 30_000,
   })
   if (!enabled) return null
-  return <AiroamRelayCard status={query.error ? undefined : query.data} />
+  // 与上方原生 Relay 网格同一套列宽，卡片左右边缘对齐。
+  return (
+    <div className='mb-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3'>
+      <AiroamRelayCard status={query.error ? undefined : query.data} />
+    </div>
+  )
 }

@@ -13,16 +13,25 @@ import {
 } from '@/components/ui/dialog'
 import { Switch } from '@/components/ui/switch'
 import { ConfirmDialog } from '@/components/confirm-dialog'
+import { StatusMark } from '@/components/status-mark'
+import {
+  OnboardingButton,
+  OnboardingCard,
+  OnboardingDialog,
+  RELAY_CARD,
+} from './native-relay-onboarding'
+import { isOpen } from './native-relay-onboarding-state'
 import {
   canResumeSchedule,
   scheduleLabel,
   scheduleResetAt,
   relayState,
+  relayTone,
   type NativeRelay,
 } from './native-relay-state'
 import { RelayUsageCard, RelayUsageDetail } from './relay-usage-card'
+import { relayKey as key, useRelayOnboarding } from './use-relay-onboarding'
 
-const key = ['panel', 'native-relays'] as const
 const endpoint = '/api/panel/native-relays'
 const successMessage = {
   start: 'Relay 已启动并恢复调度',
@@ -51,6 +60,7 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
     },
     enabled,
     retry: false,
+    meta: { quiet: true },
     refetchInterval: 30000,
     refetchIntervalInBackground: true,
   })
@@ -84,36 +94,76 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
       toast.error(`操作未完成：${error.message}。请刷新状态后核对。`),
     onSettled: () => qc.invalidateQueries({ queryKey: key }),
   })
+  const flow = useRelayOnboarding(enabled)
   if (!enabled) return null
-  if (query.error)
-    return (
-      <section className='mb-4 rounded-lg border p-4' aria-label='原生 Relay'>
-        <p>原生 Relay 状态暂不可用：{query.error.message}</p>
-        <Button variant='outline' onClick={() => void query.refetch()}>
-          重新读取
-        </Button>
-      </section>
-    )
-  if (!query.data?.items.length) return null
+  const items = query.data?.items ?? []
+  const joining = flow.sessions.filter(isOpen)
+  // 没有 Relay 也没有启用接入入口的控制器不显示这个区块。
+  if (!query.error && !items.length && !flow.view) return null
+  const serving = items.filter(
+    (relay) => relayState(relay, now) === '运行中'
+  ).length
   return (
     <section className='mb-5 space-y-3' aria-label='原生 Relay'>
-      <div className='flex items-center justify-between'>
-        <h2 className='font-semibold'>原生 Relay</h2>
-        <Button
-          variant='outline'
-          size='sm'
-          disabled={query.isFetching}
-          onClick={() => void query.refetch()}
-        >
-          刷新状态
-        </Button>
-      </div>
-      <div className='grid gap-3 md:grid-cols-2 xl:grid-cols-3'>
-        {query.data.items.map((relay) => (
-          <article
-            key={relay.id}
-            className='relative flex min-w-0 flex-col gap-2.5 rounded-[10px] bg-muted/50 p-3 ps-3.5 text-card-foreground shadow-[inset_0_0_0_1px_var(--hairline)]'
+      <div className='flex flex-wrap items-center justify-between gap-2'>
+        <div className='flex items-baseline gap-2'>
+          <h2 className='font-semibold'>原生 Relay</h2>
+          {items.length ? (
+            <span className='text-xs text-muted-foreground tabular-nums'>
+              {serving}/{items.length} 运行中
+              {joining.length ? ` · ${joining.length} 个接入中` : ''}
+            </span>
+          ) : null}
+        </div>
+        <div className='flex items-center gap-2'>
+          <Button
+            variant='outline'
+            size='sm'
+            disabled={query.isFetching}
+            onClick={() => {
+              void query.refetch()
+              void flow.refresh()
+            }}
           >
+            刷新状态
+          </Button>
+          <OnboardingButton flow={flow} />
+        </div>
+      </div>
+      {query.error ? (
+        <p
+          role='status'
+          className='flex flex-wrap items-center gap-2 rounded-[10px] px-3.5 py-2 text-xs shadow-[inset_0_0_0_1px_var(--hairline)]'
+          style={{
+            color: 'var(--status-warn)',
+            backgroundColor: 'var(--status-warn-bg)',
+          }}
+        >
+          <span>
+            原生 Relay 状态暂不可用：{query.error.message}
+            {items.length ? '。下面是上一次读到的状态。' : ''}
+          </span>
+          <button
+            type='button'
+            className='cursor-pointer underline underline-offset-2'
+            onClick={() => void query.refetch()}
+          >
+            重新读取
+          </button>
+        </p>
+      ) : null}
+      {!items.length && !joining.length && !query.error ? (
+        <p className='rounded-[10px] px-6 py-8 text-center text-sm text-muted-foreground shadow-[inset_0_0_0_1px_var(--hairline)]'>
+          还没有原生
+          Relay。添加一个席位：选出口、完成一次设备授权，其余步骤自动完成。
+        </p>
+      ) : null}
+      <div className='grid gap-3 empty:hidden md:grid-cols-2 xl:grid-cols-3'>
+        {joining.map((session) => (
+          <OnboardingCard key={session.seat} session={session} flow={flow} />
+        ))}
+        {items.map((relay) => (
+          <article key={relay.id} className={RELAY_CARD}>
             <header className='space-y-1.5'>
               <div className='flex items-center justify-between gap-2'>
                 <h3
@@ -122,9 +172,7 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
                 >
                   {relay.name}
                 </h3>
-                <span className='shrink-0 rounded bg-muted px-1.5 py-0.5 text-xs'>
-                  {relayState(relay, now)}
-                </span>
+                <StatusMark tone={relayTone(relay, now)} variant='pill' />
               </div>
               <p className='flex items-center gap-2 text-xs text-muted-foreground'>
                 <span>{relay.node} · 原生</span>
@@ -271,6 +319,7 @@ export function NativeRelays({ enabled }: { enabled: boolean }) {
           )}
         </DialogContent>
       </Dialog>
+      <OnboardingDialog flow={flow} />
     </section>
   )
 }

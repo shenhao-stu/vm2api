@@ -1,3 +1,5 @@
+import type { StatusTone } from '@/types/status'
+
 export type NativeRelay = {
   id: string
   name: string
@@ -135,6 +137,27 @@ export function relayState(relay: NativeRelay, now = Date.now()) {
     }
   }
   return '运行中'
+}
+
+const STATE_TONE: Record<string, string> = {
+  运行中: 'ok',
+  已暂停: 'off',
+  额度冷却: 'caution',
+  部分模型冷却: 'caution',
+  模型额度冷却: 'caution',
+  周额度已满: 'caution',
+  '5H额度已满': 'caution',
+  授权锁存: 'bad',
+  出口待检查: 'warn',
+  原生环境待检查: 'warn',
+  'Relay 待检查': 'warn',
+  调度配置待核对: 'warn',
+}
+
+/** 状态文案配上控制台统一的形状与颜色；未知类状态走中性。 */
+export function relayTone(relay: NativeRelay, now = Date.now()): StatusTone {
+  const text = relayState(relay, now)
+  return { key: text, text, cls: STATE_TONE[text] ?? 'none' }
 }
 
 export function scheduleResetAt(
