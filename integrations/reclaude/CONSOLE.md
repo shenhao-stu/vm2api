@@ -12,6 +12,8 @@ the admin role. Mutations also require the configured Origin, JSON content and a
 fresh UUID operation ID. An ambiguous or consumed operation cannot be replayed.
 Other deployments may omit this route; the UI hides the optional section on 404.
 
+Seats can also be added from this section: see [ONBOARDING.md](ONBOARDING.md).
+
 Configure administrator-owned JSON with these fields (no client-supplied paths):
 
 | Field | Meaning |
