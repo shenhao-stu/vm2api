@@ -293,7 +293,9 @@ test('resolveTestModels refresh merges ChatGPT ids and ignores 401', async (t) =
     }),
   })
   assert.equal(merged.source, 'chatgpt')
-  assert.ok(merged.items.some((m) => m.id === 'gpt-5.6'))
+  // gpt-5.4 is in the built-in seed; an id new to the policy (gpt-5.6 here) stays off until enabled.
+  assert.ok(merged.items.some((m) => m.id === 'gpt-5.4'))
+  assert.ok(!merged.items.some((m) => m.id === 'gpt-5.6'))
   assert.equal(merged.protocol, 'openai.responses')
 
   const denied = await resolveTestModels({
