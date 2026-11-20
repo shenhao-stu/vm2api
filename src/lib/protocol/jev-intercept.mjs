@@ -120,7 +120,17 @@ export const HARD_POLICY_RULES = Object.freeze([
     source: String.raw`(?:解除|关闭|绕过|无视)(?:你的|所有|全部)?(?:安全|内容)?(?:限制|审查|过滤|策略)`,
   },
   { category: 'jailbreak', source: String.raw`(?:越狱|破限)(?:模式|提示词|提示|指令)` },
-  { category: 'crack', source: String.raw`(?<![\w-])(?:keygen|warez)(?![\w-])` },
+  { category: 'crack', source: String.raw`(?<![\w-])warez(?![\w-])` },
+  // "keygen" is everyday cryptography and build vocabulary. It blocks only next to
+  // cracking words, or as "a keygen for <the product>".
+  {
+    category: 'crack',
+    source: String.raw`(?<![\w-])keygen(?![\w-])(?:\s+for\s+(?:this|the|that|my|a|an)\s+(?:licen[sc]e|software|program|app(?:lication)?|game|product)\b|[\s\S]{0,80}?(?:\bcrack|\bpirat|\bserial\s+(?:key|number|code)|\bactivation\s+(?:key|code)|\blicen[sc]e\s+key|\bproduct\s+key|破解|盗版|序列号|激活码|注册码))`,
+  },
+  {
+    category: 'crack',
+    source: String.raw`(?:\bcrack|\bpirat|\bserial\s+(?:key|number|code)|\bactivation\s+(?:key|code)|\blicen[sc]e\s+key|\bproduct\s+key|破解|盗版|序列号|激活码|注册码)[\s\S]{0,80}?(?<![\w-])keygen(?![\w-])`,
+  },
   { category: 'crack', source: String.raw`(?:破解补丁|注册机|激活码生成器)` },
   {
     category: 'crack',
