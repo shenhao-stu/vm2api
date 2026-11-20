@@ -173,6 +173,39 @@ class SessionPool:
             if self.entries.get(key) is entry:
                 self.entries.pop(key)
 
+    def running(self, tenant, body):
+        """Whether lease() would hand this request a CLI that is already up.
+
+        Nothing is created, retired or marked busy. The answer can be stale by
+        the time lease() runs, so the caller checks the leased session again.
+        """
+        try:
+            native_options(body)
+            key = session_key(tenant, body)
+            with self.lock:
+                if self.stopped:
+                    return False
+                if self.channel_store is not None:
+                    import native_bridge_session as native
+                    from native_channel_policy import select_channel
+                    snapshot = self.channel_store.snapshot(
+                        key, self.entries, self.capacity, requested_model=body["model"])
+                    if snapshot is not None:
+                        decision = select_channel(
+                            tenant, body, snapshot, native=native,
+                            session_identity=session_identity,
+                            allow_history_import=self.allow_history_import, check_capacity=False)
+                        if decision.action == 'reject':
+                            return False
+                        key = decision.channel_key
+                entry = self.entries.get(key)
+                if entry is None or entry.session.failed:
+                    return False
+                process = getattr(entry.session, "process", None)
+                return process is not None and process.poll() is None
+        except (ContractError, OSError, ValueError, KeyError, TypeError):
+            return False
+
     @contextmanager
     def lease(self, tenant, body):
         native_options(body)

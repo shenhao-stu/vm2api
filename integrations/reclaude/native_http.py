@@ -386,7 +386,12 @@ class NativeHandler(RelayHandler):
                 if not prewarm and self.serve_replay(
                         body, record, "request_already_consumed", started):
                     return
-                raise Rejection(503, LAUNCH_REFUSED)
+                # The pause is about starting CLIs. A conversation whose own CLI
+                # is already running starts nothing, so it is still served. Its
+                # outcome neither ends nor lengthens the pause.
+                if prewarm or not self.server.pool.running(tenant, body):
+                    raise Rejection(503, LAUNCH_REFUSED)
+                record["launch_backoff_bypassed"] = True
             context = self.lease_session(tenant, body)
             lease_started = time.monotonic()
             session = context.__enter__()
@@ -395,6 +400,9 @@ class NativeHandler(RelayHandler):
             record["native_cli_reused"] = process is not None and process.poll() is None
             lease = context
             before = set((session.directory / "dispatch").glob("*.consumed.json"))
+            if launch_epoch is None and not record["native_cli_reused"]:
+                # The CLI went away between the check and the lease.
+                raise Rejection(503, LAUNCH_REFUSED)
             if prewarm:
                 result = session.prepare_request(body)
                 if not result["reused"]:
@@ -419,8 +427,9 @@ class NativeHandler(RelayHandler):
             reply_key = self.server.replies.begin(record["session_pool_key"], request_signature)
             iterator = session.request(body)
             first = next(iterator)
-            self.server.launches.succeeded()
-            launch_settled = True
+            if launch_epoch is not None:
+                self.server.launches.succeeded()
+                launch_settled = True
             if body.get("stream"):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")

@@ -10,6 +10,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 import uuid
 
@@ -20,8 +21,10 @@ from native_launch_backoff import LAUNCH_REFUSED, PROBE_WAIT_SECONDS, LaunchBack
 from native_reply_cache import ZERO_USAGE
 
 try:
+    import test_native_configuration_channels as channels
     from test_native_http import FixtureSession, Health
 except ImportError:  # run as tests.test_native_launch_backoff
+    from tests import test_native_configuration_channels as channels
     from tests.test_native_http import FixtureSession, Health
 
 
@@ -93,10 +96,15 @@ class Backoff(unittest.TestCase):
 class PolicySession(FixtureSession):
     """A launch that the provider does not confirm leaves the conversation untouched."""
 
+    exit_code = None
+
     def request(self, body):
-        self.owner.launches += 1
-        if self.owner.unconfirmed:
-            raise RequestRejected(LAUNCH_REFUSED)
+        process = getattr(self, "process", None)
+        if process is None or process.poll() is not None:
+            self.owner.launches += 1
+            if self.owner.unconfirmed:
+                raise RequestRejected(LAUNCH_REFUSED)
+            self.process = SimpleNamespace(poll=lambda: self.exit_code)
         yield from super().request(body)
 
     def prepare_request(self, body):
@@ -235,6 +243,58 @@ class BackoffHTTP(unittest.TestCase):
         self.assertTrue(row["replayed"])
         self.assertEqual(row["launch_backoff_seconds"], 30)
 
+    def pause_with_one_running_conversation(self):
+        """One conversation has a running CLI; another one's launch then goes unconfirmed."""
+        self.assertEqual(self.request()[0], 200)
+        running = self.identity
+        self.unconfirmed = True
+        self.identity = str(uuid.uuid4())
+        self.assertEqual(self.code(self.request()), (503, LAUNCH_REFUSED))
+        self.identity = running
+        return self.body(messages=[{"role": "user", "content": "fixture"},
+                                   {"role": "assistant", "content": "fixture"},
+                                   {"role": "user", "content": "next turn"}])
+
+    def test_a_conversation_whose_cli_is_running_is_served_during_the_pause(self):
+        next_turn = self.pause_with_one_running_conversation()
+        paused = self.server.launches.snapshot()
+        launches, sessions = self.launches, len(self.created)
+        self.assertEqual(self.request(next_turn)[0], 200)
+        row = self.audit(3)[2]
+        self.assertEqual((row["launch_backoff_bypassed"], row["native_cli_reused"], row["launch_backoff_seconds"]),
+                         (True, True, 30))
+        # It started nothing and says nothing about new launches.
+        self.assertEqual((self.launches, len(self.created)), (launches, sessions))
+        self.assertEqual(self.server.launches.snapshot(), paused)
+        self.identity = str(uuid.uuid4())
+        self.assertEqual(self.code(self.request()), (503, LAUNCH_REFUSED))
+        self.assertEqual((self.launches, len(self.created)), (launches, sessions))
+
+    def test_a_conversation_whose_cli_has_exited_waits_like_the_others(self):
+        next_turn = self.pause_with_one_running_conversation()
+        self.created[0].exit_code = 1
+        paused = self.server.launches.snapshot()
+        launches, sessions = self.launches, len(self.created)
+        self.assertEqual(self.code(self.request(next_turn)), (503, LAUNCH_REFUSED))
+        self.assertNotIn("launch_backoff_bypassed", self.audit(3)[2])
+        self.assertEqual((self.launches, len(self.created)), (launches, sessions))
+        self.assertEqual(self.server.launches.snapshot(), paused)
+
+    def test_a_cli_that_exits_after_the_check_is_not_relaunched_during_the_pause(self):
+        next_turn = self.pause_with_one_running_conversation()
+        launches = self.launches
+        answered = self.server.pool.running
+
+        def exits_right_after(tenant, body):
+            result = answered(tenant, body)
+            self.created[0].exit_code = 1
+            return result
+
+        self.server.pool.running = exits_right_after
+        self.assertEqual(self.code(self.request(next_turn)), (503, LAUNCH_REFUSED))
+        self.assertEqual(self.launches, launches)
+        self.assertEqual(self.server.launches.snapshot()["failures"], 1)
+
     def test_prepare_requests_follow_the_same_pause(self):
         self.unconfirmed = True
         self.assertEqual(self.code(self.request(path="/v1/messages/prepare")), (503, LAUNCH_REFUSED))
@@ -252,6 +312,45 @@ class BackoffHTTP(unittest.TestCase):
         status, health = self.health()
         self.assertEqual((status, health["ok"], health["failed"]), (200, True, []))
         self.assertEqual(health["launch_backoff"], {"failures": 1, "retry_in_seconds": 30, "probing": False})
+
+
+class RunningCLI(unittest.TestCase):
+    """The pool answers for the same channel a lease would use, and changes nothing."""
+
+    setUp = channels.ChannelTests.setUp
+    tearDown = channels.ChannelTests.tearDown
+    new_pool = channels.ChannelTests.new_pool
+    completed = channels.ChannelTests.completed
+
+    def directories(self):
+        return sorted(p.name for p in (self.root / "sessions").iterdir())
+
+    def test_only_a_conversation_with_a_live_cli_counts_as_running(self):
+        empty = self.directories()
+        self.assertFalse(self.pool.running("tenant-a", self.body))
+        self.assertEqual(self.directories(), empty)
+        with self.pool.lease("tenant-a", self.body) as session:
+            history = self.completed(session, self.body)
+        following = {**self.body, "messages": history + [{"role": "user", "content": "continue"}]}
+        # Leased once, but no CLI process was ever started for it.
+        self.assertFalse(self.pool.running("tenant-a", following))
+        session.process = SimpleNamespace(poll=lambda: None)
+        before = self.directories()
+        self.assertTrue(self.pool.running("tenant-a", following))
+        self.assertFalse(self.pool.running("tenant-b", following))
+        stranger = {**following, "metadata": {"user_id": str(uuid.uuid4())}}
+        self.assertFalse(self.pool.running("tenant-a", stranger))
+        # Another model of the same conversation needs its own channel and CLI.
+        self.assertFalse(self.pool.running("tenant-a", {**following, "model": "sonnet"}))
+        self.assertEqual(self.directories(), before)
+        with self.pool.lease("tenant-a", following) as leased:
+            self.assertIs(leased, session)
+        session.process = SimpleNamespace(poll=lambda: 1)
+        self.assertFalse(self.pool.running("tenant-a", following))
+        session.process = SimpleNamespace(poll=lambda: None)
+        session.failed = True
+        self.assertFalse(self.pool.running("tenant-a", following))
+        session.failed, session.process = False, None  # the stand-in cannot be closed
 
 
 if __name__ == "__main__":
