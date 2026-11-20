@@ -23,6 +23,7 @@ from native_health import NativeHealth, validate_official
 from native_bridge_session import history_shape, signature
 from native_reply_cache import REPLAYABLE, ZERO_USAGE, ReplyCache, without_usage
 from native_launch_backoff import LAUNCH_REFUSED, LaunchBackoff
+from native_terminal_error import unbilled_gateway_failure
 
 
 class NativeServer(RelayServer):
@@ -165,6 +166,19 @@ def consumed_gateway_status(receipts):
         return status if type(status) is int and status in (502, 503, 504) else None
     except (OSError, ValueError, AttributeError):
         return None
+
+
+def refused_unbilled(session):
+    """This turn's own failure is already proved to be an unbilled gateway refusal."""
+    try:
+        directory = session.directory
+        state = json.loads((directory / "continuation.json").read_bytes())
+        claims = {path.stem: json.loads(path.read_bytes())
+                  for path in (directory / "caller-grants").glob("*.json")}
+        request = unbilled_gateway_failure(directory, state, claims)
+        return request is not None and request == session.caller_request_sha
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 def failure_status(error, code, expired=False):
@@ -530,10 +544,18 @@ class NativeHandler(RelayHandler):
                     error_details = {"upstream_type": "gateway_error", "upstream_status": upstream_status}
                     record["upstream_error"] = error_details
                 record["native_error"] = code
-                status, code = 400, "native_request_consumed_no_replay"
-                record['no_replay'] = True
-                if error_details:
-                    error_details = {**error_details, "no_replay": True}
+                if upstream_status in (502, 503) and refused_unbilled(session):
+                    # Nothing was produced or counted, so the same request is
+                    # admitted again. Still a 400: the caller decides to resend,
+                    # a pool must not move the turn to another account by itself.
+                    status = 400
+                    error_details = {**error_details, "retry": "same_request"}
+                    record["retry_same_request"] = True
+                else:
+                    status, code = 400, "native_request_consumed_no_replay"
+                    record['no_replay'] = True
+                    if error_details:
+                        error_details = {**error_details, "no_replay": True}
                 if self.server.relay.authorization_revoked():
                     self.server.latch()
                     code = 'device_revoked'

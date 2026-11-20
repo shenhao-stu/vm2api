@@ -645,6 +645,61 @@ class NativeHTTPTests(unittest.TestCase):
         row, = self.audit(1)
         self.assertEqual((row["attempts"], row["native_error"]), (1, "native_upstream_gateway_error"))
 
+    def test_unbilled_gateway_refusal_invites_the_same_request_but_a_timeout_does_not(self):
+        def refused(status):
+            def request(session, body):
+                stream = original(session, body)
+                next(stream)
+                stream.close()
+                receipt, = (session.directory / "dispatch").glob("*.consumed.json")
+                grant = receipt.name.split(".")[0]
+                receipt.write_text(json.dumps({"id": grant}))
+                receipt.with_name(grant + ".gateway-error.json").write_text(
+                    json.dumps({"id": grant, "status": status}))
+                raise ContractError("native_turn_failed")
+                yield
+            return request
+
+        original = FixtureSession.request
+        self.server.pool.capacity = 10
+        for turn, (status, proved, code, details) in enumerate((
+                (503, True, "native_upstream_gateway_error", {"retry": "same_request"}),
+                (503, False, "native_request_consumed_no_replay", {"no_replay": True}),
+                (504, True, "native_request_consumed_no_replay", {"no_replay": True})), 1):
+            self.identity = str(uuid.uuid4())
+            with patch.object(FixtureSession, "request", refused(status)), \
+                    patch("native_http.refused_unbilled", return_value=proved):
+                http_status, data = self.request()
+            error = json.loads(data)["error"]
+            with self.subTest(status=status, proved=proved):
+                self.assertEqual((http_status, error["code"]), (400, code))
+                self.assertEqual(error["details"], {
+                    "upstream_type": "gateway_error", "upstream_status": status, **details})
+                self.assertTrue(error["message"].startswith(code + "："))
+                row = self.audit(turn)[-1]
+                self.assertEqual(row["native_error"], "native_upstream_gateway_error")
+                self.assertEqual((row.get("retry_same_request"), row.get("no_replay")),
+                                 (True, None) if "retry" in details else (None, True))
+
+    def test_refusal_messages_keep_the_code_and_say_what_to_do(self):
+        def consumed(session, body):
+            raise RequestRejected("request_already_consumed")
+            yield
+
+        with patch.object(FixtureSession, "request", consumed):
+            error = json.loads(self.request()[1])["error"]
+        self.assertEqual(error["code"], "request_already_consumed")
+        self.assertRegex(error["message"], "^request_already_consumed：.*新会话")
+        self.identity = str(uuid.uuid4())
+
+        def busy(session, body):
+            raise RequestRejected("session_busy")
+            yield
+
+        with patch.object(FixtureSession, "request", busy):
+            error = json.loads(self.request()[1])["error"]
+        self.assertEqual(error["message"], error["code"])
+
     def test_previously_claimed_request_stops_sub_failover_without_a_second_attempt(self):
         def duplicate(session, body):
             raise RequestRejected("native_request_consumed_no_replay")

@@ -14,13 +14,17 @@ from native_paid_sibling import CompletedBoundary, PaidSibling
 from native_channel_policy import Channel, Identity, Snapshot, request_identity
 from native_quota_rejection import rejected_request, retired_request
 from native_tool_handoff import ToolHandoff
-from native_terminal_error import failed_request
+from native_terminal_error import failed_request, unbilled_gateway_failure
 
 
 # An unknown terminal may still be executing upstream. Only after the channel's
 # evidence has been quiet this long may a different caller turn continue the
 # conversation in a new channel (its claimed requests remain consumed).
 ABANDON_AFTER_SECONDS = 600
+
+# An identical request whose turn the provider's gateway refused unbilled may be
+# dispatched again this many times within one conversation.
+UNBILLED_REDISPATCHES = 2
 
 
 def quiet_seconds(directory, now):
@@ -168,6 +172,7 @@ class ChannelStore:
         if document is None:
             return None
         channels, consumed, issued_tools = [], set(), set()
+        unbilled = {}
         complete, unknown = True, False
         paid = {}
         # A channel whose own turn failed or never reached a terminal is
@@ -206,6 +211,10 @@ class ChannelStore:
             retired_quota = rejected or (retired_request(directory, state, claim_values, time.time(),
                                                         requested_model=requested_model) if status == 'failed' else None)
             terminal_error = failed_request(directory, state, claim_values) if status == 'failed' else None
+            refused_unbilled = (unbilled_gateway_failure(directory, state, claim_values)
+                                if terminal_error and not retired_quota else None)
+            if refused_unbilled:
+                unbilled[refused_unbilled] = unbilled.get(refused_unbilled, 0) + 1
             if retired_quota:
                 status = 'quota_rejected'
             elif terminal_error:
@@ -217,7 +226,7 @@ class ChannelStore:
                 if (len(request) != 64 or any(c not in '0123456789abcdef' for c in request)
                         or claim.get('request_sha256') != request):
                     raise native.ContractError('native_channel_evidence_unknown')
-                if request != rejected:
+                if request not in {rejected, refused_unbilled}:
                     consumed.add(request)
                 adoption_sha = claim.get('history_adoption_sha256')
                 if adoption_sha is not None:
@@ -334,6 +343,8 @@ class ChannelStore:
                                     pending_ids=pending, history_controls=controls,
                                     history_pending=pending_witness, paid_input=paid_input, sibling=sibling,
                                     completed=tuple(boundaries), tool_handoff=tool_handoff))
+        consumed.update(request for request, failures in unbilled.items()
+                        if failures > UNBILLED_REDISPATCHES)
         parents = {c.key: c.identity for c in channels}
         for channel in channels:
             sibling = channel.sibling

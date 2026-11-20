@@ -73,6 +73,23 @@ class Rejection(Exception):
         super().__init__(code)
 
 
+# What the caller should do after a refusal that protects an already dispatched
+# request. The message keeps the code first, so matching on the code still works.
+GUIDANCE = {
+    "request_already_consumed":
+        "这条请求已经发给上游并计入一次调用，不能原样重发。请发送新的内容继续；"
+        "如果客户端反复重发同一条请求，请用 /new 开启新会话。",
+    "native_request_consumed_no_replay":
+        "这条请求已发给上游，但结果没有完整返回，无法确认是否已执行，因此不会重发。"
+        "请停止重试，先核对上一步工具是否已执行，再用 /new 开启新会话，仅提交尚未执行的任务。",
+    "native_upstream_gateway_error":
+        "上游网关拒绝了这次调用，没有产生输出，也没有计入用量。可以原样重试；连续失败时请稍后再试。",
+    "native_request_in_flight_no_replay":
+        "同一条请求正在执行，不会重复发送。请等待它完成，不要重试。",
+}
+NO_REPLAY_GUIDANCE = "此会话无法安全续接，已发出的请求不会重发。请停止重试，用 /new 开启新会话，仅提交尚未执行的任务。"
+
+
 def load_access_token(path: Path) -> str:
     data = json.loads(path.read_text(encoding="utf-8"))
     oauth = data.get("claudeAiOauth", data)
@@ -594,7 +611,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self.server.inference.release()
 
     def send_error_json(self, status, code, details=None):
-        error = {"type": "api_error", "code": code, "message": code}
+        guidance = GUIDANCE.get(code) or (NO_REPLAY_GUIDANCE if code.endswith("_no_replay") else None)
+        error = {"type": "api_error", "code": code, "message": code + "：" + guidance if guidance else code}
         if details:
             error["details"] = details
         self.send_json(status, {"type": "error", "error": error})

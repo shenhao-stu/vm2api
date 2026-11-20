@@ -1,6 +1,8 @@
 """Read-only proof that one consumed request ended in a native server error."""
 import json
 
+from native_quota_rejection import accounted_usage
+
 
 def gateway_terminal(events, native_id):
     relevant = [e for e in events if e.get('type') in {'assistant', 'result', 'stream_event'}]
@@ -107,8 +109,8 @@ def exhausted_output_then_local_retry(events, native_id, model):
                and final_usage[k] == initial[k] >= 0 for k in keys) and final_usage['output_tokens'] > 0
 
 
-def failed_request(directory, state, claims):
-    """The old request remains consumed; this proof only retires its broken CLI."""
+def terminal_evidence(directory, state, claims):
+    """The failed channel's current grant, with its own slice of the CLI output."""
     def read(path):
         if path.is_symlink() or path.stat().st_size > 16384:
             raise ValueError('invalid terminal evidence')
@@ -133,7 +135,7 @@ def failed_request(directory, state, claims):
         final = read(directory / 'dispatch/final.safe.json')
         gateway_path = directory / 'dispatch' / (grant_id + '.gateway-error.json')
         gateway = read(gateway_path) if gateway_path.exists() else {}
-        gateway_known = gateway.get('id') == grant_id and type(gateway.get('status')) is int and gateway['status'] in (502, 503, 504)
+        status = gateway.get('status') if gateway.get('id') == grant_id else None
         if (receipt.get('id') != grant_id or receipt.get('session_id') != native_id
                 or receipt.get('model') != grant.get('model')
                 or type(final.get('upstream_attempts')) is not int
@@ -149,13 +151,57 @@ def failed_request(directory, state, claims):
         with log.open('rb') as stream:
             stream.seek(offset)
             events = [json.loads(line) for line in stream.read(2 * 1024 * 1024 + 1).splitlines() if line.strip()]
+        return {'request': request, 'native_id': native_id, 'model': grant.get('model'), 'final': final,
+                'gateway': status if type(status) is int and status in (502, 503, 504) else None,
+                'events': events}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def failed_request(directory, state, claims):
+    """The old request remains consumed; this proof only retires its broken CLI."""
+    try:
+        found = terminal_evidence(directory, state, claims)
+        if found is None:
+            return None
+        final, events, native_id = found['final'], found['events'], found['native_id']
         complete = final['denied'] == 0 and terminal_usage(events, native_id) is not None
         # Header failure can have unknown provider cost. Keep the old grant
         # consumed; this only permits a different, newly authored caller turn.
-        complete = complete or (gateway_known and gateway_terminal(events, native_id))
+        complete = complete or (found['gateway'] is not None and gateway_terminal(events, native_id))
         complete = complete or (final['denied'] == 1 and interrupted_terminal(events, native_id))
         if not complete and final['denied'] == final['upstream_attempts'] == len(claims) == 1:
-            complete = exhausted_output_then_local_retry(events, native_id, grant.get('model'))
-        return request if complete else None
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            complete = exhausted_output_then_local_retry(events, native_id, found['model'])
+        return found['request'] if complete else None
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def unbilled_gateway_failure(directory, state, claims):
+    """The provider's gateway refused this turn before any response, and nothing was counted.
+
+    Only this proof lets the caller's identical request be dispatched again:
+    a 502 or 503 at the response headers, no stream event, a single attempt,
+    zero tokens on the turn, and CLI totals that still equal the earlier
+    completed turns. A 504 stays consumed, because the provider may have run
+    the turn after its gateway stopped waiting. The provider's own bill cannot
+    be read per request; this is the evidence available on our side.
+    """
+    try:
+        found = terminal_evidence(directory, state, claims)
+        if (found is None or found['gateway'] not in (502, 503) or found['final']['denied'] != 0
+                or not gateway_terminal(found['events'], found['native_id'])):
+            return None
+        assistant, result = (e for e in found['events'] if e.get('type') in {'assistant', 'result'})
+        tokens = ('input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens')
+        usage = assistant['message'].get('usage')
+        if (assistant.get('api_error_status') != 400 or not isinstance(usage, dict)
+                or any(type(usage.get(k)) is not int or usage[k] != 0 for k in tokens)):
+            return None
+        cost = result.get('total_cost_usd')
+        first_turn = result.get('modelUsage') == {} and type(cost) in (int, float) and cost == 0
+        if first_turn or accounted_usage(directory, claims, found['request'], found['native_id'], result):
+            return found['request']
+        return None
+    except (ValueError, KeyError, TypeError, AttributeError):
         return None
