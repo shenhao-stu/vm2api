@@ -40,6 +40,8 @@ export type OnboardingView = {
   options: OnboardingOption[]
   sessions: OnboardingSession[]
   busy: boolean
+  /** 执行接入的后台服务是否在运行；较早的服务端不返回这一项。 */
+  runner_alive?: boolean
 }
 
 /** 十四个内部步骤合成管理员关心的五个阶段。 */
@@ -118,6 +120,7 @@ const ERROR_TEXT: Record<string, string> = {
   release_in_progress: 'Sub2API 正在发布，请稍后重试。',
   manager_status_not_ready: '控制台读取该席位状态未就绪。',
   runner_interrupted: '执行服务在这一步期间重启。',
+  runner_not_running: '接入服务没有在运行，这次操作没有提交。',
   host_timeout: '主机在限定时间内没有完成这一步。',
   host_unreachable: '无法连接到执行这一步的主机。',
   seat_is_live: '该席位已上线，不能通过接入流程清理。',

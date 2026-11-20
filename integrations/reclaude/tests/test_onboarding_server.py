@@ -27,6 +27,7 @@ class OnboardingRouteTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.store = Store(self.temp.name)
         self.store.prepare()
+        self.store.beat()
         (Path(self.temp.name) / "options.json").write_text(json.dumps([{"id": "direct", "label": "Direct", "expected_ip": "192.0.2.7"}]))
         self.admin = True
         self.server = self.serve(self.store)
@@ -58,7 +59,14 @@ class OnboardingRouteTests(unittest.TestCase):
     def test_the_view_lists_exits_and_sessions(self):
         status, body = self.call("GET")
         self.assertEqual((status, body["data"]), (200, {"options": [{"id": "direct", "label": "Direct", "expected_ip": "192.0.2.7"}],
-                                                        "sessions": [], "busy": False}))
+                                                        "sessions": [], "busy": False, "runner_alive": True}))
+
+    def test_nothing_is_queued_while_the_runner_is_not_running(self):
+        (Path(self.temp.name) / "runner.alive").unlink()
+        self.assertEqual(self.call("GET")[1]["data"]["runner_alive"], False)
+        status, body = self.start()
+        self.assertEqual((status, body["error"]["code"]), (503, "runner_not_running"))
+        self.assertEqual(self.store.pending(), [])
 
     def test_start_queues_a_request_and_a_second_start_is_refused(self):
         status, body = self.start()

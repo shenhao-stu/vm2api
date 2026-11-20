@@ -2,7 +2,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Window } from 'happy-dom'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
-import { OnboardingCard } from './native-relay-onboarding'
+import {
+  OnboardingCard,
+  SessionProgress,
+  StartForm,
+} from './native-relay-onboarding'
 import {
   authorizationRemaining,
   draftProblems,
@@ -219,5 +223,64 @@ describe('native Relay onboarding', () => {
     expect(html).toContain('启动原生守护进程')
     expect(html).toContain('查看并处理')
     expect(html).not.toContain('放弃')
+  })
+
+  it('says so and takes no requests while the onboarding service is not running', () => {
+    const idle = { isPending: false, mutate: () => {} }
+    const flow = (stalled: boolean) =>
+      ({
+        view: { options, sessions: [], busy: false, runner_alive: !stalled },
+        stalled,
+        unreachable: false,
+        start: idle,
+        change: idle,
+        setDialog: () => {},
+      }) as unknown as RelayOnboarding
+    const render = (node: React.ReactElement) => {
+      const doc = new Window().document
+      doc.body.innerHTML = renderToStaticMarkup(node)
+      return doc
+    }
+    const disabled = (doc: ReturnType<typeof render>, label: string) =>
+      [...doc.querySelectorAll('button')]
+        .find((button) => button.textContent === label)
+        ?.hasAttribute('disabled')
+
+    const form = render(<StartForm flow={flow(true)} />)
+    expect(form.body.textContent).toContain('接入服务没有在运行')
+    expect(disabled(form, '开始授权')).toBe(true)
+    expect(disabled(render(<StartForm flow={flow(false)} />), '开始授权')).toBe(
+      false
+    )
+
+    const stopped = session(
+      4,
+      {
+        status: 'failed',
+        error: { step: 'native', code: 'native_not_ready', retriable: true },
+      },
+      'failed'
+    )
+    const dialog = (stalled: boolean) =>
+      render(
+        <SessionProgress
+          session={stopped}
+          flow={flow(stalled)}
+          onClose={() => {}}
+        />
+      )
+    expect(dialog(true).body.textContent).toContain('重试和清理暂时不可用')
+    expect(disabled(dialog(true), '重试这一步')).toBe(true)
+    expect(disabled(dialog(true), '放弃并清理')).toBe(true)
+    expect(disabled(dialog(false), '重试这一步')).toBe(false)
+
+    const card = render(
+      <OnboardingCard session={session(5)} flow={flow(true)} />
+    )
+    expect(card.body.textContent).toContain('进度暂停更新')
+    // 较早的服务端不返回这一项时，不当作停止。
+    const doc = page({ options, sessions: [session(5)], busy: true })
+    expect(doc.body.textContent).not.toContain('接入服务没有在运行')
+    expect(errorText({ code: 'runner_not_running' })).toContain('没有提交')
   })
 })

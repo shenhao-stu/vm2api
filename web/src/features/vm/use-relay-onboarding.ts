@@ -91,6 +91,8 @@ export function useRelayOnboarding(enabled: boolean) {
     sessions,
     current: sessions.find(isOpen) ?? null,
     unreachable: !!query.error && !!view,
+    /** 后台执行服务停了：新的请求不会被接手，进度也不会前进。 */
+    stalled: view?.runner_alive === false,
     refresh,
     dialog,
     setDialog,

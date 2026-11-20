@@ -22,6 +22,8 @@ OPEN = ("queued", "running", "awaiting_authorization", "failed", "abandoning")
 CLOSED = ("live", "abandoned")
 REQUESTS = ("start", "retry", "abandon")
 KEEP_CLOSED = 86400
+# The runner marks a file every few seconds. Without a fresh mark, requests would only pile up.
+RUNNER_SILENT = 45
 
 SEAT = re.compile(r"[0-9a-f]{8}")
 EGRESS = re.compile(r"[a-z0-9][a-z0-9-]{1,31}")
@@ -147,12 +149,18 @@ class Store:
                 requests.append(request)
         return requests
 
+    def runner_alive(self):
+        try:
+            return self.clock() - (self.root / "runner.alive").stat().st_mtime < RUNNER_SILENT
+        except OSError:
+            return False
+
     def view(self):
         """Open sessions, and closed ones for a day so their outcome can be read."""
         recent = self.clock() - KEEP_CLOSED
         sessions = [session for session in self.all() if session["status"] in OPEN or session["updated_at"] >= recent]
         return {"options": self.options(), "sessions": [public_view(session) for session in sessions],
-                "busy": any(session["status"] in OPEN for session in sessions)}
+                "busy": any(session["status"] in OPEN for session in sessions), "runner_alive": self.runner_alive()}
 
     # ------------------------------------------------------------ console service
 
@@ -162,6 +170,9 @@ class Store:
             raise OnboardingError("invalid_operation_id", 400)
         if (self.receipts / operation).exists() or (self.spool / (operation + ".json")).exists():
             raise OnboardingError("operation_already_consumed")
+        if not self.runner_alive():
+            # Nobody would take the request: say so now instead of leaving it queued.
+            raise OnboardingError("runner_not_running", 503)
         write_atomic(self.spool / (operation + ".json"), {**request, "at": self.clock()})
 
     def start(self, operation, name, egress, org):
@@ -204,6 +215,10 @@ class Store:
     def prepare(self):
         for folder in (self.root, self.spool, self.receipts, self.sessions):
             folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    def beat(self):
+        """The runner is running. Called from its own thread, so a long step does not look like a stop."""
+        (self.root / "runner.alive").touch(mode=0o600)
 
     def take(self, match=None):
         """The oldest request (that `match` accepts), removed from the spool. Unreadable files are discarded."""

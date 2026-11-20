@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -18,6 +19,7 @@ class StoreTests(unittest.TestCase):
         self.now = [1000.0]
         self.store = Store(self.temp.name, clock=lambda: self.now[0])
         self.store.prepare()
+        self.store.beat()
         (Path(self.temp.name) / "options.json").write_text(json.dumps(
             [{"id": "direct", "label": "Direct", "expected_ip": "192.0.2.7"}, {"id": "../x", "label": "bad", "expected_ip": "x"}]))
 
@@ -99,6 +101,22 @@ class StoreTests(unittest.TestCase):
         taken = self.store.take(lambda request: request["action"] == "abandon")
         self.assertEqual(taken["seat"], "ab12cd34")
         self.assertEqual(list(self.store.spool.iterdir()), [])
+
+    def test_requests_are_refused_once_the_runner_has_been_silent(self):
+        mark = Path(self.temp.name) / "runner.alive"
+        os.utime(mark, (self.now[0], self.now[0]))
+        self.assertTrue(self.store.view()["runner_alive"])
+        self.store.start(operation(), "Seat", "direct", 5)
+        self.now[0] += 60
+        self.assertFalse(self.store.view()["runner_alive"])
+        self.assertEqual(self.code(self.store.change, operation(), self.store.all()[0]["seat"], "abandon"), "runner_not_running")
+        self.assertEqual(len(self.store.pending()), 1)
+        # Wrong input is still reported as wrong input.
+        self.assertEqual(self.code(self.store.start, operation(), "", "direct", 5), "invalid_name")
+        self.store.beat()
+        os.utime(mark, (self.now[0], self.now[0]))
+        self.store.change(operation(), self.store.all()[0]["seat"], "abandon")
+        self.assertEqual(len(self.store.pending()), 2)
 
     def test_a_file_that_vanishes_while_the_spool_is_listed_is_skipped(self):
         # The two services add and remove spool files while the other one lists them. A name

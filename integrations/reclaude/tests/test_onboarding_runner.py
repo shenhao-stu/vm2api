@@ -4,8 +4,10 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 import uuid
 
+import onboarding_runner
 from onboarding_happy import StepFailed
 from onboarding_runner import LOGIN_POLL_GAPS, Runner
 from onboarding_store import STEPS, Store
@@ -79,6 +81,7 @@ class RunnerTests(unittest.TestCase):
         self.now = [1000.0]
         self.store = Store(self.temp.name, clock=lambda: self.now[0])
         self.store.prepare()
+        self.store.beat()
         self.hosts = FakeHosts(self.temp.name)
         self.hosts.login = [WAITING, LINKED, BOUND]
         self.seen = []
@@ -322,6 +325,19 @@ class RunnerTests(unittest.TestCase):
             self.runner.run_forever()
         self.assertEqual((len(ticks), len(recovered)), (2, 2))
         self.assertEqual(log.getvalue(), "onboarding runner: OSError while handling a request\n")
+
+    def test_the_liveness_mark_is_written_again_after_a_write_failed(self):
+        marks = []
+
+        class Flaky:
+            def beat(self):
+                marks.append(1)
+                if len(marks) == 1:
+                    raise OSError("no space left on device")
+        with mock.patch.object(onboarding_runner.time, "sleep", side_effect=[None, None, KeyboardInterrupt()]):
+            with self.assertRaises(KeyboardInterrupt):
+                onboarding_runner.keep_marking(Flaky())
+        self.assertEqual(len(marks), 3)
 
     def test_unexpected_errors_are_reported_by_type_only(self):
         def explode(*arguments, **fields):

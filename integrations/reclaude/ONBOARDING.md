@@ -50,6 +50,12 @@ None of them becomes a path, a command or a host.
 Finished seats are published as files in `manager-configs/`. The management server picks
 them up within a few seconds, so adding or abandoning a seat never restarts it.
 
+The runner touches `ROOT/runner.alive` every ten seconds, from its own thread, so a long
+step does not look like a stop. When the mark is older than 45 seconds the management
+server answers start, retry and abandon with `503 runner_not_running` and queues nothing,
+and the console says the onboarding service is not running instead of showing a request
+that waits forever.
+
 ## Install
 
 Keep every file below outside the repository, owner-only (`0700` directories, `0600` files).

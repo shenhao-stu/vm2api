@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 
 from onboarding_happy import Happy, StepFailed
@@ -325,12 +326,24 @@ class Runner:
         self.hosts.happy.mark_live(seat)
 
 
+def keep_marking(store, pause=10):
+    """Lets the console tell a busy runner from one that is not running."""
+    while True:
+        try:
+            store.beat()
+        except OSError:
+            pass
+        time.sleep(pause)
+
+
 def main(config_path):
     config = json.loads(Path(config_path).read_text())
     for folder in ("seats", "manager-configs", "manager-state", "nginx-backups"):
         (Path(config["root"]) / folder).mkdir(mode=0o700, parents=True, exist_ok=True)
-    runner = Runner(Store(config["root"]), Hosts(config), config["sub_control_command"],
+    store = Store(config["root"])
+    runner = Runner(store, Hosts(config), config["sub_control_command"],
                     login_wait=config.get("login_wait_seconds", LOGIN_WAIT))
+    threading.Thread(target=keep_marking, args=(store,), daemon=True).start()
     runner.run_forever()
 
 

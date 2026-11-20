@@ -289,6 +289,8 @@ export function OnboardingCard({
   flow: RelayOnboarding
 }) {
   const waiting = session.status === 'awaiting_authorization'
+  const failed = session.status === 'failed'
+  const stalled = flow.stalled && !failed
   return (
     <article className={RELAY_CARD} aria-label={`${session.name} · 接入中`}>
       <header className='space-y-1.5'>
@@ -313,12 +315,16 @@ export function OnboardingCard({
       <p
         className={cn(
           'hairline-t pt-2 text-xs',
-          session.status === 'failed'
+          failed
             ? 'text-[color:var(--status-bad)]'
-            : 'text-muted-foreground'
+            : stalled
+              ? 'text-[color:var(--status-warn)]'
+              : 'text-muted-foreground'
         )}
       >
-        {sessionHeadline(session)}
+        {stalled
+          ? '接入服务没有在运行，进度暂停更新'
+          : sessionHeadline(session)}
       </p>
       <div className='hairline-t mt-auto flex min-h-9 flex-wrap items-center justify-between gap-2 pt-2'>
         {waiting ? (
@@ -337,14 +343,14 @@ export function OnboardingCard({
           className={waiting ? 'w-full' : undefined}
           onClick={() => flow.setDialog({ seat: session.seat })}
         >
-          {session.status === 'failed' ? '查看并处理' : '查看进度'}
+          {failed ? '查看并处理' : '查看进度'}
         </Button>
       </div>
     </article>
   )
 }
 
-function StartForm({ flow }: { flow: RelayOnboarding }) {
+export function StartForm({ flow }: { flow: RelayOnboarding }) {
   const options = flow.view?.options ?? []
   const [typed, setTyped] = useState<Draft>({ name: '', egress: '', org: '' })
   const change = (patch: Partial<Draft>) =>
@@ -433,12 +439,18 @@ function StartForm({ flow }: { flow: RelayOnboarding }) {
         </div>
       </div>
       <DialogFooter className='items-center sm:justify-between'>
-        <p className='text-xs text-muted-foreground'>
-          下一步会生成授权链接，你只需要完成一次网页授权。
-        </p>
+        {flow.stalled ? (
+          <p role='status' className='text-xs text-[color:var(--status-warn)]'>
+            接入服务没有在运行，暂时不能开始；恢复后这里自动可用。
+          </p>
+        ) : (
+          <p className='text-xs text-muted-foreground'>
+            下一步会生成授权链接，你只需要完成一次网页授权。
+          </p>
+        )}
         <Button
           type='submit'
-          disabled={flow.start.isPending || !options.length}
+          disabled={flow.start.isPending || !options.length || flow.stalled}
         >
           {flow.start.isPending ? '正在提交…' : '开始授权'}
         </Button>
@@ -447,7 +459,7 @@ function StartForm({ flow }: { flow: RelayOnboarding }) {
   )
 }
 
-function SessionProgress({
+export function SessionProgress({
   session,
   flow,
   onClose,
@@ -459,7 +471,8 @@ function SessionProgress({
   const [confirming, setConfirming] = useState(false)
   const failed = session.status === 'failed'
   const closed = !isOpen(session)
-  const pending = flow.change.isPending
+  const stalled = flow.stalled && !closed
+  const pending = flow.change.isPending || stalled
   return (
     <div className='space-y-4'>
       <div className='flex flex-wrap items-center justify-between gap-2'>
@@ -504,14 +517,18 @@ function SessionProgress({
         </section>
       )}
       <PhaseList session={session} />
-      {flow.unreachable && (
+      {flow.unreachable ? (
         <p className='text-xs text-[color:var(--status-warn)]'>
           暂时读不到最新进度，流程仍在后台进行，恢复后自动更新。
         </p>
-      )}
+      ) : stalled ? (
+        <p role='status' className='text-xs text-[color:var(--status-warn)]'>
+          接入服务没有在运行：进度不会前进，重试和清理暂时不可用。服务恢复后这里自动更新。
+        </p>
+      ) : null}
       <DialogFooter className='items-center sm:justify-between'>
         <p className='text-xs text-muted-foreground'>
-          {closed
+          {closed || stalled
             ? ''
             : failed
               ? '流程已停在这一步，不会自行继续。'
@@ -548,7 +565,8 @@ function SessionProgress({
         cancelBtnText='继续接入'
         confirmText='放弃并清理'
         desc='会移除为这个席位创建的隔离环境、网关、私有路由和 Sub2API 账号，其他 Relay 不受影响。如果设备已经授权，它在 ReClaude 网站上的设备记录需要你手动移除。'
-        isLoading={pending}
+        isLoading={flow.change.isPending}
+        disabled={stalled}
         handleConfirm={() =>
           flow.change.mutate(
             { seat: session.seat, verb: 'abandon' },
