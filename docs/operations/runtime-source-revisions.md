@@ -38,4 +38,6 @@ The table above describes the published gateway images. Later commits on `main` 
 | New launches pause after the provider leaves policy unconfirmed | `4324ecda` | The native Relay HTTP workers, since 2026-11-20. Released with the stale-cache change because that change alone shortens the interval between failed launches. |
 | Relay sessions recover after switching accounts | `5d36a9ef` | The native Relay HTTP workers, since 2026-11-19. |
 | Enrolled native devices appear before inference admission | `ae795e07` | The Relay management service, since 2026-11-19. |
-| Upstream fixes: egress DNS cache, atomic credential symlinks, 429 instead of 502 when every account is rate limited, refusal details in diagnostics | `b6024028`, `3e3680d5`, `70f9183e`, `55003e26` | No runtime yet. They need a gateway image rebuild and a guarded restart. |
+| Upstream fixes: atomic credential symlinks, 429 instead of 502 when every account is rate limited, refusal details in diagnostics | `3e3680d5`, `70f9183e`, `55003e26` | The Claude gateway, since 2026-11-20, as a file overlay on the running image. |
+| Upstream fix: egress DNS cache | `b6024028` | No runtime yet. It lives in the Go worker and needs a worker rebuild, not a file overlay. |
+| "keygen" blocks only next to cracking words | `f05df3f5` | The Claude gateway, since 2026-11-20: first as saved intercept rules through the panel API, then as the built-in rule in the same file overlay. |
