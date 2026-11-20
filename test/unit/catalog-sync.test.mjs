@@ -89,10 +89,17 @@ test('Claude sync without a reachable slot records the failure and changes nothi
 
 test('a new GPT id stays disabled until review; known ids keep their switch', (t) => {
   withDb(t)
-  const result = syncGptIdsIntoPolicy([{ id: 'gpt-5.6' }, { id: 'gpt-7-preview' }])
+  // The built-in seed follows the current catalog, so the known ids are stated here.
+  new SettingsRepo().set('gpt_model_policy', {
+    version: 1,
+    models: { 'gpt-5.6': { enabled: true }, 'gpt-known-disabled': { enabled: false } },
+  })
+  loadGptModelPolicy({ force: true })
+  const result = syncGptIdsIntoPolicy([{ id: 'gpt-5.6' }, { id: 'gpt-known-disabled' }, { id: 'gpt-7-preview' }])
   assert.deepEqual(result.added, ['gpt-7-preview'])
   const models = getGptModelPolicy().models
   assert.equal(models['gpt-5.6'].enabled, true)
+  assert.equal(models['gpt-known-disabled'].enabled, false)
   assert.equal(models['gpt-7-preview'].enabled, false)
   assert.ok(!result.ids.includes('gpt-7-preview'))
 })
