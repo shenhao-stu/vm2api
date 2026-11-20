@@ -125,6 +125,77 @@ def official_quota(config, now=None):
         return None
 
 
+# Scheduling stops once this share of the seat quota or less is left, and comes
+# back only when at least the larger share is available again.
+SEAT_PAUSE_REMAINING = 0.01
+SEAT_RESUME_REMAINING = 0.05
+# Our own metering ran 1-4% under the official figure over the same interval.
+METERED_MARGIN = 1.05
+# A new cycle is assumed this long after the official reset time. The reading
+# does not carry the cycle length; a week is the shortest one seen, so a reset
+# time older than that says nothing about the current cycle.
+RESET_GRACE_MS = 600000
+CYCLE_MS = 7 * 86400000
+
+
+def metered_since(config, since_ms, now_ms):
+    """Cost this relay metered itself in (since, now], or None without a readable ledger."""
+    ledger = config.get("usage_ledger")
+    if not ledger:
+        return None
+    def stamp(ms):
+        return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat(
+            timespec="milliseconds").replace("+00:00", "Z")
+    try:
+        account_id = ledger["account_id"]
+        if not isinstance(account_id, str) or not account_id:
+            return None
+        uri = Path(ledger["path"]).as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.25)) as db:
+            row = db.execute("""
+                SELECT sum(total_cost) FROM usage_logs
+                WHERE created_at > :since AND created_at <= :now AND (
+                    final_account_id = :account OR
+                    (final_account_id IS NULL AND account_id = :account AND attempt_count = 1)
+                )
+            """, {"account": account_id, "since": stamp(since_ms), "now": stamp(now_ms)}).fetchone()
+        cost = row[0] or 0
+        return cost if math.isfinite(cost) and cost >= 0 else None
+    except (KeyError, ValueError, TypeError, OSError, OverflowError, sqlite3.Error):
+        return None
+
+
+def seat_quota(config, now=None):
+    """Seat usage for scheduling decisions.
+
+    The official reading is used while it is fresh. The reader depends on a
+    browser session and is often away, so a stale reading is carried forward
+    with the cost this relay metered since then. After the official reset time
+    only the cost metered in the new cycle counts.
+    """
+    now_ms = int((now if now is not None else time.time()) * 1000)
+    official = official_quota(config, now_ms / 1000)
+    if not official:
+        return None
+    limit, reset = official["quota_usd"], official["resets_at_ms"]
+    if not official["stale"]:
+        used, source, cycle_reset = official["used_usd"], "official", False
+    else:
+        after_reset = -1 if reset is None else now_ms - reset
+        if 0 <= after_reset < RESET_GRACE_MS or after_reset >= CYCLE_MS:
+            return None  # at the reset instant, or cycles later, neither figure can be trusted
+        cycle_reset = after_reset >= 0
+        start, base = (reset, 0) if cycle_reset else (official["observed_at_ms"], official["used_usd"])
+        metered = metered_since(config, start, now_ms)
+        if metered is None:
+            return None
+        used, source = base + metered * METERED_MARGIN, "estimated"
+        if cycle_reset:
+            reset = None
+    return {"used_usd": used, "quota_usd": limit, "resets_at_ms": reset, "source": source,
+            "cycle_reset": cycle_reset, "remaining": (limit - used) / limit}
+
+
 class Manager:
     def __init__(self, config, call=command):
         self.config, self.call = config, call
@@ -133,6 +204,7 @@ class Manager:
         (self.root / "operations").mkdir(mode=0o700, exist_ok=True)
         self.lock = threading.Lock()
         self.cached = None
+        self.exit_retry_at = 0
 
     def record(self, event, **data):
         with (self.root / "audit.jsonl").open("a", encoding="utf-8") as file:
@@ -176,15 +248,70 @@ class Manager:
                 self.record("account_needs_review", **data)
         guard = (guard_status(self.config, r.get("exit_guard") or {})
                  if self.config.get("guard_source") == "runtime" else guard_status(self.config))
+        seat = seat_quota(self.config)
+        sub = self._pause_exhausted_seat(seat, sub)
         result = {"id": self.config["id"], "name": self.config["name"],
                   "node": self.config["node"], "kind": "reclaude_native",
                   "binding": self.config["binding"], "sub_account": self.config["sub_account"],
                   "concurrency": self.config["concurrency"], "models": self.config["models"],
                   "observed_at": time.time(), "runtime": r, "guard": guard,
                   "usage": relay_usage(self.config), "official_quota": official_quota(self.config),
+                  "seat_quota": seat, "seat_quota_paused": self.seat_pause.exists(),
                   "sub": sub, "authorization_latched": (self.root / "authorization-latch.json").exists()}
+        self._resume_reset_seat(result)
         self.cached = result
         return result
+
+    @property
+    def seat_pause(self):
+        return self.root / "seat-quota-pause.json"
+
+    def _pause_exhausted_seat(self, seat, sub):
+        """Stop scheduling a seat whose quota is used up. In-flight turns are not touched."""
+        if (not seat or seat["remaining"] > SEAT_PAUSE_REMAINING or self.seat_pause.exists()
+                or sub.get("schedulable") is False):
+            return sub
+        sub = self.sub("pause")
+        if sub.get("schedulable") is not False:
+            raise ManagementError("sub_pause_unconfirmed", 503)
+        data = {"at": time.time(), "sub_account": self.config["sub_account"],
+                **{key: seat[key] for key in ("used_usd", "quota_usd", "resets_at_ms", "source")}}
+        with self.seat_pause.open("x") as file:
+            json.dump(data, file)
+        self.record("seat_quota_paused", **data)
+        return sub
+
+    def _end_seat_pause(self, event, **data):
+        self.seat_pause.replace(self.root / ("seat-quota-pause.%d.json" % int(time.time() * 1000)))
+        self.record(event, **data)
+
+    def _resume_reset_seat(self, state):
+        """Undo only our own quota pause, and only once the seat has quota again."""
+        if not self.seat_pause.exists():
+            return
+        if state["sub"].get("schedulable") is not False:
+            state["seat_quota_paused"] = False  # someone resumed it: that stands
+            return self._end_seat_pause("seat_quota_pause_superseded", reason="resumed")
+        seat = state["seat_quota"]
+        if not seat or seat["remaining"] < SEAT_RESUME_REMAINING:
+            return
+        try:
+            self.require_schedule_ready(state)
+        except ManagementError:
+            return  # not healthy yet; the next refresh looks again
+        if time.monotonic() < self.exit_retry_at:
+            return
+        try:
+            self.runtime("verify_exit")
+        except ManagementError:
+            # Do not probe the exit through the public lookup services every half minute.
+            self.exit_retry_at = time.monotonic() + 300
+            return
+        sub = self.sub("resume")
+        if not sub.get("schedulable"):
+            return
+        state["sub"], state["seat_quota_paused"] = sub, False
+        self._end_seat_pause("seat_quota_resumed", **{key: seat[key] for key in ("used_usd", "quota_usd", "source")})
 
     def status(self):
         if self.cached and time.time() - self.cached["observed_at"] < 15:
@@ -197,6 +324,9 @@ class Manager:
 
     def require_schedule_ready(self, state):
         r = state["runtime"]
+        seat = state["seat_quota"]
+        if seat and seat["remaining"] <= SEAT_PAUSE_REMAINING:
+            raise ManagementError("seat_quota_exhausted")
         if (state["authorization_latched"] or r.get("revoked") or r.get("auth_latched")
                 or not state["guard"]["ready"] or state["sub"].get("shared_policy_matches") is False
                 or r.get("failed_checks") or r.get("management_paused")
@@ -221,6 +351,9 @@ class Manager:
             except FileExistsError:
                 raise ManagementError("operation_already_consumed") from None
             self.record("operation_started", action=action, operation_id=operation_id)
+            if action in ("pause_schedule", "stop") and self.seat_pause.exists():
+                # The operator wants it paused: a quota reset must not undo that.
+                self._end_seat_pause("seat_quota_pause_superseded", reason=action)
             if action == "pause_schedule":
                 # The native scheduler is authoritative; never stop a paid turn.
                 if self.sub("pause").get("schedulable") is not False:
@@ -245,6 +378,9 @@ class Manager:
                         or r.get("failed_checks") or not state["guard"]["ready"]
                         or not r.get("container_running")):
                     raise ManagementError("start_requires_healthy_original_binding_and_exit")
+                seat = state["seat_quota"]
+                if seat and seat["remaining"] <= SEAT_PAUSE_REMAINING:
+                    raise ManagementError("seat_quota_exhausted")
                 self.runtime("verify_exit")
                 self.runtime("start")
                 ready = self._refresh()

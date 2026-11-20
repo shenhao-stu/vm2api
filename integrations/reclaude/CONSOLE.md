@@ -149,8 +149,27 @@ on stdin. The publisher checks scope, recency and order before atomic replacemen
 A reader interval of five minutes fits the ten-minute freshness indicator.
 When Chrome is offline, its login expires, or the reported window resets,
 the card dates the last observation. The organization window can also include
-activity from other devices. Both views are admin-only and independent of Relay
-admission and lifecycle.
+activity from other devices. Both views are admin-only. The percentage windows
+are independent of Relay admission and lifecycle.
+
+The seat's dollar quota does affect scheduling. With 1% of the quota or less
+left, the manager pauses the Relay's Sub2API account, leaves in-flight turns and
+the worker alone, and records `seat_quota_paused` with a marker in the state
+directory. It resumes only a pause it made itself: the marker is still there, the
+account is still paused, at least 5% of the quota is available, the Relay passes
+the same readiness checks as a manual resume, and the exit check succeeds. A
+manual pause or stop removes the marker, so a reset never undoes an operator's
+pause. Manual resume and start answer `seat_quota_exhausted` while the seat has
+no quota.
+
+The reader is often away, so the decision does not need a fresh reading. A stale
+reading is carried forward with the cost the Relay metered itself since that
+observation, plus a 5% margin; ten minutes after the official reset time, only
+cost metered in the new cycle counts. The management API returns this figure as
+`seat_quota` with `source` `official` or `estimated`. The estimate cannot see
+other devices on the same seat, and a reset time more than a week old gives no
+figure and no automatic action. Without a configured `official_quota` and
+`usage_ledger` nothing is paused or resumed automatically.
 
 ### Multiple native accounts
 
