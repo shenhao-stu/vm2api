@@ -22,6 +22,7 @@ from native_session_pool import SessionPool, memory_pressure, session_key
 from native_health import NativeHealth, validate_official
 from native_bridge_session import history_shape, signature
 from native_reply_cache import REPLAYABLE, ZERO_USAGE, ReplyCache, without_usage
+from native_launch_backoff import LAUNCH_REFUSED, LaunchBackoff
 
 
 class NativeServer(RelayServer):
@@ -92,6 +93,7 @@ class NativeServer(RelayServer):
         self.active_requests = 0
         self.management_pause = root / "management-paused"
         self.replies = ReplyCache(root / "replies")
+        self.launches = LaunchBackoff()
         self.reaper = threading.Thread(target=self.reap, daemon=True)
         self.reaper.start()
 
@@ -231,6 +233,7 @@ class NativeHandler(RelayHandler):
             "models": list(self.server.limits.models),
             "memory_high_bytes": self.server.memory_high_bytes,
             "history_import_enabled": self.server.pool.allow_history_import,
+            "launch_backoff": self.server.launches.snapshot(),
         })
 
     def serve_replay(self, body, record, code, started):
@@ -326,6 +329,8 @@ class NativeHandler(RelayHandler):
         request_signature = None
         sent_events = []
         self.permit_released = False
+        launch_epoch = None
+        launch_settled = False
 
         def expire():
             expired.set()
@@ -359,6 +364,15 @@ class NativeHandler(RelayHandler):
             if failed or not self.server.proof():
                 record["readiness_failures"] = failed or ["official_proof_unavailable"]
                 raise Rejection(503, "native_not_ready")
+            launch_epoch, launch_wait = self.server.launches.admit()
+            if launch_epoch is None:
+                # A recent launch got no policy confirmation. Start nothing, but a
+                # turn this relay already finished can still be answered again.
+                record["launch_backoff_seconds"] = launch_wait
+                if not prewarm and self.serve_replay(
+                        body, record, "request_already_consumed", started):
+                    return
+                raise Rejection(503, LAUNCH_REFUSED)
             context = self.lease_session(tenant, body)
             lease_started = time.monotonic()
             session = context.__enter__()
@@ -369,6 +383,10 @@ class NativeHandler(RelayHandler):
             before = set((session.directory / "dispatch").glob("*.consumed.json"))
             if prewarm:
                 result = session.prepare_request(body)
+                if not result["reused"]:
+                    # Only a launch that just happened proves the provider answered.
+                    self.server.launches.succeeded()
+                    launch_settled = True
                 result["idle_ttl_seconds"] = (
                     self.server.pool.prepared_idle_seconds
                     if session.prepared else self.server.pool.idle_seconds
@@ -387,6 +405,8 @@ class NativeHandler(RelayHandler):
             reply_key = self.server.replies.begin(record["session_pool_key"], request_signature)
             iterator = session.request(body)
             first = next(iterator)
+            self.server.launches.succeeded()
+            launch_settled = True
             if body.get("stream"):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -473,6 +493,9 @@ class NativeHandler(RelayHandler):
             )
             if expired.is_set():
                 code = "native_request_deadline"
+            if code == LAUNCH_REFUSED and launch_epoch is not None and not launch_settled:
+                self.server.launches.failed(launch_epoch)
+                launch_settled = True
             if (code in REPLAYABLE and not committed and not prewarm
                     and self.serve_replay(body, record, code, started)):
                 return
@@ -560,6 +583,8 @@ class NativeHandler(RelayHandler):
                         lease.__exit__(None, None, None)
                 finally:
                     self.server.replies.finish(reply_key)
+                    if launch_epoch is not None and not launch_settled:
+                        self.server.launches.release(launch_epoch)
                     if not self.permit_released:
                         self.server.inference.release()
                     with self.server.counter_lock:
