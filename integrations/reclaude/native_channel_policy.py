@@ -57,6 +57,9 @@ class Snapshot:
     abandoned: frozenset[str] = frozenset()
     abandoned_requests: frozenset[str] = frozenset()
     abandoned_tool_ids: frozenset[str] = frozenset()
+    # Caller histories (signatures) that busy channels of this scope are serving now,
+    # known from the lease before any claim of theirs is durable.
+    inflight_requests: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,8 @@ def consistent_snapshot(snapshot, native):
                 snapshot.evidence_complete, snapshot.unknown_dispatch, snapshot.inflight,
                 snapshot.stopped, snapshot.memory_pressure))
             or not digest(snapshot.logical_key) or not all(digest(s) for s in snapshot.consumed)
+            or type(snapshot.inflight_requests) is not frozenset
+            or not all(digest(s) for s in snapshot.inflight_requests)
             or any(type(c) is not Channel or type(c.identity) is not Identity
                    for c in snapshot.channels)):
         return False
@@ -163,9 +168,30 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
         return reject("session_scope_mismatch")
     if any(c.status == 'policy_refused' for c in channels):
         return reject('upstream_policy_refused_no_replay')
+    concurrent = ()
     if snapshot.inflight:
-        return reject('native_request_in_flight_no_replay' if request_sha in snapshot.consumed
-                      else 'session_busy')
+        if request_sha in snapshot.consumed:
+            return reject('native_request_in_flight_no_replay')
+        # A turn that starts or continues a channel of its own, such as a
+        # subagent's, runs beside the busy ones. A repeat of a running request,
+        # a turn of a busy channel's configuration, or tool results that no idle
+        # channel is waiting for may belong to a busy channel, so they wait.
+        concurrent = tuple(c for c in channels if c.busy)
+        channels = tuple(c for c in channels if not c.busy)
+        try:
+            native.initial_request(body, allow_history_import=True)
+            identity = request_identity(scope, body, native)
+            last = next(m for m in reversed(messages) if m['role'] != 'system')
+            results = {b['tool_use_id'] for b in last['content'] if b['type'] == 'tool_result'}
+            kept = [b for b in last['content'] if b['type'] != 'text' or b['text'].strip()]
+        except (native.ContractError, KeyError, TypeError, StopIteration):
+            return reject('session_busy')
+        trimmed = native.signature([({**m, 'content': kept} if m is last else m) for m in messages])
+        awaited = frozenset().union(*(c.pending_ids for c in channels))
+        if ({request_sha, trimmed} & snapshot.inflight_requests
+                or any(c.identity == identity for c in concurrent)
+                or not results <= awaited):
+            return reject('session_busy')
     # A positive claim is decisive even when its terminal is unknown. A 5xx
     # here would invite another account to execute the very same request.
     if not snapshot.evidence_complete or snapshot.unknown_dispatch:
@@ -182,8 +208,8 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
             return reject("native_session_evidence_unknown")
     if snapshot.stopped:
         return reject("native_pool_stopped")
-    if snapshot.inflight or any(c.key not in abandoned and (c.busy or c.status in {"in_flight", "closing"})
-                               for c in channels):
+    if any(c.key not in abandoned and (c.busy or c.status in {"in_flight", "closing"})
+           for c in channels):
         return reject("session_busy")
     retired = tuple(c.key for c in channels
                     if c.status in {'quota_rejected', 'terminal_error'} or c.key in abandoned)
@@ -259,7 +285,7 @@ def select_channel(tenant, body, snapshot, *, native, session_identity,
             return reject('native_session_capacity')
         if selected:
             return Decision('reuse', 'verified_existing_channel', scope, request_sha, selected.key)
-        key = scope if not channels and not retired else native.signature([
+        key = scope if not channels and not retired and not concurrent else native.signature([
             'native-caller-history-v1', scope, identity.model, identity.system_sha256,
             identity.anchor_sha256, request_sha, sorted(retired)])
         if any(c.key == key for c in snapshot.channels):

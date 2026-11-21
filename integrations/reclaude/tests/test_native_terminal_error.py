@@ -130,8 +130,9 @@ class TerminalErrorTests(unittest.TestCase):
             active.dispatch_process = None
             with self.assertRaisesRegex(ContractError, '^native_request_in_flight_no_replay$'):
                 with self.pool.lease('tenant-a', self.body): pass
-            with self.assertRaisesRegex(ContractError, '^session_busy$'):
-                with self.pool.lease('tenant-a', {**self.body, 'messages': [user('new input')]}): pass
+            # A new conversation of this session runs beside the live claim on its own channel.
+            with self.pool.lease('tenant-a', {**self.body, 'messages': [user('new input')]}) as other:
+                self.assertNotEqual(other.directory, active.directory)
         with self.assertRaisesRegex(ContractError, '^native_session_evidence_unknown$'):
             with self.pool.lease('tenant-a', {**self.body, 'messages': [user('new input')]}): pass
 

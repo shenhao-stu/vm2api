@@ -74,6 +74,8 @@ class Entry:
     session: object
     touched: float
     busy: bool = False
+    # Caller history signature of the turn holding this lease, if any.
+    request: str | None = None
 
 
 class SessionPool:
@@ -272,6 +274,7 @@ class SessionPool:
                     entry = self.entries[key] = Entry(session, self.clock())
                 if retiring is None:
                     entry.busy = True
+                    entry.request = decision.request_sha256 if decision else None
             if retiring is None:
                 break
             self.retire(*retiring)
@@ -281,6 +284,7 @@ class SessionPool:
             retiring = None
             with self.lock:
                 entry.touched = self.clock()
+                entry.request = None
                 if getattr(entry.session, "suspended", False):
                     retiring = key, entry
                 else:

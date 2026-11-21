@@ -28,7 +28,7 @@ from native_launch_backoff import LAUNCH_REFUSED, LaunchBackoff
 from native_terminal_error import unbilled_gateway_failure
 
 # Refusals that start nothing and clear once another turn on this relay ends.
-ADMISSION_WAIT_CODES = frozenset({"session_busy", "native_session_capacity"})
+ADMISSION_WAIT_CODES = frozenset({"session_busy", "native_session_capacity", "native_memory_pressure"})
 
 
 class NativeServer(RelayServer):
@@ -100,12 +100,9 @@ class NativeServer(RelayServer):
         self.management_pause = root / "management-paused"
         self.replies = ReplyCache(root / "replies")
         self.launches = LaunchBackoff()
-        # A caller whose conversation is mid-turn, or whose relay has no free CLI,
-        # waits here for a bounded time instead of being refused. Waiters keep their
-        # execution permit; the caps stop one conversation from holding all of them.
+        # A caller whose turn may belong to a busy channel, or whose relay has no
+        # free CLI or memory, waits here for a bounded time instead of being refused.
         self.admission_wait_seconds = 45.0
-        self.admission_waiters_per_session = 3
-        self.admission_waiters_total = max(1, limits.concurrency // 2)
         self.admission_lock = threading.Lock()
         self.admission_waiting = {}
         self.reaper = threading.Thread(target=self.reap, daemon=True)
@@ -275,12 +272,7 @@ class NativeHandler(RelayHandler):
     def join_admission_queue(self, key):
         server = self.server
         with server.admission_lock:
-            waiting = server.admission_waiting.get(key, 0)
-            if (waiting >= server.admission_waiters_per_session
-                    or sum(server.admission_waiting.values()) >= server.admission_waiters_total):
-                return False
-            server.admission_waiting[key] = waiting + 1
-            return True
+            server.admission_waiting[key] = server.admission_waiting.get(key, 0) + 1
 
     def leave_admission_queue(self, key):
         server = self.server
@@ -292,12 +284,14 @@ class NativeHandler(RelayHandler):
                 del server.admission_waiting[key]
 
     def lease_when_admitted(self, tenant, body, record, started, expired, may_wait):
-        """Enter the conversation's lease, waiting while it is busy or the relay is full.
+        """Enter the conversation's lease, waiting while it may belong to a busy
+        channel or the relay has no free CLI or memory.
 
-        Both refusals come before anything is started and clear when another turn
+        Subagents of a conversation run on channels of their own and do not wait.
+        These refusals come before anything is started and clear when another turn
         on this relay ends, so the caller would only retry them. Waiting dispatches
         nothing, is bounded by half the request budget, and stops for a caller who
-        has gone away.
+        has gone away. Every caller may wait; none is turned away for waiting.
         """
         server = self.server
         key = record["session_pool_key"]
@@ -319,10 +313,8 @@ class NativeHandler(RelayHandler):
                         record["admission_wait_code"] = str(error)
                         budget = server.limits.request_seconds / 2 - (now - started)
                         deadline = now + min(server.admission_wait_seconds, budget)
-                        queued = self.join_admission_queue(key)
-                        if not queued:
-                            record["admission_queue_full"] = True
-                            raise
+                        self.join_admission_queue(key)
+                        queued = True
                     if now >= deadline:
                         raise
                     pause = min(delay, deadline - now)

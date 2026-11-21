@@ -202,7 +202,9 @@ class ChannelTests(unittest.TestCase):
             self.assertEqual(read_json(active.directory / 'continuation.json')['status'], 'awaiting_tools')
             for request in (body, fresh):
                 try:
-                    with self.pool.lease('tenant-a', request):
+                    with self.pool.lease('tenant-a', request) as other:
+                        # A new conversation of this session runs on a channel of its own.
+                        self.assertNotEqual(other.directory, active.directory)
                         observed.append('admitted')
                 except ContractError as exc:
                     observed.append(str(exc))
@@ -212,7 +214,7 @@ class ChannelTests(unittest.TestCase):
             with patch.object(active, 'prepare', side_effect=check_during_prepare):
                 with self.assertRaisesRegex(ContractError, '^offline_prepare_finished$'):
                     list(active.request(following))
-        self.assertEqual(observed, ['native_request_in_flight_no_replay', 'session_busy'])
+        self.assertEqual(observed, ['native_request_in_flight_no_replay', 'admitted'])
         self.assertEqual(len(list((active.directory / 'caller-grants').glob('*.json'))), 1)
 
     def test_pending_tool_identity_changes_are_rejected(self):

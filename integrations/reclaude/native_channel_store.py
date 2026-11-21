@@ -179,12 +179,19 @@ class ChannelStore:
         # abandoned: its claimed requests stay consumed (never replayed), but
         # its evidence no longer decides a different caller turn.
         abandoned, abandoned_requests, abandoned_tools, live_tools = set(), set(), set(), set()
+        inflight_requests = set()
         for key, raw_identity in document['channels'].items():
             if (len(key) != 64 or any(c not in '0123456789abcdef' for c in key)
                     or raw_identity.get('logical_key') != logical):
                 raise native.ContractError('native_channel_evidence_unknown')
             directory = self.root / key
             entry = entries.get(key)
+            busy = bool(entry and entry.busy)
+            if busy and getattr(entry, 'request', None):
+                inflight_requests.add(entry.request)
+            # A busy channel's own turn is still writing its evidence. It cannot
+            # decide another channel's turn; that turn's policy keeps clear of it.
+            settled, certain = True, True
             state_path = directory / 'continuation.json'
             state = read_json(state_path) if state_path.exists() else {}
             session = entry.session if entry else None
@@ -265,7 +272,7 @@ class ChannelStore:
                     # resend stays consumed; only its terminal is unknown.
                     channel_unknown = True
                 elif receipt.get('id') != grant_id:
-                    unknown = True
+                    certain = False
                 elif (isinstance(claim.get('terminal_usage'), dict)
                       and all(type(claim['terminal_usage'].get(k)) is int and claim['terminal_usage'][k] >= 0
                               for k in ('input_tokens', 'output_tokens'))):
@@ -284,21 +291,21 @@ class ChannelStore:
                         paid_input = request
             grant_path = directory / 'dispatch/grant.json'
             if grant_path.exists() and read_json(grant_path).get('id') not in known_grants:
-                complete = False
+                settled = False
             records = list((directory / 'dispatch').glob('*.consumed.json'))
             for path in records:
                 grant = path.name.removesuffix('.consumed.json')
                 if grant not in known_grants or read_json(path).get('id') != grant:
-                    complete = False
+                    settled = False
             if status == 'prepared' and (records or known_grants):
-                complete = False
+                settled = False
             if (status not in {'quota_rejected', 'terminal_error', 'policy_refused'} and session is not None and session.history
                     and (length != len(session.history)
                          or history_sha != native.signature(native.history_shape(session.history)))):
                 if session.failed:
                     channel_unknown = True
                 else:
-                    complete = False
+                    settled = False
             idle_dead = session is None and status in {'in_flight', 'closing'}
             if (not (entry and entry.busy) and (status == 'failed' or idle_dead or channel_unknown)
                     and quiet_seconds(directory, time.time()) >= ABANDON_AFTER_SECONDS):
@@ -309,7 +316,10 @@ class ChannelStore:
             else:
                 live_tools.update(channel_tools)
                 if channel_unknown:
-                    unknown = True
+                    certain = False
+            if not busy:
+                complete = complete and settled
+                unknown = unknown or not certain
             try:
                 fields = dict(raw_identity)
                 marker = fields.pop('paid_sibling', None)
@@ -339,7 +349,7 @@ class ChannelStore:
                         raise native.ContractError('native_channel_evidence_unknown') from None
                 boundaries.append(CompletedBoundary(claim['request_sha256'], digest, count, record))
             channels.append(Channel(key, identity, status, length, history_sha,
-                                    resident=entry is not None, busy=bool(entry and entry.busy),
+                                    resident=entry is not None, busy=busy,
                                     pending_ids=pending, history_controls=controls,
                                     history_pending=pending_witness, paid_input=paid_input, sibling=sibling,
                                     completed=tuple(boundaries), tool_handoff=tool_handoff))
@@ -366,7 +376,8 @@ class ChannelStore:
                         issued_tool_ids=frozenset(issued_tools),
                         abandoned=frozenset(abandoned),
                         abandoned_requests=frozenset(abandoned_requests & consumed),
-                        abandoned_tool_ids=frozenset(abandoned_tools - live_tools))
+                        abandoned_tool_ids=frozenset(abandoned_tools - live_tools),
+                        inflight_requests=frozenset(inflight_requests))
 
     def bind(self, session, request_sha, grant_id):
         directory = session.directory / 'caller-grants'

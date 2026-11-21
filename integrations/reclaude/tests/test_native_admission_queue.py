@@ -143,35 +143,30 @@ class AdmissionQueueTests(unittest.TestCase):
         self.assertEqual(first_result[0][0], 200)
         self.assertEqual(self.server.admission_waiting, {})
 
-    def test_waiters_of_one_conversation_are_capped(self):
-        self.server.admission_waiters_per_session = 1
+    def test_every_waiting_turn_of_a_conversation_is_served_without_a_cap(self):
         first, first_result = self.start_running_turn()
-        second, second_result = self.background(self.body("second"))
-        self.until(lambda: self.waiting() == 1)
-        started = time.monotonic()
-        status, _ = self.request(self.body("third"))
-        self.assertEqual(status, 429)
-        self.assertLess(time.monotonic() - started, 1)
-        refused = self.row("session_busy")
-        self.assertTrue(refused["admission_queue_full"])
-        self.assertEqual(refused["attempts"], 0)
+        waiting = [self.background(self.body("turn %d" % n)) for n in range(3)]
+        self.until(lambda: self.waiting() == 3)
+        self.assertFalse(any(r.get("admission_queue_full") for r in self.rows()))
         self.hold.set()
         first.join(5)
-        second.join(5)
-        self.assertEqual((first_result[0][0], second_result[0][0]), (200, 200))
-        self.assertEqual(self.consumed(), 2)
+        for worker, _ in waiting:
+            worker.join(10)
+        self.assertEqual([first_result[0][0]] + [r[0][0] for _, r in waiting], [200] * 4)
+        self.assertEqual(self.consumed(), 4)
+        self.assertEqual(self.server.admission_waiting, {})
 
-    def test_waiters_across_the_relay_are_capped(self):
-        self.server.admission_waiters_total = 1
-        first, first_result = self.start_running_turn()
-        second, second_result = self.background(self.body("second"))
-        self.until(lambda: self.waiting() == 1)
-        self.assertEqual(self.request(self.body("third"))[0], 429)
-        self.assertTrue(self.row("session_busy")["admission_queue_full"])
+    def test_turn_refused_for_memory_pressure_starts_once_memory_is_free(self):
+        relieved = threading.Event()
+        self.server.pool.under_pressure = lambda: not relieved.is_set()
         self.hold.set()
-        first.join(5)
-        second.join(5)
-        self.assertEqual((first_result[0][0], second_result[0][0]), (200, 200))
+        worker, result = self.background(self.body("under pressure"))
+        self.until(lambda: self.waiting() == 1)
+        relieved.set()
+        worker.join(5)
+        self.assertEqual(result[0][0], 200)
+        served = next(r for r in self.rows() if "admission_wait_ms" in r)
+        self.assertEqual(served["admission_wait_code"], "native_memory_pressure")
 
     def test_caller_that_left_while_waiting_is_never_dispatched(self):
         first, first_result = self.start_running_turn()

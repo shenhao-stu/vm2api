@@ -316,6 +316,8 @@ class NativeHTTPTests(unittest.TestCase):
         self.assertFalse(self.created)
 
     def test_memory_pressure_and_missing_reading_never_dispatch(self):
+        # Pressure that persists through the admission wait still ends in 429.
+        self.server.admission_wait_seconds = 0.2
         self.server.pool.under_pressure = lambda: True
         self.assertEqual(self.request()[0], 429)
         def unavailable():
