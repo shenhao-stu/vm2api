@@ -11,7 +11,9 @@ import json
 import os
 import re
 from pathlib import Path
+import select
 import signal
+import socket
 import threading
 import time
 from urllib.parse import urlsplit
@@ -24,6 +26,9 @@ from native_bridge_session import history_shape, signature
 from native_reply_cache import REPLAYABLE, ZERO_USAGE, ReplyCache, without_usage
 from native_launch_backoff import LAUNCH_REFUSED, LaunchBackoff
 from native_terminal_error import unbilled_gateway_failure
+
+# Refusals that start nothing and clear once another turn on this relay ends.
+ADMISSION_WAIT_CODES = frozenset({"session_busy", "native_session_capacity"})
 
 
 class NativeServer(RelayServer):
@@ -95,6 +100,14 @@ class NativeServer(RelayServer):
         self.management_pause = root / "management-paused"
         self.replies = ReplyCache(root / "replies")
         self.launches = LaunchBackoff()
+        # A caller whose conversation is mid-turn, or whose relay has no free CLI,
+        # waits here for a bounded time instead of being refused. Waiters keep their
+        # execution permit; the caps stop one conversation from holding all of them.
+        self.admission_wait_seconds = 45.0
+        self.admission_waiters_per_session = 3
+        self.admission_waiters_total = max(1, limits.concurrency // 2)
+        self.admission_lock = threading.Lock()
+        self.admission_waiting = {}
         self.reaper = threading.Thread(target=self.reap, daemon=True)
         self.reaper.start()
 
@@ -250,6 +263,79 @@ class NativeHandler(RelayHandler):
             "launch_backoff": self.server.launches.snapshot(),
         })
 
+    def caller_gone(self):
+        """The body was read whole and nothing may follow it on this connection,
+        so a readable socket can only mean the caller closed its side."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
+
+    def join_admission_queue(self, key):
+        server = self.server
+        with server.admission_lock:
+            waiting = server.admission_waiting.get(key, 0)
+            if (waiting >= server.admission_waiters_per_session
+                    or sum(server.admission_waiting.values()) >= server.admission_waiters_total):
+                return False
+            server.admission_waiting[key] = waiting + 1
+            return True
+
+    def leave_admission_queue(self, key):
+        server = self.server
+        with server.admission_lock:
+            left = server.admission_waiting[key] - 1
+            if left:
+                server.admission_waiting[key] = left
+            else:
+                del server.admission_waiting[key]
+
+    def lease_when_admitted(self, tenant, body, record, started, expired, may_wait):
+        """Enter the conversation's lease, waiting while it is busy or the relay is full.
+
+        Both refusals come before anything is started and clear when another turn
+        on this relay ends, so the caller would only retry them. Waiting dispatches
+        nothing, is bounded by half the request budget, and stops for a caller who
+        has gone away.
+        """
+        server = self.server
+        key = record["session_pool_key"]
+        queued = False
+        waited_from = deadline = None
+        delay = 0.05
+        try:
+            while True:
+                context = self.lease_session(tenant, body)
+                try:
+                    return context, context.__enter__()
+                except ContractError as error:
+                    if (not may_wait or str(error) not in ADMISSION_WAIT_CODES
+                            or expired.is_set()):
+                        raise
+                    now = time.monotonic()
+                    if waited_from is None:
+                        waited_from = now
+                        record["admission_wait_code"] = str(error)
+                        budget = server.limits.request_seconds / 2 - (now - started)
+                        deadline = now + min(server.admission_wait_seconds, budget)
+                        queued = self.join_admission_queue(key)
+                        if not queued:
+                            record["admission_queue_full"] = True
+                            raise
+                    if now >= deadline:
+                        raise
+                    pause = min(delay, deadline - now)
+                time.sleep(pause)
+                delay = min(1.0, delay * 2)
+                if self.caller_gone():
+                    raise Rejection(499, "caller_disconnected_while_waiting")
+        finally:
+            if queued:
+                self.leave_admission_queue(key)
+            if waited_from is not None:
+                record["admission_wait_ms"] = round((time.monotonic() - waited_from) * 1000)
+
     def serve_replay(self, body, record, code, started):
         """Answer an identical repeat from the completed turn. Never dispatches."""
         try:
@@ -392,16 +478,21 @@ class NativeHandler(RelayHandler):
                 if prewarm or not self.server.pool.running(tenant, body):
                     raise Rejection(503, LAUNCH_REFUSED)
                 record["launch_backoff_bypassed"] = True
-            context = self.lease_session(tenant, body)
             lease_started = time.monotonic()
-            session = context.__enter__()
+            # A launch probe decides whether launches resume; it is never held back.
+            lease, session = self.lease_when_admitted(
+                tenant, body, record, started, expired,
+                may_wait=not prewarm and launch_epoch in (None, 0))
             record["pool_lease_ms"] = round((time.monotonic() - lease_started) * 1000)
             process = getattr(session, "process", None)
             record["native_cli_reused"] = process is not None and process.poll() is None
-            lease = context
             before = set((session.directory / "dispatch").glob("*.consumed.json"))
             if launch_epoch is None and not record["native_cli_reused"]:
                 # The CLI went away between the check and the lease.
+                raise Rejection(503, LAUNCH_REFUSED)
+            if ("admission_wait_ms" in record and launch_epoch == 0
+                    and not record["native_cli_reused"] and self.server.launches.snapshot()["failures"]):
+                # A launch failed while this caller waited; its pause covers this launch too.
                 raise Rejection(503, LAUNCH_REFUSED)
             if prewarm:
                 result = session.prepare_request(body)

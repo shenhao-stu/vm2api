@@ -776,6 +776,8 @@ class NativeHTTPTests(unittest.TestCase):
                 self.assertEqual(self.audit()[-1]['attempts'], 0)
 
     def test_disconnect_drains_terminal_and_keeps_one_lease(self):
+        # The busy check below must answer at once rather than wait for this turn.
+        self.server.admission_wait_seconds = 0
         self.release = threading.Event()
         raw = json.dumps(self.body(stream=True)).encode()
         sock = socket.create_connection(self.server.server_address, timeout=3)
