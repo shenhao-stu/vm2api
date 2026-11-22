@@ -3204,7 +3204,7 @@ for (const reason of ['quota_5h_safety', 'quota_7d_safety', 'quota_guard_request
     let healthCalls = 0
     const reset = new Date(Date.now() + 3600_000).toISOString()
     const pool = scheduler(root, {
-      accountQuota: { canAccept: () => ({ ok: false, reason, detail: { reset } }) },
+      accountQuota: { canAccept: () => ({ ok: false, reason, detail: { reset, guard_until: Date.parse(reset) } }) },
       workerHealth: async () => {
         healthCalls++
         return { ok: true, credential: { has_access: true } }
@@ -3213,6 +3213,9 @@ for (const reason of ['quota_5h_safety', 'quota_7d_safety', 'quota_guard_request
     const result = await pool.selectAndReserve({ model: 'claude-fable-5-2', allowWait: false })
     assert.equal(result.ok, false)
     assert.equal(result.reason, reason)
+    if (reason === 'quota_guard_request_too_large') {
+      assert.ok(result.retry_after_ms > 3500_000 && result.retry_after_ms <= 3600_000)
+    }
     assert.equal(healthCalls, 0, 'a known local rejection must not wait for worker transport')
   })
 }

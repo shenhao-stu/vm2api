@@ -209,7 +209,7 @@ function emptyPoolFailure(candidates, now = Date.now()) {
     return { reason: 'fable_requires_max', retry_after_ms: null }
   }
   if ((candidates?.rejections?.quota_guard_request_too_large || 0) > 0) {
-    return { reason: 'quota_guard_request_too_large', retry_after_ms: null }
+    return { reason: 'quota_guard_request_too_large', retry_after_ms: candidates.guardUntil > now ? candidates.guardUntil - now : null }
   }
   const { rate_limited: limited = null, overloaded = null } = candidates?.cooldowns || {}
   if (overloaded != null) {
@@ -953,6 +953,7 @@ export class PoolScheduler extends EventEmitter {
           candidates.cooldowns[kind] = prev == null ? until : Math.min(prev, until)
         } else if (kind === 'quota_guard_request_too_large') {
           candidates.rejections.quota_guard_request_too_large += 1
+          if (eligibility.guardUntil > now) candidates.guardUntil = Math.min(candidates.guardUntil ?? Infinity, eligibility.guardUntil)
         } else if (kind === 'rest_period') {
           const until = Number(eligibility.until) || 0
           candidates.rest_until = candidates.rest_until == null ? until : Math.min(candidates.rest_until, until)
@@ -1112,6 +1113,7 @@ export class PoolScheduler extends EventEmitter {
     // health completes, so concurrent usage cannot turn this into an admission bypass.
     const quotaGate = !pinned && this.accountQuota?.canAccept(accountId, { tier: vmTierOf(vm), quotaRequest })
     if (quotaGate && !quotaGate.ok && !QUOTA_WAIT_REASONS.has(quotaGate.reason)) {
+      if (quotaGate.reason === 'quota_guard_request_too_large') return { ok: false, reason: quotaGate.reason, guardUntil: quotaGate.detail?.guard_until }
       const quota = quotaRejection(quotaGate.reason, quotaGate.detail?.reset, now)
       return { ok: false, reason: quotaGate.reason || 'quota_gate', ...(quota ? { until: quota.until } : {}) }
     }

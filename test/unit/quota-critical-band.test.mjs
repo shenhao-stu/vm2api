@@ -533,3 +533,25 @@ test('a zero-dispatch large-cold rejection retains the session pin for its next 
   assert.equal(pins.get('session')?.accountId, 'account-1')
   assert.equal(pins.get('family')?.accountId, 'account-1')
 })
+
+test('critical-band large request supplies the last implicated window reset only', () => {
+  const q = quota()
+  const secs = Math.floor(Date.now() / 1000)
+  for (const [id, five, seven, expected] of [
+    ['five', 0.79, 0.2, secs + 30],
+    ['seven', 0.2, 0.79, secs + 90],
+    ['both', 0.79, 0.79, secs + 90],
+  ]) {
+    q.ingestHeaders(id, {
+      'anthropic-ratelimit-unified-5h-utilization': String(five),
+      'anthropic-ratelimit-unified-7d-utilization': String(seven),
+      'anthropic-ratelimit-unified-5h-reset': String(secs + 30),
+      'anthropic-ratelimit-unified-7d-reset': String(secs + 90),
+    })
+    const denied = q.canAccept(id, { requestRisk: largeColdRisk })
+    assert.equal(denied.reason, 'quota_guard_request_too_large')
+    assert.equal(denied.detail.guard_until, expected * 1000)
+  }
+  setUtil(q, 'unknown', {u5: 0.79})
+  assert.equal(q.canAccept('unknown', {requestRisk: largeColdRisk}).detail.guard_until, null)
+})

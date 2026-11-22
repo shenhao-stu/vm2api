@@ -681,10 +681,14 @@ export class AccountQuota {
       const risk = resolveRequestRisk({ requestRisk, quotaRequest }, accountId, quotaConfig)
       const tooLarge = this._requestTooLargeInBand({ quotaConfig, risk, stale })
       if (tooLarge) {
+        const resets = []
+        if (in5) resets.push(parseResetMs(w5.reset))
+        if (in7) resets.push(parseResetMs(w7.reset))
         return {
           ok: false,
           reason: 'quota_guard_request_too_large',
           detail: {
+            guard_until: resets.every(value => Number.isSafeInteger(value) && value > Date.now()) ? Math.max(...resets) : null,
             utilization_5h: u5,
             utilization_7d: u7,
             limit_5h: ratio,
