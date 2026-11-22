@@ -37,6 +37,15 @@ describe('official Fable allowance is not a subscription label', () => {
     expect(vm).toEqual(before)
   })
 
+  it.each([[0.01, 1], [1, 100], [1.01, 101], [1.12, 112]])(
+    'renders an official ratio of %s as %s percent',
+    (ratio, percent) => {
+      const vm = pro({ subscription_type: 'max', utilization_7d_oi: ratio })
+      expect(fableRow(vm)).toEqual({ kind: 'bar', pct: expect.closeTo(percent, 8) })
+      expect(renderToStaticMarkup(<VmUsageWindows vm={vm} now={now} />)).toContain(percent + '%')
+    }
+  )
+
   it('uses observed window evidence even when the subscription label is unknown', () => {
     const vm = pro({ subscription_type: null, account_tier: undefined })
     expect(fableRow(vm)).toEqual({ kind: 'bar', pct: 27 })

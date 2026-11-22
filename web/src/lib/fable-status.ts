@@ -150,6 +150,12 @@ export function fableUsedOf(
   return Number.isFinite(used) && used >= 0 ? used : null
 }
 
+/** The native 7d_oi reading is a ratio even when it exceeds 1. */
+function fablePercent(subject: FableSubject, used: number | null): number {
+  if (used == null) return 0
+  return subject.utilization_7d_oi != null ? used * 100 : pct(used)
+}
+
 /** 对齐 `fableWeeklyFull`。 */
 export function fableWeeklyFull(
   subject: FableSubject,
@@ -158,7 +164,7 @@ export function fableWeeklyFull(
   if (subject.has_token === false || isCodexVm(subject as Vm)) return false
   const fb = (subject.fable as Record<string, unknown> | undefined) || {}
   const used = fableUsedOf(subject, tierKey)
-  if (used != null) return windowLimited(subject.status_7d_oi, pct(used))
+  if (used != null) return windowLimited(subject.status_7d_oi, fablePercent(subject, used))
   return (
     tierKey === 'max' &&
     (windowLimited(subject.status_7d_oi, 0) || Boolean(fb.limited))
@@ -215,7 +221,7 @@ export function fableState(
     return { usedPct: null, tone: { key: 'bad', cls: 'bad', text: '拒' } }
   const used = fableUsedOf(subject, tierKey)
   if (used != null) {
-    const u = pct(used)
+    const u = fablePercent(subject, used)
     return {
       usedPct: u,
       tone: { key: 'ok', cls: 'ok', text: `${u.toFixed(1)}%` },
@@ -253,7 +259,7 @@ export function fableUtil(subject: FableSubject, tierKey: string): number {
   ) {
     return 100
   }
-  return pct(fableUsedOf(subject, tierKey))
+  return fablePercent(subject, fableUsedOf(subject, tierKey))
 }
 
 /** 每账号 Fable 并发上限的兜底值。对齐 `fableCap`。 */
@@ -419,7 +425,7 @@ export function fableCardInfo(
   else if (fableWeeklyFull(subject, tierKey)) bits.unshift('周额度满')
 
   if (used != null) {
-    return { usedPct: pct(used), reset, bits, badgeText: '', badgeCls: 'ok' }
+    return { usedPct: fablePercent(subject, used), reset, bits, badgeText: '', badgeCls: 'ok' }
   }
   const txt = fableProbeLabel(subject, tierKey, now)
   const denied = fablePlanDenied(fb) || inventedFableWindow(subject)
